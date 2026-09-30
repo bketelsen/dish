@@ -1,0 +1,17 @@
+{
+  "name": "dish",
+  "private": true,
+  "type": "module",
+  "description": "Personal DeepSeek Harness plugin workspace",
+  "scripts": {
+    "dsh": "dsh",
+    "web": "dsh web",
+    "typecheck": "tsc -p tsconfig.json --noEmit && pnpm -r --if-present typecheck",
+    "build": "pnpm -r --if-present build"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh": "0.2.0-rc.2",
+    "typescript": "^6.0.0",
+    "@types/node": "^24.0.0"
+  }
+}

@@ -1,0 +1,17 @@
+# Mounted after @deepseek-ai/dsh-base, which provides authorization,
+# credentials, settings, and the llm-pi-ai adapter these plugins drive.
+- insert:
+    - id: dish-copilot-catalog
+      name: dish-copilot/catalog
+      config:
+        cacheFile: !!js dshHomePath('dish-copilot-models.json')
+    - id: dish-copilot
+      name: dish-copilot
+
+# llm-pi-ai reads pi-ai's Copilot catalog when its config changes, not per
+# request. Mount it after the catalog plugin has re-applied cached additions,
+# so a route listing them resolves from the first request. This sets the row's
+# whole `inject`; the base row declares none. Remove this bundle rather than
+# disabling dish-copilot-catalog, or llm-pi-ai waits for it forever.
+- id: llm-pi-ai
+  inject: [copilotCatalog]
