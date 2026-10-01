@@ -67,7 +67,7 @@ Each write is atomic, and a commit lands only if `main` is still where the write
   - Releasing a claim (the plugin unloads) leaves its files untouched.
 - **Commit**: one atomic change to one or more documents, carrying:
   - an author: `{ kind: 'user' }`, `{ kind: 'agent', sessionId, role }`, or `{ kind: 'system' }` for the store's own commits (the root commit and `seed`); git records `user` as the user identity, and `agent` and `system` as the agent identity
-  - a message, generated as `<paths>: <summary>` plus an optional note
+  - a message, generated as `<paths>: <summary>` plus an optional note; the subject names the first 3 paths, then "and N more"
   - trailers: `Dish-Author-Kind`, `Dish-Session` and `Dish-Role` (agent only), `Dish-Note` (when there's a note)
 - **Proposal**: a branch `proposal/<id>` whose commits sit on top of the `main` commit it was based on. Metadata (title, rationale, author session, created, status) is stored in the tip commit's message trailers, so the branch alone carries everything.
 
@@ -102,9 +102,9 @@ interface DishConfig {
 
 type Change = { path: string, text: string } | { path: string, delete: true }
 interface WriteMeta {
-  author: Author
+  author: Author                 // a user or agent author; system is store-internal and refused here
   note?: string
-  /** Optimistic concurrency: the main commit the editor loaded. */
+  /** Optimistic concurrency: the full 40-hex id of the main commit the editor loaded. Not a commit: NOT_FOUND. */
   base?: string
 }
 ```
@@ -119,6 +119,7 @@ Consumers re-read on these events rather than caching.
 
 - All repository operations go through one in-process queue, and the `dish.lock` file keeps a second process out.
 - **`write` with `base`:**
+  - `base` must be the full 40-hex id of a commit; anything else, or an id that isn't in the repository, is `NOT_FOUND`.
   - If a path being written changed on `main` since `base`, the write is refused with `CONFLICT`, and the editor reloads.
   - If only *other* paths changed since `base`, the write goes through, built on current `main`.
 

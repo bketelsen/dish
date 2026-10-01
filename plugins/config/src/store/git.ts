@@ -44,6 +44,7 @@ export const GIT_ENV_DENYLIST: readonly string[] = [
   'GIT_DEFAULT_HASH', 'GIT_DIR', 'GIT_INDEX_FILE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS',
   'GIT_CONFIG_COUNT', 'GIT_GRAFT_FILE', 'GIT_NO_REPLACE_OBJECTS', 'GIT_REPLACE_REF_BASE', 'GIT_PREFIX',
   'GIT_SHALLOW_FILE', 'GIT_NAMESPACE', 'GIT_GLOB_PATHSPECS', 'GIT_NOGLOB_PATHSPECS', 'GIT_CEILING_DIRECTORIES',
+  'GIT_DEFAULT_REF_FORMAT',
 ]
 
 /**
@@ -137,7 +138,11 @@ export class Git {
   /** Create the repository (bare, `HEAD` on `branch`). Safe to call on an existing one. */
   async initBare(branch: 'main'): Promise<void> {
     // SHA-1 explicitly: a user's init.defaultObjectFormat=sha256 would break the 40-zero compare-and-swap, and GitHub is SHA-1.
-    const result = await exec(['init', '--bare', '--object-format=sha1', '-b', branch, this.gitDir], {})
+    // Loose `files` refs explicitly too: a user's init.defaultRefFormat=reftable would keep refs and their locks where
+    // the startup cleanup doesn't look. (The environment's GIT_DEFAULT_REF_FORMAT is scrubbed by `gitEnv`; git older
+    // than 2.45 ignores the config key and always uses files.)
+    const result = await exec(
+      ['-c', 'init.defaultRefFormat=files', 'init', '--bare', '--object-format=sha1', '-b', branch, this.gitDir], {})
     if (result.code !== 0) throw new Error(`git init failed (exit ${result.code}): ${result.stderr.trim()}`)
   }
 

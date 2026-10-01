@@ -347,6 +347,27 @@ test('initBare pins SHA-1 even when the user config defaults new repos to SHA-25
   assert.equal((await git.run(['rev-parse', '--show-object-format'])).stdout.trim(), 'sha1')
 })
 
+test('initBare pins the files ref format, whatever the user config or the environment says', async () => {
+  const config = join(await tempDir(), 'gitconfig')
+  await writeFile(config, '[init]\n\tdefaultRefFormat = reftable\n')
+  // reftable keeps its refs where the startup cleanup and the ref-lock handling don't look.
+  for (const [label, vars] of [
+    ['global config', { GIT_CONFIG_GLOBAL: config }],
+    ['environment', { GIT_DEFAULT_REF_FORMAT: 'reftable' }],
+  ] as const) {
+    const dir = join(await tempDir(), 'config.git')
+    const git = new Git(dir)
+    await withEnv(vars, async () => {
+      await git.initBare('main')
+      await commit(git, [{ path: 'a.md', text: '1' }])
+    })
+    assert.equal((await git.run(['rev-parse', '--show-ref-format'])).stdout.trim(), 'files', label)
+    assert.equal(await git.resolve(MAIN) !== undefined, true, label)
+    await readFile(join(dir, MAIN))
+    await git.run(['fsck'])
+  }
+})
+
 test('gitEnv drops variables that redirect a repository, keeps the ones auth needs, and applies overrides last', () => {
   const kept = {
     PATH: '/usr/bin', HOME: '/home/u', GIT_SSH_COMMAND: 'ssh -i k', GIT_SSH: '/bin/ssh', GIT_ASKPASS: '/bin/askpass',
@@ -371,7 +392,7 @@ test('gitEnv drops variables that redirect a repository, keeps the ones auth nee
     'GIT_COMMON_DIR', 'GIT_QUARANTINE_PATH', 'GIT_AUTHOR_DATE', 'GIT_COMMITTER_DATE', 'GIT_DEFAULT_HASH', 'GIT_DIR',
     'GIT_INDEX_FILE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_GRAFT_FILE',
     'GIT_NO_REPLACE_OBJECTS', 'GIT_REPLACE_REF_BASE', 'GIT_PREFIX', 'GIT_SHALLOW_FILE', 'GIT_NAMESPACE', 'GIT_GLOB_PATHSPECS',
-    'GIT_NOGLOB_PATHSPECS', 'GIT_CEILING_DIRECTORIES',
+    'GIT_NOGLOB_PATHSPECS', 'GIT_CEILING_DIRECTORIES', 'GIT_DEFAULT_REF_FORMAT',
   ]) assert.ok(GIT_ENV_DENYLIST.includes(name), name)
 })
 
@@ -389,6 +410,7 @@ const STRAY: Record<string, () => Promise<Record<string, string>>> = {
   'index file': async () => ({ GIT_INDEX_FILE: join(await tempDir(), 'index') }),
   'namespace': async () => ({ GIT_NAMESPACE: 'elsewhere' }),
   'default hash': async () => ({ GIT_DEFAULT_HASH: 'sha256' }),
+  'default ref format': async () => ({ GIT_DEFAULT_REF_FORMAT: 'reftable' }),
   'config count': async () => ({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.bare', GIT_CONFIG_VALUE_0: 'false' }),
   'frozen dates': async () => ({ GIT_AUTHOR_DATE: '@1000000000 +0000', GIT_COMMITTER_DATE: '@1000000000 +0000' }),
 }
@@ -424,6 +446,7 @@ for (const [label, make] of Object.entries(STRAY)) {
     // With the environment back to normal the repository must be whole.
     await git.run(['fsck'])
     assert.equal((await git.run(['rev-parse', '--show-object-format'])).stdout.trim(), 'sha1')
+    assert.equal((await git.run(['rev-parse', '--show-ref-format'])).stdout.trim(), 'files')
     assert.deepEqual(await indexLeftovers(dir), [])
     for (const value of Object.values(vars).filter(v => v.startsWith('/') && !v.endsWith('/index'))) {
       assert.deepEqual(await readdir(value), [], `${value} was written to`)

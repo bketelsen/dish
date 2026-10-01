@@ -1,11 +1,13 @@
+import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { ConfigStoreError } from '../src/store/errors.ts'
 import { Git } from '../src/store/git.ts'
 import type { Change } from '../src/store/git.ts'
+import { secretKind } from '../src/store/guard.ts'
 import { ConfigStore } from '../src/store/store.ts'
 import type { WriteMeta } from '../src/store/store.ts'
 import { AGENT, AGENTA, USER, USERA, ns, openStore, recorder, repoPath } from './helpers.ts'
@@ -67,6 +69,21 @@ async function externalCommit(git: Git, path: string, text: string): Promise<str
   const id = await git.commitTree(await git.buildTree(head, [{ path, text }]), [head], 'external', USER)
   assert.equal(await git.casRef(MAIN, id, head), true)
   return id
+}
+
+/** A pid that certainly isn't running: a child that was started and has already exited. */
+async function deadPid(): Promise<number> {
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  const pid = child.pid
+  assert.ok(pid !== undefined)
+  await once(child, 'exit')
+  return pid
+}
+
+/** Set a file's modification time to `ageMs` ago. */
+async function age(path: string, ageMs: number): Promise<void> {
+  const then = new Date(Date.now() - ageMs)
+  await utimes(path, then, then)
 }
 
 /** The store's private git runner, for tests that interfere with it on purpose. */
@@ -266,6 +283,24 @@ test('seed refuses paths the owner does not own, and writes nothing at all', asy
   assert.equal(await store.head(), head)
 })
 
+test('seed scans every path for secrets before it hands any of them to git', async () => {
+  const { store, git } = await openAt({ claims: [ns('prompts/', 'write', 'prompts')] })
+  const before = await objects(git)
+  const runner = gitOf(store)
+  const original = runner.run.bind(runner)
+  let gitCalls = 0
+  runner.run = async (...args) => { gitCalls++; return original(...args) }
+  await assert.rejects(store.seed({ 'prompts/fine.md': 'x', [`prompts/${TOKEN}.md`]: 'x' }, 'prompts'), (error: unknown) => {
+    assert.ok(error instanceof ConfigStoreError)
+    assert.equal(error.code, 'SECRET')
+    assert.ok(!error.message.includes(TOKEN), error.message)
+    return true
+  })
+  await assert.rejects(store.seed({ 'prompts/../x': 'x' }, 'prompts'), isStoreError('INVALID'))
+  assert.equal(gitCalls, 0, 'no git process was started')
+  assert.equal(await objects(git), before)
+})
+
 test('seed runs the guard and the validators; the agent policy does not apply to it', async () => {
   const validate = (_path: string, text: string) => (text === 'bad' ? 'bad document' : undefined)
   const { store, git } = await openAt({ claims: [ns('prompts/', 'none', 'prompts', validate)] })
@@ -348,6 +383,45 @@ test('a repository that has refs but no refs/heads/main is refused and left alon
   assert.equal(await strayGit.resolve('refs/heads/master'), undefined)
 })
 
+/** A repository the way a crash in the middle of `git init --bare` leaves it: some of what init makes, removed. */
+async function crashedInit(remove: string[]): Promise<string> {
+  const repository = await repoPath()
+  await new Git(repository).initBare('main')
+  for (const name of remove) await rm(join(repository, name), { recursive: true })
+  return repository
+}
+
+const INIT_CRASHES: Record<string, string[]> = {
+  'before HEAD: only config, description and hooks': ['HEAD', 'refs', 'objects', 'info', 'branches'],
+  'before HEAD, with info and branches': ['HEAD', 'refs', 'objects'],
+  'HEAD written, objects/ not yet': ['objects'],
+  'HEAD and objects written, refs/ not yet': ['refs'],
+}
+
+for (const [label, remove] of Object.entries(INIT_CRASHES)) {
+  test(`a first start that crashed inside git init is completed: ${label}`, async () => {
+    const repository = await crashedInit(remove)
+    const store = await openStore({ repository })
+    const git = new Git(repository)
+    const head = await store.head()
+    assert.equal(await storedMessage(git, head), 'Initialize dish config\n\nDish-Author-Kind: system\n')
+    assert.equal((await git.run(['rev-list', '--count', head])).stdout.trim(), '1')
+    assert.equal((await git.run(['rev-parse', '--show-ref-format'])).stdout.trim(), 'files')
+    await git.run(['fsck'])
+    assert.equal((await git.run(['symbolic-ref', 'HEAD'])).stdout.trim(), MAIN)
+  })
+}
+
+test('a directory that is not a repository, even with a HEAD file, is left exactly as it was', async () => {
+  const repository = await repoPath()
+  await mkdir(join(repository, 'refs', 'heads'), { recursive: true })
+  const files = ['HEAD', 'dish-index-keepme', join('refs', 'heads', 'x.lock'), 'packed-refs.lock']
+  for (const name of files) await writeFile(join(repository, name), 'not git')
+  await assert.rejects(openStore({ repository }), isPlainError(/not a dish config repository, refusing to initialize over existing files/))
+  for (const name of files) assert.equal(await readFile(join(repository, name), 'utf8'), 'not git', `${name} is untouched`)
+  assert.deepEqual((await readdir(repository)).sort(), ['HEAD', 'dish-index-keepme', 'packed-refs.lock', 'refs'], 'no lock left behind')
+})
+
 test('open validates maxBytes before it takes any lock', async () => {
   const repository = await repoPath()
   await assert.rejects(openStore({ repository, maxBytes: Number.NaN }), isPlainError(/maxBytes/))
@@ -359,8 +433,9 @@ test('open validates maxBytes before it takes any lock', async () => {
 test('startup removes what a crashed process left behind, but only once it holds the lock', async () => {
   const { store, repository } = await openAt({ claims: [ns('prompts/')] })
   await store.write([{ path: 'prompts/a.md', text: 'A' }], { author: USERA })
+  const staleTemp = `dish.lock.${await deadPid()}.0123abcd.tmp`
   const stale = [
-    'dish-index-0a1b2c3d', 'dish-index-0a1b2c3d.lock', 'dish.lock.999999.0123abcd.tmp', 'packed-refs.lock',
+    'dish-index-0a1b2c3d', 'dish-index-0a1b2c3d.lock', staleTemp, 'packed-refs.lock',
     'refs/heads/main.lock', 'refs/heads/nested/branch.lock', 'refs/tags/v1.lock',
   ]
   const mine = `dish.lock.${process.pid}.0123abcd.tmp`
@@ -368,6 +443,7 @@ test('startup removes what a crashed process left behind, but only once it holds
   await mkdir(join(repository, 'refs', 'heads', 'nested'), { recursive: true })
   await mkdir(join(repository, 'refs', 'tags'), { recursive: true })
   for (const name of [...stale, mine, ...unrelated]) await writeFile(join(repository, name), 'x')
+  await age(join(repository, staleTemp), 120_000)
   const keep = new Git(repository)
   assert.equal(await keep.casRef('refs/heads/keep', await store.head(), null), true)
 
@@ -382,6 +458,28 @@ test('startup removes what a crashed process left behind, but only once it holds
   assert.equal(await reopened.read('prompts/a.md'), 'A')
   // A stale ref lock would have made every update-ref throw.
   assert.ok(await reopened.write([{ path: 'prompts/b.md', text: 'B' }], { author: USERA }))
+})
+
+test('startup leaves a lock temp file alone unless its process is dead and it is more than a minute old', async () => {
+  const { store, repository } = await openAt()
+  await store.close()
+  const dead = await deadPid()
+  const named = (pid: number, tag: string) => `dish.lock.${pid}.${tag}.tmp`
+  const plan = [
+    { name: named(dead, '00000001'), ageMs: 120_000, removed: true },
+    { name: named(dead, '00000002'), ageMs: 1_000, removed: false },       // another process may be mid-acquire
+    { name: named(process.ppid, '00000003'), ageMs: 120_000, removed: false }, // its process is alive
+    { name: named(process.pid, '00000004'), ageMs: 120_000, removed: false }, // ours
+  ]
+  for (const { name, ageMs } of plan) {
+    await writeFile(join(repository, name), 'x')
+    await age(join(repository, name), ageMs)
+  }
+  await openStore({ repository })
+  for (const { name, removed } of plan) {
+    if (removed) await assert.rejects(stat(join(repository, name)), { code: 'ENOENT' }, name)
+    else await stat(join(repository, name))
+  }
 })
 
 // --- close --------------------------------------------------------------------------------------
@@ -582,6 +680,18 @@ test('a secret in the note, role or sessionId is SECRET, names the field, and wr
   await assert.rejects(store.write(change, { author: { kind: 'agent', sessionId: AWS_KEY } }), refused('sessionId', AWS_KEY))
   await assert.rejects(store.write(change, { author: { kind: 'agent', sessionId: TOKEN } }), refused('sessionId', TOKEN))
   assert.equal(await objects(git), before)
+})
+
+test('a note whose cap leaves a secret behind is SECRET, though the whole note matched nothing', async () => {
+  const { store, git } = await openAt({ claims: [ns('prompts/')] })
+  const before = await objects(git)
+  // 17 characters after AKIA match nothing; cut to 16 at the 200-character cap, they are an access key.
+  const note = `${'x'.repeat(179)} AKIA${'A'.repeat(17)}`
+  assert.equal(secretKind(note), undefined)
+  assert.equal(secretKind(Array.from(note).slice(0, 200).join('')), 'an AWS access key ID')
+  await assert.rejects(store.write([{ path: 'prompts/a.md', text: '1' }], { author: USERA, note }), isStoreError('SECRET', 'note'))
+  assert.equal(await objects(git), before)
+  assert.ok(await store.write([{ path: 'prompts/a.md', text: '1' }], { author: USERA, note: `${'x'.repeat(179)} AKIA${'A'.repeat(15)}` }))
 })
 
 // --- write: order of checks ---------------------------------------------------------------------

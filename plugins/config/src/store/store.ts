@@ -1,4 +1,4 @@
-import { access, mkdir, readdir, rm } from 'node:fs/promises'
+import { mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { ConfigStoreError } from './errors.ts'
 import { Git, pathProblem } from './git.ts'
@@ -73,6 +73,10 @@ const CONTROL = /[\x00-\x1f\x7f]/
 const NOTE_CONTROL = /[\x00-\x1f\x7f-\x9f]/
 /** `dish.lock.<pid>.<random>.tmp`: the temporary file `acquireLock` links the lock from. */
 const LOCK_TEMP = /^dish\.lock\.(\d+)\.[0-9a-f]+\.tmp$/
+/** A lock temp file lives for a moment; one this old was left by a crash, not by a process mid-acquire. */
+const STALE_TEMP_MS = 60_000
+/** Everything `git init --bare` puts in a directory. */
+const GIT_INIT_ENTRIES: readonly string[] = ['HEAD', 'branches', 'config', 'description', 'hooks', 'info', 'objects', 'refs']
 
 /** What `write` and `seed` hand to `commit` once every check has passed. */
 interface Prepared {
@@ -170,11 +174,17 @@ function checkMeta(author: EditAuthor, rawNote: unknown): { author: EditAuthor, 
   }
   // The whole note is scanned, not just what survives the cap: a token must not slip out half-cut.
   if (note !== undefined) fields.unshift(['note', note])
-  for (const [field, value] of fields) {
-    const kind = secretKind(value)
-    if (kind !== undefined) throw new ConfigStoreError('SECRET', `the ${field} looks like ${kind}`)
-  }
-  return note === undefined ? { author: recorded } : { author: recorded, note: capNote(note) }
+  for (const [field, value] of fields) refuseSecret(field, value)
+  if (note === undefined) return { author: recorded }
+  // And the cut itself is scanned: dropping the tail of a near-miss (AKIA plus 17 characters) can leave a match.
+  const capped = capNote(note)
+  refuseSecret('note', capped)
+  return { author: recorded, note: capped }
+}
+
+function refuseSecret(field: string, value: string): void {
+  const kind = secretKind(value)
+  if (kind !== undefined) throw new ConfigStoreError('SECRET', `the ${field} looks like ${kind}`)
 }
 
 // --- commit messages ----------------------------------------------------------------------------
@@ -200,10 +210,14 @@ function isOwnLockFile(name: string): boolean {
   return name === 'dish.lock' || LOCK_TEMP.test(name)
 }
 
-/** A `dish.lock.<pid>.<random>.tmp` left by some other process. */
-function isForeignLockTemp(name: string): boolean {
-  const match = LOCK_TEMP.exec(name)
-  return match !== null && Number(match[1]) !== process.pid
+/** Whether no process has `pid`. Any answer but "no such process" (including a pid that isn't valid) counts as alive. */
+function processIsGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error) {
+    return (error as { code?: unknown }).code === 'ESRCH'
+  }
 }
 
 function warn(message: string): void {
@@ -308,7 +322,8 @@ export class ConfigStore {
 
   /**
    * Commit `changes` to `main` as one atomic commit. Checked in this order,
-   * and nothing reaches git until all have passed:
+   * and nothing reaches git until all have passed. First, the author's kind
+   * must be `user` or `agent` (`INVALID`). Then:
    * 1. a non-empty, well-formed list with no path twice (`INVALID`)
    * 2. every path usable as a document path (`INVALID`)
    * 3. every path owned (`UNOWNED`); an agent author needs the namespace's `agent` policy to be `write` (`FORBIDDEN`)
@@ -343,6 +358,8 @@ export class ConfigStore {
       for (const [path, spec] of owners) {
         if (spec.owner !== owner) throw new ConfigStoreError('UNOWNED', `${label(path)} belongs to ${JSON.stringify(spec.owner)}, not ${JSON.stringify(owner)}`)
       }
+      // Every path is scanned before git sees any of them, not only the ones that turn out to be missing.
+      for (const { path } of all) checkContent(path, '', this.maxBytes)
       const head = await this.mainCommit()
       const missing: Change[] = []
       for (const change of all) {
@@ -368,42 +385,41 @@ export class ConfigStore {
 
   /**
    * Make sure `<repository>` holds a dish config repository with a `main`.
-   * With the lock held, a repository that already exists is cleaned of what a
-   * crashed run left; one that doesn't is created, but only in a directory with
-   * nothing else in it.
+   *
+   * With the lock held and git agreeing the directory is a repository, it is
+   * cleaned of what a crashed run left, and finished if the root commit is missing.
+   * Otherwise it is created, but only in a directory that holds nothing except what
+   * `git init --bare` makes: that also finishes a first start that crashed inside
+   * `git init`, which writes `config` before `HEAD` and `HEAD` before `objects/`.
    */
   private async ensureRepository(): Promise<void> {
-    if (!(await this.pathExists(join(this.repository, 'HEAD')))) {
-      await this.initialize()
+    if (await this.isRepository()) {
+      await this.removeStaleFiles()
+      if ((await this.git.resolve(MAIN)) === undefined) await this.completeInitialization()
       return
     }
-    await this.removeStaleFiles()
-    if ((await this.git.resolve(MAIN)) === undefined) await this.completeInitialization()
+    await this.initialize()
   }
 
-  private async pathExists(path: string): Promise<boolean> {
-    try {
-      await access(path)
-      return true
-    } catch (error) {
-      if ((error as { code?: unknown }).code === 'ENOENT') return false
-      throw error
-    }
+  /** Whether git itself accepts the directory as a repository (a stray `HEAD` file doesn't make one). */
+  private async isRepository(): Promise<boolean> {
+    return (await this.git.run(['rev-parse', '--git-dir'], { allowFail: true })).code === 0
   }
 
   private async initialize(): Promise<void> {
-    const others = (await readdir(this.repository)).filter(name => !isOwnLockFile(name))
+    const others = (await readdir(this.repository)).filter(name => !isOwnLockFile(name) && !GIT_INIT_ENTRIES.includes(name))
     if (others.length > 0) {
       throw new Error(`${this.repository} is not a dish config repository, refusing to initialize over existing files`)
     }
+    // Safe on what a crashed `git init` left: it fills in whatever is missing and changes nothing else.
     await this.git.initBare('main')
-    await this.createRootCommit()
+    await this.completeInitialization()
   }
 
   /**
-   * A repository whose `HEAD` exists but `main` doesn't. The only one this
-   * store will touch is a freshly initialized one with no refs at all (a crash
-   * between `git init` and the root commit); anything else isn't its own.
+   * Make the root commit in a repository that has no `main`. The only one this
+   * store will touch is a freshly initialized one with `HEAD` on `main` and no refs
+   * at all (`git init` finished, the root commit didn't); anything else isn't its own.
    */
   private async completeInitialization(): Promise<void> {
     const head = (await this.git.run(['symbolic-ref', '-q', 'HEAD'], { allowFail: true })).stdout.trim()
@@ -422,17 +438,19 @@ export class ConfigStore {
 
   /**
    * Delete what a crashed process leaves behind, now that this one holds the lock:
-   * temporary indexes (`dish-index-*`, `.lock` variants included), other
-   * processes' lock temp files, and the ref and packed-refs locks that would make every ref update fail.
+   * temporary indexes (`dish-index-*`, `.lock` variants included), lock temp files
+   * of dead processes, and the ref and packed-refs locks that would make every ref
+   * update fail. A lock temp file is only taken for a leftover when its process is
+   * gone and it is old: a second process starting up right now has one for a moment
+   * (its `acquireLock` is about to fail with `LOCKED`), and must not lose it.
    */
   private async removeStaleFiles(): Promise<void> {
     const stale: string[] = []
     for (const entry of await readdir(this.repository, { withFileTypes: true })) {
       if (!entry.isFile()) continue
       const { name } = entry
-      if (name.startsWith('dish-index-') || name === 'packed-refs.lock' || isForeignLockTemp(name)) {
-        stale.push(join(this.repository, name))
-      }
+      const path = join(this.repository, name)
+      if (name.startsWith('dish-index-') || name === 'packed-refs.lock' || (await this.isStaleLockTemp(name, path))) stale.push(path)
     }
     try {
       for (const entry of await readdir(join(this.repository, 'refs'), { recursive: true, withFileTypes: true })) {
@@ -442,6 +460,19 @@ export class ConfigStore {
       if ((error as { code?: unknown }).code !== 'ENOENT') throw error
     }
     await Promise.all(stale.map(path => rm(path, { force: true })))
+  }
+
+  private async isStaleLockTemp(name: string, path: string): Promise<boolean> {
+    const match = LOCK_TEMP.exec(name)
+    if (match === null) return false
+    const pid = Number(match[1])
+    if (pid === process.pid || !processIsGone(pid)) return false
+    try {
+      return Date.now() - (await stat(path)).mtimeMs > STALE_TEMP_MS
+    } catch (error) {
+      if ((error as { code?: unknown }).code === 'ENOENT') return false
+      throw error
+    }
   }
 
   // --- refs and commits --------------------------------------------------------------------------
