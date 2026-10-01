@@ -54,7 +54,7 @@ import { DEFAULT_SETTINGS, DEFAULT_TEXT, JUDGE_SPEC, parseSettings } from './set
 import type { JudgeSettings } from './settings.ts'
 
 export { createJudge } from './client.ts'
-export type { Answer, Asked, Decision, Judge, JudgeAgent, JudgeDeps, JudgeRequest, JudgeResult, JudgeStatus, JsonValue, LogLine, Purpose, Question } from './client.ts'
+export type { Answer, Asked, DecideOptions, Decision, Judge, JudgeAgent, JudgeDeps, JudgeRequest, JudgeResult, JudgeStatus, JsonValue, LogLine, Purpose, Question } from './client.ts'
 export type { JudgeLogLine, JudgePurpose, ReadQuery, ReadResult } from './log.ts'
 export type { CommandSettings, JudgeSettings, ParseResult, ScreeningSettings, ToolSettings } from './settings.ts'
 

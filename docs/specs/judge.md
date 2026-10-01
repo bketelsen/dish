@@ -73,12 +73,13 @@ interface Judge {
   /** One Jev call: one state, any number of typed questions. Never throws: a failure is { ok: false }. */
   ask<D extends Decision>(request: { state: JsonValue, questions: Record<string, Question>, purpose: Purpose, agent?: Agent,
                                      signal?: AbortSignal, tool?: string, callId?: string, subject?: string,
-                                     decide?: (result: JudgeResult) => D | Promise<D> })
+                                     decide?: (result: JudgeResult, opts: { signal: AbortSignal }) => D | Promise<D> })
     : Promise<JudgeResult & { decided?: D }>
   status(): Promise<JudgeStatus>        // last success or failure, p50/p95, calls and failures over the last 100, key present
 }
 type JudgeResult = { ok: true, answers: Record<string, Answer>, latencyMs: number }
-                 | { ok: false, reason: 'unavailable' | 'invalid', message: string, tooBig?: true }
+                 | { ok: false, reason: 'unavailable', message: string }
+                 | { ok: false, reason: 'invalid', from: 'request' | 'server', message: string, tooBig?: true }
 type Decision = { decision: string, withheld?: string }
 type Question = { type: 'noul', instructions: string, criteria?: { true: string, false: string } }
               | { type: 'choice', instructions: string, criteria: Record<string, string | null> }     // 2–255 options
@@ -90,6 +91,8 @@ type Purpose = 'command' | 'approval' | 'screen' | 'ask'
 - **The key** is resolved on every call. With no key, every call is `unavailable` ("no TypeSafe key: set it on Settings → Judge").
 - **Time limit:** `timeoutMs`, default 2000, covering the whole call: the settings read, the key lookup, the request and `decide`. There are no retries inside it: a gate would rather fall back than wait. A `429` or `529` is `unavailable`, and its `retry-after` (1–60 s, default 5 s) is respected by skipping Jev until it passes, timed on a monotonic clock.
 - **Statuses.** `401` is `unavailable` ("the TypeSafe key was refused"). `400` and `422` are `invalid`: the live API answers `400` for requests its own rules refuse, such as an unknown model or a state over its token limit. Every other non-2xx status is `unavailable`. Callers treat every `ok: false`, `invalid` included, as unavailable and fail closed.
+- **Where an `invalid` result came from.** `from: 'request'` is the client's own checks refusing the request before anything was sent (a question id, type, option or count that isn't allowed, a state that isn't JSON or is too big), so the caller's request is what to fix. `from: 'server'` is TypeSafe's `400` or `422`, which is more often the judge's configuration (an unknown model) than the caller's request. `ask_judge` asks the model to fix its question only for `'request'`; for `'server'` it reports the judge as unavailable.
+- **`status()` and the key.** `state` is `no-key` only when the credential store has no key. When the key can't be read (the lookup fails or takes longer than the time limit) it is `unavailable`, with a `lastError` such as "could not read the TypeSafe key from the credential store": the key may well be set, so the page doesn't ask for one.
 - **Too big.** A `state` over 100 KB of JSON, a request body over 256 KB, or the API's `max_tokens_exceeded` is `invalid` with `tooBig: true`, so the screen can split its content and try again. These don't change the status, so one large page doesn't mark the judge unavailable.
 - **Checking requests and responses.** Requests are checked before sending: types, criteria counts, and size, with `state` capped at ~100 KB of JSON. Responses are checked as the ten-levels client does:
   - each answer's type matches its question;
@@ -99,6 +102,7 @@ type Purpose = 'command' | 'approval' | 'screen' | 'ask'
 
   A malformed response is `unavailable`, and is logged.
 - **Logging.** Every call is logged (see [the log](#the-log)), whatever its outcome, as one line. The caller's `decide` hook, run on the settled result, puts the decision (and a withheld id) on that line. If the hook fails, the line's decision is `null` and the caller fails closed. A call is never held up by a log write.
+- **The hook's time and its signal.** `decide` has the rest of the call's time limit, and a few milliseconds (50) of its own if Jev used it all, so a call that timed out can still be decided. It is given `{ signal }` as a second argument (a hook of one argument still works): the signal aborts when the hook's time ends, or when the request's own `signal` does, and is aborted already for a call that was cancelled. A hook that waits for something, such as `log.withhold` looking up the key, passes it on, so that what it waits for ends with its time.
 
 ## `judge.yaml`
 

@@ -1647,3 +1647,142 @@ test('the mask the log service uses follows the same rule: a short key is left, 
   const mask = await currentKeyMask(async () => long, 100)
   assert.equal(mask(`${long} ${JSON.stringify(long).slice(1, -1)} ${encodeURIComponent(long)}`), '‹key› ‹key› ‹key›')
 })
+
+// --- decide gets a signal ---------------------------------------------------------------------------------
+
+/** A hook that waits for nothing but its signal: it ends when the signal aborts, with what it says. */
+const untilSignal = (seen: { aborts: number[], reasons: unknown[], started: number }) => (_result: JudgeResult, { signal }: { signal: AbortSignal }): Promise<never> =>
+  new Promise((_, reject) => {
+    const abort = () => { seen.aborts.push(performance.now() - seen.started); seen.reasons.push(signal.reason); reject(signal.reason) }
+    if (signal.aborted) abort()
+    else signal.addEventListener('abort', abort, { once: true })
+  })
+
+test('decide is given a signal that aborts when its time ends: a hook that waits on a promise that never settles, raced against it, ends on time', async () => {
+  const r = await rig({ timeoutMs: 200 })
+  r.jev.queue(ok())
+  const started = performance.now()
+  const asked = await r.ask({
+    decide: async (_result: JudgeResult, { signal }: { signal: AbortSignal }) => {
+      await Promise.race([new Promise<never>(() => {}), new Promise<never>((_, reject) => { signal.addEventListener('abort', () => reject(signal.reason), { once: true }) })])
+      return { decision: 'never' }
+    },
+  })
+  const elapsed = performance.now() - started
+  assert.equal(asked.ok, true, 'Jev answered')
+  assert.equal(asked.decided, undefined, 'and the hook did not decide')
+  assert.equal(r.lines[0]!.decision, null)
+  assert.match(r.lines[0]!.error!, /^decide failed: it took longer than the time limit$/)
+  assert.ok(elapsed >= 180 && elapsed < 200 + 300, `the call took ${elapsed} ms of a 200 ms limit`)
+})
+
+test('the hook is typed with the signal as its second argument, and a hook of one argument is a hook all the same', async () => {
+  const r = await rig()
+  r.jev.always(ok())
+  const typed = await r.judge.ask({
+    state: 's',
+    questions: QUESTIONS,
+    purpose: 'ask',
+    decide: (result, { signal }) => ({ decision: result.ok && !signal.aborted ? 'allow' : 'ask' }),
+  })
+  assert.deepEqual(typed.decided, { decision: 'allow' })
+  const short = await r.judge.ask({ state: 's', questions: QUESTIONS, purpose: 'ask', decide: result => ({ decision: result.ok ? 'allow' : 'ask' }) })
+  assert.deepEqual(short.decided, { decision: 'allow' })
+})
+
+test('the signal aborts with the same reason as the time limit says, whichever of the two the hook is stopped by', async () => {
+  const r = await rig({ timeoutMs: 120 })
+  r.jev.queue(ok())
+  const seen = { aborts: [] as number[], reasons: [] as unknown[], started: performance.now() }
+  await r.ask({ decide: untilSignal(seen) })
+  assert.equal(seen.aborts.length, 1)
+  assert.ok(seen.reasons[0] instanceof Error && seen.reasons[0].message === 'it took longer than the time limit')
+  assert.match(r.lines[0]!.error!, /^decide failed: it took longer than the time limit$/)
+})
+
+test('when Jev has used the whole time limit, the hook still has its 50 ms, and the signal aborts then', async () => {
+  const r = await rig({ timeoutMs: 100 })
+  r.jev.queue({ kind: 'answer', body: jevBody(GOOD), delayMs: 400 })
+  const seen = { aborts: [] as number[], reasons: [] as unknown[], started: 0 }
+  let hookStarted = 0
+  const asked = await r.ask({
+    decide: (result: JudgeResult, options: { signal: AbortSignal }) => {
+      hookStarted = performance.now()
+      seen.started = hookStarted
+      assert.equal(result.ok, false, 'the call timed out')
+      return untilSignal(seen)(result, options)
+    },
+  })
+  assert.equal(asked.ok, false)
+  assert.equal(seen.aborts.length, 1)
+  assert.ok(seen.aborts[0]! >= 40 && seen.aborts[0]! < 50 + 250, `aborted ${seen.aborts[0]} ms after the hook began`)
+  assert.match(r.lines[0]!.error!, /timed out after 100 ms; decide failed: it took longer than the time limit$/)
+})
+
+test('the signal is already aborted when the call was cancelled, with the caller\'s reason', async () => {
+  const r = await rig()
+  const controller = new AbortController()
+  const reason = new Error('the caller gave up')
+  controller.abort(reason)
+  let at: { aborted: boolean, reason: unknown } | undefined
+  const asked = await r.ask({
+    signal: controller.signal,
+    decide: (result: JudgeResult, { signal }: { signal: AbortSignal }) => {
+      at = { aborted: signal.aborted, reason: signal.reason }
+      assert.equal(result.ok, false)
+      return { decision: 'ask' }
+    },
+  })
+  assert.deepEqual(at, { aborted: true, reason })
+  assert.equal(asked.ok === false && asked.message, 'the call to the judge was cancelled')
+  assert.deepEqual(asked.decided, { decision: 'ask' }, 'a hook that does not wait on the signal still decides')
+  assert.equal(r.jev.requests.length, 0)
+})
+
+test('the signal aborts when the caller\'s signal does, while the hook is waiting, and not only at the end of its time', async () => {
+  const r = await rig({ timeoutMs: 2000 })
+  r.jev.queue(ok())
+  const controller = new AbortController()
+  const seen = { aborts: [] as number[], reasons: [] as unknown[], started: 0 }
+  const reason = new Error('the caller gave up')
+  const hook = untilSignal(seen)
+  const asked = await r.ask({
+    signal: controller.signal,
+    decide: (result: JudgeResult, options: { signal: AbortSignal }) => {
+      seen.started = performance.now()
+      setTimeout(() => controller.abort(reason), 50)
+      return hook(result, options)
+    },
+  })
+  assert.equal(asked.ok, true, 'it was answered before it was cancelled')
+  assert.equal(seen.aborts.length, 1)
+  assert.ok(seen.aborts[0]! >= 40 && seen.aborts[0]! < 500, `aborted ${seen.aborts[0]} ms in, of 2000`)
+  assert.equal(seen.reasons[0], reason)
+  assert.equal(r.lines[0]!.error, 'decide failed: the caller gave up')
+})
+
+test('a hook that decides before its time is up is unaffected: the same line and result, and its signal is never aborted afterwards', async () => {
+  const r = await rig({ timeoutMs: 150 })
+  r.jev.always(ok())
+  const signals: AbortSignal[] = []
+  const syncHook = (_result: JudgeResult) => ({ decision: 'allow' })                                   // one argument, as before
+  const asyncHook = async (_result: JudgeResult, { signal }: { signal: AbortSignal }) => { signals.push(signal); return { decision: 'pass', withheld: 'abc' } }
+  const first = await r.ask({ decide: syncHook })
+  assert.deepEqual(first.decided, { decision: 'allow' })
+  const second = await r.ask({ decide: asyncHook })
+  assert.deepEqual(second.decided, { decision: 'pass', withheld: 'abc' })
+  assert.deepEqual(r.lines.map(line => [line.decision, line.error, line.withheld]), [['allow', null, undefined], ['pass', null, 'abc']])
+  const noSignal = await r.ask({ decide: (...args: unknown[]) => ({ decision: String(args.length) }) })
+  assert.deepEqual(noSignal.decided, { decision: '2' }, 'it is the second argument, an object with the signal')
+  // The time it had passes, and nothing aborts: what a hook that is done leaves behind is nothing.
+  await new Promise<void>(resolve => setTimeout(resolve, 250))
+  assert.deepEqual(signals.map(signal => signal.aborted), [false])
+})
+
+test('a hook that throws, or rejects, is as it was, with a signal given or not', async () => {
+  const r = await rig()
+  r.jev.always(ok())
+  await r.ask({ decide: () => { throw new Error('threw') } })
+  await r.ask({ decide: async (_result: JudgeResult, _options: { signal: AbortSignal }) => { throw new Error('rejected') } })
+  assert.deepEqual(r.lines.map(line => [line.decision, line.error]), [[null, 'decide failed: threw'], [null, 'decide failed: rejected']])
+})

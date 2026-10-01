@@ -32,7 +32,8 @@
  * The client doesn't know where its log goes: `log` is a function it is given, called once for every call, whatever its
  * outcome, and never waited for (a call whose settling fails has a minimal line, so every call has one). The caller can
  * have its decision written on that line: `decide` is called with the settled result and returns what was decided, which
- * goes on the line and comes back as `decided`. This file imports no dsh, so it can be tested against a fake server alone.
+ * goes on the line and comes back as `decided`. `decide` is given a signal that ends with its time, or with the caller's, for
+ * whatever it waits for. This file imports no dsh, so it can be tested against a fake server alone.
  *
  * @module dish-judge/client
  */
@@ -106,8 +107,20 @@ export interface JudgeRequest<D extends Decision = Decision> {
    * still be decided. If it throws, rejects, takes too long or returns no `decision`, the line has `decision: null` and
    * says "decide failed: …", and the result has no `decided`: a caller that needs a decision must treat that as its
    * failure case.
+   *
+   * It is given a `signal` too (a hook of one argument still works): it aborts when the hook's time ends, whether that is
+   * the call's time limit or the few milliseconds it always has, and when the caller's own `signal` does, and it is aborted
+   * already for a call that was cancelled. A hook that waits for something, such as a `withhold` that looks up the key, hands
+   * it on, so that what it waits for ends when the time does. The client does not wait for a hook that ignores it past its
+   * time: that is the hook failing, as above.
    */
-  decide?: (result: JudgeResult) => D | Promise<D>
+  decide?: (result: JudgeResult, options: DecideOptions) => D | Promise<D>
+}
+
+/** What a `decide` hook is given besides the result. */
+export interface DecideOptions {
+  /** Aborts when the hook's time ends (with an `Error` saying it took longer than the time limit), or when the request's `signal` aborts (with its reason). */
+  signal: AbortSignal
 }
 
 export type JudgeResult =
@@ -820,12 +833,13 @@ export function createJudge(deps: JudgeDeps): Judge {
     let decided: D | undefined
     if (typeof request.decide === 'function') {
       const hook = request.decide
+      // The hook's time, and a signal that ends with it, or with the caller's. One timer: the signal and the race with the
+      // hook end together, with the same reason, whichever of them a hook is stopped by.
+      const time = new AbortController()
+      const timer = setTimeout(() => time.abort(new Error('it took longer than the time limit')), Math.max(DECIDE_FLOOR_MS, scope.deadline - tick()))
+      const signal = request.signal === undefined ? time.signal : AbortSignal.any([time.signal, request.signal])
       try {
-        const value: unknown = await within(
-          Promise.resolve().then(() => hook(result)),
-          Math.max(DECIDE_FLOOR_MS, scope.deadline - tick()),
-          'it took longer than the time limit',
-        )
+        const value: unknown = await untilAborted(Promise.resolve().then(() => hook(result, { signal })), time.signal)
         const said = value as Partial<Decision> | null
         if (said === null || typeof said !== 'object' || typeof said.decision !== 'string' || (said.withheld !== undefined && typeof said.withheld !== 'string')) {
           throw new Error('it returned no decision')
@@ -836,6 +850,8 @@ export function createJudge(deps: JudgeDeps): Judge {
       } catch (error) {
         const problem = `decide failed: ${clip(scope.mask(describe(error)))}`
         line.error = line.error === null ? problem : `${line.error}; ${problem}`
+      } finally {
+        clearTimeout(timer)
       }
     }
 
