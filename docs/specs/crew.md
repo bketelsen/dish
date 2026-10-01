@@ -1,6 +1,6 @@
 # Spec: the crew (`dish-crew`)
 
-Status: draft, 2026-10-01. Implements roadmap step 4. Builds on the [design](../design.md) (the crew, the reviewer rule), the [config store](config-store.md), [prompts](prompts.md), the 2026-09-30 spike (`plugins/crew`, design "Spike results") and the [agent-team research](../research/2026-10-01-dsh-agent-team.md).
+Status: implemented 2026-10-01 (branch `crew`). Implements roadmap step 4. Builds on the [design](../design.md) (the crew, the reviewer rule), the [config store](config-store.md), [prompts](prompts.md), the 2026-09-30 spike (`plugins/crew`, design "Spike results") and the [agent-team research](../research/2026-10-01-dsh-agent-team.md).
 
 ## Summary
 
@@ -97,7 +97,7 @@ Empty strings are treated as absent. The checks run in this order, before anythi
 
 1. **Caller.** Only a top-level agent may delegate (`isTopLevelAgent`).
 2. **Role.** It must exist in `crew.yaml` and have a prompt (`dishPrompts.persona(role)`).
-3. **Follow-up (`to`).** The child must be one this session started, in the same role. A follow-up uses no new delegation, but it's checked against the running and writer limits like a start.
+3. **Follow-up (`to`).** The child must be one this session started, in the same role. A follow-up uses no new delegation. It's checked against the running and writer limits counting every other child, not itself: a follow-up to a running child adds no running child.
 4. **Limits.**
    - **Running:** the count of this session's crew children that are running now (`ctx.agents.get(id)?.status === 'running'`) must be under `limits.running`.
    - **Writers:** if the role `writes`, the count of running writing children must be under `limits.writers`.
@@ -138,7 +138,7 @@ It moves here from `dish-prompts`, as `presets/dish.patch.yml`, still generated 
 - **adds `delegate`:** the row `dish-crew/delegate`;
 - **removes dsh's own delegation:** the rows for `subagent`, `subagent_fork`, `workflow` and their engine. The main agent delegates through crew only, which is structural rather than a prompt request. It keeps `send_message`, `interrupt_agent` and `list_agents`.
 
-`dish-prompts` keeps its persona row and loses the preset. `dish-crew` depends on `dish-prompts` and `dish-config`. Installing crew without prompts is refused at load, with a clear message, so the preset can't half-mount. `orchestrator` takes the preset over in step 7.
+`dish-prompts` keeps its persona row and loses the preset. `dish-crew` depends on `dish-prompts` and `dish-config`. Without `dish-prompts`, the persona row logs once and `delegate` refuses every call, naming the missing plugin; nothing refuses at load. `orchestrator` takes the preset over in step 7.
 
 ## Notices and labels
 
@@ -214,3 +214,20 @@ Roles, models and limits live in `crew.yaml`, not here.
 
 - **Step 6 (workspaces):** children can't have their own working directory in dsh 0.2.0-rc.2. They inherit the parent's `cwd`, and `workspace-write` limits writes to the session workspace. Worktrees per task will need to live inside the workspace, or wait for an upstream option. A per-child `cwd` in `startContinuable` would be a reasonable upstream proposal.
 - **Upstream:** finish notices with the child's label and error, and journaling custom session events from outside dsh, would each remove a workaround here.
+
+## Notes from the build
+
+- **The running rule.** A child counts as running when dsh says it's running, or when the record says `running` and the agent still exists. The record is marked running on every `subagent/start`, so a child woken by `send_message` counts too.
+- **The reviewer rule excludes by vendor as well as family name.** A model missing from `crew.yaml`, renamed families, or provider-qualified ids (`github-copilot/claude-…`, `us.anthropic.claude-…`) can't put a reviewer on the reviewed work's vendor. `reviews` can't name a reviewer child, and a follow-up to a reviewer is re-checked against the reviewed work as it is now.
+- **Visible tools are the ones a child can inherit:** the parent's preset and global layers, never tools on the parent agent's own scope. dsh's `restrict` refuses those, and a refusal that slips through is turned into "remove X from `roles.<r>.tools`".
+- **Services.** The preset row reads everything it doesn't inject through `ctx.get`. A property read of an un-injected service throws in dsh, because the providers are siblings of the row, not ancestors. The tests provide every stub from a sibling plugin, so they'd catch it.
+- **Notices.** Each notice is matched to its own run by the report's content and the stop reason dsh's line implies, not by "the latest run". The notice's collapsed summary is role-named too.
+- **The preset generator** refuses to emit any enabled row from dsh's delegation packages.
+- **Live check (2026-10-01), on the real install:**
+  - a researcher on Claude Sonnet 5.5;
+  - a coder, with a second coder in the same step refused;
+  - a reviewer on `gpt-5.6-sol`;
+  - fix rounds to the same coder, including after a dsh restart.
+
+  The records, reports and labels were as specified. It also found a `dish-copilot` catalog bug: Sonnet 5.5 was copied from Sonnet 5 and rejected every request. That's fixed by preferring the closest version of the same vendor.
+- **Small follow-up:** the Prompts remote's `reset` should default its note to "Reset to the default" itself, as the page does. Resets made through the remote without a note read as edits in History.
