@@ -48,6 +48,7 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import { maskSecrets, printOwnLogs, xdgPaths } from 'dish-kit'
 import { createJudge, currentKeyMask } from './client.ts'
+import { registerCommandGate } from './gate.ts'
 import { JudgeLog } from './log.ts'
 import type { JudgeLogLine, ReadQuery, ReadResult } from './log.ts'
 import { DEFAULT_SETTINGS, DEFAULT_TEXT, JUDGE_SPEC, parseSettings } from './settings.ts'
@@ -564,6 +565,10 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
   // function, so that a load that is slow can never leave a window in which the plugin is there and no gate is. They use
   // `ctx.judge`, `settings` and `log`, which are all there by now. Do not put an `await` in this function.
   // -----------------------------------------------------------------------------------------------------------------
+
+  // The command gate (see `gate.ts`): a prepended `tools/pre-execute` listener for the tools in `tools.gated`, and a
+  // `tools/result` listener that forgets a call's verdict when it settles. The cache is for Task 5's approval answerer.
+  const verdicts = registerCommandGate(ctx)
 
   // In the background. A failure is logged, and the plugin works all the same: old files that stay are only disk.
   return pruneAtLoad(judgeLog, { keepMs: KEEP_LOG_MS, slowAfterMs: internals.pruneSlowAfterMs ?? PRUNE_SLOW_AFTER_MS, directory, logger })
