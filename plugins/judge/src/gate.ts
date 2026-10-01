@@ -15,9 +15,10 @@
  * - **No log of its own.** The client writes one line for each call it makes. The gate passes `decide`, which gives that
  *   line the verdict (`allow`, `ask` or `deny`), and `tool`, `callId` and `subject` (the command), so there is one line per
  *   decision. The client masks the TypeSafe key in the line, and the decision log (`log.ts`) masks secrets when it writes it.
- * - **Others have their say.** The gate is prepended, so it is first in the waterfall, but it does not cut the others off:
- *   once it has its verdict it calls `next()` and returns the stricter of the two (allow < ask < deny < cancel). A later
- *   listener that denies or cancels wins over the gate's `allow` or `ask`; the gate never lets a human approve over it.
+ * - **Others have their say, except on a deny.** The gate is prepended, so it is first in the waterfall. For its own `allow` or
+ *   `ask` it calls `next()` and returns the stricter of the two (allow < ask < deny < cancel): a later listener that denies or
+ *   cancels wins, and the gate never lets a human approve over it. Its own `deny` is final and `next()` is not called, as in
+ *   dsh's auto-review: a call that will not run should not start the `PreToolUse` hooks or recorders after it.
  * - **A verdict cache** (`VerdictCache`, below) is written before `next()` is called and read by the approval answerer.
  *
  * ### What was found in dsh 0.2.0-rc.2, and where the state comes from
@@ -28,7 +29,8 @@
  *   timeoutMs?, workdir?, run_in_background?, sandbox_permissions?, justification? }`; the persistent variants
  *   (`dsh-tool-bash-persistent`, `dsh-tool-pwsh-persistent`) take `{ command }` alone. So `command` is the text to judge. The
  *   tools validate their own arguments, so by the time the gate sees them they are not necessarily well formed; a call
- *   whose `command` is not a string is judged on the JSON of its arguments, which is what it would have run on.
+ *   whose `command` is not a string is judged on `bash({...JSON of its arguments...})`, and any other gated tool is judged
+ *   on its name and all its arguments the same way (see `commandOf`).
  *   `sandbox_permissions` and `justification` are the escalation: a call with both asks the approval service for a wider
  *   sandbox mode before it runs, from inside the tool.
  * - **The working directory.** `exec.agent.session.header.cwd` is the session's cwd (`SessionHeader.cwd`, absolute, optional).
@@ -49,6 +51,10 @@
  *   one-line preview. If it is missing or throws, the task is `''`: the judge then reads every command as not serving a task
  *   it can't see, and the gate asks you more often. A crew child's brief carries a trailing guidance block ("Your parent
  *   agent id is …"), and a compacted-away or image-only first message leaves nothing to read; both are accepted.
+ *   The route dsh prefers, for a later follow-up: a `session/event` listener (emit mode, one per session) that keeps
+ *   `WeakMap<Session, { brief, latest }>`, filled from each `user/message` event with `source.kind === 'user'` (the brief is
+ *   the first one after `inheritedEventCount`). It needs no read of the log, but it also misses what was said before the
+ *   plugin loaded or the session was resumed, which a projection registered with `ctx.sessionProjections` would not.
  *
  * @module dish-judge/gate
  */
@@ -74,6 +80,16 @@ export const EFFECT_QUESTION: Question = {
     irreversible: 'it deletes or overwrites data that can\'t be recovered, changes things outside `workspace`, publishes, pushes, merges, deploys, sends, or spends',
     other: null,
   },
+}
+
+/**
+ * `EFFECT_QUESTION` for a call that asks for a wider sandbox (`escalation` is in the state). The spec's question names only
+ * `command`, but the gate's verdict is also what lets the escalation through, so the judge is told to read it too. Same
+ * options. A call with no escalation is asked the spec's question, word for word.
+ */
+export const EFFECT_WITH_ESCALATION_QUESTION: Question = {
+  ...EFFECT_QUESTION,
+  instructions: 'What would running `command` from `cwd`, with the extra access requested in `escalation`, do to files, systems and data?',
 }
 
 /** Whether the command belongs to the task. */
@@ -151,15 +167,17 @@ export const VERDICT_TTL_MS = 10 * 60 * 1000
 export const VERDICT_MAX_ENTRIES = 1000
 
 /**
- * The gate's verdicts by call id, for the approval answerer (`get(callId)`).
+ * The gate's verdicts by agent and call id, for the approval answerer: `get(owner, callId)`, where `owner` is
+ * `verdictOwner(request.agent)` (the agent's id).
  *
  * - **An entry goes** when the call settles (`registerCommandGate` deletes it on `tools/result`), after 10 minutes, or when it
  *   is the oldest of more than 1000. Expiry is on a monotonic clock, so a wall clock set back or forward changes nothing; the
  *   clock can be given for tests.
  * - **Bounded.** No more than `max` entries are ever held. Writing an entry that is there already makes it the newest.
- * - **A call id is the whole key.** A call id is the model provider's, unique within a session and not across them; the
- *   answerer only reads an entry for the call an approval request names, and the gate overwrites an entry whenever it
- *   decides a call afresh.
+ * - **The key is the agent and the call id.** A call id is the model provider's, unique within one session and not across
+ *   them (dsh-llm falls back to `call-${index}` when a provider gives none), so two agents can make calls with the same id at
+ *   once. Keyed by call id alone, one agent's `allow` could overwrite another's `ask` before the approval request reads it,
+ *   and a command that was to be put to a human would run. `delete` removes one agent's entry and no other's.
  */
 export class VerdictCache {
   readonly #entries = new Map<string, VerdictEntry>()
@@ -173,30 +191,32 @@ export class VerdictCache {
     this.#max = options.max ?? VERDICT_MAX_ENTRIES
   }
 
-  /** The entry for `callId`, or `undefined` if there is none or it has expired (which also drops it). */
-  get(callId: string): VerdictEntry | undefined {
-    const entry = this.#entries.get(callId)
+  /** The entry for this agent's call `callId`, or `undefined` if there is none or it has expired (which also drops it). */
+  get(owner: string, callId: string): VerdictEntry | undefined {
+    const key = keyOf(owner, callId)
+    const entry = this.#entries.get(key)
     if (entry === undefined) return undefined
     if (this.#expired(entry)) {
-      this.#entries.delete(callId)
+      this.#entries.delete(key)
       return undefined
     }
     return entry
   }
 
-  /** Write the entry for `callId`, making it the newest, and drop what has expired and what is over the limit. */
-  set(callId: string, input: VerdictInput): void {
-    this.#entries.delete(callId)
-    this.#entries.set(callId, {
+  /** Write the entry for this agent's call `callId`, making it the newest, and drop what has expired and what is over the limit. */
+  set(owner: string, callId: string, input: VerdictInput): void {
+    const key = keyOf(owner, callId)
+    this.#entries.delete(key)
+    this.#entries.set(key, {
       verdict: input.verdict,
       escalationCovered: input.escalationCovered,
       at: this.#now(),
       ...input.memo === undefined ? {} : { memo: input.memo },
     })
     // The map is in the order of `at`, so what has expired, and what is oldest, is at the front.
-    for (const [key, entry] of this.#entries) {
+    for (const [oldKey, entry] of this.#entries) {
       if (!this.#expired(entry)) break
-      this.#entries.delete(key)
+      this.#entries.delete(oldKey)
     }
     while (this.#entries.size > this.#max) {
       const oldest = this.#entries.keys().next()
@@ -205,9 +225,9 @@ export class VerdictCache {
     }
   }
 
-  /** Forget `callId`. */
-  delete(callId: string): void {
-    this.#entries.delete(callId)
+  /** Forget this agent's call `callId`; the same call id of another agent stays. */
+  delete(owner: string, callId: string): void {
+    this.#entries.delete(keyOf(owner, callId))
   }
 
   /** How many entries are held, expired ones that have not been dropped yet included. */
@@ -220,6 +240,11 @@ export class VerdictCache {
   }
 }
 
+/** One key for an agent and a call id, whatever characters either has. */
+function keyOf(owner: string, callId: string): string {
+  return JSON.stringify([owner, callId])
+}
+
 // --- reading the call -------------------------------------------------------------------------------
 
 /** The parts of a dsh `Agent` the gate reads: its id, its session's header, and the session's events. */
@@ -230,6 +255,16 @@ export type GateAgent = JudgeAgent & {
     readonly inheritedEventCount?: unknown
     snapshotEvents?(fromSeq?: number): readonly unknown[]
   }
+}
+
+/**
+ * The `owner` of an agent's entries in the `VerdictCache`: its id (`Agent.id`, the session id), which is what a tool call's
+ * `exec.agent` and an approval request's `agent` both carry. An agent with no id at all has the empty owner, and shares
+ * entries with others that have none; every agent dsh makes has one.
+ */
+export function verdictOwner(agent: { readonly id?: unknown, readonly session?: { readonly id?: unknown } } | undefined): string {
+  const id = agent?.id ?? agent?.session?.id
+  return typeof id === 'string' || typeof id === 'number' ? String(id) : ''
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -250,20 +285,31 @@ function clip(text: string, max: number): string {
   return `${text.slice(0, end)}…`
 }
 
-/** The text the gate judges: the command, or if there is none, the arguments as JSON, which is all there is to read. */
-function commandOf(args: unknown): string {
-  if (isRecord(args)) {
+/** The tools whose `command` is the whole of what they run: the two shells. */
+const SHELLS: ReadonlySet<string> = new Set(['bash', 'pwsh'])
+
+/**
+ * The text the gate judges, which is the state's `command`. For `bash` and `pwsh` it is their `command`. Any other gated tool
+ * is judged on all its arguments and its name, as `<tool>(<JSON of the arguments>)`: `mcp__ssh__run({"host":"prod-db",
+ * "command":"rm -rf /"})` has `host` in it, which `command` alone would hide. One key (`command`) and one question
+ * wording serve both, which is why this is not a separate `tool` field. A shell call whose `command` is not a string (the
+ * tool refuses it itself) is judged the same way, on what it was called with.
+ */
+function commandOf(name: string, args: unknown): string {
+  if (SHELLS.has(name) && isRecord(args)) {
     const command = given(args.command)
     if (command !== undefined) return command
   }
+  let json: string | undefined
   try {
-    return JSON.stringify(args) ?? ''
+    json = JSON.stringify(args)
   } catch {
-    return ''
+    // Not JSON: nothing to show but the name.
   }
+  return `${name}(${json ?? ''})`
 }
 
-/** `sandbox_permissions` and the `justification` that goes with it, as one line; `undefined` for a call without them. */
+/** `sandbox_permissions` and the `justification` that goes with it, as one line; `undefined` for a call without them (a shell's arguments only: for any other tool they are in the JSON already). */
 function escalationOf(args: unknown): string | undefined {
   if (!isRecord(args)) return undefined
   const permissions = given(args.sandbox_permissions)
@@ -352,7 +398,7 @@ export function isGated(name: string, patterns: readonly string[]): boolean {
 
 /** What `decide` returns: the word for the log line, and what the gate answers dsh. */
 interface Outcome extends Decision {
-  decision: VerdictKind
+  decision: VerdictKind | 'cancel'
   pre: PreToolDecision
 }
 
@@ -444,12 +490,14 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     if (!isGated(exec.name, settings.tools.gated)) return next()
 
     const callId = String(exec.callId)
+    const owner = verdictOwner(agent)
     const topLevel = isTopLevelAgent(agent)
+    const shell = SHELLS.has(exec.name)
     const args = exec.arguments
-    const command = commandOf(args)
-    const escalation = escalationOf(args)
+    const command = commandOf(exec.name, args)
+    const escalation = shell ? escalationOf(args) : undefined
     const sessionCwd = given(agent.session?.header?.cwd)
-    const cwd = directoryOf(args, sessionCwd)
+    const cwd = shell ? directoryOf(args, sessionCwd) : sessionCwd
     let workspace: string | undefined
     try {
       workspace = deps.workspaceRoot?.(agent)
@@ -458,11 +506,11 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     }
     workspace ??= cwd
 
-    // Once per call id: a call that comes through again, as it was, is not put to the judge again.
+    // Once per call: a call of this agent that comes through again, as it was, is not put to the judge again.
     const key = createHash('sha256')
-      .update(JSON.stringify([agent.id ?? agent.session?.id ?? null, exec.name, command, cwd ?? null, escalation ?? null]))
+      .update(JSON.stringify([exec.name, command, cwd ?? null, escalation ?? null]))
       .digest('hex')
-    const known = deps.cache.get(callId)
+    const known = deps.cache.get(owner, callId)
 
     let ours: PreToolDecision
     if (known?.memo?.key === key) {
@@ -480,35 +528,42 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
         if (judge !== undefined) {
           const asked = await judge.ask<Outcome>({
             state,
-            questions: { effect: EFFECT_QUESTION, serves_task: SERVES_TASK_QUESTION },
+            // The spec's question, or, when a wider sandbox is asked for, the same with the escalation named in it.
+            questions: { effect: escalation === undefined ? EFFECT_QUESTION : EFFECT_WITH_ESCALATION_QUESTION, serves_task: SERVES_TASK_QUESTION },
             purpose: 'command',
             agent,
             signal: exec.signal,
             tool: exec.name,
             callId,
             subject: command,
-            decide: result => decideCommand(result, settings, topLevel),
+            // A call that was cancelled has no one to ask, so the line says it was cancelled, not asked or denied.
+            decide: result => exec.signal.aborted ? { decision: 'cancel', pre: { kind: 'cancel' } } : decideCommand(result, settings, topLevel),
           })
           outcome = asked.decided
         }
       } catch {
         // The client never throws for a Jev failure; this is anything else, and is no reason to let a command run.
       }
-      // A call that was cancelled has no one to ask: it must not leave an approval prompt behind.
+      // A call that was cancelled must not leave an approval prompt behind.
       if (exec.signal.aborted) return { kind: 'cancel' }
       ours = (outcome ?? unavailable(topLevel)).pre
-      deps.cache.set(callId, {
+      deps.cache.set(owner, callId, {
         verdict: verdictOf(ours),
         escalationCovered: ours.kind === 'allow' && escalation !== undefined,
         memo: { key, decision: ours },
       })
     }
 
-    // The others have their say: a stricter answer from a later listener stands, and the cache says what the call came to.
+    // The gate's own deny is final, as dsh's auto-review's is: a call that will not run has no use for the hooks and
+    // recorders that listen after this one, and must not trigger them.
+    if (ours.kind === 'deny') return ours
+
+    // Allow and ask let the others have their say: a stricter answer from a later listener stands, and the cache says what
+    // the call came to.
     const theirs = await next()
     const final = stricter(ours, theirs)
     if (final.kind !== ours.kind) {
-      deps.cache.set(callId, { verdict: verdictOf(final), escalationCovered: false, memo: { key, decision: ours } })
+      deps.cache.set(owner, callId, { verdict: verdictOf(final), escalationCovered: false, memo: { key, decision: ours } })
     }
     return final
   }
@@ -529,6 +584,6 @@ export function registerCommandGate(ctx: Context): VerdictCache {
     cache,
   })
   ctx.on('tools/pre-execute', gate, { prepend: true })
-  ctx.on('tools/result', (exec) => { cache.delete(String(exec.callId)) })
+  ctx.on('tools/result', (exec) => { cache.delete(verdictOwner(exec.agent), String(exec.callId)) })
   return cache
 }

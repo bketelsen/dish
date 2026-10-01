@@ -449,7 +449,10 @@ test('a store that is a sibling plugin of this one is found by ctx.get, with a f
     await handle
     assert.equal((await ctx.dishJudge.settings()).timeoutMs, 4000)
     assert.deepEqual(judgeLines(logs), [])
+    assert.equal((await ctx.dishJudge.settings()).timeoutMs, 4000)
+    // What was read is kept until the store says judge.yaml changed, as it does after every commit.
     stored = undefined
+    await ctx.parallel('dish-config/changed', ['judge.yaml'], 'abc', USER as never)
     for (let call = 0; call < 3; call++) assert.equal(await ctx.dishJudge.settings(), DEFAULT_SETTINGS)
     assert.equal(judgeLines(logs).length, 1, logs.join('\n'))
     assert.match(judgeLines(logs)[0]!, /judge\.yaml is not in the config store; using the shipped default/)

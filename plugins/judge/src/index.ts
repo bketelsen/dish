@@ -252,6 +252,12 @@ export const SETTINGS_RETRY_AFTER_BUDGETS = 10
 /** The most reads of the store that are waiting at once: the one that is current, and two that were let go of. A store that has kept three is not asked again until one answers. */
 const MAX_READS_AT_ONCE = 3
 
+/** What `createSettingsReader` makes: `settings()`, and the way to say that what it has kept is out of date. */
+export type SettingsReader = (() => Promise<JudgeSettings>) & {
+  /** Forget the settings that were read: the next call reads the store again. For `dish-config/changed` of `judge.yaml`. */
+  invalidate(): void
+}
+
 /**
  * `settings()` over a store that may or may not be there, looked up on every call. Each distinct problem is logged
  * once, and none of it is thrown: every gate reads this on every call, and the shipped default always works.
@@ -263,6 +269,14 @@ const MAX_READS_AT_ONCE = 3
  * for each call. A read that is still going `SETTINGS_RETRY_AFTER_BUDGETS` budgets after it began is let go of (what it
  * finds, if it does, is kept all the same, unless something newer is) and the next call reads again, with at most
  * three reads waiting at once.
+ *
+ * **What it read is kept**, because every tool call of every agent asks for the settings (to learn whether it is a gated
+ * tool), and a read of the store is a few milliseconds that can be 200 when the store is stuck. A read that came to an
+ * answer the file will keep giving (its settings, a missing file, a file that doesn't pass) is kept for the store that was
+ * read, and answers every call until `invalidate()`, which the plugin calls when dish-config says `judge.yaml` changed; a
+ * different store (the config plugin restarted) is a different answer, and is read afresh. A read that failed is not kept,
+ * so the next call tries again. A read that went over its budget is kept when it does end, as above. A read that began
+ * before an `invalidate()` and ends after it is not kept, since what it found may be what was just replaced.
  */
 export function createSettingsReader(
   store: () => Reader | undefined,
@@ -270,7 +284,11 @@ export function createSettingsReader(
   budgetMs = SETTINGS_READ_BUDGET_MS,
   /** What says a message once: the plugin's own, which the log shares, or one made from `logger`. */
   tell: (message: string) => void = warnOnce(logger),
-): () => Promise<JudgeSettings> {
+): SettingsReader {
+  /** What the last read that came to an answer found, and the store it asked. */
+  let kept: { reader: Reader, settings: JudgeSettings } | undefined
+  /** How many times `invalidate` has been called: a read keeps its answer only if this is what it was when the read began. */
+  let epoch = 0
   /** The last settings that were read from the store and passed `parseSettings`. */
   let lastGood: JudgeSettings | undefined
   /** Which read found them. Reads are numbered as they begin, and one that ends after a later one did can't put older settings over theirs. */
@@ -279,6 +297,12 @@ export function createSettingsReader(
   /** The reads that have begun and not ended. */
   let waiting = 0
   const read = async (number: number): Promise<JudgeSettings> => {
+    const asOf = epoch
+    /** Keep `settings` as the answer of `reader`, unless an `invalidate()` came while it was being read. */
+    const keep = (reader: Reader, settings: JudgeSettings): JudgeSettings => {
+      if (asOf === epoch) kept = { reader, settings }
+      return settings
+    }
     try {
       const reader = store()
       if (reader === undefined) {
@@ -294,18 +318,18 @@ export function createSettingsReader(
       }
       if (stored === undefined) {
         tell('judge.yaml is not in the config store; using the shipped default')
-        return DEFAULT_SETTINGS
+        return keep(reader, DEFAULT_SETTINGS)
       }
       const parsed = parseSettings(stored)
       if (!parsed.ok) {
         tell(`judge.yaml in the config store is not valid, so the shipped default is used: ${parsed.problem}`)
-        return DEFAULT_SETTINGS
+        return keep(reader, DEFAULT_SETTINGS)
       }
       if (number > lastGoodFrom) {
         lastGood = parsed.settings
         lastGoodFrom = number
       }
-      return parsed.settings
+      return keep(reader, parsed.settings)
     } catch (error) {
       tell(`could not get the judge settings (${describe(error)}); using the shipped default`)
       return DEFAULT_SETTINGS
@@ -327,16 +351,33 @@ export function createSettingsReader(
     tell(`reading judge.yaml from the config store took more than ${budgetMs} ms; using ${lastGood === undefined ? 'the shipped default' : 'the settings last read'} until it answers`)
     return lastGood ?? DEFAULT_SETTINGS
   }
-  return () => {
+  const settings = (): Promise<JudgeSettings> => {
+    if (kept !== undefined) {
+      let reader: Reader | undefined
+      try {
+        reader = store()
+      } catch {
+        // Not there: the read below says so.
+      }
+      if (reader === kept.reader) return Promise.resolve(kept.settings)
+    }
     if (current !== undefined && performance.now() - current.since >= budgetMs * SETTINGS_RETRY_AFTER_BUDGETS && waiting < MAX_READS_AT_ONCE) current = undefined
     const mine = current ?? begin()
     const left = budgetMs - (performance.now() - mine.since)
     if (left <= 0) return Promise.resolve(fallback())
     return new Promise<JudgeSettings>((resolve) => {
       const timer = setTimeout(() => { resolve(fallback()) }, left)
-      mine.done.then((settings) => { clearTimeout(timer); resolve(settings) }, () => { clearTimeout(timer); resolve(lastGood ?? DEFAULT_SETTINGS) })
+      mine.done.then((found) => { clearTimeout(timer); resolve(found) }, () => { clearTimeout(timer); resolve(lastGood ?? DEFAULT_SETTINGS) })
     })
   }
+  return Object.assign(settings, {
+    invalidate(): void {
+      epoch++
+      kept = undefined
+      // A read that is going began before this, so what it finds may be what was just replaced: calls must not join it.
+      current = undefined
+    },
+  })
 }
 
 /** How long the decision log is kept: day files and withheld files older than this are removed when the plugin loads. */
@@ -519,6 +560,9 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
 
   // `ctx.get` is read on every call: the store is optional, and may come, go and come back.
   const settings = createSettingsReader(() => ctx.get('dishConfig'), logger, SETTINGS_READ_BUDGET_MS, tell)
+  // What the reader has read is kept until the store says `judge.yaml` changed (every commit says which paths it changed:
+  // a page's save, the seed, a revert), so an edit takes effect on the next call, and no call reads the store otherwise.
+  ctx.on('dish-config/changed', (paths) => { if (paths.includes('judge.yaml')) settings.invalidate() })
 
   // With the store there: claim judge.yaml, as an effect so it goes when the store, or this plugin, does, and seed it.
   // A claim that is refused (someone else owns the path) or a seed that fails leaves the store as it is.
@@ -567,7 +611,8 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
   // -----------------------------------------------------------------------------------------------------------------
 
   // The command gate (see `gate.ts`): a prepended `tools/pre-execute` listener for the tools in `tools.gated`, and a
-  // `tools/result` listener that forgets a call's verdict when it settles. The cache is for Task 5's approval answerer.
+  // `tools/result` listener that forgets a call's verdict when it settles. It looks the client, the settings and the sandbox
+  // policy up with `ctx.get` on each call. The cache is for Task 5's approval answerer.
   const verdicts = registerCommandGate(ctx)
 
   // In the background. A failure is logged, and the plugin works all the same: old files that stay are only disk.
