@@ -155,11 +155,11 @@ It moves here from `dish-prompts`, as `presets/dish.patch.yml`, still generated 
 
 ## The record
 
-Crew keeps its own runtime record, because the session log can't hold custom events. It lives in `$XDG_DATA_HOME/dish/crew/<sha256(parent session id)>/`:
-- **`children.json`** lists, per child: `id`, `n` (its order in the session), `role`, `title`, `model`, `family`, `reviews`, `startedAt`, `followUps`, `runs[]` (`{ endedAt, stopReason, error?, report }`) and `last` (status).
+Crew keeps its own runtime record, because the session log can't hold custom events. It lives in `$XDG_DATA_HOME/dish/crew/`: `sessions/<sha256(parent session id)>/` per session, and `by-child/<sha256(child id)>` pointers so a child's runs are filed after a restart. Each session directory holds:
+- **`children.json`** names its session and lists, per child: `id`, `n` (its order in the session), `role`, `title`, `model`, `family`, `reviews`, `startedAt`, `followUps`, `runs[]` (`{ endedAt, stopReason, error?, report }`) and `last` (status).
   - It's written atomically: a temp file, then rename.
   - It's the source for limits, the reviewer rule, and notices.
-- **`<n>-<role>-<run>.md`** holds the child's closing message from each run, captured on `subagent/end`.
+- **`<n>-<role>-<run>.md`** holds the child's closing message from each run, captured on `subagent/end`. A child is marked running on every `subagent/start` (a first start, a wake or a resume), so a child woken by `send_message` still counts toward the limits.
 - **Deleting old records:** session directories not written to for 180 days are pruned at startup.
 
 The notice gives the report's path. The main agent decides whether to promote a report into a repo's docs or, later, the memory vault.
