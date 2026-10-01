@@ -10,6 +10,8 @@
  * Not right after a letter or digit, unless that one comes right after a backslash. A token in a string that holds an
  * escape (`"x\nghp_…"`, `printf 'x\tsk-…'`) follows a letter, the `n` or `t` of the escape, and is a token all the same.
  * The backslash is what tells the two apart: `xghp_…` and `\ncghp_…` still follow a letter, and a plain one blocks a match.
+ * A known limit: `\uXXXX` and `\xXX` escapes are not treated as escapes. A hex digit before a token still blocks it, and
+ * detection has the same gap.
  */
 const NOT_AFTER_ALNUM = /(?<!(?<!\\)[A-Za-z0-9])/
 /** The same for capitals and digits only, which is what an AWS key's neighbour is judged by. */
@@ -56,13 +58,18 @@ const PATTERNS: readonly SecretPattern[] = [
     label: 'a private key',
     body: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----/,
     // The key is the header and what follows it, up to 8 KB:
-    // - to its END line, if there is one before another `-----BEGIN` (whatever is between: PGP armor has `Version:` and
-    //   `Comment:` lines with dots and brackets in them). The gap stops at the next BEGIN so that a text with many headers
-    //   and no END lines is scanned once, not once for each header, which would be 8 KB for every 28 characters;
+    // - to its END line, if there is one before another private key header (whatever is between: PGP armor has `Version:`
+    //   and `Comment:` lines with dots and brackets in them, and a fake `-----BEGIN x.` line does not end it). The gap stops
+    //   at the next real header, which is a match of its own and is merged with this one, so that a text with many headers and
+    //   no END lines is scanned once, not once for each header, which would be 8 KB for every 28 characters;
     // - or, with no END line, the characters a key can be made of: base64, the `Proc-Type: 4,ENCRYPTED` and `DEK-Info:`
-    //   lines of an old key, spaces and line breaks, and the backslash of a `\n` that is written out. The first other
-    //   character ends it, so `grep "-----BEGIN RSA PRIVATE KEY-----" ~/.ssh/id_rsa | wc -l` keeps all but the header.
-    mask: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----(?:(?:(?!-----BEGIN)[\s\S]){0,8192}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----|[A-Za-z0-9+\/=:,\s\\-]{0,8192})/,
+    //   lines of an old key, the dots, brackets, `@` and `<>` of a PGP `Version:` or `Comment:` line, spaces and line
+    //   breaks, and the backslash of a `\n` that is written out. The first other character ends it, so that
+    //   `grep "-----BEGIN RSA PRIVATE KEY-----" ~/.ssh/id_rsa | wc -l` keeps all but the header. It stops before a token
+    //   (a prefix with the body to go with it), so that the token is at the end of the mask and is masked in its turn: the
+    //   letters of `ghp`, `github` and `sk-` are among the characters, and it would otherwise run into the token and stop at
+    //   its `_`, leaving the rest of the token. A prefix with no token behind it (`risk-free`) is not a place to stop.
+    mask: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----(?:(?:(?!-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY)[\s\S]){0,8192}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----|(?:(?!gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|sk-[A-Za-z0-9_-]{32})[A-Za-z0-9+\/=:,\s\\.()@<>-]){0,8192})/,
   },
   // AKIA is a long-term access key, ASIA a temporary one.
   { label: 'an AWS access key ID', before: NOT_AFTER_UPPER, body: /(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])/ },
