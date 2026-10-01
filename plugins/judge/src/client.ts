@@ -22,6 +22,14 @@
  *   so that a key of "a" doesn't turn every "a" into noise) and an error body is cut to 200 characters first. A call that ended before the key
  *   was looked up, and has text of the caller's to log, looks it up for the mask (and the caller's signal ends that lookup
  *   too: a call that was cancelled is not held for a credential store that hangs).
+ * - **No credential leaves with the request.** Before the body is made, every string in the `state` (at any depth, object keys
+ *   included) and the texts of the questions (instructions, a choice option's description, a noul's criteria, a score's
+ *   levels) are passed through the key's mask and then dish-kit's `maskSecrets`, so a command that carries a token, or a page
+ *   that shows one, goes to TypeSafe with the token masked. Question ids and a choice's option names are not masked: the
+ *   answers are keyed by them, and they are limited to a charset already. The limits on the state (100 KB) and the body
+ *   (256 KB) are checked on what is sent, since a mask can be longer than what it hides (a request that is too big as it is
+ *   given is refused before that). If the masking fails, for any reason, nothing is sent: the call is `unavailable`. What the
+ *   caller gave is not changed, and the log line is made from it as it was.
  * - **Statuses.** `401` is `unavailable` ("the TypeSafe key was refused"); `400` and `422` are `invalid`, with the start of
  *   what TypeSafe said; `429` and `529` are `unavailable` and start the back-off; any other non-2xx is `unavailable`.
  *   A request that is too big (the state over 100 KB, the whole body over 256 KB, or TypeSafe's `max_tokens_exceeded`) is
@@ -38,7 +46,7 @@
  * @module dish-judge/client
  */
 
-import { isTopLevelAgent } from 'dish-kit'
+import { isTopLevelAgent, maskSecrets } from 'dish-kit'
 import type { AgentLike } from 'dish-kit'
 // Types only, so that this file does not load the log: the one line type and its parts are the log's.
 import type { JsonValue, JudgeLogLine, JudgePurpose } from './log.ts'
@@ -219,6 +227,8 @@ export interface JudgeDeps {
   now?: () => number
   /** A monotonic clock, in ms: for the back-off, the time limit and the latencies. Defaults to `performance.now()`. */
   tick?: () => number
+  /** What hides the credentials in every text that is sent. Defaults to dish-kit's `maskSecrets`; here for a test of what a failure of it does. */
+  maskSecrets?: (text: string) => string
 }
 
 /** The most of `state`, as JSON text in UTF-8: Jev's own limit is 32k tokens for `state` and the longest question. */
@@ -360,6 +370,45 @@ const kb = (bytes: number): number => Math.ceil(bytes / 1024)
 /** A refusal for being too big: says nothing about Jev. */
 function tooBig(message: string): { ok: false, message: string, tooBig: true } {
   return { ok: false, message, tooBig: true }
+}
+
+// --- masking what is sent --------------------------------------------------------------------------
+
+/**
+ * `value` with every string in it, and every key of every object, passed through `mask`: a copy, so what the caller gave is
+ * as it was. Numbers, booleans and `null` are as they are. `value` is what `JSON.parse` made, so it has no cycles, no
+ * `undefined`, no class instances. An object is rebuilt with `fromEntries`, which defines each key as a property of its own,
+ * `__proto__` too.
+ */
+function maskDeep(value: unknown, mask: (text: string) => string): unknown {
+  if (typeof value === 'string') return mask(value)
+  if (Array.isArray(value)) return value.map(item => maskDeep(item, mask))
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [mask(key), maskDeep(item, mask)]))
+  }
+  return value
+}
+
+/**
+ * The questions as they will go on the wire, with every text in them masked: instructions, a choice option's description, a
+ * noul's criteria, a score's levels. **Not** the question ids, nor a choice's option names: the answers are keyed by them, and
+ * `checkQuestions` has limited what they can be.
+ */
+function maskQuestions(questions: Record<string, Question>, mask: (text: string) => string): Record<string, Question> {
+  const masked: Record<string, Question> = {}
+  for (const [id, question] of Object.entries(questions)) {
+    const instructions = mask(question.instructions)
+    if (question.type === 'noul') {
+      masked[id] = question.criteria === undefined
+        ? { type: 'noul', instructions }
+        : { type: 'noul', instructions, criteria: { true: mask(question.criteria.true), false: mask(question.criteria.false) } }
+    } else if (question.type === 'choice') {
+      masked[id] = { type: 'choice', instructions, criteria: Object.fromEntries(Object.entries(question.criteria).map(([option, description]) => [option, description === null ? null : mask(description)])) }
+    } else {
+      masked[id] = { type: 'score', instructions, criteria: question.criteria.map(level => mask(level)) }
+    }
+  }
+  return masked
 }
 
 // --- checking the answer --------------------------------------------------------------------------
@@ -620,6 +669,7 @@ export function createJudge(deps: JudgeDeps): Judge {
   const now = deps.now ?? Date.now
   const tick = deps.tick ?? (() => performance.now())
   const endpoint = `${deps.baseUrl.replace(/\/+$/, '')}/v1/systemone`
+  const secrets = deps.maskSecrets ?? maskSecrets
 
   /** The latencies of the last answered calls, oldest first. */
   const latencies: number[] = []
@@ -676,8 +726,8 @@ export function createJudge(deps: JudgeDeps): Judge {
     scope.limit = settings.timeoutMs
     scope.deadline = begun + settings.timeoutMs
 
-    const body = `{"model":${JSON.stringify(settings.model)},"state":${state.value},"questions":${JSON.stringify(questions.value)}}`
-    const bodyBytes = Buffer.byteLength(body)
+    // Too big as it is given: refused before anything is asked of the key or masked. What is sent is checked again once it is masked.
+    const bodyBytes = Buffer.byteLength(`{"model":${JSON.stringify(settings.model)},"state":${state.value},"questions":${JSON.stringify(questions.value)}}`)
     if (bodyBytes > MAX_BODY_BYTES) {
       return invalid('request', `the request is ${kb(bodyBytes)} KB and the most is 256 KB: send less`, 'none', null, true)
     }
@@ -704,6 +754,32 @@ export function createJudge(deps: JudgeDeps): Judge {
     }
     scope.mask = maskerFor(key)
 
+    // Nothing leaves this machine with a credential in it. Every string that is sent (the state, at any depth, object keys
+    // included, and the texts of the questions) is passed through the key's mask, so that the key goes whole, and then
+    // through the patterns of `maskSecrets`. The size limits are for what is sent, so they are checked again on it: a mask can
+    // be longer than what it hides. If any of this fails, nothing is sent: the call is unavailable.
+    let sent: string
+    try {
+      const hide = (text: string): string => {
+        const hidden = secrets(scope.mask(text))
+        if (typeof hidden !== 'string') throw new TypeError('a mask gave something that is not a string')
+        return hidden
+      }
+      const maskedState = JSON.stringify(maskDeep(JSON.parse(state.value), hide))
+      const maskedBytes = Buffer.byteLength(maskedState)
+      if (maskedBytes > MAX_STATE_BYTES) {
+        return invalid('request', `state is ${kb(maskedBytes)} KB of JSON once its secrets are masked and the most is 100 KB: send the part that matters`, 'none', null, true)
+      }
+      sent = `{"model":${JSON.stringify(settings.model)},"state":${maskedState},"questions":${JSON.stringify(maskQuestions(questions.value, hide))}}`
+    } catch {
+      // What failed is not repeated: it may hold what was being masked.
+      return failure('unavailable', 'the request could not be cleared of secrets, so nothing was sent', 'failed')
+    }
+    const sentBytes = Buffer.byteLength(sent)
+    if (sentBytes > MAX_BODY_BYTES) {
+      return invalid('request', `the request is ${kb(sentBytes)} KB once its secrets are masked and the most is 256 KB: send less`, 'none', null, true)
+    }
+
     const started = tick()
     const elapsed = () => Math.max(0, Math.round(tick() - started))
     let status: number
@@ -714,7 +790,7 @@ export function createJudge(deps: JudgeDeps): Judge {
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body,
+        body: sent,
         signal,
         // The key must not follow a redirect anywhere.
         redirect: 'error',

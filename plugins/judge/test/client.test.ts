@@ -1786,3 +1786,221 @@ test('a hook that throws, or rejects, is as it was, with a signal given or not',
   await r.ask({ decide: async (_result: JudgeResult, _options: { signal: AbortSignal }) => { throw new Error('rejected') } })
   assert.deepEqual(r.lines.map(line => [line.decision, line.error]), [[null, 'decide failed: threw'], [null, 'decide failed: rejected']])
 })
+
+// --- secrets are masked before anything goes to TypeSafe --------------------------------------------------
+
+// Credentials as dish-kit's patterns know them, built from parts so that this file holds no literal that looks like one.
+const GH = `ghp_${'Zq9Xk2'.repeat(6)}`
+const SK = `sk-${'Ab3dE5gH7j'.repeat(4)}`
+const MASKED_GH = '‹secret: a GitHub token›'
+const MASKED_SK = '‹secret: an sk- API key›'
+/** A key as TypeSafe's is not, for the patterns: nothing in dish-kit knows it. Its three forms differ. */
+const FAKE_KEY = 'fk-Q9x+7/Zr"k\\%Y_dist1nct'
+
+/** Every string in `value`, object keys included. */
+function allStrings(value: unknown, into: string[] = []): string[] {
+  if (typeof value === 'string') into.push(value)
+  else if (Array.isArray(value)) for (const item of value) allStrings(item, into)
+  else if (value !== null && typeof value === 'object') for (const [key, item] of Object.entries(value)) { into.push(key); allStrings(item, into) }
+  return into
+}
+
+/** What the fake Jev was sent, as text, and parsed. */
+const sent = (r: Rig, index = -1) => {
+  const request = r.jev.requests.at(index)!
+  return { text: request.text, json: request.json as { model: string, state: unknown, questions: Record<string, any> } }
+}
+
+test('a token in a string state never reaches the server, and the mask is what is sent in its place', async () => {
+  const r = await rig()
+  r.jev.queue(ok())
+  const command = `curl -sS -H "Authorization: Bearer ${GH}" https://api.github.com/user`
+  answersOf(await r.ask({ state: command }))
+  const { text, json } = sent(r)
+  assert.ok(!text.includes(GH) && !text.includes('Zq9Xk2Zq9Xk2'))
+  assert.equal(json.state, `curl -sS -H "Authorization: Bearer ${MASKED_GH}" https://api.github.com/user`)
+})
+
+test('a token in a nested object value, an array and an object key never reaches the server', async () => {
+  const r = await rig()
+  r.jev.queue(ok())
+  const state = {
+    command: `git clone https://x:${GH}@github.com/o/r.git`,
+    env: { deep: { deeper: [{ TOKEN: SK }, 'plain', 3, true, null, [`bearer ${SK}`]] } },
+    [GH]: 'a key that is a token',
+    nested: { [`key-${SK}`]: { [SK]: 1 } },
+    task: 'fix it',
+    count: 7,
+  }
+  const copy = structuredClone(state)
+  answersOf(await r.ask({ state }))
+  const { text, json } = sent(r)
+  for (const secret of [GH, SK, 'Zq9Xk2Zq9Xk2', 'Ab3dE5gH7jAb3dE5gH7j']) assert.ok(!text.includes(secret), secret)
+  for (const string of allStrings(json.state)) assert.ok(!/gh[pousr]_[A-Za-z0-9]{36}|sk-[A-Za-z0-9_-]{32}/.test(string), string)
+  const sentState = json.state as Record<string, any>
+  assert.equal(sentState.command, `git clone https://x:${MASKED_GH}@github.com/o/r.git`)
+  assert.deepEqual(sentState.env, { deep: { deeper: [{ TOKEN: MASKED_SK }, 'plain', 3, true, null, [`bearer ${MASKED_SK}`]] } })
+  assert.equal(sentState[MASKED_GH], 'a key that is a token')
+  assert.deepEqual(sentState.nested, { [`key-${MASKED_SK}`]: { [MASKED_SK]: 1 } })
+  assert.equal(sentState.count, 7)
+  assert.deepEqual(state, copy, 'the caller\'s own state is not changed')
+})
+
+test('a token in a question\'s instructions, a choice option\'s description, a noul\'s criteria or a score\'s levels never reaches the server', async () => {
+  const r = await rig()
+  const questions = {
+    n: { type: 'noul', instructions: `Is ${GH} fine?`, criteria: { true: `yes, with ${SK}`, false: `no, with ${GH}` } },
+    c: { type: 'choice', instructions: `Which, for ${SK}?`, criteria: { alpha: `the first, ${GH}`, beta: null, gamma: 'plain' } },
+    s: { type: 'score', instructions: `How much, ${GH}?`, criteria: [`low ${SK}`, 'mid', `high ${GH}`] },
+  }
+  const copy = structuredClone(questions)
+  r.jev.queue({ kind: 'answer', body: jevBody({ n: noulAnswer(0.5), c: choiceAnswer('alpha', { alpha: 0.5, beta: 0.3, gamma: 0.2 }), s: scoreAnswer(1, { 0: 0.2, 1: 0.6, 2: 0.2 }) }) })
+  answersOf(await r.ask({ questions }))
+  const { text, json } = sent(r)
+  for (const secret of [GH, SK, 'Zq9Xk2Zq9Xk2', 'Ab3dE5gH7jAb3dE5gH7j']) assert.ok(!text.includes(secret), secret)
+  assert.deepEqual(json.questions, {
+    n: { type: 'noul', instructions: `Is ${MASKED_GH} fine?`, criteria: { true: `yes, with ${MASKED_SK}`, false: `no, with ${MASKED_GH}` } },
+    c: { type: 'choice', instructions: `Which, for ${MASKED_SK}?`, criteria: { alpha: `the first, ${MASKED_GH}`, beta: null, gamma: 'plain' } },
+    s: { type: 'score', instructions: `How much, ${MASKED_GH}?`, criteria: [`low ${MASKED_SK}`, 'mid', `high ${MASKED_GH}`] },
+  })
+  assert.deepEqual(questions, copy, 'the caller\'s own questions are not changed')
+})
+
+test('the current key never reaches the server, in the form it has, escaped as JSON, or URL-encoded, in the state or the questions', async () => {
+  const r = await rig({ key: async () => FAKE_KEY })
+  r.jev.queue({ kind: 'answer', body: jevBody({ q: noulAnswer(0.5) }) })
+  const forms = [FAKE_KEY, JSON.stringify(FAKE_KEY).slice(1, -1), encodeURIComponent(FAKE_KEY)]
+  assert.equal(new Set(forms).size, 3)
+  const state = { command: `curl -H "Authorization: Bearer ${FAKE_KEY}"`, json: forms[1], url: `https://x.test/?k=${forms[2]}`, [FAKE_KEY]: 1, list: [forms[0]] }
+  answersOf(await r.ask({ state, questions: { q: { type: 'noul', instructions: `Is ${FAKE_KEY} used (${forms[2]})?` } } }))
+  const { text, json } = sent(r)
+  for (const form of forms) {
+    assert.ok(!text.includes(form), `${form} in the body as text`)
+    assert.ok(!text.includes(JSON.stringify(form).slice(1, -1)), `${form}, escaped for the body`)
+    for (const string of allStrings(json)) assert.ok(!string.includes(form), `${form} in ${string}`)
+  }
+  assert.equal(r.jev.requests[0]!.headers.authorization, `Bearer ${FAKE_KEY}`, 'the key is in the header, where it belongs')
+  const sentState = json.state as Record<string, any>
+  assert.equal(sentState.command, 'curl -H "Authorization: Bearer ‹key›"')
+  assert.equal(sentState['‹key›'], 1)
+  assert.equal(json.questions.q.instructions, 'Is ‹key› used (‹key›)?')
+})
+
+test('question ids and choice option names are not masked, so the answers map back to them', async () => {
+  const r = await rig()
+  const id = `ghp_${'zq9xk2'.repeat(6)}`                // a question id the GitHub pattern matches, and the id charset allows
+  const option = `ghp_${'Zq9Xk2'.repeat(6)}`            // an option name it matches too
+  const secretOption = `sk-${'Ab3dE5gH7j'.repeat(4)}`
+  assert.match(id, /^[a-z][a-z0-9_]*$/)
+  const questions = { [id]: { type: 'choice', instructions: 'Which?', criteria: { [option]: `the first, ${GH}`, [secretOption]: null, plain: 'x' } } }
+  r.jev.queue({ kind: 'answer', body: jevBody({ [id]: choiceAnswer(option, { [option]: 0.7, [secretOption]: 0.2, plain: 0.1 }) }) })
+  const result = answersOf(await r.ask({ questions }))
+  const { json } = sent(r)
+  assert.deepEqual(Object.keys(json.questions), [id])
+  assert.deepEqual(Object.keys(json.questions[id].criteria), [option, secretOption, 'plain'])
+  assert.equal(json.questions[id].criteria[option], `the first, ${MASKED_GH}`, 'the description is masked, the name is not')
+  const answer = result.answers[id]
+  assert.ok(answer?.type === 'choice' && answer.choice === option)
+  assert.deepEqual(Object.keys(answer.probabilities), [option, secretOption, 'plain'])
+})
+
+test('text with no secret in it is sent as it was: the same request, byte for byte', async () => {
+  const r = await rig()
+  r.jev.queue(ok())
+  const state = { command: 'git status', cwd: '/work', n: 1.5, big: 12345678901, flag: false, none: null, list: ['a', { b: 'c' }], 'a key': 'é€𝄞', __proto__x: 1 }
+  answersOf(await r.ask({ state }))
+  const { text } = sent(r)
+  assert.equal(text, `{"model":${JSON.stringify(DEFAULT_SETTINGS.model)},"state":${JSON.stringify(state)},"questions":${JSON.stringify(QUESTIONS)}}`)
+})
+
+test('a key named __proto__ is kept as a key of its own, and masked like any other', async () => {
+  const r = await rig()
+  r.jev.queue(ok())
+  const state = JSON.parse(`{"__proto__":{"x":"${GH}"},"y":1}`) as unknown
+  answersOf(await r.ask({ state }))
+  const { text } = sent(r)
+  assert.ok(!text.includes(GH))
+  assert.equal(text.includes('"__proto__":{"x":"‹secret: a GitHub token›"}'), true)
+})
+
+test('the caller\'s own copies are as they were: the line has the subject as given, and the result is the answers', async () => {
+  const r = await rig()
+  r.jev.queue(ok())
+  const subject = `curl -H "Authorization: Bearer ${GH}"`
+  const asked = await r.ask({ state: { command: subject }, subject })
+  answersOf(asked)
+  assert.equal(r.lines[0]!.subject, subject, 'the log masks what it writes; the client does not change what it is given')
+})
+
+test('the size limits are for what is sent: a state that is over 100 KB only once its secrets are masked is too big, and nothing is sent', async () => {
+  const r = await rig()
+  // 20-character AWS key ids, each of which becomes a longer mask.
+  const one = 'AKIAIOSFODNN7EXAMPLE '
+  const state = one.repeat(4800)
+  assert.ok(Buffer.byteLength(JSON.stringify(state)) <= 100 * 1024, 'it fits as it is')
+  const failure = failureOf(await r.ask({ state }), 'invalid')
+  assert.equal(failure.from, 'request')
+  assert.equal(failure.tooBig, true)
+  assert.match(failure.message, /100 KB/)
+  assert.equal(r.jev.requests.length, 0)
+  assert.equal((await r.judge.status()).calls, 0, 'and it says nothing about Jev')
+})
+
+test('a request that is over 256 KB only once its secrets are masked is too big, and a state that masks smaller is not made too big by them', async () => {
+  const r = await rig()
+  const one = 'AKIAIOSFODNN7EXAMPLE '
+  const instructions = one.repeat(2900)                  // about 61 KB as it is, 100 KB masked
+  const questions = Object.fromEntries(['a', 'b', 'c', 'd'].map(id => [id, { type: 'noul', instructions }]))
+  const failure = failureOf(await r.ask({ questions, state: 's' }), 'invalid')
+  assert.deepEqual([failure.from, failure.tooBig], ['request', true])
+  assert.match(failure.message, /256 KB/)
+  assert.equal(r.jev.requests.length, 0)
+
+  // A request that fits as it is, with a secret in it that masks shorter, goes.
+  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${'MIIEowIBAAKCAQEA'.repeat(200)}\n-----END RSA PRIVATE KEY-----`
+  r.jev.queue(ok())
+  answersOf(await r.ask({ state: { pem } }))
+  assert.equal(r.jev.requests.length, 1)
+  assert.ok(!sent(r).text.includes('MIIEow'))
+  assert.deepEqual(sent(r).json.state, { pem: '‹secret: a private key›' })
+})
+
+test('a failure to mask sends nothing: the call is unavailable, and what failed is not repeated', async () => {
+  for (const mask of [(): string => { throw new Error(`mask broke on ${GH}`) }, (): string => undefined as unknown as string, (): string => 42 as unknown as string]) {
+    const jev = await startFakeJev()
+    jev.always(ok())
+    const lines: LogLine[] = []
+    const judge = createJudge({
+      baseUrl: jev.url,
+      key: async () => KEY,
+      settings: async () => DEFAULT_SETTINGS,
+      log: (line) => { lines.push(structuredClone(line)) },
+      maskSecrets: mask,
+    })
+    const result = await judge.ask({ state: { command: `curl ${GH}` }, questions: QUESTIONS, purpose: 'command' })
+    assert.equal(result.ok, false)
+    if (result.ok) return
+    assert.equal(result.reason, 'unavailable')
+    assert.equal(result.message, 'the request could not be cleared of secrets, so nothing was sent')
+    assert.equal(jev.requests.length, 0, 'nothing was sent')
+    assert.doesNotMatch(JSON.stringify([result, lines]), /mask broke|Zq9Xk2/)
+    assert.equal((await judge.status()).state, 'unavailable', 'and it shows on the status')
+    assert.equal(lines.length, 1)
+  }
+})
+
+test('the secret mask a client is given is the one it uses, and without one it is dish-kit\'s', async () => {
+  let calls = 0
+  const jev = await startFakeJev()
+  jev.always(ok())
+  const judge = createJudge({
+    baseUrl: jev.url,
+    key: async () => KEY,
+    settings: async () => DEFAULT_SETTINGS,
+    log: () => {},
+    maskSecrets: (text) => { calls++; return text },
+  })
+  await judge.ask({ state: { a: 'b' }, questions: { q: { type: 'noul', instructions: 'x' } }, purpose: 'ask' })
+  assert.ok(calls > 0, 'the one given is the one used')
+  assert.equal(jev.requests.length, 1)
+})

@@ -22,8 +22,11 @@ const BASE_URL = 'https://api.typesafe.ai'
 
 /** What the real server sent back, for each call, as the client read it. */
 const exchanges: Array<{ status: number, text: string }> = []
+/** The bodies of the requests, as sent: nothing else of a request is kept, so not the header the key is in. */
+const bodies: string[] = []
 const realFetch = globalThis.fetch
 globalThis.fetch = async (input, init) => {
+  if (typeof init?.body === 'string') bodies.push(init.body)
   const response = await realFetch(input, init)
   // Only the response is kept: the request, with the key in it, never is.
   response.clone().text().then(text => { exchanges.push({ status: response.status, text }) }, () => {})
@@ -234,4 +237,34 @@ test('live: a request TypeSafe refuses (an unknown model) is a 400, which is inv
   assert.equal(result.tooBig, undefined)
   assert.equal((await judge.status()).state, 'unavailable', 'a typo\'d model shows')
   noLeak([result, lines, await judge.status()])
+})
+
+test('live: a command that carries a token goes to Jev with the token masked, and Jev still reads it', { skip: SKIP, timeout: 30_000 }, async () => {
+  // A token that is not one, from parts, as dish-kit's patterns know a GitHub one.
+  const token = `ghp_${'Zq9Xk2'.repeat(6)}`
+  const { judge, lines } = client(KEY!, 10_000)
+  const state = { ...STATE, command: `curl -sS -H "Authorization: Bearer ${token}" https://api.github.com/user`, task: 'find out which GitHub user I am logged in as' }
+  const result: JudgeResult = await judge.ask({ state, questions: QUESTIONS, purpose: 'command', subject: state.command })
+  assert.equal(result.ok, true, result.ok ? '' : `${result.reason}: ${safe(result.message)}`)
+  if (!result.ok) return
+
+  // What was sent: the command, with the token masked, and no part of the token.
+  const body = bodies.at(-1)!
+  assert.ok(!body.includes(token) && !body.includes('Zq9Xk2Zq9Xk2'), 'the token was sent')
+  assert.ok(body.includes('‹secret: a GitHub token›'), 'the mask was not sent')
+  assert.ok(body.includes('https://api.github.com/user'), 'the rest of the command was sent')
+
+  // Jev still reads a command whose token is a mask: the answers have their shapes, and say something about a GET.
+  const { serves_task, effect } = result.answers
+  assert.equal(serves_task?.type, 'noul')
+  assert.equal(effect?.type, 'choice')
+  if (serves_task?.type === 'noul') console.log('live: masked curl → serves_task', serves_task.noul)
+  if (effect?.type === 'choice') {
+    console.log('live: masked curl → effect', effect.choice, JSON.stringify(effect.probabilities))
+    assert.deepEqual(Object.keys(effect.probabilities).sort(), ['irreversible', 'other', 'read_only', 'reversible'])
+    assert.notEqual(effect.choice, 'irreversible', 'a GET with a token is not read as irreversible')
+  }
+  // The caller's own copy of the command is as it was: it is the log that masks what it writes.
+  assert.equal(lines[0]!.subject, state.command)
+  noLeak([result, lines])
 })
