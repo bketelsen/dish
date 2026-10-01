@@ -113,5 +113,6 @@ pnpm --filter dish-crew sync-preset
 - **`send_message` isn't checked against the limits.** It can still wake a finished child, and the woken child counts as running from then on. Fix rounds should go through `delegate` with `to`.
 - **Children share the main agent's working directory.** dsh 0.2.0-rc.2 has no per-child `cwd`.
 - **Children can't ask you anything.** dsh runs them with approval policy `never`.
+- **A crew child's approval requests are refused when `dish-judge` isn't loaded.** With `dish-judge`, a child is switched to approval policy `ask` and the judge answers it. If the judge is then disabled, uninstalled or unloaded, a child that had settled still has `ask` in its log, and a follow-up would resume it at `ask`. Without a guard, dsh would show its prompt in the child's own session, where nobody sees it, and nothing times it out. So crew refuses a crew child's request whenever `dish-judge` is absent. Other children, and the main agent, are untouched.
 - **Without `dish-prompts`,** the persona row logs once and `delegate` refuses every call, naming the missing plugin. Nothing refuses at load.
 - **Claude Sonnet 5.5 comes from `dish-copilot`'s catalog,** which copies settings from the nearest catalog model of the same generation. An older copy rejected every request from crew children (Task 9's live check found it).
