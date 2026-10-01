@@ -108,7 +108,7 @@ At $0.042 per million input tokens it's cheap enough to sit on every tool call, 
 | Decision (2026-09-30) | |
 |---|---|
 | Shape | A `judge` service (`ctx.judge`) that plugins call. The main agent also gets an ad hoc `ask_judge` tool. |
-| First uses | **Guardrails.** (1) A machine answerer on dsh's approval seam: each command is read-only, reversible or irreversible, with confidence gating (confident and safe runs; irreversible is blocked; in between asks you). This makes `infra`'s tiered autonomy real. (2) Screening tool results for injected instructions before they reach an agent (GitHub issues, CI logs, web pages). |
+| First uses | **Guardrails.** (Refined in the [judge spec](specs/judge.md): in the web profile approvals only fire on sandbox escalations, so the gate sits on every shell command, with the approval answerer behind it.) (1) A machine answerer on dsh's approval seam: each command is read-only, reversible or irreversible, with confidence gating (confident and safe runs; irreversible is blocked; in between asks you). This makes `infra`'s tiered autonomy real. (2) Screening tool results for injected instructions before they reach an agent (GitHub issues, CI logs, web pages). |
 | Later uses | Checking crew claims against evidence, diff risk scores, issue triage into initiatives, model routing, and when to compact. |
 | Questions vs thresholds | Questions live in each plugin's code, reviewed like code. Thresholds live in the config store, tunable in the UI with history. |
 | When Jev is down | Gates fail closed and ask you. Advisory uses skip. |
