@@ -208,3 +208,4 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
      - Approvals and the inbox need routing per user.
      - Who may edit prompts, crew and family direction, vs who may only use them?
    - **Cost:** whose Copilot quota pays for whose work?
+   - **Where it would go:** the Caddy VM that already fronts your self-hosted services, with its route and the dish Incus instance defined in your GitOps repo `~/projects/fleet`.
