@@ -13,6 +13,9 @@
 //   - the rows of dsh's own delegation (`subagent`, `subagent_fork` and the
 //     workflow engine) get `disabled: true`, so the main agent delegates through
 //     crew only. `send_message`, `interrupt_agent` and `list_agents` stay.
+// A row of any other id whose package is one of dsh's delegation packages, and
+// that the preset leaves enabled, stops the generator, so a dsh upgrade can't
+// slip `subagent` back in.
 // The list is then wrapped in a preset row of its own.
 
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
@@ -34,8 +37,29 @@ const DESCRIPTION = "The dish main agent: your prompts from Settings → Prompts
  * `tool-subagent` is the one that matters most: its `modelSelectionSettings: true` installs `subagent` into every agent
  * on the preset, children included, where no tool filter reaches, so leaving it on would hand crew's children a way to
  * delegate around crew. `workflow-ptc` is the workflow engine's own row, and `tool-workflow` the tool on top of it.
+ * The codex, claude-code and ralph rows ship disabled already; naming them keeps them off whatever dsh does with them.
  */
-const DISABLED = ['tool-subagent', 'tool-subagent-fork', 'workflow-ptc', 'tool-workflow']
+const DISABLED = [
+  'tool-subagent',
+  'tool-subagent-fork',
+  'workflow-ptc',
+  'tool-workflow',
+  'tool-subagent-codex',
+  'tool-subagent-claude-code',
+  'tool-ralph',
+]
+
+/**
+ * The packages whose rows give an agent a way to delegate or to run workflows around crew. In the dish preset every row
+ * of one of them must be `disabled: true`, whatever its id, so a dsh upgrade that adds one, or turns one on, fails the
+ * generator instead of quietly handing the main agent's children `subagent`.
+ */
+const DELEGATION_PACKAGES = [
+  '@deepseek-ai/dsh-tool-subagent',
+  '@deepseek-ai/dsh-tool-workflow',
+  '@deepseek-ai/dsh-tool-ralph',
+  '@deepseek-ai/dsh-workflow-ptc',
+]
 
 /** The `insert` row around the list, in the standard file's own shape. The list goes under `plugins:`. */
 const WRAPPER = [
@@ -90,6 +114,46 @@ function disable(rows, id) {
 }
 
 /**
+ * Refuse a row of a delegation package that is not literally `disabled: true`.
+ *
+ * Rows named in DISABLED have just been turned off, so this catches the others: a row dsh added under a new id, or one
+ * it ships enabled that nobody listed.
+ *
+ * @param {string[]} rows the list's lines
+ * @throws {Error} naming the first such row
+ */
+function refuseEnabledDelegation(rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const named = /^(\s*)(- )?name:\s*(['"]?)([^'"\s#]+)\3\s*(#.*)?$/.exec(rows[i])
+    if (named === null || !DELEGATION_PACKAGES.includes(named[4])) continue
+
+    // The row this name belongs to: its `- ` line is the name line itself, or the nearest line above it one level out.
+    const keyIndent = named[2] === undefined ? indentOf(rows[i]) : indentOf(rows[i]) + 2
+    let start = i
+    if (named[2] === undefined) {
+      start = -1
+      for (let j = i - 1; j >= 0; j--) {
+        if (isBlank(rows[j]) || isComment(rows[j]) || indentOf(rows[j]) >= keyIndent) continue
+        if (indentOf(rows[j]) === keyIndent - 2 && rows[j].trimStart().startsWith('- ')) start = j
+        break
+      }
+    }
+    if (start === -1) throw new Error(`could not find the row that \`${named[4]}\` belongs to, line ${i + 1} of the standard preset's list`)
+    const dash = indentOf(rows[start])
+    let end = start + 1
+    while (end < rows.length && (isBlank(rows[end]) || isComment(rows[end]) || indentOf(rows[end]) > dash)) end++
+
+    const own = []
+    for (let j = start; j < end; j++) if (!isBlank(rows[j]) && !isComment(rows[j])) own.push(j)
+    const at = key => own.find(j => new RegExp(`^\\s*(- )?${key}:`).test(rows[j]) && indentOf(rows[j]) + (rows[j].trimStart().startsWith('- ') ? 2 : 0) === keyIndent)
+    const id = at('id') === undefined ? undefined : rows[at('id')].replace(/^\s*(- )?id:\s*/, '').replace(/\s*#.*$/, '').replace(/^(['"])(.*)\1$/, '$2')
+    const off = at('disabled')
+    if (off !== undefined && /^\s*(- )?disabled:\s*true\s*(#.*)?$/.test(rows[off])) continue
+    throw new Error(`the \`${id ?? named[4]}\` row (${named[4]}) of the standard preset is not disabled in the dish preset, so the main agent's children would get dsh's own delegation. Add its id to DISABLED in scripts/sync-preset.mjs, or leave it out of the preset on purpose.`)
+  }
+}
+
+/**
  * The dish preset's patch file, made from the text of dsh-web-app's standard
  * preset.
  *
@@ -139,6 +203,7 @@ export function generate(standardText, version) {
   ]
   const rows = [...list.slice(0, start), ...persona, ...delegate, ...list.slice(last + 1)]
   for (const id of DISABLED) disable(rows, id)
+  refuseEnabledDelegation(rows)
 
   // Under the wrapper the rows sit at LIST_INDENT. They already do, unless dsh
   // reshaped its file; then every line moves by the same amount.

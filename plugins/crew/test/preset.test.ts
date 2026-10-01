@@ -22,6 +22,17 @@ const DESCRIPTION = "The dish main agent: your prompts from Settings → Prompts
 /** The standard rows that dsh's own delegation machinery lives in: the dish preset disables them, so the main agent delegates through crew. */
 const DISABLED_IDS = ['tool-subagent', 'tool-subagent-fork', 'workflow-ptc', 'tool-workflow']
 
+/** Standard rows of the same machinery that dsh already ships disabled. The dish preset keeps them off. */
+const STOCK_DISABLED_IDS = ['tool-subagent-codex', 'tool-subagent-claude-code', 'tool-ralph']
+
+/** The packages that give an agent a way to delegate or run workflows around crew. Every row of one must be `disabled: true`, whatever its id. */
+const DELEGATION_PACKAGES = [
+  '@deepseek-ai/dsh-tool-subagent',
+  '@deepseek-ai/dsh-tool-workflow',
+  '@deepseek-ai/dsh-tool-ralph',
+  '@deepseek-ai/dsh-workflow-ptc',
+]
+
 /** The standard preset's file text and its dsh-web-app version, read from the dsh-web-app that dsh itself resolves. */
 const standard = readStandard()
 
@@ -110,6 +121,14 @@ test('the rows for send_message, interrupt_agent and list_agents stay enabled, a
   assert.ok(output.includes('- id: delegation\n'), 'the delegation group stays')
 })
 
+test('the rows dsh ships disabled stay as they are, so the dish preset has no enabled delegation row', () => {
+  const output = generate(standard.text, standard.version)
+  for (const id of STOCK_DISABLED_IDS) {
+    assert.deepEqual(rowLines(output, id), rowLines(standard.text, id), id)
+    assert.ok(rowLines(output, id).some(line => line.trim() === 'disabled: true'), id)
+  }
+})
+
 // --- the output is YAML dsh can read -----------------------------------------------------------
 
 interface YamlParser {
@@ -119,27 +138,27 @@ interface YamlParser {
 }
 
 /**
- * js-yaml is not a dependency of this package. dsh's agent preset registry declares it, so follow the chain of declared
- * dependencies from the dsh-web-app dsh resolves: web app, then agent preset, then its registry, then js-yaml.
+ * A js-yaml to parse the output with. It first follows the chain of dependencies dsh itself declares, from the
+ * dsh-web-app dsh resolves (web app, then agent preset, then its registry, then js-yaml), so the check reads the
+ * output the way dsh's own registry would. If that chain can't be followed (dsh moved its dependencies), it falls back
+ * to this package's own js-yaml, so the structural check below never skips.
  */
-function findYaml(): YamlParser | undefined {
+function findYaml(): YamlParser {
   try {
     const next = (from: string, name: string) => realpathSync(createRequire(from).resolve(`${name}/package.json`))
     const agentPreset = next(standard.packagePath, '@deepseek-ai/dsh-agent-preset')
     const registry = next(agentPreset, '@deepseek-ai/dsh-agent-preset-registry')
     return createRequire(registry)('js-yaml') as YamlParser
   } catch {
-    return undefined
+    return createRequire(join(PLUGIN, 'package.json'))('js-yaml') as YamlParser
   }
 }
 
 const yaml = findYaml()
 
-test('the dish preset parses as YAML with its !!js tags, and its list is the standard list with the persona swapped', {
-  skip: yaml === undefined ? 'js-yaml could not be reached through dsh-agent-preset-registry' : false,
-}, () => {
-  const parse = (text: string): any => yaml!.load(text, {
-    schema: yaml!.DEFAULT_SCHEMA.extend([new yaml!.Type('tag:yaml.org,2002:js', { kind: 'scalar', construct: data => ({ js: data }) })]),
+test('the dish preset parses as YAML with its !!js tags, and its list is the standard list with the persona swapped', () => {
+  const parse = (text: string): any => yaml.load(text, {
+    schema: yaml.DEFAULT_SCHEMA.extend([new yaml.Type('tag:yaml.org,2002:js', { kind: 'scalar', construct: data => ({ js: data }) })]),
   })
   const dish = parse(generate(standard.text, standard.version))
   const stock = parse(standard.text)
@@ -177,7 +196,16 @@ test('the dish preset parses as YAML with its !!js tags, and its list is the sta
   ])
   const before = disabledIds(stock[0].insert[0].config.plugins)
   assert.deepEqual(DISABLED_IDS.filter(id => before.includes(id)), [], 'the standard preset has none of the four disabled')
+  assert.deepEqual(STOCK_DISABLED_IDS.filter(id => !before.includes(id)), [], 'the standard preset ships the other delegation rows disabled')
   assert.deepEqual(disabledIds(row.config.plugins).sort(), [...before, ...DISABLED_IDS].sort(), 'exactly those four are newly disabled')
+  /** Every row of a delegation package, nested groups too, as `[id, disabled]`. */
+  const delegationRows = (entries: any[]): [string, unknown][] => entries.flatMap(entry => [
+    ...(DELEGATION_PACKAGES.includes(entry.name) ? [[entry.id, entry.disabled] as [string, unknown]] : []),
+    ...(Array.isArray(entry.config) ? delegationRows(entry.config) : []),
+  ])
+  const delegation = delegationRows(row.config.plugins)
+  assert.deepEqual(delegation.map(([id]) => id).sort(), [...DISABLED_IDS, ...STOCK_DISABLED_IDS].sort(), 'the delegation packages have exactly these rows')
+  assert.deepEqual(delegation.filter(([, disabled]) => disabled !== true).map(([id]) => id), [], 'every row of a delegation package is disabled: true')
   const ids = (entries: any[]): string[] => entries.flatMap(entry => [entry.id, ...(Array.isArray(entry.config) ? ids(entry.config) : [])])
   assert.ok(ids(row.config.plugins).includes('tool-subagent-control'))
   assert.ok(ids(row.config.plugins).includes('tool-subagent-list-agents'))
@@ -264,6 +292,22 @@ const DELEGATE = [
 ]
 
 /** The four rows of dsh's own delegation, in the standard preset's shape (nested in a group, with their own config), and as the dish preset has them. */
+/** The rows of the same machinery that dsh ships disabled, in the standard preset's shape. */
+const STOCK_OFF = [
+  '              - id: tool-subagent-codex',
+  "                name: '@deepseek-ai/dsh-tool-subagent'",
+  '                disabled: true',
+  '                config:',
+  '                  provider: codex',
+  '              - id: tool-subagent-claude-code',
+  "                name: '@deepseek-ai/dsh-tool-subagent'",
+  '                disabled: true',
+  '                config:',
+  '                  provider: claude-code',
+  '              - id: tool-ralph',
+  "                name: '@deepseek-ai/dsh-tool-ralph'",
+  '                disabled: true',
+]
 const DELEGATION = [
   '          - id: delegation',
   '            name: cordis:group',
@@ -284,6 +328,7 @@ const DELEGATION = [
   "                name: '@deepseek-ai/dsh-workflow-ptc'",
   '              - id: tool-workflow',
   "                name: '@deepseek-ai/dsh-tool-workflow'",
+  ...STOCK_OFF,
 ]
 const DELEGATION_OFF = [
   '          - id: delegation',
@@ -309,6 +354,7 @@ const DELEGATION_OFF = [
   '              - id: tool-workflow',
   "                name: '@deepseek-ai/dsh-tool-workflow'",
   '                disabled: true',
+  ...STOCK_OFF,
 ]
 
 /** What the generator makes, as `[header, body]`. */
@@ -397,10 +443,10 @@ test('a row that is already disabled has its value replaced, not a second disabl
     : [line])
   const body = bodyOf([...PERSONA, ...list])
   const lines = body.split('\n')
-  assert.equal(lines.filter(line => line.trim().startsWith('disabled:')).length, 5, '4 rows and one config key')
+  assert.equal(lines.filter(line => line.trim().startsWith('disabled:')).length, 8, '7 rows and one config key')
   assert.deepEqual(
     lines.filter(line => /^ {16}disabled:/.test(line)),
-    Array(4).fill('                disabled: true'),
+    Array(7).fill('                disabled: true'),
   )
   assert.ok(lines.includes('                  disabled: false'), 'a nested config key of that name is left alone')
   assert.ok(!body.includes('process.platform'))
@@ -415,8 +461,8 @@ test('a standard file with no persona row, two persona rows, or no plugin list i
   assert.throws(() => generate('- insert:\n    - id: preset-standard\n', '1.0.0'), /plugins/)
 })
 
-test('a standard file missing any of the four delegation rows is refused, naming it', () => {
-  for (const id of DISABLED_IDS) {
+test('a standard file missing any of the delegation rows is refused, naming it', () => {
+  for (const id of [...DISABLED_IDS, ...STOCK_DISABLED_IDS]) {
     const at = DELEGATION.findIndex(line => line.endsWith(`- id: ${id}`))
     assert.notEqual(at, -1, id)
     // The row runs to the next row of the group, or the end.
@@ -428,9 +474,36 @@ test('a standard file missing any of the four delegation rows is refused, naming
 
 test('a delegation row listed twice, or with no name, is refused too', () => {
   const twice = [...DELEGATION, ...DELEGATION.slice(6, 8)]
-  assert.throws(() => generate(standardOf([...PERSONA, ...twice]), '1.0.0'), /tool-subagent/)
+  assert.throws(() => generate(standardOf([...PERSONA, ...twice]), '1.0.0'), /`tool-subagent`/)
   const nameless = DELEGATION.filter(line => line !== "                name: '@deepseek-ai/dsh-tool-workflow'")
-  assert.throws(() => generate(standardOf([...PERSONA, ...nameless]), '1.0.0'), /tool-workflow/)
+  assert.throws(() => generate(standardOf([...PERSONA, ...nameless]), '1.0.0'), /`tool-workflow`/)
+})
+
+test('a new row of a delegation package that is not disabled is refused, naming it', () => {
+  const extra = (name: string, ...tail: string[]) => ['              - id: tool-extra', `                name: ${name}`, ...tail]
+  for (const pkg of DELEGATION_PACKAGES) {
+    for (const [what, tail] of [
+      ['enabled', []],
+      ['explicitly on', ['                disabled: false']],
+      ['by an expression', ["                disabled: !!js process.platform === 'win32'"]],
+    ] as [string, string[]][]) {
+      const list = [...PERSONA, ...DELEGATION, ...extra(`'${pkg}'`, ...tail)]
+      assert.throws(() => generate(standardOf(list), '1.0.0'), error => error instanceof Error && error.message.includes('`tool-extra`') && error.message.includes(pkg), `${pkg} ${what}`)
+    }
+    // Quoted the other way and at the top of the list rather than in the group: still found.
+    const top = extra(`"${pkg}"`).map(line => line.slice(4))
+    assert.throws(() => generate(standardOf([...top, ...PERSONA, ...DELEGATION]), '1.0.0'), /`tool-extra`/, `${pkg} at the top, double-quoted`)
+  }
+  const sibling = ['              - id: tool-extra', "                name: '@deepseek-ai/dsh-tool-subagent'", '                config:', '                  provider: spawn']
+  assert.throws(() => generate(standardOf([...PERSONA, ...DELEGATION, ...sibling]), '1.0.0'), /`tool-extra`/, 'the standard shape: a row with config')
+})
+
+test('a new row of a delegation package that is already disabled: true is accepted, and the control rows are not delegation rows', () => {
+  const quiet = ['              - id: tool-extra', "                name: '@deepseek-ai/dsh-tool-subagent'", '                disabled: true']
+  const output = bodyOf([...PERSONA, ...DELEGATION, ...quiet])
+  assert.ok(output.includes([...quiet, ''].join('\n')), 'the row is left as dsh has it')
+  // `dsh-tool-subagent-control` is another package, not the exact name of a delegation one.
+  assert.doesNotThrow(() => generate(standardOf([...PERSONA, ...DELEGATION]), '1.0.0'))
 })
 
 // --- running the script ------------------------------------------------------------------------
