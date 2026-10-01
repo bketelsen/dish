@@ -12,6 +12,8 @@
   "files": [
     "src",
     "defaults",
+    "presets",
+    "scripts",
     "cordis.patch.yml"
   ],
   "license": "MIT",
@@ -20,7 +22,10 @@
   ],
   "dsh": {
     "bundle": {
-      "patch": "./cordis.patch.yml"
+      "patch": [
+        "./cordis.patch.yml",
+        "./presets/dish.patch.yml"
+      ]
     }
   },
   "dependencies": {
@@ -36,6 +41,10 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
     "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2"
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-web-app": "0.2.0-rc.2"
+  },
+  "scripts": {
+    "sync-preset": "node scripts/sync-preset.mjs"
   }
 }
