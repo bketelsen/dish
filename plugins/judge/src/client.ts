@@ -18,7 +18,8 @@
  *   monotonic clock, so a wall clock that is set back can neither extend one nor make the other negative.
  * - **The key stays in the call.** It is resolved at the start of each call, goes into one header, and is dropped. It is not
  *   in any string the client produces: every message, log line and status passes through a mask that hides the key (as it
- *   is, JSON-escaped and URL-encoded) and an error body is cut to 200 characters first. A call that ended before the key
+ *   is, JSON-escaped and URL-encoded; a value of fewer than `MIN_MASKED_KEY_CHARS` characters is no working key, and is left,
+ *   so that a key of "a" doesn't turn every "a" into noise) and an error body is cut to 200 characters first. A call that ended before the key
  *   was looked up, and has text of the caller's to log, looks it up for the mask (and the caller's signal ends that lookup
  *   too: a call that was cancelled is not held for a credential store that hangs).
  * - **Statuses.** `401` is `unavailable` ("the TypeSafe key was refused"); `400` and `422` are `invalid`, with the start of
@@ -397,8 +398,16 @@ function checkAnswers(body: unknown, questions: Record<string, Question>): { ok:
 
 // --- the exchange ---------------------------------------------------------------------------------
 
-/** A function that hides every form of `key` in a text: as it is, JSON-escaped, and URL-encoded. */
+/**
+ * The fewest characters a key can have and still be hidden in a text. The real key is about a hundred; TypeSafe answers 401 to
+ * a shorter one than a key can be, so a value this short is no working key, and hiding it would hide every "a" in what is
+ * logged. A call with such a key fails with "the TypeSafe key was refused" and logs what it was given, as it is.
+ */
+export const MIN_MASKED_KEY_CHARS = 20
+
+/** A function that hides every form of `key` in a text: as it is, JSON-escaped, and URL-encoded. Not a key of fewer than `MIN_MASKED_KEY_CHARS` characters. */
 function maskerFor(key: string): (text: string) => string {
+  if (key.length < MIN_MASKED_KEY_CHARS) return text => text
   const forms = [...new Set([key, JSON.stringify(key).slice(1, -1), encodeURIComponent(key)])].sort((a, b) => b.length - a.length)
   return text => forms.reduce((masked, form) => masked.split(form).join(MASKED), text)
 }

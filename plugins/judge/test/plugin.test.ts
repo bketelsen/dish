@@ -1090,7 +1090,7 @@ test('a write that throws at once, as a write of another make might, does not re
   ])
 })
 
-test('at start, day files and withheld files older than 30 days are removed before the service is provided, and the rest are kept', async () => {
+test('at start, day files and withheld files older than 30 days are removed, in the background, and the rest are kept', async () => {
   const where = await dirs()
   const day = (ago: number): string => new Date(Date.now() - ago * DAY_MS).toISOString().slice(0, 10)
   await mkdir(join(where.state, 'withheld'), { recursive: true })
@@ -1108,15 +1108,11 @@ test('at start, day files and withheld files older than 30 days are removed befo
   await utimes(oldDay, longAgo, longAgo)
 
   const ctx = new Context()
-  // Whether the old day was still there when the service appeared: the prune comes first, as crew's does.
-  let oldWhenProvided: boolean | undefined
-  ctx.on('internal/service', (name) => {
-    if (name === 'dishJudge' && oldWhenProvided === undefined) oldWhenProvided = existsSync(oldDay)
-  })
   const handle = mountJudge(ctx, where.state)
   try {
     await handle
-    assert.equal(oldWhenProvided, false)
+    // The prune is the load's last step and the load does not wait for it: wait for it, with a bound.
+    await waitFor('the old files to be pruned', () => !existsSync(oldDay) && !existsSync(oldWithheld), 5000)
     assert.equal(existsSync(oldDay), false)
     assert.equal(existsSync(oldWithheld), false)
     assert.equal(existsSync(edgeDay), true)
@@ -1144,6 +1140,7 @@ test('a prune that fails is logged once, and the plugin loads and works all the 
     await handle
     assert.ok(ctx.get('dishJudge'), 'the plugin is there')
     assert.ok(ctx.get('judge'), 'and so is the client')
+    await waitFor('the warning about the prune', () => judgeLines(logs).length > 0, 5000)
     const lines = judgeLines(logs)
     assert.equal(lines.length, 1, logs.join('\n'))
     assert.match(lines[0]!, /^\[dish-judge\] warn: could not prune the decision log in .*: .*EACCES/)
@@ -1155,14 +1152,14 @@ test('a prune that fails is logged once, and the plugin loads and works all the 
   }
 })
 
-test('a plugin that is unloaded while it prunes goes away quietly: it does not fail, and it provides nothing', async () => {
+test('a plugin that is unloaded while its prune goes on goes away quietly: nothing fails, and nothing of it is left', async () => {
   const where = await dirs()
   await mkdir(where.state, { recursive: true })
   await writeFile(join(where.state, '2020-01-01.jsonl'), `${JSON.stringify(logAt())}\n`)
   const ctx = new Context()
   const logs = watchLogs(ctx)
   const handle = mountJudge(ctx, where.state)
-  // The plugin says it removed a file in the one step between the prune and providing the services: unload it there.
+  // The plugin says it removed a file when the prune is done, which is after the load: unload it there.
   let unloaded: Promise<void> | undefined
   ctx.logger.exporter({
     levels: { default: 3 },
@@ -1171,8 +1168,8 @@ test('a plugin that is unloaded while it prunes goes away quietly: it does not f
     },
   })
   await handle
+  await waitFor('the plugin to be unloaded, after its prune', () => unloaded !== undefined, 5000)
   await unloaded
-  assert.ok(unloaded !== undefined, 'the plugin was unloaded while it was loading')
   assert.equal(existsSync(join(where.state, '2020-01-01.jsonl')), false, 'the prune was done')
   assert.equal(ctx.get('dishJudge'), undefined)
   assert.equal(ctx.get('judge'), undefined)
@@ -1228,7 +1225,7 @@ test('the key is looked up for each withheld result, and a key that is set again
   try {
     await handle
     const first = await ctx.dishJudge.log.withhold({ tool: 't', content: `a ${FAKE_KEY} b` })
-    key = 'second-key-Mx83'
+    key = 'second-key-Mx83-long-enough'
     const second = await ctx.dishJudge.log.withhold({ tool: 't', content: `a ${FAKE_KEY} b ${key} c` })
     assert.equal(lookups, 2)
     assert.equal((await ctx.dishJudge.log.withheld(first))?.content, 'a ‹key› b')
@@ -1330,6 +1327,247 @@ test('a withhold that the disk refuses is rejected to its caller and said once',
     await assert.rejects(ctx.dishJudge.log.withhold({ tool: 't', content: 'c' }), { code: 'ENOTDIR' })
     assert.equal(judgeLines(logs).length, 1, logs.join('\n'))
     assert.match(judgeLines(logs)[0]!, /^\[dish-judge\] warn: could not keep a withheld result in .*a-file\/judge: ENOTDIR \(mkdir\)$/)
+  } finally {
+    await handle.dispose()
+    await stub.dispose()
+  }
+})
+
+// --- the load: services first, and a bounded wait ---------------------------------------------------------
+
+/** A log that is only what the plugin needs of one, and does nothing unless `overrides` says. */
+function fakeLog(overrides: Record<string, unknown> = {}): plugin.Internals['log'] {
+  return {
+    write: async () => {},
+    withhold: async () => '0123456789abcdef',
+    read: async () => ({ lines: [], skipped: 0 }),
+    withheld: async () => undefined,
+    flush: async () => {},
+    prune: async () => ({ days: 0, withheld: 0 }),
+    ...overrides,
+  } as plugin.Internals['log']
+}
+
+/**
+ * Mount dish-judge as `plugin.start` with `internals`: a log that hangs, or a short wait, in the place of the real ones. `held.pruned`
+ * is the prune the load left going, which the load, like `apply`, does not wait for.
+ */
+function mountWith(ctx: Context, stateDirectory: string, internals: plugin.Internals, config: Partial<plugin.Config> = {}) {
+  const held: { pruned?: Promise<void> } = {}
+  const handle = ctx.plugin({
+    name: plugin.name,
+    apply: (own: Context, given: plugin.Config) => { held.pruned = plugin.start(own, given, internals) },
+  } as never, { terminal: false, stateDirectory, ...config } as never)
+  return Object.assign(handle, { held })
+}
+
+test('the load waits for nothing: with a prune that never ends, the load is done at once, and the services are there', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  let pruning = 0
+  const handle = mountWith(ctx, where.state, { log: fakeLog({ prune: () => { pruning++; return new Promise(() => {}) } }) })
+  try {
+    const started = performance.now()
+    await handle
+    const elapsed = performance.now() - started
+    assert.ok(elapsed < 1000, `the load took ${elapsed} ms`)
+    assert.equal(pruning, 1, 'the prune was started')
+    assert.ok(ctx.get('dishJudge') && ctx.get('judge'), 'and the services are visible, though it has not ended')
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('cordis shows a service only when apply is done: that is why the load can wait for nothing', async () => {
+  // The fact the load is built on. If a later cordis shows a service at once, the comment in `start` is out of date.
+  const ctx = new Context()
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const heard: string[] = []
+  const handle = ctx.plugin({
+    name: 'slow-provider',
+    async apply(own: Context) {
+      ;(own as unknown as { provide(name: string, value: unknown): void }).provide('slowThing', { here: true })
+      ;(own as unknown as { on(name: string, listener: () => void): void }).on('slow/event' as never, () => { heard.push('listener') })
+      await gate
+    },
+  } as never, undefined as never)
+  try {
+    await new Promise<void>(resolve => setTimeout(resolve, 30))
+    assert.equal((ctx as unknown as { get(name: string): unknown }).get('slowThing'), undefined, 'a service provided before an await is not visible while it waits')
+    ;(ctx as unknown as { emit(name: string): void }).emit('slow/event')
+    assert.deepEqual(heard, ['listener'], 'a listener registered before the await is live at once')
+  } finally {
+    release()
+    await handle
+    await handle.dispose()
+  }
+})
+
+test('a prune that is slow is said to be slow once, goes on, and says how it ended; the plugin is there throughout', async () => {
+  assert.equal(plugin.PRUNE_SLOW_AFTER_MS, 2000)
+  const where = await dirs()
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  let fail: (error: Error) => void = () => {}
+  const handle = mountWith(ctx, where.state, {
+    log: fakeLog({ prune: () => new Promise((_, reject) => { fail = reject }) }),
+    pruneSlowAfterMs: 80,
+  })
+  try {
+    await handle
+    assert.ok(ctx.get('dishJudge') && ctx.get('judge'))
+    await waitFor('the slow warning', () => judgeLines(logs).some(line => /pruning the decision log in .* is taking more than 80 ms; it goes on in the background/.test(line)), 5000)
+    assert.equal(judgeLines(logs).length, 1, logs.join('\n'))
+    fail(new Error('disk gone'))
+    await handle.held.pruned
+    assert.match(judgeLines(logs).at(-1)!, /could not prune the decision log in .*: disk gone/)
+    assert.ok(ctx.get('judge'))
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('a prune that is done in time is not said to be slow, even when the time passes', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  const handle = mountWith(ctx, where.state, { log: fakeLog({ prune: async () => ({ days: 0, withheld: 0 }) }), pruneSlowAfterMs: 40 })
+  try {
+    await handle
+    await handle.held.pruned
+    await new Promise<void>(resolve => setTimeout(resolve, 120))
+    assert.deepEqual(judgeLines(logs), [])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('pruneAtLoad says what it removed and what it could not do, and a logger that throws is not a failed load', async () => {
+  const said: string[] = []
+  const logger = { info: (format: string, ...args: unknown[]) => { said.push(`info ${format.replace(/%[sd]/g, () => String(args.shift()))}`) }, warn: (format: string, ...args: unknown[]) => { said.push(`warn ${format.replace(/%[sd]/g, () => String(args.shift()))}`) } }
+  const options = { keepMs: 1, slowAfterMs: 60_000, directory: '/state', logger }
+  await plugin.pruneAtLoad({ prune: async () => ({ days: 2, withheld: 3 }) }, options)
+  await plugin.pruneAtLoad({ prune: async () => ({ days: 0, withheld: 0 }) }, options)
+  await plugin.pruneAtLoad({ prune: async () => { throw new Error('nope') } }, options)
+  await plugin.pruneAtLoad({ prune: () => { throw new Error('thrown at once') } }, options)
+  assert.deepEqual(said, [
+    'info removed 2 day file(s) and 3 withheld file(s) of the decision log older than 30 days',
+    'warn could not prune the decision log in /state: nope',
+    'warn could not prune the decision log in /state: thrown at once',
+  ])
+  // A logger that throws, for the info, the warn, and both.
+  const angry = { info: () => { throw new Error('logger is broken') }, warn: () => { throw new Error('logger is broken') } }
+  await plugin.pruneAtLoad({ prune: async () => ({ days: 1, withheld: 0 }) }, { ...options, logger: angry })
+  await plugin.pruneAtLoad({ prune: async () => { throw new Error('nope') } }, { ...options, logger: angry })
+  // And a prune that never ends is a promise that doesn't, with a slow warning that is said once and does not throw.
+  const hung = plugin.pruneAtLoad({ prune: () => new Promise(() => {}) }, { ...options, slowAfterMs: 20, logger: angry })
+  assert.equal(await Promise.race([hung.then(() => 'ended'), new Promise<string>(resolve => setTimeout(() => resolve('going on'), 80))]), 'going on')
+})
+
+test('a logger that throws when the plugin says it removed old files does not fail the load, or anything else', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  ctx.logger.exporter({
+    levels: { default: 3 },
+    export: (message) => { if (message.name === 'dish-judge') throw new Error('exporter is broken') },
+  })
+  const handle = mountWith(ctx, where.state, { log: fakeLog({ prune: async () => ({ days: 1, withheld: 1 }) }) })
+  try {
+    await handle
+    await handle.held.pruned
+    assert.ok(ctx.get('judge'))
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('unloading waits for the lines on their way for at most its bound, so a disk that is stuck does not hold up a shutdown', async () => {
+  assert.equal(plugin.FLUSH_BUDGET_MS, 2000)
+  const where = await dirs()
+  const ctx = new Context()
+  let flushes = 0
+  const handle = mountWith(ctx, where.state, { log: fakeLog({ flush: () => { flushes++; return new Promise(() => {}) } }), flushBudgetMs: 120 })
+  await handle
+  const started = performance.now()
+  await handle.dispose()
+  const elapsed = performance.now() - started
+  assert.equal(flushes, 1, 'it did wait for the log')
+  assert.ok(elapsed >= 100 && elapsed < 120 + 500, `unloading took ${elapsed} ms`)
+  assert.equal(ctx.get('dishJudge'), undefined)
+})
+
+test('flushWithin gives the log what it asks for and no more, and never rejects', async () => {
+  const done: string[] = []
+  await plugin.flushWithin({ flush: async () => { await new Promise<void>(resolve => setTimeout(resolve, 30)); done.push('flushed') } }, 5000)
+  assert.deepEqual(done, ['flushed'], 'a flush that is quick is waited for')
+  await plugin.flushWithin({ flush: () => Promise.reject(new Error('no')) }, 5000)
+  await plugin.flushWithin({ flush: () => { throw new Error('no') } }, 5000)
+  const started = performance.now()
+  await plugin.flushWithin({ flush: () => new Promise(() => {}) }, 60)
+  assert.ok(performance.now() - started >= 50)
+})
+
+// --- withhold, with a deadline ---------------------------------------------------------------------------
+
+test('withhold ends its wait for the key when the signal it is given aborts: the key lookup that hangs costs what the caller has', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const stub = await provideStub(ctx, 'credentials', credentials(() => new Promise(() => {})))
+  const handle = mountJudge(ctx, where.state)
+  try {
+    await handle
+    const content = leaky(FAKE_KEY)
+    const expected = content.replaceAll(`ghp_${'A1b2C3d4E5'.repeat(4)}`, '‹secret: a GitHub token›')
+
+    // Aborted while it waits.
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 60)
+    let started = performance.now()
+    let id = await ctx.dishJudge.log.withhold({ tool: 'web_fetch', content }, { signal: controller.signal })
+    let elapsed = performance.now() - started
+    assert.ok(elapsed >= 50 && elapsed < plugin.WITHHOLD_KEY_BUDGET_MS - 20, `took ${elapsed} ms`)
+    assert.equal((await ctx.dishJudge.log.withheld(id))?.content, expected, 'kept with the patterns alone')
+
+    // Aborted already: no wait at all.
+    started = performance.now()
+    id = await ctx.dishJudge.log.withhold({ tool: 'web_fetch', content }, { signal: AbortSignal.abort() })
+    elapsed = performance.now() - started
+    assert.ok(elapsed < 150, `took ${elapsed} ms`)
+    assert.equal((await ctx.dishJudge.log.withheld(id))?.content, expected)
+
+    // A signal that is never aborted leaves the cap as the bound.
+    started = performance.now()
+    await ctx.dishJudge.log.withhold({ tool: 'web_fetch', content }, { signal: new AbortController().signal })
+    elapsed = performance.now() - started
+    assert.ok(elapsed >= plugin.WITHHOLD_KEY_BUDGET_MS - 20 && elapsed < plugin.WITHHOLD_KEY_BUDGET_MS + 400, `took ${elapsed} ms`)
+  } finally {
+    await handle.dispose()
+    await stub.dispose()
+  }
+})
+
+test('a signal that has not aborted does not stop the key being hidden, and one that is not a signal is ignored', async () => {
+  const { ctx, dispose } = await mountWithJev(await dirs())
+  try {
+    for (const options of [{ signal: new AbortController().signal }, {}, undefined, { signal: 'no' }, null, 7]) {
+      const id = await ctx.dishJudge.log.withhold({ tool: 't', content: `a ${FAKE_KEY} b` }, options as never)
+      assert.equal((await ctx.dishJudge.log.withheld(id))?.content, 'a ‹key› b', JSON.stringify(options))
+    }
+  } finally {
+    await dispose()
+  }
+})
+
+test('withhold of a short key leaves the content as it is: only a key of 20 characters or more is hidden', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const stub = await provideStub(ctx, 'credentials', credentials(async () => ({ value: 'a' })))
+  const handle = mountJudge(ctx, where.state)
+  try {
+    await handle
+    const id = await ctx.dishJudge.log.withhold({ tool: 'bash a', content: 'a banana' })
+    assert.deepEqual(await ctx.dishJudge.log.withheld(id), { tool: 'bash a', content: 'a banana' })
   } finally {
     await handle.dispose()
     await stub.dispose()

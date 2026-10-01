@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
-import { createJudge } from '../src/client.ts'
+import { createJudge, currentKeyMask, MIN_MASKED_KEY_CHARS } from '../src/client.ts'
 import type { Asked, Judge, JudgeResult, JudgeStatus, LogLine, Question } from '../src/client.ts'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
 import type { JudgeSettings } from '../src/settings.ts'
@@ -1610,4 +1610,40 @@ test('decide is given the invalid result with its from, and the result that come
   r.jev.queue({ kind: 'status', status: 422, body: 'no' })
   const server = await r.ask({ decide: () => ({ decision: 'ask' }) })
   assert.equal(server.ok === false && server.reason === 'invalid' && server.from, 'server')
+})
+
+// --- a key too short to be a key is not hidden ------------------------------------------------------------
+
+test('a key shorter than 20 characters is not hidden in what is logged: it can not be a working key, and hiding "a" would ruin every line', async () => {
+  assert.equal(MIN_MASKED_KEY_CHARS, 20)
+  const r = await rig({ key: async () => 'a' })
+  r.jev.queue({ kind: 'status', status: 401 })
+  const asked = await r.ask({ subject: 'a banana', tool: 'bash a', callId: 'a-1', decide: () => ({ decision: 'ask a banana' }) })
+  assert.equal(failureOf(asked).message, 'the TypeSafe key was refused', 'the 401 is how a short key shows')
+  assert.equal(r.lines[0]!.subject, 'a banana')
+  assert.equal(r.lines[0]!.tool, 'bash a')
+  assert.equal(r.lines[0]!.callId, 'a-1')
+  assert.equal(r.lines[0]!.decision, 'ask a banana')
+  assert.equal(r.lines[0]!.error, 'the TypeSafe key was refused')
+
+  // The edge: 19 characters are left as they are, and 20 are hidden.
+  for (const [key, hidden] of [['k'.repeat(19), false], ['k'.repeat(20), true]] as const) {
+    const edge = await rig({ key: async () => key })
+    edge.jev.queue({ kind: 'status', status: 500, body: `{"detail":"key ${key} is odd"}` })
+    const failure = failureOf(await edge.ask({ subject: `curl ${key}` }))
+    assert.equal(edge.lines[0]!.subject.includes(key), !hidden, `${key.length} characters`)
+    assert.equal(failure.message.includes(key), !hidden, `${key.length} characters`)
+    assert.equal(edge.lines[0]!.subject, hidden ? 'curl ‹key›' : `curl ${key}`)
+  }
+})
+
+test('the mask the log service uses follows the same rule: a short key is left, a long one is hidden in all three forms', async () => {
+  for (const key of ['a', '1', 'tsk-short', 'k'.repeat(19)]) {
+    const mask = await currentKeyMask(async () => key, 100)
+    assert.equal(mask('a banana, 1 and tsk-short'), 'a banana, 1 and tsk-short', key)
+  }
+  const long = 'fk-Q9x+7/Zr"k\\%Y_dist1nct'
+  assert.ok(long.length >= 20)
+  const mask = await currentKeyMask(async () => long, 100)
+  assert.equal(mask(`${long} ${JSON.stringify(long).slice(1, -1)} ${encodeURIComponent(long)}`), '‹key› ‹key› ‹key›')
 })

@@ -10,8 +10,10 @@
  * - claims `judge.yaml` in the store, closed to agents, and seeds it when `dishConfig` is there. `dishConfig` is
  *   optional, so there is no order to keep: with no store, every answer is the shipped default;
  * - checks its configuration when it loads, so a bad setting fails the plugin to load rather than the first call;
- * - prunes the decision log when it loads (day files and withheld files older than 30 days), before it provides
- *   anything, as crew prunes its records. A prune that fails is one warning, and the plugin loads all the same;
+ * - prunes the decision log when it loads (day files and withheld files older than 30 days). The services, and the
+ *   listeners the later steps add, are all there before the load waits for anything; it then waits for the prune for at
+ *   most `PRUNE_BUDGET_MS`, because dsh's server waits for every plugin to load, and a prune that is not done by then
+ *   carries on in the background. A prune that fails is one warning, and the plugin loads all the same;
  * - logs as `dish-judge`.
  *
  * **The decision log, `ctx.get('dishJudge').log`**, is the one surface the gate, the approval answerer, the result screen,
@@ -22,14 +24,15 @@
  *   cause, not a flood. The Jev client's own lines are written through it (every call is logged, whatever its outcome); the
  *   approval answerer writes its `approval` lines with it, and anything else that decides something does the same. It is a
  *   plain function: it keeps working when taken off the service (`const { write } = log`).
- * - `withhold({ tool, content })` gives the id of what it kept. Before it keeps it, it hides the TypeSafe key in the
- *   content and the tool name (as it is, JSON-escaped and URL-encoded), which no secret pattern would find; the key is looked
- *   up for it, for at most `WITHHOLD_KEY_BUDGET_MS`, and with no key, or one that can't be had in time, it keeps the content
- *   all the same, masked by the patterns alone. It rejects when the disk does (and says so once), so the screen that
- *   withholds a result knows it did not keep it. `decide` hooks have the call's time limit, so a caller awaits it there.
- * - `read(query)` and `withheld(id)` are the log's own, for the page: a page of lines newest first, and what `withhold` kept.
- *   They reject for a query that isn't one, and for what the disk says. A `read` sees the lines written so far to a file
- *   that is there, but not one whose file the write has still to make: `flush()` first, in a test, to have them all.
+ * - `withhold({ tool, content }, { signal }?)` gives the id of what it kept. Before it keeps it, it hides the TypeSafe key
+ *   in the content and the tool name (as it is, JSON-escaped and URL-encoded, when the key has at least 20 characters),
+ *   which no secret pattern would find; the key is looked up for it, for at most `WITHHOLD_KEY_BUDGET_MS`, or until the
+ *   `signal` aborts if that is sooner (a caller whose `decide` hook has little time left passes one that ends with it),
+ *   and with no key, or one that can't be had in time, it keeps the content all the same, masked by the patterns alone.
+ *   It rejects when the disk does (and says so once), so the screen that withholds a result knows it did not keep it.
+ * - `read(query)` and `withheld(id)` are the log's own, for the page: a page of lines newest first, and what `withhold`
+ *   kept. They reject for a query that isn't one, and for what the disk says. A `read` has every line whose `write` was
+ *   called before it, the first of a fresh log or of a new UTC day included.
  * - `flush()` resolves once every line written so far is on the disk or has failed. It never rejects. The plugin awaits it,
  *   for at most two seconds, when it unloads, so that the last decisions are not lost with the process.
  *
@@ -67,10 +70,12 @@ export interface JudgeLogService {
   /**
    * Keep `content`, which a screen withheld from the result of `tool`, for the user to read: masked (the key in it, whatever
    * form it is in, and anything that looks like a credential) and capped. Gives the id to put on the log line. Waits at most
-   * `WITHHOLD_KEY_BUDGET_MS` for the key, and with none keeps the content with the patterns' mask alone.
+   * `WITHHOLD_KEY_BUDGET_MS` for the key, and with none keeps the content with the patterns' mask alone. `options.signal`
+   * ends the wait for the key sooner, so that it can end with the time a `decide` hook has: the content is then kept with
+   * the patterns' mask alone, and the write to the disk, which the signal does not cancel, goes on.
    * @throws TypeError if `tool` or `content` isn't a string; whatever the disk says, which it also warns of, once.
    */
-  withhold(input: { tool: string, content: string }): Promise<string>
+  withhold(input: { tool: string, content: string }, options?: { signal?: AbortSignal }): Promise<string>
   /** A page of lines, newest first: see `JudgeLog.read`. */
   read(query?: ReadQuery): Promise<ReadResult>
   /** What `withhold` kept under `id`, or `undefined`: see `JudgeLog.withheld`. */
@@ -189,11 +194,6 @@ function describe(error: unknown): string {
 /** `text`, cut to `length` characters, with `…` where it was cut. */
 function shortened(text: string, length: number): string {
   return text.length > length ? `${text.slice(0, length)}…` : text
-}
-
-/** Whether `error` is cordis refusing an effect because the plugin has been unloaded: a plugin that is going away didn't fail. */
-function unloaded(error: unknown): boolean {
-  return (error as { code?: unknown } | null)?.code === 'INACTIVE_EFFECT'
 }
 
 /** What the settings need of the store: its reads. */
@@ -350,6 +350,9 @@ export const WITHHOLD_KEY_BUDGET_MS = 250
 /** How long the plugin waits for the log's writes to finish when it unloads. */
 export const FLUSH_BUDGET_MS = 2000
 
+/** How long the prune of the log may take before the plugin says that it is slow. */
+export const PRUNE_SLOW_AFTER_MS = 2000
+
 /** What went wrong with the disk, in a few words that are the same each time the cause is: its code and the call that failed, else what it says. */
 function reasonOf(error: unknown): string {
   const { code, syscall } = (typeof error === 'object' && error !== null ? error : {}) as { code?: unknown, syscall?: unknown }
@@ -386,12 +389,13 @@ export function createLogService(log: LogStore, options: LogServiceOptions): Jud
         failed(error)
       }
     },
-    async withhold(input) {
+    async withhold(input, options) {
       if (typeof input !== 'object' || input === null || typeof input.tool !== 'string' || typeof input.content !== 'string') {
         throw new TypeError('withhold takes { tool, content }, both strings')
       }
       // The key first, whole, before the log applies its patterns, which could change the text around it.
-      const mask = await currentKeyMask(key, keyBudgetMs)
+      const signal = typeof options === 'object' && options !== null && options.signal instanceof AbortSignal ? options.signal : undefined
+      const mask = await currentKeyMask(key, keyBudgetMs, signal)
       try {
         return await log.withhold({ tool: mask(input.tool), content: mask(input.content) })
       } catch (error) {
@@ -412,10 +416,88 @@ export function createLogService(log: LogStore, options: LogServiceOptions): Jud
 }
 
 /**
+ * Wait for the log's writes that are queued now, for at most `budgetMs`: a stuck disk is no reason to hold up a shutdown.
+ * Never rejects.
+ */
+export async function flushWithin(log: { flush(): Promise<void> }, budgetMs: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => log.flush()).catch(() => {}),
+      new Promise<void>((done) => { timer = setTimeout(done, budgetMs) }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export interface PruneOptions {
+  /** Files older than this are removed. */
+  keepMs: number
+  /** How long the prune may take before it is said to be slow. */
+  slowAfterMs: number
+  /** Where the log is, for what is said. */
+  directory: string
+  logger: { info(format: string, ...args: unknown[]): void, warn(format: string, ...args: unknown[]): void }
+}
+
+/**
+ * Prune the log, for the plugin that has just loaded. Nothing waits for it: dsh's server waits for every plugin to load, and
+ * a state directory that hangs must not hang the start, so the load is done before this is. It is safe beside writes and
+ * reads (it goes through each day file's queue, and a reader tolerates a file that goes). It says how it ended, and says
+ * once that it is slow if it is still going after `slowAfterMs`. A failure is one warning, not a failed load, and so is a
+ * logger that throws. The promise it gives resolves when the prune ends, and never rejects.
+ */
+export function pruneAtLoad(log: { prune(maxAgeMs: number): Promise<{ days: number, withheld: number }> }, options: PruneOptions): Promise<void> {
+  const { keepMs, slowAfterMs, directory, logger } = options
+  /** A logger that throws is not worth a failed start. */
+  const say = (level: 'info' | 'warn', format: string, ...args: unknown[]): void => {
+    try {
+      logger[level](format, ...args)
+    } catch {
+      // Nothing to do about it.
+    }
+  }
+  // Not kept alive by this: a prune that hangs is not a reason for the process to stay.
+  const timer = setTimeout(() => {
+    say('warn', 'pruning the decision log in %s is taking more than %d ms; it goes on in the background', directory, slowAfterMs)
+  }, slowAfterMs)
+  timer.unref()
+  return Promise.resolve().then(() => log.prune(keepMs)).then(
+    (removed) => {
+      if (removed.days + removed.withheld > 0) say('info', 'removed %d day file(s) and %d withheld file(s) of the decision log older than 30 days', removed.days, removed.withheld)
+    },
+    (error: unknown) => { say('warn', 'could not prune the decision log in %s: %s', directory, describe(error)) },
+  ).finally(() => { clearTimeout(timer) })
+}
+
+/** What `start` takes besides the configuration, for a test to put a log that hangs, or a short wait, in the place of the real ones. */
+export interface Internals {
+  /** The log, in place of the `JudgeLog` of the state directory. */
+  log?: LogStore & { prune(maxAgeMs: number): Promise<{ days: number, withheld: number }> }
+  pruneSlowAfterMs?: number
+  flushBudgetMs?: number
+}
+
+/**
  * Provide `dishJudge` and `judge`, and claim and seed `judge.yaml` whenever the store is there.
  * @throws a plain `Error` for a `baseUrl`, `keyName` or `stateDirectory` that can't be used.
  */
-export async function apply(ctx: Context, config: Config): Promise<void> {
+export function apply(ctx: Context, config: Config): void {
+  // Nothing is returned for cordis to wait for, and nothing is awaited: see `start`.
+  void start(ctx, config, {})
+}
+
+/**
+ * What `apply` does, and it is not `async`: **the load waits for nothing.** cordis makes a service visible to other plugins,
+ * and to this one, only when `apply` is done, and dsh's server waits for every plugin to load, so anything this waited for
+ * (a state directory that hangs, say) would hold the judge back from every gate, and the start with it. A listener
+ * registered here, on the other hand, is live at once. So the services and the listeners are all set up, with no `await`
+ * between, and what remains is the prune of the log, which goes on after the load, in the background. The promise it gives
+ * is that prune, which never rejects: tests wait for it, and `apply` does not.
+ * @throws a plain `Error` for a `baseUrl`, `keyName` or `stateDirectory` that can't be used.
+ */
+export function start(ctx: Context, config: Config, internals: Internals): Promise<void> {
   const logger = ctx.logger(name)
   if (config.terminal) printOwnLogs(ctx, name)
   /** A logger that throws is not worth a failed lookup or a failed start. */
@@ -466,35 +548,23 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return resolved?.value
   }
 
-  const judgeLog = new JudgeLog(directory)
+  const judgeLog = internals.log ?? new JudgeLog(directory)
   const log = createLogService(judgeLog, { key, tell, directory })
 
   // A shutdown waits for the lines that are on their way, so that the last decisions are not lost with the process: cordis
   // runs this when the plugin is disposed. Not for long, since a disk that is stuck is no reason to hold up a shutdown.
-  ctx.effect(() => async () => {
-    let timer: NodeJS.Timeout | undefined
-    try {
-      await Promise.race([log.flush(), new Promise<void>((done) => { timer = setTimeout(done, FLUSH_BUDGET_MS) })])
-    } finally {
-      clearTimeout(timer)
-    }
-  })
+  ctx.effect(() => () => flushWithin(log, internals.flushBudgetMs ?? FLUSH_BUDGET_MS))
 
-  // Before the services are there, so that nothing asks the log while it is pruned. A failure is logged, and the plugin
-  // works all the same: old files that stay are only disk.
-  try {
-    const removed = await judgeLog.prune(KEEP_LOG_MS)
-    if (removed.days + removed.withheld > 0) logger.info('removed %d day file(s) and %d withheld file(s) of the decision log older than 30 days', removed.days, removed.withheld)
-  } catch (error) {
-    warn('could not prune the decision log in %s: %s', directory, describe(error))
-  }
+  ctx.provide('dishJudge', { settings, log })
+  ctx.provide('judge', createJudge({ baseUrl, key, settings, log: line => log.write(line) }))
 
-  try {
-    ctx.provide('dishJudge', { settings, log })
-    ctx.provide('judge', createJudge({ baseUrl, key, settings, log: line => log.write(line) }))
-  } catch (error) {
-    // Unloaded while it was pruning: the plugin is going away, and didn't fail.
-    if (unloaded(error)) return
-    throw error
-  }
+  // ---- LISTENERS GO HERE ------------------------------------------------------------------------------------------
+  // The command gate (`tools/pre-execute`), the approval answerer (`approval/request`), the result screen
+  // (`tools/post-execute`) and the tool `ask_judge` are registered here: above the prune, and with no `await` anywhere in this
+  // function, so that a load that is slow can never leave a window in which the plugin is there and no gate is. They use
+  // `ctx.judge`, `settings` and `log`, which are all there by now. Do not put an `await` in this function.
+  // -----------------------------------------------------------------------------------------------------------------
+
+  // In the background. A failure is logged, and the plugin works all the same: old files that stay are only disk.
+  return pruneAtLoad(judgeLog, { keepMs: KEEP_LOG_MS, slowAfterMs: internals.pruneSlowAfterMs ?? PRUNE_SLOW_AFTER_MS, directory, logger })
 }

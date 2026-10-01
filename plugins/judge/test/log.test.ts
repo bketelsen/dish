@@ -857,3 +857,68 @@ test('flush resolves once every queued write is done', async () => {
   await log.flush()
 })
 
+
+test('a read right after the first write of a fresh log sees it: the file is still being made', async () => {
+  const { directory } = await scratch()
+  const log = new JudgeLog(directory)
+  void log.write(line({ subject: 'the first' }))
+  const page = await log.read()
+  assert.deepEqual(page.lines.map(one => one.subject), ['the first'])
+})
+
+test('a read right after the first write of a new UTC day sees it, with the lines of the day before', async () => {
+  const { directory } = await scratch()
+  const log = new JudgeLog(directory)
+  await log.write(line({ subject: 'yesterday', at: NOON }))
+  void log.write(line({ subject: 'today', at: NOON + DAY }))
+  const page = await log.read()
+  assert.deepEqual(page.lines.map(one => one.subject), ['today', 'yesterday'])
+  // And a filtered or limited one does as well.
+  void log.write(line({ subject: 'tomorrow', at: NOON + 2 * DAY, purpose: 'ask' }))
+  assert.deepEqual((await log.read({ purpose: 'ask' })).lines.map(one => one.subject), ['tomorrow'])
+  void log.write(line({ subject: 'the day after', at: NOON + 3 * DAY }))
+  assert.deepEqual((await log.read({ limit: 1 })).lines.map(one => one.subject), ['the day after'])
+})
+
+test('a write that was queued while the read waited is not waited for, and the read still returns', async () => {
+  const { directory } = await scratch()
+  const log = new JudgeLog(directory)
+  void log.write(line({ subject: 'first' }))
+  const reading = log.read()
+  void log.write(line({ subject: 'later', at: NOON + DAY }))
+  const page = await reading
+  assert.ok(page.lines.some(one => one.subject === 'first'))
+  await log.flush()
+  assert.equal((await log.read()).lines.length, 2)
+})
+
+test('flush resolves while writes keep coming: it waits for what was queued when it was called, and no more', async () => {
+  const { directory } = await scratch()
+  const log = new JudgeLog(directory)
+  let stop = false
+  let queued = 0
+  // A burst of writes in every turn of the event loop: the queue is never empty while this runs.
+  const writer = (async () => {
+    while (!stop) {
+      for (let index = 0; index < 20; index++) void log.write(line({ callId: `c${queued++}`, at: NOON + (queued % 3) * DAY }))
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+  })()
+  try {
+    await new Promise<void>(resolve => setTimeout(resolve, 30))
+    const before = queued
+    const outcome = await Promise.race([
+      log.flush().then(() => 'flushed'),
+      new Promise<string>(resolve => setTimeout(() => resolve('still waiting'), 3000)),
+    ])
+    assert.equal(outcome, 'flushed', 'flush did not wait for writes that came after it')
+    assert.equal(stop, false, 'and the writer was still going')
+    // What was queued before it is on the disk.
+    const lines = await Promise.all(['2026-10-01', '2026-10-02', '2026-10-03'].map(async day => (await dayLines(directory, day)).length))
+    assert.ok(lines.reduce((total, count) => total + count, 0) >= before, `${lines} lines for ${before} queued`)
+  } finally {
+    stop = true
+    await writer
+    await log.flush()
+  }
+})

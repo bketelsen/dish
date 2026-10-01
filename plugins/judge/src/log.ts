@@ -418,9 +418,13 @@ export class JudgeLog {
     return run
   }
 
-  /** Resolve once every write that is queued now is done. For a shutdown, and for a test, to wait on. */
+  /**
+   * Resolve once every write that is queued now is done: the tails of the queues are taken once, so writes that come after
+   * the call are not waited for, and a log that is written to all the time can still be flushed. For a shutdown, and for a
+   * test, to wait on. Never rejects: a queue's tail does not.
+   */
   async flush(): Promise<void> {
-    while (this.#queues.size > 0) await Promise.all([...this.#queues.values()])
+    await Promise.all([...this.#queues.values()])
   }
 
   /**
@@ -557,6 +561,8 @@ export class JudgeLog {
    * - **Paging.** `next` is an opaque cursor for the page after this one, and is there only if there is a matching line
    *   older than the last one returned. A page from it neither repeats a line nor misses one, whatever has been written
    *   since, and goes on with the older files if the one it points into is gone.
+   * - **Written lines.** Every line whose `write` was called before `read` is in what it reads, the first line of a fresh log or
+   *   of a new UTC day included; a line written after may or may not be.
    * - **Unreadable lines** (not JSON, torn, not shaped like a line, or longer than a megabyte) are skipped. `skipped` counts
    *   those among the lines the page went through, up to its last line, so that a count is not made twice over two pages.
    * - Memory: one chunk of a file, and the page. A long file isn't read past what the page needs.
@@ -571,6 +577,9 @@ export class JudgeLog {
     const purpose = query.purpose === undefined || (query.purpose as string) === '' ? undefined : query.purpose
     const decision = query.decision === undefined || query.decision === '' ? undefined : query.decision
 
+    // What is queued now is in its file before the files are listed: a write that is the first of a fresh log, or of a new UTC
+    // day, is making its file, which a listing would not have. A write queued after this may or may not be in the page.
+    await this.flush()
     const lines: JudgeLogLine[] = []
     let skipped = 0
     let cut: { day: string, offset: number, skipped: number } | undefined
