@@ -2,7 +2,7 @@
   "name": "dish-crew",
   "version": "0.0.1",
   "private": true,
-  "description": "A fixed crew of specialists the main agent delegates to (spike)",
+  "description": "A fixed crew of specialists the main agent delegates to",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
@@ -10,6 +10,7 @@
   },
   "files": [
     "src",
+    "defaults",
     "cordis.patch.yml"
   ],
   "license": "MIT",
@@ -19,7 +20,11 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "~3.18.4"
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "dish-config": "workspace:*",
+    "dish-kit": "workspace:*",
+    "dish-prompts": "workspace:*",
+    "js-yaml": "^4.1.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
@@ -30,6 +35,7 @@
     "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
     "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
     "@deepseek-ai/dsh-subagent": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-tools": "0.2.0-rc.2"
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@types/js-yaml": "^4.0.9"
   }
 }
