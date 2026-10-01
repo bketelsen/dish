@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ConfigStoreError } from '../src/store/errors.ts'
-import { checkContent } from '../src/store/guard.ts'
+import { checkContent, secretKind } from '../src/store/guard.ts'
 import { NamespaceRegistry } from '../src/store/namespaces.ts'
 import type { NamespaceSpec } from '../src/store/namespaces.ts'
 
@@ -100,6 +100,16 @@ test('overlapping claims are refused: identical exact paths, and an exact path i
   assertBadClaim(inner, spec('prompts/'), /overlap/)
 })
 
+test('a file and a directory of the same name overlap, since one tree cannot hold both', () => {
+  for (const [first, second] of [['prompts', 'prompts/'], ['prompts/', 'prompts'], ['x/y', 'x/y/z'], ['x/y/z', 'x/y'],
+    ['x/y', 'x/y/z/'], ['x/y/z/', 'x/y'], ['x/y/', 'x/y/z']]) {
+    const registry = new NamespaceRegistry()
+    registry.claim(spec(first))
+    assertBadClaim(registry, spec(second), /overlap/)
+    assert.equal(registry.all().length, 1)
+  }
+})
+
 test('a refused overlap names both owners and leaves the registry unchanged', () => {
   const registry = new NamespaceRegistry()
   const first = spec('prompts/', 'prompts-plugin')
@@ -115,7 +125,10 @@ test('claims that only share a spelling do not overlap', () => {
   registry.claim(spec('prompts/'))
   registry.claim(spec('promptsx/'))
   registry.claim(spec('prompt/'))
-  assert.equal(registry.all().length, 5)
+  registry.claim(spec('x/y'))
+  registry.claim(spec('x/yz/'))
+  registry.claim(spec('x/y.md'))
+  assert.equal(registry.all().length, 8)
 })
 
 test('the disposer is idempotent and removes only its own claim', () => {
@@ -243,7 +256,10 @@ const secrets: Array<{ name: string, secret: string, label: string }> = [
   { name: 'OPENSSH private key', secret: `-----BEGIN ${'OPENSSH'} PRIVATE KEY-----`, label: 'a private key' },
   { name: 'RSA private key', secret: `-----BEGIN ${'RSA'} PRIVATE KEY-----`, label: 'a private key' },
   { name: 'bare private key', secret: `-----BEGIN PRIVATE KEY-----`, label: 'a private key' },
+  { name: 'encrypted private key', secret: `-----BEGIN ${'ENCRYPTED'} PRIVATE KEY-----`, label: 'a private key' },
+  { name: 'PGP private key block', secret: `-----BEGIN ${'PGP'} PRIVATE KEY BLOCK-----`, label: 'a private key' },
   { name: 'AKIA', secret: `AKIA${'IOSFODNN7EXAMPLE'}`, label: 'an AWS access key ID' },
+  { name: 'ASIA (temporary AWS key)', secret: `ASIA${'IOSFODNN7EXAMPLE'}`, label: 'an AWS access key ID' },
 ]
 
 for (const { name, secret, label } of secrets) {
@@ -255,6 +271,43 @@ for (const { name, secret, label } of secrets) {
     assertNoLeak(error.message, secret, ['pelican', 'walrus', 'key ='])
   })
 }
+
+// A token glued to other word characters is still a token: `_` and `-` are not letters or digits.
+const GH = `ghp_${GH_BODY}`
+const PAT = `github_pat_${'Qw7Lm3'.repeat(4)}_${'Rt5Yp8'.repeat(10)}`
+const SK = `sk-${'Hj4Nb6'.repeat(6)}`
+const AKIA = `AKIA${'IOSFODNN7EXAMPLE'}`
+const wrapped: Array<{ name: string, text: string, secret: string, label: string }> = [
+  { name: 'ghp_ token then _old', text: `${GH}_old`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token in underscores', text: `_${GH}_`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token in double underscores', text: `__${GH}__`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token after TOKEN_', text: `TOKEN_${GH}`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token followed by letters', text: `${GH}tail`, secret: GH, label: 'a GitHub token' },
+  { name: 'github_pat_ token in underscores', text: `_${PAT}_`, secret: PAT, label: 'a GitHub fine-grained token' },
+  { name: 'github_pat_ token after an equals sign', text: `GITHUB_TOKEN=${PAT}`, secret: PAT, label: 'a GitHub fine-grained token' },
+  { name: 'sk- key in underscores', text: `_${SK}_`, secret: SK, label: 'an sk- API key' },
+  { name: 'sk- key after an equals sign', text: `API_KEY=${SK}`, secret: SK, label: 'an sk- API key' },
+  { name: 'AKIA key then _x', text: `${AKIA}_x`, secret: AKIA, label: 'an AWS access key ID' },
+  { name: 'AKIA key then lowercase letters', text: `${AKIA}abc`, secret: AKIA, label: 'an AWS access key ID' },
+  { name: 'AKIA key in underscores', text: `_${AKIA}_`, secret: AKIA, label: 'an AWS access key ID' },
+  { name: 'AKIA key after a prefix and underscore', text: `AWS_KEY_${AKIA}`, secret: AKIA, label: 'an AWS access key ID' },
+]
+
+for (const { name, text, secret, label } of wrapped) {
+  test(`checkContent refuses a wrapped secret: ${name}`, () => {
+    const error = refusal('prompts/coder.md', `before\n${text}\nafter\n`)
+    assert.equal(error.code, 'SECRET')
+    assert.equal(error.message, `prompts/coder.md: looks like ${label}`)
+    assertNoLeak(error.message, secret)
+  })
+}
+
+test('secretKind names the kind of the first secret in a text, or nothing', () => {
+  assert.equal(secretKind(`key ${GH}`), 'a GitHub token')
+  assert.equal(secretKind(`key ${AKIA}`), 'an AWS access key ID')
+  assert.equal(secretKind('a GitHub token, an AWS key, a PEM header'), undefined)
+  assert.equal(secretKind(''), undefined)
+})
 
 test('a secret anywhere in the text is found: first byte, last byte, in the middle of a long document', () => {
   const secret = `ghp_${GH_BODY}`
@@ -272,6 +325,9 @@ test('checkContent allows prose that mentions credentials without containing one
     'AKIA' + 'a'.repeat(16),
     'xghp_' + 'a'.repeat(36),
     'The key is -----BEGIN-----.',
+    'github_pat_token_for_deploy_scripts',
+    'Words that merely end in sk-: risk-assessment-for-the-whole-release-pipeline, task-runner-configuration-for-ci.',
+    '-----BEGIN CERTIFICATE-----',
   ].join('\n')
   checkContent('prompts/security.md', prose, MAX)
   checkContent('empty.md', '', MAX)
@@ -301,6 +357,40 @@ test('the size check runs before the secret scan, and never shows content', () =
   const error = refusal('a.md', `${secret}${'x'.repeat(MAX)}`)
   assert.equal(error.code, 'TOO_LARGE')
   assertNoLeak(error.message, secret)
+})
+
+test('a secret in the path is refused without showing the path, whatever the body is', () => {
+  for (const { name, secret, label } of secrets) {
+    const path = `prompts/${secret}.md`
+    const error = refusal(path, 'hello')
+    assert.equal(error.code, 'SECRET', name)
+    assert.equal(error.message, `the document path looks like ${label}`, name)
+    assertNoLeak(error.message, secret, ['prompts/'])
+  }
+})
+
+test('the path is scanned before the size, so an oversized body never gets a message that shows a secret path', () => {
+  const secret = `ghp_${GH_BODY}`
+  const error = refusal(`prompts/${secret}.md`, 'x'.repeat(300_000))
+  assert.equal(error.code, 'SECRET')
+  assert.equal(error.message, 'the document path looks like a GitHub token')
+  assertNoLeak(error.message, secret)
+  // A path with no secret in it is still named in a TOO_LARGE message.
+  assert.equal(refusal('prompts/big.md', 'x'.repeat(300_000)).message.startsWith('prompts/big.md: '), true)
+})
+
+test('a secret path wins over a secret body, and a clean path with a secret body still names the path', () => {
+  const body = `ghp_${GH_BODY}`
+  assert.equal(refusal(`prompts/${AKIA}.md`, body).message, 'the document path looks like an AWS access key ID')
+  assert.equal(refusal('prompts/coder.md', body).message, 'prompts/coder.md: looks like a GitHub token')
+})
+
+test('wrapped secrets in a path are found too', () => {
+  for (const { name, text, secret, label } of wrapped) {
+    const error = refusal(`prompts/${text}.md`, 'hello')
+    assert.equal(error.message, `the document path looks like ${label}`, name)
+    assertNoLeak(error.message, secret)
+  }
 })
 
 test('a path that could forge log lines is shown escaped', () => {

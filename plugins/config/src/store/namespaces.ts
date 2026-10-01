@@ -19,9 +19,21 @@ function matches(prefix: string, path: string): boolean {
   return prefix.endsWith('/') ? path.startsWith(prefix) : path === prefix
 }
 
-/** Two prefixes overlap when either one covers the other. */
+/** `prefix` without the trailing slash that marks a subtree. */
+function bare(prefix: string): string {
+  return prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
+}
+
+/**
+ * Whether two claims can't both hold. A tree has one thing at each path, so
+ * `x/y` (a file) and `x/y/` (a directory) clash even though a document path
+ * never matches both; so do `x/y` and anything under `x/y/`. Claims are
+ * disjoint when neither is the other or one of its parent directories.
+ */
 function overlaps(a: string, b: string): boolean {
-  return matches(a, b) || matches(b, a)
+  const first = bare(a)
+  const second = bare(b)
+  return first === second || second.startsWith(`${first}/`) || first.startsWith(`${second}/`)
 }
 
 /**
@@ -32,7 +44,7 @@ function checkSpec(spec: NamespaceSpec): void {
   if (typeof spec !== 'object' || spec === null) throw new Error('namespace spec must be an object')
   if (typeof spec.prefix !== 'string') throw new Error('namespace prefix must be a string')
   // A trailing slash only marks a subtree; everything before it follows the same rules as a document path.
-  const problem = pathProblem(spec.prefix.endsWith('/') ? spec.prefix.slice(0, -1) : spec.prefix)
+  const problem = pathProblem(bare(spec.prefix))
   if (problem !== undefined) throw new Error(`invalid namespace prefix ${JSON.stringify(spec.prefix)}: ${problem}`)
   if (typeof spec.owner !== 'string' || spec.owner === '') {
     throw new Error(`namespace ${JSON.stringify(spec.prefix)} needs a non-empty owner`)
@@ -49,8 +61,8 @@ interface Claim {
 }
 
 /**
- * Who owns which paths. Claims never overlap, so a path has at most one
- * owner. Releasing a claim only forgets the owner; the files stay.
+ * Who owns which paths. Claims are disjoint (see `overlaps`), so a path has at
+ * most one owner. Releasing a claim only forgets the owner; the files stay.
  */
 export class NamespaceRegistry {
   private claims: Claim[] = []
