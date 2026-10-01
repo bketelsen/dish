@@ -12,6 +12,9 @@
  *   instead of caching;
  * - `main` is pushed to a remote after each commit, when one is configured.
  *
+ * - when a `tools` service is there, the main agent gets `config_read`, `config_list`, `config_write` and
+ *   `config_propose` (see `tools.ts`); the store itself needs no `tools` service.
+ *
  * The plugin claims `README.md` itself, for people only, and seeds it once.
  *
  * @module dish-config
@@ -30,6 +33,7 @@ import { NamespaceRegistry } from './store/namespaces.ts'
 import type { NamespaceSpec } from './store/namespaces.ts'
 import { ConfigStore } from './store/store.ts'
 import type { Author, CommitInfo, ProposalEvent, RemoteStatus } from './store/store.ts'
+import { toolDefinitions } from './tools.ts'
 
 export { ConfigStoreError } from './store/errors.ts'
 export type { ErrorCode } from './store/errors.ts'
@@ -301,6 +305,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
   try {
     ctx.provide('dishConfig', service)
+    // The tools are optional: with no `tools` service the store works all the same, and they register when one appears.
+    // Registered through the child context, they go when the `tools` service does, or the plugin.
+    ctx.inject(['tools'], (child) => {
+      for (const definition of toolDefinitions(service, namespaces)) child.tools.register(definition)
+    })
   } catch (error) {
     // Unloaded during the seed: the close effect is registered, so it closes the store. Not a failure.
     if (unloaded(error)) return

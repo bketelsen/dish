@@ -181,15 +181,23 @@ Consumers re-read on these events rather than caching.
 
 ## Agent tools
 
-Provided by `dish-config` for the main agent; `crew` filters them out for children.
+Provided by `dish-config` for the **main agent only**. They are registered when a `tools` service is present (the store itself needs none), and each one refuses a caller that isn't the main agent before it does anything else: no calling agent, or a session whose `delegationDepth` is above zero, gets `config tools are for the main agent only; ask the main agent to make this change`. `crew`'s tool filter is not what this rests on.
 
-| Tool | Does | Allowed where the namespace's `agent` is |
-|---|---|---|
-| `config_read(path)` / `config_list(prefix)` | read `main` | `write` or `propose` |
-| `config_write(changes, note)` | direct commit, authored as the agent | `write` |
-| `config_propose(title, rationale, changes)` | opens a proposal branch | `write` or `propose` |
+| Tool | Does | Returns | Allowed where the namespace's `agent` is |
+|---|---|---|---|
+| `config_read({ path })` | reads one document from `main` | `{ path, text, commit }`: `text` is `null` for a missing document, and `commit` is the head it was read at | `write` or `propose` |
+| `config_list({ prefix })` | lists documents on `main` (`''` for all) | `{ paths, commit }`: only paths an agent may see | `write` or `propose` |
+| `config_write({ changes, note?, base? })` | direct commit, authored as the agent | `{ commit, paths }`; `commit` is `null` and `paths` empty when nothing changed | `write` |
+| `config_propose({ title, rationale, changes })` | opens a proposal branch | `{ proposal, paths }` | `write` or `propose` |
 
-- **Prompting** tells the agent: use `config_write` only for a change the user asked for in this conversation, and `config_propose` for anything it initiates.
+- `changes` is a list of `{ path, text?, delete? }`. Each has **exactly one** of `text` (the whole new document, which may be empty) or `delete: true`; both or neither is `INVALID`, refused before the store is called. `delete: false` counts as not deleting.
+- **Author.** Every write and proposal is `{ kind: 'agent', sessionId: <the calling session>, role: 'main' }`.
+- **`config_read` returns the head it read from.** The tool takes `head()` and then reads at that exact commit, so `commit` is true of `text` even if something else commits in between.
+- **`base`** is optional. When given, it is passed to the store, so a change made since the agent's read (in the UI, say) to a path being written is `CONFLICT`, not an overwrite; a change to other paths is not. The tool description tells the model to pass the `commit` from `config_read`. Without it a write is unconditional, as for any caller.
+- **Read policy lives in the tools.** `config_read` on a path in a namespace whose `agent` is `none` is `FORBIDDEN`, whether or not the document exists, and on a path no namespace owns `UNOWNED`. `config_list` leaves out every path whose namespace is `none` or unowned, so `README.md` (people only) never shows. Write and propose policy is the store's (`FORBIDDEN`), not repeated here.
+- **Empty strings are absent** for `note` and `base`: models fill every optional parameter. A `rationale` is required, but may be empty, as the store allows.
+- **Errors.** A refusal by the store reaches the model as an `Error` whose message is `<CODE>: <message>` (`CONFLICT`, `FORBIDDEN`, `SECRET`, ...), so it can act on the code. The store's own messages and the tools' never carry document text (a secret in `text` is `SECRET` without an echo); a namespace's `validate` message is its owner's to keep free of it.
+- **Prompting** is in the tool descriptions: use `config_write` only for a change the user asked for in this conversation, and `config_propose` for anything the agent initiates; pass `base` from `config_read`; on `CONFLICT`, read again and redo the change; on a proposal that went `STALE`, read again and open a fresh one.
 - **Structural backstop.** Sessions started by `triggers` (unattended) don't get `config_write` at all. This is enforced when `triggers` exists; until then, every session is interactive.
 - **Per-namespace defaults** (each set by its owner):
   - `prompts/` and `crew.yaml`: `write`
