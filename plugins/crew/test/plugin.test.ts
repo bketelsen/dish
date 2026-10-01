@@ -122,7 +122,13 @@ test('the policy of the namespace holds through dishConfig: a person\'s broken f
       { code: 'INVALID', message: /crew\.yaml.*roles\.coder\.family: "antropic" is not a family \(families: anthropic, openai\)/ })
     await assert.rejects(store.write([{ path: 'crew.yaml', text: 'roles: [' }], { author: USER }), { code: 'INVALID' })
     await assert.rejects(store.write([{ path: 'crew.yaml', text: 'provider: !!js/function "function () {}"\n' }], { author: USER }), { code: 'INVALID' })
-    await assert.rejects(store.write([{ path: 'crew.yaml', text: '' }], { author: USER }), { code: 'INVALID' })
+    // The store puts the path in front of what the namespace says, so what it says doesn't name the file again.
+    await assert.rejects(
+      store.write([{ path: 'crew.yaml', text: '' }], { author: USER }),
+      (error: Error) => /^crew\.yaml: the file is empty; it needs /.test(error.message) && (error as { code?: string }).code === 'INVALID')
+    await assert.rejects(
+      store.write([{ path: 'crew.yaml', text: 'roles: [' }], { author: USER }),
+      (error: Error) => /^crew\.yaml: not valid YAML \(line \d+, column \d+\): /.test(error.message))
     assert.equal(await store.read('crew.yaml'), DEFAULT_TEXT)
     assert.equal((await store.history({ path: 'crew.yaml' })).length, 1)
   })

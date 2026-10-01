@@ -19,37 +19,38 @@ export type Tier = 'strong' | 'mid'
 
 /** The model a family uses at each tier. */
 export interface FamilySettings {
-  strong: string
-  mid: string
+  readonly strong: string
+  readonly mid: string
 }
 
 export interface Limits {
   /** Crew children running at once, per session. */
-  running: number
+  readonly running: number
   /** Of those, children of roles with `writes: true`. */
-  writers: number
+  readonly writers: number
   /** Delegations a session may start, ever. */
-  perSession: number
+  readonly perSession: number
 }
 
 export interface RoleSettings {
-  tier: Tier
+  readonly tier: Tier
   /** The family the role's model comes from. Absent for the reviewer, which takes the first of `reviewerFamilies` that isn't the reviewed work's. */
-  family?: string
-  writes: boolean
+  readonly family?: string
+  readonly writes: boolean
   /** The reviewer: exactly one role has it. */
-  reviews: boolean
-  /** Tool names. A name a child can't see when it starts is left out then, so these are only a ceiling. */
-  tools: string[]
+  readonly reviews: boolean
+  /** Tool names, at least one. A name a child can't see when it starts is left out then, so these are only a ceiling. */
+  readonly tools: readonly string[]
 }
 
+/** Everything in it is frozen, and the types say so: copy before changing anything. */
 export interface CrewSettings {
-  provider: string
+  readonly provider: string
   /** Model ids per family and tier; a family's models identify it. */
-  families: Record<string, FamilySettings>
-  reviewerFamilies: string[]
-  limits: Limits
-  roles: Record<string, RoleSettings>
+  readonly families: Readonly<Record<string, FamilySettings>>
+  readonly reviewerFamilies: readonly string[]
+  readonly limits: Limits
+  readonly roles: Readonly<Record<string, RoleSettings>>
 }
 
 export type ParseResult = { ok: true, settings: CrewSettings } | { ok: false, problem: string }
@@ -61,6 +62,8 @@ const ROLE_KEYS = ['tier', 'family', 'writes', 'reviews', 'tools'] as const
 
 /** What a role may be called: the prompts grammar, since each role has a prompt document by its name. */
 const ROLE_NAME = /^[a-z][a-z0-9-]*$/
+/** What a family may be called: the same. */
+const FAMILY_NAME = /^[a-z][a-z0-9-]*$/
 /** `common` and `main` have documents of their own, so no crew role can have those names. */
 const RESERVED = ['common', 'main']
 
@@ -127,9 +130,16 @@ function noOtherKeys(from: Record<string, unknown>, path: string, allowed: reado
   }
 }
 
-function nonEmptyString(value: unknown, path: string, what: string): string {
-  if (typeof value !== 'string' || value.trim() === '') refuse(path, `must be ${what} (got ${shown(value)})`)
+/** Refuse `value` if it starts or ends with whitespace: it would be a different name from the one it looks like. */
+function unpadded(value: string, path: string): string {
+  if (value !== value.trim()) refuse(path, `must not start or end with whitespace (got ${shown(value)})`)
   return value
+}
+
+/** A string with something in it and no whitespace around it: a provider, a model id, a tool name. */
+function plainString(value: unknown, path: string, what: string): string {
+  if (typeof value !== 'string' || value.trim() === '') refuse(path, `must be ${what} (got ${shown(value)})`)
+  return unpadded(value, path)
 }
 
 function parseFamilies(value: unknown): Record<string, FamilySettings> {
@@ -139,20 +149,21 @@ function parseFamilies(value: unknown): Record<string, FamilySettings> {
   const owner = new Map<string, string>()
   for (const [name, models] of Object.entries(value)) {
     const path = at('families', name)
-    if (name === '') refuse(path, 'a family needs a name')
+    unpadded(name, path)
+    if (!FAMILY_NAME.test(name)) refuse(path, `${shown(name)} is not a valid family name (lowercase letters, digits and hyphens, starting with a letter)`)
     if (!isMapping(models)) refuse(path, `must be a mapping with strong and mid models (got ${shown(models)})`)
     noOtherKeys(models, path, TIERS)
-    const family = {} as FamilySettings
+    const chosen = {} as Record<Tier, string>
     for (const tier of TIERS) {
-      const model = nonEmptyString(required(models, tier, path, 'a model id'), at(path, tier), 'a model id')
+      const model = plainString(required(models, tier, path, 'a model id'), at(path, tier), 'a model id')
       const other = owner.get(model)
       if (other !== undefined && other !== name) {
         refuse(at(path, tier), `${shown(model)} is also in family ${truncate(other)}; a model belongs to one family`)
       }
       owner.set(model, name)
-      family[tier] = model
+      chosen[tier] = model
     }
-    families[name] = family
+    families[name] = { strong: chosen.strong, mid: chosen.mid }
   }
   return families
 }
@@ -162,6 +173,8 @@ function parseReviewerFamilies(value: unknown, families: Record<string, FamilySe
   return value.map((item, index) => {
     const path = `reviewerFamilies[${index}]`
     if (typeof item !== 'string') refuse(path, `must be a family name (got ${shown(item)})`)
+    unpadded(item, path)
+    // A family of the file has passed the grammar of family names, so this is the check of it too.
     if (families[item] === undefined) refuse(path, `${shown(item)} is not a family (families: ${listed(Object.keys(families))})`)
     return item
   })
@@ -170,14 +183,14 @@ function parseReviewerFamilies(value: unknown, families: Record<string, FamilySe
 function parseLimits(value: unknown): Limits {
   if (!isMapping(value)) refuse('limits', `must be a mapping with ${LIMIT_KEYS.join(', ')} (got ${shown(value)})`)
   noOtherKeys(value, 'limits', LIMIT_KEYS)
-  const limits = {} as Limits
+  const chosen = {} as Record<(typeof LIMIT_KEYS)[number], number>
   for (const key of LIMIT_KEYS) {
     const limit = required(value, key, 'limits', 'a positive integer')
     if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1) refuse(at('limits', key), `${shown(limit)} is not a positive integer`)
-    limits[key] = limit
+    chosen[key] = limit
   }
-  if (limits.writers > limits.running) refuse('limits.writers', `${limits.writers} is more than limits.running (${limits.running})`)
-  return limits
+  if (chosen.writers > chosen.running) refuse('limits.writers', `${chosen.writers} is more than limits.running (${chosen.running})`)
+  return { running: chosen.running, writers: chosen.writers, perSession: chosen.perSession }
 }
 
 function parseRole(name: string, value: unknown, families: Record<string, FamilySettings>): RoleSettings {
@@ -208,13 +221,16 @@ function parseRole(name: string, value: unknown, families: Record<string, Family
   } else {
     const named = required(value, 'family', path, `families: ${listed(Object.keys(families))}`)
     if (typeof named !== 'string') refuse(at(path, 'family'), `must be a family name (got ${shown(named)})`)
+    unpadded(named, at(path, 'family'))
+    // A family of the file has passed the grammar of family names, so this is the check of it too.
     if (families[named] === undefined) refuse(at(path, 'family'), `${shown(named)} is not a family (families: ${listed(Object.keys(families))})`)
     family = named
   }
 
   const listing = required(value, 'tools', path, 'a list of tool names')
   if (!Array.isArray(listing)) refuse(at(path, 'tools'), `must be a list of tool names (got ${shown(listing)})`)
-  const tools = listing.map((tool, index) => nonEmptyString(tool, `${at(path, 'tools')}[${index}]`, 'a non-empty tool name'))
+  if (listing.length === 0) refuse(at(path, 'tools'), 'a role needs at least one tool')
+  const tools = listing.map((tool, index) => plainString(tool, `${at(path, 'tools')}[${index}]`, 'a non-empty tool name'))
 
   return { tier: tier as Tier, ...family === undefined ? {} : { family }, writes, reviews, tools }
 }
@@ -247,9 +263,9 @@ function blank(text: string): boolean {
 function yamlProblem(error: unknown): string {
   if (error instanceof YAMLException) {
     const where = error.mark === undefined || error.mark === null ? '' : ` (line ${error.mark.line + 1}, column ${error.mark.column + 1})`
-    return `crew.yaml is not valid YAML${where}: ${truncate(error.reason, REASON)}`
+    return `not valid YAML${where}: ${truncate(error.reason, REASON)}`
   }
-  return `crew.yaml is not valid YAML: ${truncate(error instanceof Error ? error.message : String(error), REASON)}`
+  return `not valid YAML: ${truncate(error instanceof Error ? error.message : String(error), REASON)}`
 }
 
 /**
@@ -265,10 +281,10 @@ export function parseSettings(text: string): ParseResult {
     return { ok: false, problem: yamlProblem(error) }
   }
   try {
-    if (document === undefined || (document === null && blank(text))) refuse('', 'crew.yaml is empty')
-    if (!isMapping(document)) refuse('', `crew.yaml must be a mapping of settings (got ${shown(document)})`)
+    if (document === undefined || (document === null && blank(text))) refuse('', `the file is empty; it needs ${TOP_KEYS.slice(0, -1).join(', ')} and ${TOP_KEYS[TOP_KEYS.length - 1]}`)
+    if (!isMapping(document)) refuse('', `must be a mapping of settings (got ${shown(document)})`)
     noOtherKeys(document, '', TOP_KEYS)
-    const provider = nonEmptyString(required(document, 'provider', '', 'a provider id'), 'provider', 'a provider id')
+    const provider = plainString(required(document, 'provider', '', 'a provider id'), 'provider', 'a provider id')
     const families = parseFamilies(required(document, 'families', '', 'family names, each with strong and mid models'))
     const reviewerFamilies = parseReviewerFamilies(required(document, 'reviewerFamilies', '', 'a list of family names'), families)
     const limits = parseLimits(required(document, 'limits', '', 'running, writers and perSession'))

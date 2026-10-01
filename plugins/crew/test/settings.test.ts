@@ -105,13 +105,11 @@ test('limits, families and the reviewer follow the file', () => {
   assert.deepEqual([...settings.roles.coder!.tools], ['read'])
 })
 
-test('a one-model family, a model reused by a family\'s two tiers, and an empty tools list are fine', () => {
+test('a one-model family, and a model reused by a family\'s two tiers, are fine', () => {
   const settings = settingsOf(shippedWith((document) => {
     document.families.anthropic = { strong: 'claude-opus-5.5', mid: 'claude-opus-5.5' }
-    document.roles.writer.tools = []
   }))
   assert.equal(settings.families.anthropic!.mid, 'claude-opus-5.5')
-  assert.deepEqual([...settings.roles.writer!.tools], [])
 })
 
 // --- every rule, broken in turn -------------------------------------------------------------------
@@ -246,22 +244,29 @@ test('tags are refused: nothing in crew.yaml is executable, or anything but plai
 
 test('YAML that does not parse is refused with where, and without the document', () => {
   const problem = problemOf('provider: github-copilot\nfamilies: {\nroles: [\n')
-  assert.match(problem, /^crew\.yaml is not valid YAML \(line \d+, column \d+\): /)
+  assert.match(problem, /^not valid YAML \(line \d+, column \d+\): /)
   assert.ok(problem.length < 300, problem)
   assert.ok(!problem.includes('github-copilot'), problem)
   // A duplicate key is a syntax error too: the second would silently win.
   assert.match(problemOf(DEFAULT_TEXT.replace('limits:', 'provider: other\nlimits:')), /duplicate/i)
   // A stream of several documents is one too many.
-  assert.match(problemOf(`${DEFAULT_TEXT}---\nprovider: other\n`), /^crew\.yaml is not valid YAML/)
+  assert.match(problemOf(`${DEFAULT_TEXT}---\nprovider: other\n`), /^not valid YAML/)
 })
 
 test('an empty file, or one that is not a mapping, is refused', () => {
-  assert.match(problemOf(''), /^crew\.yaml is empty/)
-  assert.match(problemOf('# only a comment\n'), /^crew\.yaml is empty/)
-  assert.match(problemOf('~\n'), /^crew\.yaml must be a mapping/)
-  assert.match(problemOf('- a\n- b\n'), /^crew\.yaml must be a mapping/)
-  assert.match(problemOf('just text\n'), /^crew\.yaml must be a mapping/)
-  assert.match(problemOf('42\n'), /^crew\.yaml must be a mapping/)
+  const empty = 'the file is empty; it needs provider, families, reviewerFamilies, limits and roles'
+  assert.equal(problemOf(''), empty)
+  assert.equal(problemOf('# only a comment\n'), empty)
+  assert.equal(problemOf('~\n'), 'must be a mapping of settings (got null)')
+  assert.equal(problemOf('- a\n- b\n'), 'must be a mapping of settings (got a list)')
+  assert.equal(problemOf('just text\n'), 'must be a mapping of settings (got "just text")')
+  assert.equal(problemOf('42\n'), 'must be a mapping of settings (got 42)')
+})
+
+test('no problem starts by naming crew.yaml: the store puts the path in front of it', () => {
+  for (const text of ['', '~', 'roles: [', DEFAULT_TEXT.replace('running: 4', 'running: !!set {}'), `${DEFAULT_TEXT}---\n`, shippedWith((d) => { d.limits.running = 0 })]) {
+    assert.doesNotMatch(problemOf(text), /crew\.yaml/, text.slice(0, 30))
+  }
 })
 
 test('a refusal never echoes much of the file, however large the offending value', () => {
@@ -284,6 +289,88 @@ test('a refusal never echoes much of the file, however large the offending value
     d.roles.coder.family = 'nope'
   })
   assert.ok(many.length < 500, many)
+})
+
+// --- strings that would be wrong in a way that is hard to see ---------------------------------------
+
+/** A string with a space in front, and one with a space behind. */
+const PADDED = (value: string) => [` ${value}`, `${value} `, `\t${value}`, `${value}\n`]
+
+test('provider, model ids, tool names and reviewer families may not start or end with whitespace', () => {
+  for (const provider of PADDED('github-copilot')) {
+    assert.match(problemWith((d) => { d.provider = provider }), /^provider: must not start or end with whitespace \(got "/, JSON.stringify(provider))
+  }
+  for (const tier of ['strong', 'mid']) {
+    for (const model of PADDED('gpt-5.6-sol')) {
+      assert.match(problemWith((d) => { d.families.openai[tier] = model }), new RegExp(`^families\\.openai\\.${tier}: must not start or end with whitespace`), JSON.stringify(model))
+    }
+  }
+  for (const tool of PADDED('read')) {
+    assert.match(problemWith((d) => { d.roles.coder.tools = ['glob', tool] }), /^roles\.coder\.tools\[1\]: must not start or end with whitespace/, JSON.stringify(tool))
+  }
+  for (const family of PADDED('openai')) {
+    assert.match(problemWith((d) => { d.reviewerFamilies = ['anthropic', family] }), /^reviewerFamilies\[1\]: must not start or end with whitespace/, JSON.stringify(family))
+    assert.match(problemWith((d) => { d.roles.coder.family = family }), /^roles\.coder\.family: must not start or end with whitespace/, JSON.stringify(family))
+  }
+})
+
+test('a padded copy of a model can not hide it in a second family', () => {
+  assert.match(
+    problemWith((d) => { d.families.openai.mid = ' claude-sonnet-5.5' }),
+    /^families\.openai\.mid: must not start or end with whitespace/)
+  assert.match(
+    problemWith((d) => { d.families.openai.mid = 'claude-sonnet-5.5' }),
+    /^families\.openai\.mid: "claude-sonnet-5\.5" is also in family anthropic/)
+})
+
+test('a family is named like a role: lowercase letters, digits and hyphens, starting with a letter', () => {
+  const models = { strong: 'some-strong', mid: 'some-mid' }
+  for (const name of ['two words', ' ', '', 'Upper', '2fast', '-dash', 'under_score', 'tëst', 'dot.ted']) {
+    assert.match(problemWith((d) => { d.families[name] = models }), /^families(\.|\[)[^:]*: .*(is not a valid family name|must not start or end with whitespace)/, JSON.stringify(name))
+  }
+  // `__proto__` as an own key, which is what the YAML says (assigning it would set a prototype instead).
+  assert.match(problemWith((d) => {
+    Object.defineProperty(d.families, '__proto__', { value: models, enumerable: true, configurable: true, writable: true })
+  }), /^families\.__proto__: .*is not a valid family name/)
+  for (const name of ['google', 'x-ai', 'in-house-2']) assert.ok(parseSettings(shippedWith((d) => { d.families[name] = models })).ok, name)
+})
+
+test('a family named in reviewerFamilies or a role has to be one of the file, whatever it is called', () => {
+  for (const name of ['two words', 'Anthropic', '__proto__', 'constructor', '']) {
+    assert.match(problemWith((d) => { d.reviewerFamilies = [name] }), /^reviewerFamilies\[0\]: .*is not a family \(families: anthropic, openai\)/, JSON.stringify(name))
+    assert.match(problemWith((d) => { d.roles.coder.family = name }), /^roles\.coder\.family: .*is not a family \(families: anthropic, openai\)/, JSON.stringify(name))
+  }
+})
+
+test('a role needs at least one tool', () => {
+  assert.equal(problemWith((d) => { d.roles.writer.tools = [] }), 'roles.writer.tools: a role needs at least one tool')
+  assert.ok(parseSettings(shippedWith((d) => { d.roles.writer.tools = ['read'] })).ok)
+})
+
+test('the types of the settings are readonly, as the objects are frozen', () => {
+  const settings = DEFAULT_SETTINGS
+  // Each of these fails to typecheck, and fails when run.
+  // @ts-expect-error the limits are readonly
+  assert.throws(() => { settings.limits.running = 1 }, TypeError)
+  // @ts-expect-error the provider is readonly
+  assert.throws(() => { settings.provider = 'x' }, TypeError)
+  // @ts-expect-error the families are readonly
+  assert.throws(() => { settings.families.openai = { strong: 'a', mid: 'b' } }, TypeError)
+  // @ts-expect-error a family's models are readonly
+  assert.throws(() => { settings.families.openai!.mid = 'x' }, TypeError)
+  // @ts-expect-error the roles are readonly
+  assert.throws(() => { settings.roles.coder = settings.roles.writer! }, TypeError)
+  // @ts-expect-error a role's tier is readonly
+  assert.throws(() => { settings.roles.coder!.tier = 'strong' }, TypeError)
+  // @ts-expect-error a role's tools can't be added to
+  assert.throws(() => { settings.roles.coder!.tools.push('x') }, TypeError)
+  // @ts-expect-error a role's tools can't be sorted in place
+  assert.throws(() => { settings.roles.coder!.tools.sort() }, TypeError)
+  // @ts-expect-error the reviewer families can't be added to
+  assert.throws(() => { settings.reviewerFamilies.push('x') }, TypeError)
+  // Copies are another matter.
+  const tools: string[] = [...settings.roles.coder!.tools].sort()
+  assert.equal(tools.length, settings.roles.coder!.tools.length)
 })
 
 // --- the namespace --------------------------------------------------------------------------------

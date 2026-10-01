@@ -156,7 +156,7 @@ export function apply(ctx: Context, config: Config): void {
     try {
       child.effect(() => child.dishConfig.claim(CREW_SPEC))
     } catch (error) {
-      if (present) logger.warn('could not claim crew.yaml: %s', describe(error))
+      logger.warn('could not claim crew.yaml: %s', describe(error))
       return
     }
     try {
