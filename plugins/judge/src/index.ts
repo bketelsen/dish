@@ -1,20 +1,32 @@
 /**
  * dish-judge: a fast typed judge in front of the risky edges of every agent.
  *
- * This is the host plugin. It is the one place the judge's pieces are wired together; for now it:
+ * This is the host plugin. It is the one place the judge's pieces are wired together. `start()` does these, in this order,
+ * with no `await` between them, so the plugin's load waits for nothing (see `start`):
  *
- * - provides the `dishJudge` service: `settings()` is the `judge.yaml` in the config store as it is now (see
- *   `settings.ts`), and `log` is the decision log (see below). Later steps add the listeners to this plugin;
- * - provides the `judge` service, the Jev client (see `client.ts`): the key is looked up in dsh's credential store on
- *   every call, the model and time limit are the settings of the moment, and every call is written to the decision log;
- * - claims `judge.yaml` in the store, closed to agents, and seeds it when `dishConfig` is there. `dishConfig` is
- *   optional, so there is no order to keep: with no store, every answer is the shipped default;
- * - checks its configuration when it loads, so a bad setting fails the plugin to load rather than the first call;
- * - prunes the decision log when it loads (day files and withheld files older than 30 days). The services, and the
- *   listeners the later steps add, are all there before the load waits for anything; it then waits for the prune for at
- *   most `PRUNE_BUDGET_MS`, because dsh's server waits for every plugin to load, and a prune that is not done by then
- *   carries on in the background. A prune that fails is one warning, and the plugin loads all the same;
- * - logs as `dish-judge`.
+ * - **The services.**
+ *   - `dishJudge`: `settings()` is the `judge.yaml` in the config store as it is now (see `settings.ts`), and `log` is the
+ *     decision log (see below).
+ *   - `judge`: the Jev client (see `client.ts`). The key is looked up in dsh's credential store on every call, the model and
+ *     time limit are the settings of the moment, and every call is written to the decision log.
+ * - **The listeners**, at the marker below, all there before the plugin is. Each looks the services up with `ctx.get` on every
+ *   call:
+ *   - the command gate (`gate.ts`): a prepended `tools/pre-execute` listener, and a `tools/result` listener that forgets a
+ *     call's verdict;
+ *   - the approval answerer (`answerer.ts`): a prepended `approval/request` listener, and the switch that makes a crew
+ *     child's approval policy `ask` when its parent's is;
+ *   - `ask_judge` (`ask.ts`): the tool, through the `tools` service when there is one;
+ *   - the result screen (`screen.ts`): a `tools/post-execute` listener, not prepended;
+ *   - the remote (`remote.ts`): the server half of Settings → Judge, a child plugin that needs `dishJudge` and `judge`.
+ * - **The prune**, in the background and last: the decision log's day files and withheld files older than 30 days. The load does
+ *   not wait for it (dsh's server waits for every plugin to load, and a state directory that hangs must not hang the start);
+ *   `start` gives the promise of the prune, which tests wait for and `apply` does not. A prune that fails, or is slow, is
+ *   one warning, and the plugin works all the same.
+ *
+ * Besides these, it claims `judge.yaml` in the store, closed to agents, and seeds it when `dishConfig` is there: `dishConfig` is
+ * optional, so there is no order to keep, and with no store every answer is the shipped default. It checks its configuration
+ * (`baseUrl`, `keyName`, `stateDirectory`) when it loads, so a bad setting fails the plugin to load rather than the first
+ * call. It logs as `dish-judge`.
  *
  * **The decision log, `ctx.get('dishJudge').log`**, is the one surface the gate, the approval answerer, the result screen,
  * `ask_judge` and the page use. It is the `JudgeLog` of `log.ts` in the state directory, with these differences:
@@ -36,7 +48,7 @@
  * - `flush()` resolves once every line written so far is on the disk or has failed. It never rejects. The plugin awaits it,
  *   for at most two seconds, when it unloads, so that the last decisions are not lost with the process.
  *
- * `prune` is not on it: pruning is the plugin's, at load.
+ * `prune` is not on it: pruning is the plugin's, in the background once it has loaded.
  *
  * @module dish-judge
  */

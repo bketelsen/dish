@@ -476,7 +476,7 @@ test('a megabyte of private key headers with no END, one after the other, is sca
     const text = unit.repeat((4 * MEGABYTE) / unit.length)
     let masked = ''
     const time = took(() => { masked = maskSecrets(text) })
-    assert.ok(time < 1_000, `maskSecrets took ${time.toFixed(0)} ms for ${JSON.stringify(unit)}`)
+    assert.ok(time < 3_000, `maskSecrets took ${time.toFixed(0)} ms for ${JSON.stringify(unit)}`)
     assert.equal(secretKind(masked), undefined)
   }
 })
@@ -817,7 +817,9 @@ test('an error from the scan fails closed: a kind that the guard refuses, and a 
 // --- how long it takes -------------------------------------------------------------------------------
 
 // Withheld web and MCP content is attacker-controlled, so what a text does to a pattern has to be bounded. Each of these
-// is a megabyte of what a pattern nearly matches. The bound is a generous 500 ms against what is, on a laptop, a few ms.
+// is a megabyte of what a pattern nearly matches. A bound is at least 10 times the longest the test has taken on a laptop
+// (about 30 ms for a megabyte, about 140 ms for four), so that a machine under heavy parallel load does not fail a test that
+// is not slow. A pattern that went quadratic would take seconds to minutes, which every bound here still catches.
 const MEGABYTE = 1024 * 1024
 const nearMisses: Array<[string, () => string]> = [
   ['a header and PRIVATE KEY over and over', () => `-----BEGIN ${'PRIVATE KEY'.repeat(MEGABYTE / 11)}`],
@@ -874,7 +876,7 @@ test('headers that nothing ends are not each scanned for 8 KB: four megabytes of
     const text = unit.repeat((4 * MEGABYTE) / unit.length)
     let masked = ''
     const time = took(() => { masked = maskSecrets(text) })
-    assert.ok(time < 500, `maskSecrets took ${time.toFixed(0)} ms`)
+    assert.ok(time < 3_000, `maskSecrets took ${time.toFixed(0)} ms`)
     assert.equal(secretKind(masked), undefined)
   }
 })

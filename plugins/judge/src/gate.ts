@@ -11,7 +11,9 @@
  *   (`effect`, `serves_task`) are the spec's, as constants below. The answers become a verdict by the spec's table: allow,
  *   ask you (the main agent), or deny (a crew child). A judge that is unavailable in any way, that gives answers the gate
  *   can't read, or whose `decide` hook did not come back, is **unavailable**, and unavailable asks you or denies a child.
- *   Nothing here lets a command run on a failure.
+ *   Nothing here lets a command run on a failure. A command with what looks like a private key in it is not sent (the client's
+ *   `opaque` flag on its refusal): it asks you or denies a child the same way, but the words say what is so, not that the judge
+ *   is unavailable.
  * - **No log of its own.** The client writes one line for each call it makes. The gate passes `decide`, which gives that
  *   line the verdict (`allow`, `ask` or `deny`), and `tool`, `callId` and `subject` (the command), so there is one line per
  *   decision. The client masks the TypeSafe key in the line, and the decision log (`log.ts`) masks secrets when it writes it.
@@ -126,6 +128,12 @@ const EFFECT_WORDS: Readonly<Record<string, string>> = {
 
 const UNAVAILABLE_ASK = 'The command needs your approval because the judge is unavailable.'
 const UNAVAILABLE_DENY = 'The command was refused because the judge is unavailable; nothing ran. Report it to the main agent instead, or try again later.'
+/**
+ * For a command the client would not send because it holds what looks like a private key (a mask would take in what is written
+ * around the key, so the judge could not read the command). The judge is not unavailable then, and these say what is true.
+ */
+const OPAQUE_ASK = 'The command needs your approval: it holds what looks like a private key, which isn\'t sent to the judge, so the judge couldn\'t read it.'
+const OPAQUE_DENY = 'The command was refused: it holds what looks like a private key, which isn\'t sent to the judge; nothing ran. Report it to the main agent instead, or leave the key out.'
 
 const p2 = (probability: number): string => probability.toFixed(2)
 
@@ -430,10 +438,15 @@ interface Outcome extends Decision {
   pre: PreToolDecision
 }
 
-function unavailable(topLevel: boolean): Outcome {
+/** Ask the main agent's user, or refuse a child: with `reason` for the one, and `denial` for the other. */
+function notLetThrough(topLevel: boolean, reason: string, denial: string): Outcome {
   return topLevel
-    ? { decision: 'ask', pre: { kind: 'ask', reason: UNAVAILABLE_ASK, displayReason: { en: UNAVAILABLE_ASK } } }
-    : { decision: 'deny', pre: { kind: 'deny', reason: UNAVAILABLE_DENY } }
+    ? { decision: 'ask', pre: { kind: 'ask', reason, displayReason: { en: reason } } }
+    : { decision: 'deny', pre: { kind: 'deny', reason: denial } }
+}
+
+function unavailable(topLevel: boolean): Outcome {
+  return notLetThrough(topLevel, UNAVAILABLE_ASK, UNAVAILABLE_DENY)
 }
 
 /** The numbers the table reads, from the checked answers; `undefined` if they are not what was asked for. */
@@ -452,6 +465,9 @@ function readings(result: JudgeResult): { choice: string, probabilities: Record<
  * the main agent is asked, with the judge's reading, and a child is refused, with the reading, written for the model.
  */
 export function decideCommand(result: JudgeResult, settings: JudgeSettings, topLevel: boolean): Outcome {
+  // The client's own flag, not its message: a request that holds a private key was refused, and the judge could not read it. It
+  // is asked or refused like an unavailable judge, but not called one.
+  if (!result.ok && result.reason === 'invalid' && result.opaque === true) return notLetThrough(topLevel, OPAQUE_ASK, OPAQUE_DENY)
   const seen = readings(result)
   if (seen === undefined) return unavailable(topLevel)
   const { readOnly, reversible, servesTask } = settings.commands

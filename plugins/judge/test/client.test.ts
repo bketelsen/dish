@@ -1983,6 +1983,7 @@ test('a private key in what would be sent stops the call: its mask would hide wh
     const failure = failureOf(await r.ask(request), 'invalid')
     assert.equal(failure.from, 'request', name)
     assert.equal(failure.tooBig, undefined, `${name}: not too big, so the screen does not split it and try again`)
+    assert.equal(failure.opaque, true, `${name}: and it says so, so a gate does not have to read the message`)
     assert.match(failure.message, /private key/, name)
     assert.equal(r.jev.requests.length, 0, `${name}: nothing was sent`)
     assert.equal((await r.judge.status()).calls, 0, `${name}: and it says nothing about Jev`)
@@ -2001,6 +2002,33 @@ test('a private key in what would be sent stops the call: its mask would hide wh
   r.jev.queue(ok())
   answersOf(await r.ask({ state: { command: `npm test\ngh api -H "Authorization: token ${GH}" /user` } }))
   assert.equal(r.jev.requests.length, 1)
+})
+
+test('`opaque` is on the private-key refusal and on no other result', async () => {
+  const r = await rig()
+  const header = '-----BEGIN PRIVATE KEY-----'
+  // The refusal that holds a private key, in the state and in a question.
+  assert.equal(failureOf(await r.ask({ state: { command: `npm test\n${header}\nrm -rf ~` } }), 'invalid').opaque, true)
+  assert.equal(failureOf(await r.ask({ questions: { q: { type: 'noul', instructions: `Is this fine: ${header} rm -rf ~` } } }), 'invalid').opaque, true)
+  assert.equal(r.jev.requests.length, 0)
+
+  // Every other refusal as written, by this client and by TypeSafe, and every failure of Jev, is without it, and so is an answer.
+  const others: Array<[string, () => Promise<JudgeResult>]> = [
+    ['a question that is not allowed', () => r.ask({ questions: {} })],
+    ['a state too big as given', () => r.ask({ state: 'x'.repeat(200 * 1024) })],
+    ['a state that is not JSON', () => r.ask({ state: { big: 10n } })],
+    ['a TypeSafe 422', async () => { r.jev.queue({ kind: 'status', status: 422, body: '{"detail":"no"}' }); return r.ask() }],
+    ['a TypeSafe 400 for size', async () => { r.jev.queue({ kind: 'status', status: 400, body: '{"detail":{"error_type":"max_tokens_exceeded"}}' }); return r.ask() }],
+    ['a TypeSafe 503', async () => { r.jev.queue({ kind: 'status', status: 503, body: 'down' }); return r.ask() }],
+    ['an answer', async () => { r.jev.queue(ok()); return r.ask() }],
+  ]
+  for (const [name, call] of others) {
+    const result = await call()
+    assert.equal('opaque' in result, false, name)
+  }
+  // A token alone is masked and sent: that is no refusal.
+  r.jev.queue(ok())
+  assert.equal('opaque' in await r.ask({ state: { command: `curl -H "Authorization: token ${GH}" /user` } }), false)
 })
 
 test('a failure to mask sends nothing: the call is unavailable, and what failed is not repeated', async () => {

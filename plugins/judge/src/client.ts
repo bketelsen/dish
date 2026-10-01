@@ -29,7 +29,8 @@
  *   answers are keyed by them, and they are limited to a charset already. The limits on the state (100 KB) and the body
  *   (256 KB) are checked on what is sent, since a mask can be longer than what it hides (a request that is too big as it is
  *   given is refused before that). A request with a private key's mask in it is not sent either (`OPAQUE_MASKS`: that mask takes
- *   in whatever is written around the key), and is `invalid` from the request. If the masking fails, for any reason, nothing is sent: the call is `unavailable`. What the
+ *   in whatever is written around the key), and is `invalid` from the request with `opaque: true`, which says so to a gate without its reading the message
+ *   (and is on no other result). If the masking fails, for any reason, nothing is sent: the call is `unavailable`. What the
  *   caller gave is not changed, and the log line is made from it as it was.
  * - **Statuses.** `401` is `unavailable` ("the TypeSafe key was refused"); `400` and `422` are `invalid`, with the start of
  *   what TypeSafe said; `429` and `529` are `unavailable` and start the back-off; any other non-2xx is `unavailable`.
@@ -134,17 +135,20 @@ export interface DecideOptions {
 
 export type JudgeResult =
   | { ok: true, answers: Record<string, Answer>, latencyMs: number }
-  /** Jev could not be asked, or did not answer as it should: `from` and `tooBig` are only on an `invalid` result. */
-  | { ok: false, reason: 'unavailable', message: string, from?: undefined, tooBig?: undefined }
+  /** Jev could not be asked, or did not answer as it should: `from`, `tooBig` and `opaque` are only on an `invalid` result. */
+  | { ok: false, reason: 'unavailable', message: string, from?: undefined, tooBig?: undefined, opaque?: undefined }
   /**
    * `invalid` is a request refused as written, and `from` says by whom: `'request'` is this client, before anything was
    * sent (a question id, type, option or count that isn't allowed, a state that can't be written as JSON or is too big),
    * so what to change is in the request the caller made, and `message` says what; `'server'` is TypeSafe, with a 400 or
    * 422 (an unknown model, a request its schema or its own rules refuse), which is more often the judge's configuration
    * than the caller's request. `tooBig` says it was too big (the state over 100 KB, the whole request over 256 KB, or
-   * TypeSafe's `max_tokens_exceeded`), which says nothing about Jev, and can come from either.
+   * TypeSafe's `max_tokens_exceeded`), which says nothing about Jev, and can come from either. `opaque` is set for one refusal
+   * only, and only from `'request'`: the request holds what looks like a private key, whose mask would take in what is written
+   * around it, so nothing was sent and the judge could not have read it. It is how a gate tells that from any other refusal as
+   * written (the message is for people, and no gate matches on it).
    */
-  | { ok: false, reason: 'invalid', from: 'request' | 'server', message: string, tooBig?: true }
+  | { ok: false, reason: 'invalid', from: 'request' | 'server', message: string, tooBig?: true, opaque?: true }
 
 /** A result, and what the request's `decide` made of it, if it made anything. */
 export type Asked<D extends Decision = Decision> = JudgeResult & { decided?: D }
@@ -396,7 +400,7 @@ function maskDeep(value: unknown, mask: (text: string) => string): unknown {
  * is written there: `npm test`, a fake header and `git push --force` on the next line is sent as `npm test` and a mask, and a page
  * that wraps its instructions to an agent in a fake key is sent as a mask. The judge would be asked about what is left, and its
  * answer would be about something other than what runs or what the agent reads. A scan that failed hides all of a text. A
- * request with either in what it would send is not sent: it is `invalid` from the request, which every gate takes as unavailable.
+ * request with either in what it would send is not sent: it is `invalid` from the request, with `opaque: true`.
  */
 const OPAQUE_MASKS: readonly string[] = ['‹secret: a private key›', '‹secret: an unreadable secret scan›']
 /**
@@ -658,15 +662,15 @@ function clip(text: string): string {
 type Outcome =
   | { kind: 'answers', answers: Record<string, Answer>, latencyMs: number }
   | { kind: 'failure', reason: 'unavailable', message: string, effect: 'failed' | 'none', latencyMs: number | null }
-  | { kind: 'failure', reason: 'invalid', from: 'request' | 'server', message: string, effect: 'failed' | 'none', latencyMs: number | null, tooBig?: true }
+  | { kind: 'failure', reason: 'invalid', from: 'request' | 'server', message: string, effect: 'failed' | 'none', latencyMs: number | null, tooBig?: true, opaque?: true }
 
 function failure(reason: 'unavailable', message: string, effect: 'failed' | 'none', latencyMs: number | null = null): Outcome {
   return { kind: 'failure', reason, message, effect, latencyMs }
 }
 
 /** A request refused as written, by this client (`request`) or by TypeSafe (`server`). */
-function invalid(from: 'request' | 'server', message: string, effect: 'failed' | 'none', latencyMs: number | null = null, tooBig = false): Outcome {
-  return { kind: 'failure', reason: 'invalid', from, message, effect, latencyMs, ...tooBig ? { tooBig: true as const } : {} }
+function invalid(from: 'request' | 'server', message: string, effect: 'failed' | 'none', latencyMs: number | null = null, flags: { tooBig?: boolean, opaque?: boolean } = {}): Outcome {
+  return { kind: 'failure', reason: 'invalid', from, message, effect, latencyMs, ...flags.tooBig === true ? { tooBig: true as const } : {}, ...flags.opaque === true ? { opaque: true as const } : {} }
 }
 
 /** What goes with one call while it runs. */
@@ -706,7 +710,7 @@ export function createJudge(deps: JudgeDeps): Judge {
     const questions = checkQuestions(request.questions)
     if (!questions.ok) return invalid('request', questions.message, 'none')
     const state = checkState(request.state)
-    if (!state.ok) return invalid('request', state.message, 'none', null, state.tooBig === true)
+    if (!state.ok) return invalid('request', state.message, 'none', null, { tooBig: state.tooBig === true })
     const cancelled = () => failure('unavailable', CANCELLED, 'none')
     if (request.signal?.aborted) return cancelled()
 
@@ -746,7 +750,7 @@ export function createJudge(deps: JudgeDeps): Judge {
     // Too big as it is given: refused before anything is asked of the key or masked. What is sent is checked again once it is masked.
     const bodyBytes = Buffer.byteLength(`{"model":${JSON.stringify(settings.model)},"state":${state.value},"questions":${JSON.stringify(questions.value)}}`)
     if (bodyBytes > MAX_BODY_BYTES) {
-      return invalid('request', `the request is ${kb(bodyBytes)} KB and the most is 256 KB: send less`, 'none', null, true)
+      return invalid('request', `the request is ${kb(bodyBytes)} KB and the most is 256 KB: send less`, 'none', null, { tooBig: true })
     }
 
     const timeout = limitSignal(scope.deadline - tick())
@@ -787,10 +791,10 @@ export function createJudge(deps: JudgeDeps): Judge {
       const maskedState = JSON.stringify(maskDeep(JSON.parse(state.value), hide))
       const maskedQuestions = JSON.stringify(maskQuestions(questions.value, hide))
       // Before the size: a split of what is too big would not make the judge see what a mask took in.
-      if (opaque) return invalid('request', OPAQUE_REFUSAL, 'none')
+      if (opaque) return invalid('request', OPAQUE_REFUSAL, 'none', null, { opaque: true })
       const maskedBytes = Buffer.byteLength(maskedState)
       if (maskedBytes > MAX_STATE_BYTES) {
-        return invalid('request', `state is ${kb(maskedBytes)} KB of JSON once its secrets are masked and the most is 100 KB: send the part that matters`, 'none', null, true)
+        return invalid('request', `state is ${kb(maskedBytes)} KB of JSON once its secrets are masked and the most is 100 KB: send the part that matters`, 'none', null, { tooBig: true })
       }
       sent = `{"model":${JSON.stringify(settings.model)},"state":${maskedState},"questions":${maskedQuestions}}`
     } catch {
@@ -799,7 +803,7 @@ export function createJudge(deps: JudgeDeps): Judge {
     }
     const sentBytes = Buffer.byteLength(sent)
     if (sentBytes > MAX_BODY_BYTES) {
-      return invalid('request', `the request is ${kb(sentBytes)} KB once its secrets are masked and the most is 256 KB: send less`, 'none', null, true)
+      return invalid('request', `the request is ${kb(sentBytes)} KB once its secrets are masked and the most is 256 KB: send less`, 'none', null, { tooBig: true })
     }
 
     const started = tick()
@@ -850,7 +854,7 @@ export function createJudge(deps: JudgeDeps): Judge {
     // is no sign that Jev is down, so the status doesn't take it as one; any other is, so a typo'd model shows on the page.
     if (status === 400 || status === 422) {
       const big = status === 400 && isTooManyTokens(text)
-      return invalid('server', `TypeSafe refused the request (HTTP ${status})${detail()}`, big ? 'none' : 'failed', latencyMs, big)
+      return invalid('server', `TypeSafe refused the request (HTTP ${status})${detail()}`, big ? 'none' : 'failed', latencyMs, { tooBig: big })
     }
     if (status < 200 || status > 299) return failure('unavailable', `TypeSafe answered HTTP ${status}${detail()}`, 'failed', latencyMs)
 
@@ -908,7 +912,7 @@ export function createJudge(deps: JudgeDeps): Judge {
     } else {
       const message = scope.mask(outcome.message)
       result = outcome.reason === 'invalid'
-        ? { ok: false, reason: 'invalid', from: outcome.from, message, ...outcome.tooBig === true ? { tooBig: true as const } : {} }
+        ? { ok: false, reason: 'invalid', from: outcome.from, message, ...outcome.tooBig === true ? { tooBig: true as const } : {}, ...outcome.opaque === true ? { opaque: true as const } : {} }
         : { ok: false, reason: 'unavailable', message }
     }
 

@@ -467,6 +467,40 @@ for (const { name, build } of UNAVAILABLE_CASES) {
   })
 }
 
+// --- a request that holds a private key -------------------------------------------------------------
+
+/** What the client says of a request it would not send because of a private key in it. */
+const OPAQUE: JudgeResult = { ok: false, reason: 'invalid', from: 'request', opaque: true, message: 'the request holds what looks like a private key, which is not sent to TypeSafe: nothing was sent; leave the key out' }
+const OPAQUE_ASK = 'The command needs your approval: it holds what looks like a private key, which isn\'t sent to the judge, so the judge couldn\'t read it.'
+const OPAQUE_DENY = 'The command was refused: it holds what looks like a private key, which isn\'t sent to the judge; nothing ran. Report it to the main agent instead, or leave the key out.'
+
+test('a command that holds a private key says so, not that the judge is unavailable: the main agent is asked, and a child is refused with nothing run', async () => {
+  const gate = gateOf(() => OPAQUE).gate
+  assert.deepEqual((await run(gate)).decision, { kind: 'ask', reason: OPAQUE_ASK, displayReason: { en: OPAQUE_ASK } })
+  assert.deepEqual((await run(gate, { agent: agentOf({ child: true, cwd: '/work/app' }) })).decision, { kind: 'deny', reason: OPAQUE_DENY })
+  // The word on the log line, and the cache, are the same as for any ask and deny.
+  assert.equal(decideCommand(OPAQUE, DEFAULT_SETTINGS, true).decision, 'ask')
+  assert.equal(decideCommand(OPAQUE, DEFAULT_SETTINGS, false).decision, 'deny')
+  const { gate: cached, cache } = gateOf(() => OPAQUE)
+  const main = await run(cached)
+  const child = await run(cached, { agent: agentOf({ child: true }) })
+  assert.equal(verdictFor(cache, main.exec)?.verdict, 'ask')
+  assert.equal(verdictFor(cache, child.exec)?.verdict, 'deny')
+})
+
+test('only the client\'s own flag makes it a private key: other refusals as written, with whatever words, are still an unavailable judge', async () => {
+  for (const result of [
+    { ok: false, reason: 'invalid', from: 'request', message: 'the request holds what looks like a private key' },
+    { ok: false, reason: 'invalid', from: 'request', message: 'the state is too big', tooBig: true },
+    { ok: false, reason: 'invalid', from: 'server', message: 'TypeSafe refused the request (HTTP 400)' },
+  ] as const) {
+    const main = decideCommand(result, DEFAULT_SETTINGS, true)
+    assert.equal(main.pre.kind === 'ask' && main.pre.reason, 'The command needs your approval because the judge is unavailable.')
+    const child = decideCommand(result, DEFAULT_SETTINGS, false)
+    assert.equal(child.pre.kind === 'deny' && child.pre.reason, 'The command was refused because the judge is unavailable; nothing ran. Report it to the main agent instead, or try again later.')
+  }
+})
+
 test('an unavailable judge is cached as an ask for the main agent and a deny for a child', async () => {
   const { gate, cache } = gateOf(() => DOWN)
   const main = await run(gate)
@@ -1211,7 +1245,9 @@ test('a command that a fake private key header would hide from the judge does no
   assert.equal(p.approvals.length, 1, 'the main agent\'s call is put to you')
   const child = await p.call('bash', BASH(hidden), agentOf({ child: true, cwd: '/work/app', events: [userEvent(1, 'fix the failing test in parser.ts')] }))
   assert.equal(child.isError, true)
-  assert.match(textOf(child), /the judge is unavailable; nothing ran/)
+  assert.match(textOf(child), /it holds what looks like a private key, which isn't sent to the judge; nothing ran/)
+  assert.doesNotMatch(textOf(child), /unavailable/)
+  assert.match(p.approvals[0]!.displayReason?.en ?? '', /^The command needs your approval: it holds what looks like a private key, which isn't sent to the judge, so the judge couldn't read it\.$/)
   assert.deepEqual(p.ran, [], 'nothing ran')
   assert.equal(p.jev.requests.length, 0, 'and nothing was sent to TypeSafe')
 })
