@@ -1,11 +1,11 @@
 /**
- * The History page's pure helpers: how a patch's lines are told apart, how times and authors are worded, and what
- * each outcome the store can give is called in plain language. The JSX around them is checked in a browser.
+ * The History page's pure helpers: how times and authors are worded, and what each outcome the store can give is called
+ * in plain language. (How a patch's lines are told apart is dish-kit's: `packages/dish-kit/test/ui-diff.test.ts`.) The
+ * JSX around them is checked in a browser.
  */
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { classifyPatch, patchTotals } from '../src/client/diff.ts'
 import {
   authorLabel, commitText, noCommitsText, normalizeFilter, orderProposals, relativeTime, remoteLine, shortId, subjectOf,
 } from '../src/client/format.ts'
@@ -13,83 +13,6 @@ import {
   NOTHING_TO_ACCEPT, NOTHING_TO_REVERT, STALE_TEXT, failureNotice, unexpectedNotice,
 } from '../src/client/outcome.ts'
 import type { ProposalInfo, RemoteStatus } from '../src/protocol.ts'
-
-const PATCH = [
-  'diff --git a/prompts/a.md b/prompts/a.md',
-  'index 1111111..2222222 100644',
-  '--- a/prompts/a.md',
-  '+++ b/prompts/a.md',
-  '@@ -1,3 +1,3 @@ heading',
-  ' keep',
-  '-old',
-  '+new',
-  ' tail',
-  '',
-].join('\n')
-
-test('classifyPatch tells headers, hunk markers, added, removed and context lines apart', () => {
-  const lines = classifyPatch(PATCH)
-  assert.deepEqual(lines.map(line => line.kind), [
-    'meta', 'meta', 'meta', 'meta', 'hunk', 'context', 'remove', 'add', 'context',
-  ])
-  assert.equal(lines[4]!.text, '@@ -1,3 +1,3 @@ heading')
-  assert.equal(lines[6]!.text, '-old', 'a line keeps its marker')
-  assert.equal(lines[7]!.text, '+new')
-})
-
-test('classifyPatch: the trailing newline is not a line of its own', () => {
-  assert.equal(classifyPatch('diff --git a/x b/x\n').length, 1)
-  assert.deepEqual(classifyPatch(''), [])
-})
-
-test('classifyPatch: inside a hunk a line starting with --- or +++ is a removed or added line, not a header', () => {
-  const lines = classifyPatch([
-    'diff --git a/x.md b/x.md',
-    '--- a/x.md',
-    '+++ b/x.md',
-    '@@ -1,2 +1,2 @@',
-    '--- a rule',
-    '+++ a heading',
-    '',
-  ].join('\n'))
-  assert.deepEqual(lines.map(line => line.kind), ['meta', 'meta', 'meta', 'hunk', 'remove', 'add'])
-})
-
-test('classifyPatch: "no newline" notes and empty context lines', () => {
-  const lines = classifyPatch([
-    'diff --git a/x b/x',
-    '@@ -1 +1 @@',
-    '-a',
-    '\\ No newline at end of file',
-    '+b',
-    '',
-    ' c',
-    '',
-  ].join('\n'))
-  assert.deepEqual(lines.map(line => line.kind), ['meta', 'hunk', 'remove', 'note', 'add', 'context', 'context'])
-})
-
-test('classifyPatch: several hunks, and a binary file or a new empty file with no hunk at all', () => {
-  const several = classifyPatch([
-    'diff --git a/x b/x',
-    '@@ -1 +1 @@',
-    '-a',
-    '+b',
-    '@@ -9 +9 @@',
-    '-y',
-    '+z',
-    '',
-  ].join('\n'))
-  assert.deepEqual(several.map(line => line.kind), ['meta', 'hunk', 'remove', 'add', 'hunk', 'remove', 'add'])
-
-  const none = classifyPatch('diff --git a/e b/e\nnew file mode 100644\nindex 0000000..e69de29\n')
-  assert.deepEqual(none.map(line => line.kind), ['meta', 'meta', 'meta'])
-})
-
-test('patchTotals counts the added and removed lines, and not the headers', () => {
-  assert.deepEqual(patchTotals(classifyPatch(PATCH)), { added: 1, removed: 1 })
-  assert.deepEqual(patchTotals([]), { added: 0, removed: 0 })
-})
 
 test('authorLabel: you, "<role> agent", and the store itself', () => {
   assert.equal(authorLabel({ kind: 'user' }), 'You')

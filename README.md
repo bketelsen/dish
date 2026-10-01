@@ -11,6 +11,7 @@ pnpm install
 pnpm build          # bundles each plugin's browser half (plugins/*/lib/client.js)
 pnpm dsh plugin --profile web add ./plugins/copilot
 pnpm dsh plugin --profile web add ./plugins/config
+pnpm dsh plugin --profile web add ./plugins/prompts
 pnpm web            # = dsh web; prints the UI URL (with its access token)
 ```
 
@@ -35,6 +36,7 @@ Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, termin
 |---|---|
 | [`copilot`](plugins/copilot) | GitHub Copilot as a model provider: a sign-in card on Settings → Models, plus a model list kept in step with your account (including models newer than dsh's bundled catalog). |
 | [`config`](plugins/config) | The versioned config store other plugins keep what you author in: a bare git repo pushed to GitHub, namespaces per plugin, main-agent tools with proposal branches, and a Settings → History page. |
+| [`prompts`](plugins/prompts) | Every agent's persona text in the config store: role prompts plus shared house rules, edited on Settings → Prompts with preview, default diff and history. A **dish** preset gives them to the main agent, and each agent keeps the prompt it started with. |
 
 ## Writing another plugin
 

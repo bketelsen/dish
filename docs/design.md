@@ -124,7 +124,7 @@ Each is its own bundle. "Provides" names its Cordis service; plugins depend only
 | `config-store` | `dishConfig` | — | the config git repo: namespaced documents, history, diff, revert, change events |
 | `prompts` | `dishPrompts` | `dishConfig` | role prompts plus the editor page (edit, history, diff, revert) |
 | `skills` (placeholder) | to decide | `dishConfig` | dish's own skills (the pipeline's brainstorm, plan, test-first and review procedures, and others), stored and versioned in the config store, edited in the web UI, and offered to agents through dsh's skill mechanism. Shape not discussed yet. |
-| `crew` | `crew` | `prompts`, `dishConfig` | roles, model tiers, the model-family rule, giving each delegated child its role's identity and tools, the `delegate` tool |
+| `crew` | `crew` | `prompts`, `dishConfig` | roles, model tiers, the model-family rule, giving each delegated child its role's identity and tools, the `delegate` tool. On dsh-subagent, not dsh's agent teams: see [the research note](research/2026-10-01-dsh-agent-team.md) |
 | `projects` | `projects` | `dishConfig` | the repo registry: family, role, clone path, gate command |
 | `workspaces` | `workspaces` | `projects` | clones on the VM, one worktree per task, cleanup |
 | `gates` | — | `projects` | gate execution at turn-stop, retry rounds |
