@@ -5,13 +5,17 @@
 //   node <dish-kit>/scripts/build-client.mjs [--watch]
 // The package name comes from <cwd>/package.json; the entry is
 // <cwd>/src/client/index.tsx and the output <cwd>/lib/client.js.
+// Modules the plugin asks the shell for beyond its own platform table, in
+// `dsh.client.external` of its package.json, stay require() calls too: the
+// package's own file for such a module has no runtime exports to bundle.
 // `--watch` rebuilds on change; the running dsh hot-swaps the bundle.
 import { context } from 'esbuild'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const cwd = process.cwd()
-const { name } = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'))
+const { name, dsh } = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'))
+const requested = dsh?.client?.external ?? []
 const watch = process.argv.includes('--watch')
 
 const ctx = await context({
@@ -30,6 +34,7 @@ const ctx = await context({
     '@deepseek-ai/cordis',
     '@deepseek-ai/dsh-client-store', '@deepseek-ai/dsh-client-ui-slots',
     '@deepseek-ai/dsh-client-ui-primitives', '@deepseek-ai/dsh-client-ui-dockkit',
+    ...requested,
   ],
   define: { 'process.env.NODE_ENV': '"production"' },
   banner: { js: `window.__ModuleLoader__.load({ id: ${JSON.stringify(name)}, factory: (require) => { var module = { exports: {} }; var exports = module.exports;` },
