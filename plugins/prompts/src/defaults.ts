@@ -14,11 +14,15 @@ function load(role: Role): string {
   return readFileSync(new URL(pathFor(role).slice('prompts/'.length), DIRECTORY), 'utf8')
 }
 
-/** Every shipped prompt by role: `common`, `main` and the six crew roles. */
-export const DEFAULTS: Readonly<Record<Role, string>> = Object.freeze(
-  Object.fromEntries(['common', 'main', ...CREW_ROLES].map(role => [role, load(role)])))
+/**
+ * Every shipped prompt by role: `common`, `main` and the six crew roles. It has no prototype, so a role
+ * name that is also an `Object.prototype` member (`constructor` is a legal crew role) reads as undefined.
+ */
+export const DEFAULTS: Readonly<Record<Role, string>> = Object.freeze(Object.assign(
+  Object.create(null) as Record<Role, string>,
+  Object.fromEntries(['common', 'main', ...CREW_ROLES].map(role => [role, load(role)]))))
 
 /** The shipped prompt for `role`, or `undefined` if dish ships none (a crew role the user added). */
 export function defaultText(role: Role): string | undefined {
-  return Object.hasOwn(DEFAULTS, role) ? DEFAULTS[role] : undefined
+  return DEFAULTS[role]
 }

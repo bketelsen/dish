@@ -58,11 +58,12 @@ export function roleFor(path: string): Role | undefined {
  */
 export function validate(path: string, text: string): string | undefined {
   if (roleFor(path) === undefined) {
+    // The store prefixes every message with the path, so these don't repeat it.
     if (path.startsWith(CREW_PREFIX)) {
-      return `${JSON.stringify(path)} isn't a crew prompt: prompts/crew/ holds one prompt per role, as prompts/crew/<role>.md, `
-        + 'where <role> is lowercase letters, digits and hyphens starting with a letter (and not "common" or "main")'
+      return 'not a crew prompt: use prompts/crew/<role>.md, where <role> is lowercase letters, digits and hyphens, '
+        + 'starts with a letter, and isn\'t "common" or "main"'
     }
-    return `${JSON.stringify(path)} is not a prompt document: use ${COMMON_PATH}, ${MAIN_PATH} or prompts/crew/<role>.md`
+    return `not a prompt document: use ${COMMON_PATH}, ${MAIN_PATH} or prompts/crew/<role>.md`
   }
   if (text.trim() === '') return 'a prompt can\'t be empty; use Reset to go back to the default'
   return undefined

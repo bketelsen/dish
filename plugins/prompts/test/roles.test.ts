@@ -89,16 +89,24 @@ test('validate refuses a path under prompts/crew/ that is not <role>.md', () => 
   ]) {
     const message = validate(path, 'real text')
     assert.ok(message !== undefined, `${path} should be refused`)
-    assert.match(message, /prompts\/crew\/<role>\.md/, path)
+    assert.match(message, /^not a crew prompt: use prompts\/crew\/<role>\.md, where <role> /, path)
+    // The store prefixes every message with the path, so the message must not repeat it.
+    assert.ok(!message.includes(path), `${path} is repeated in: ${message}`)
   }
+  assert.equal(
+    validate('prompts/crew/A.md', 'x'),
+    'not a crew prompt: use prompts/crew/<role>.md, where <role> is lowercase letters, digits and hyphens, '
+    + 'starts with a letter, and isn\'t "common" or "main"')
   // The path is judged before the text, so a bad path says so even when the text is empty too.
-  assert.match(validate('prompts/crew/a/b.md', '')!, /prompts\/crew\/<role>\.md/)
+  assert.match(validate('prompts/crew/a/b.md', '')!, /^not a crew prompt: /)
 })
 
 test('validate accepts a role the crew spec allows, and refuses a path that is no prompt at all', () => {
   assert.equal(validate('prompts/crew/data-2.md', 'text'), undefined)
   assert.equal(validate('prompts/crew/a.md', 'text'), undefined)
-  assert.match(validate('prompts/x.md', 'text')!, /not a prompt/)
+  assert.equal(
+    validate('prompts/x.md', 'text'),
+    'not a prompt document: use prompts/common.md, prompts/main.md or prompts/crew/<role>.md')
 })
 
 // --- namespace specs -------------------------------------------------------------------------
@@ -127,8 +135,8 @@ test('namespaceSpecs: every claim validates with the same rules as validate', ()
   }
   assert.equal(crew!.validate('prompts/crew/coder.md', ''), EMPTY_MESSAGE)
   assert.equal(crew!.validate('prompts/crew/coder.md', 'text'), undefined)
-  assert.match(crew!.validate('prompts/crew/a/b.md', 'text')!, /prompts\/crew\/<role>\.md/)
-  assert.match(crew!.validate('prompts/crew/A.md', 'text')!, /prompts\/crew\/<role>\.md/)
+  assert.match(crew!.validate('prompts/crew/a/b.md', 'text')!, /^not a crew prompt: /)
+  assert.match(crew!.validate('prompts/crew/A.md', 'text')!, /^not a crew prompt: /)
 })
 
 test('namespaceSpecs makes a fresh set each time', () => {
@@ -164,6 +172,14 @@ test('defaultText returns the role\'s default, and undefined for a role with non
 
 test('DEFAULTS cannot be changed by a caller', () => {
   assert.ok(Object.isFrozen(DEFAULTS))
+})
+
+test('DEFAULTS inherits nothing: "constructor" is a legal crew role, and has no default', () => {
+  assert.equal(Object.getPrototypeOf(DEFAULTS), null)
+  assert.equal(DEFAULTS['constructor'], undefined)
+  assert.equal(DEFAULTS['__proto__'], undefined)
+  assert.equal(DEFAULTS['toString'], undefined)
+  assert.equal(validate('prompts/crew/constructor.md', 'text'), undefined)
 })
 
 test('the shipped files are laid out like the store, one per role', () => {
