@@ -179,8 +179,8 @@ The page talks to a Typert remote, Cordis service `dishPromptsRemote`, wire name
 | `read(role)` | `Outcome<{ text, commit, defaultText, missing }>`: `missing` when the document is absent and `text` is the default |
 | `save(role, text, base, note)` | `Outcome<CommitInfo \| null>`: `null` when nothing changed |
 | `reset(role, base, note)` | `Outcome<CommitInfo \| null>`: writes the shipped default |
-| `preview(role)` | `Outcome<{ text, approximate, fallback, unknownVariables }>`: `fallback` when dsh's assembly couldn't be used and the text has markers in place of dsh's sections |
-| `variables()` | `Outcome<{ name, value }[]>`: the variables visible to the dish preset, `value` empty for per-agent ones |
+| `preview(role)` | `Outcome<{ text, approximate, fallback, unknownVariables }>`: `fallback` when dsh's assembly couldn't be used and the text has markers in place of dsh's sections; `unknownVariables` is then always `[]` |
+| `variables()` | `Outcome<{ variables: { name, value }[], fallback }>`: the variables visible to the dish preset, `value` empty for per-agent ones. With `fallback` (dsh's assembly unusable) the list is empty, and the page doesn't warn about unknown names. |
 
 ## Testing
 
