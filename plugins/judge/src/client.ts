@@ -7,26 +7,36 @@
  * - **It never throws for a Jev failure.** A missing key, a refused key, a time out, a bad status, a dropped connection, a
  *   malformed answer: each is `{ ok: false, reason: 'unavailable' }` (or `'invalid'`, for a request that was refused as
  *   written). The caller decides what that means; the gates fail closed.
- * - **It is bounded.** One request, no retries, and `timeoutMs` covers the whole call: looking the key up, the exchange and
- *   reading the body. A `429` or `529` also puts Jev out of use for a while (`retry-after`, between 1 and 60 seconds, 5 if
- *   it says nothing), and a call in that time answers `unavailable` at once without calling `fetch`: the back-off is
- *   host-wide, one client for every gate.
+ * - **It is bounded, whatever its dependencies do.** One request, no retries, and `timeoutMs` covers the whole call: the
+ *   settings lookup, the key lookup, the exchange, reading the body and the caller's `decide` hook. The caller's signal
+ *   cuts it short too. A lookup that never answers is cut off (the settings at the `timeoutMs` last seen, the shipped one
+ *   before any; the key within what is left of the call), and a `decide` always gets a few milliseconds of its own, so a
+ *   call that timed out can still be decided. A `429` or `529` also puts Jev out of use for a while (`retry-after`,
+ *   between 1 and 60 seconds, 5 if it says nothing), and a call in that time answers `unavailable` at once without calling
+ *   `fetch`: the back-off is host-wide, one client for every gate. The back-off and the latencies are measured on a
+ *   monotonic clock, so a wall clock that is set back can neither extend one nor make the other negative.
  * - **The key stays in the call.** It is resolved at the start of each call, goes into one header, and is dropped. It is not
  *   in any string the client produces: every message, log line and status passes through a mask that hides the key (as it
- *   is, JSON-escaped and URL-encoded) and an error body is cut to 200 characters first.
+ *   is, JSON-escaped and URL-encoded) and an error body is cut to 200 characters first. A call that ended before the key
+ *   was looked up, and has text of the caller's to log, looks it up for the mask.
  * - **Statuses.** `401` is `unavailable` ("the TypeSafe key was refused"); `400` and `422` are `invalid`, with the start of
  *   what TypeSafe said; `429` and `529` are `unavailable` and start the back-off; any other non-2xx is `unavailable`.
+ *   A request that is too big (the state over 100 KB, the whole body over 256 KB, or TypeSafe's `max_tokens_exceeded`) is
+ *   `invalid` with `tooBig: true`, and says nothing about Jev: it leaves the status alone.
  * - **An answer is believed only if it is what was asked for:** the right type for each question, probabilities that cover
  *   exactly the declared options and sum to 1 within 0.025, a choice that is one of its options, a score within its range.
  *
  * The client doesn't know where its log goes: `log` is a function it is given, called once for every call, whatever its
- * outcome, and never waited for. This file imports no dsh, so it can be tested against a fake server alone.
+ * outcome, and never waited for. The caller can have its decision written on that line: `decide` is called with the
+ * settled result and returns what was decided, which goes on the line and comes back as `decided`. This file imports no
+ * dsh, so it can be tested against a fake server alone.
  *
  * @module dish-judge/client
  */
 
 import { isTopLevelAgent } from 'dish-kit'
 import type { AgentLike } from 'dish-kit'
+import { DEFAULT_SETTINGS } from './settings.ts'
 import type { JudgeSettings } from './settings.ts'
 
 /** Anything JSON can hold. */
@@ -56,7 +66,18 @@ export type Purpose = 'command' | 'approval' | 'screen' | 'ask'
  */
 export type JudgeAgent = AgentLike & { readonly id?: unknown }
 
-export interface JudgeRequest {
+/**
+ * What a caller decided from a result, as the log line has it. A caller can return more than this (its own verdict, its
+ * reason), and gets it all back as `decided`.
+ */
+export interface Decision {
+  /** What was decided, in a word: `allow`, `ask`, `deny`, `withhold`, `warn`, `pass`. Shown on the page. */
+  decision: string
+  /** The id of content the log kept because the decision withheld it from an agent, if it did. */
+  withheld?: string
+}
+
+export interface JudgeRequest<D extends Decision = Decision> {
   /** What is judged: a string, an object or an array, at most 100 KB of JSON. */
   state: JsonValue
   /** One to many questions, keyed by ids of lower-case letters, digits and underscores, starting with a letter. */
@@ -71,11 +92,29 @@ export interface JudgeRequest {
   callId?: string
   /** What the line says was judged: the command, the tool and size of a result, or `ask_judge`. */
   subject?: string
+  /**
+   * What the caller decides from the result, for the log. It is called with the result of every call, an answer or a
+   * failure, once that is settled (with the key masked out of its message) and before the line is written, and what it
+   * returns is the line's `decision` (and `withheld`) and comes back as `decided`.
+   *
+   * It has the call's time limit, with a little time of its own if Jev used all of it, so a call that timed out can
+   * still be decided. If it throws, rejects, takes too long or returns no `decision`, the line has `decision: null` and
+   * says "decide failed: …", and the result has no `decided`: a caller that needs a decision must treat that as its
+   * failure case.
+   */
+  decide?: (result: JudgeResult) => D | Promise<D>
 }
 
 export type JudgeResult =
   | { ok: true, answers: Record<string, Answer>, latencyMs: number }
-  | { ok: false, reason: 'unavailable' | 'invalid', message: string }
+  /**
+   * `invalid` is a request TypeSafe, or this client, refused as written; `tooBig` says it was too big (the state over
+   * 100 KB, the whole request over 256 KB, or TypeSafe's `max_tokens_exceeded`), which says nothing about Jev.
+   */
+  | { ok: false, reason: 'unavailable' | 'invalid', message: string, tooBig?: true }
+
+/** A result, and what the request's `decide` made of it, if it made anything. */
+export type Asked<D extends Decision = Decision> = JudgeResult & { decided?: D }
 
 /**
  * Where Jev stands, from the last 100 calls.
@@ -83,21 +122,29 @@ export type JudgeResult =
  * `p50` and `p95` are the latencies of the last 100 calls that **returned answers**: a failed call (a timeout, an error
  * status, a malformed answer) is not counted, so the figures say how fast Jev is when it works, not how long a failure
  * took. They are `null` until there is such a call.
+ *
+ * `calls` and `failures` are over the last 100 calls that tried Jev, whether they returned answers or failed: `failures`
+ * of the `calls` did not (a time out is one). A call that says nothing about Jev is in neither: one refused as written
+ * or as too big, one without a key, one that was cancelled, one skipped in a back-off.
  */
 export interface JudgeStatus {
-  /** Whether there is a usable key now. */
+  /** Whether there is a usable key now. A lookup that fails, or takes longer than the call's time limit, is no key. */
   keySet: boolean
   /**
    * `no-key` without a key. Otherwise `unavailable` while Jev is being skipped (a `429` or `529`) or when the last call that
-   * was sent got no answers (a `400` or `422` is that too), and `ok` if not, including before any call.
+   * tried Jev got no answers (a `400` or `422` that isn't about size is that too), and `ok` if not, including before any call.
    */
   state: 'ok' | 'unavailable' | 'no-key'
-  /** The message of the last call that was sent and got no answers; kept after a success, with `lastErrorAt`. */
+  /** The message of the last call that tried Jev and got no answers; kept after a success, with `lastErrorAt`. */
   lastError?: string
   lastErrorAt?: number
   lastOkAt?: number
   p50: number | null
   p95: number | null
+  /** How many calls the window holds, at most 100. */
+  calls: number
+  /** How many of them failed. */
+  failures: number
 }
 
 /** The `judge` service: one place that asks Jev, for the gates, the screen and `ask_judge`. */
@@ -106,10 +153,10 @@ export interface Judge {
    * One Jev call: one state, any number of typed questions. Never throws for a Jev failure: it returns `{ ok: false }`.
    * A request that is refused before it is sent (`invalid`) is not a failure of Jev and does not change the status.
    */
-  ask(request: JudgeRequest): Promise<JudgeResult>
+  ask<D extends Decision = Decision>(request: JudgeRequest<D>): Promise<Asked<D>>
   /**
    * The status now. It is asynchronous because whether there is a key is looked up afresh (the key is only ever held for
-   * the length of a call); it never calls Jev.
+   * the length of a call); it never calls Jev, and a key lookup that hangs is cut off like a call's.
    */
   status(): Promise<JudgeStatus>
 }
@@ -122,26 +169,29 @@ declare module '@deepseek-ai/cordis' {
 }
 
 /**
- * One line of the decision log, as the spec's "The log" has it. The client writes one for every call it handles, with
- * `decision: null`: it knows what Jev said and how long it took, not what the caller did about it.
+ * One line of the decision log. The client writes one for every call it handles; `decision` and `withheld` are what the
+ * caller's `decide` said, and `decision` is `null` without one (or when it failed).
  */
 export interface LogLine {
   /** When the call began, in ms since the epoch. */
   at: number
   purpose: Purpose
-  /** The asking agent's session id, or `null` with no agent. */
-  agent: string | null
-  /** Whether the asker is a child: an agent that isn't plainly the main one counts as one. */
-  child: boolean
-  tool: string | null
-  callId: string | null
+  /** The asking agent's session id. Left off with no agent. */
+  agent?: string
+  /** Whether the asker is a child: an agent that isn't plainly the main one counts as one. Left off with no agent. */
+  child?: boolean
+  /** Left off when the caller gave none. */
+  tool?: string
+  callId?: string
   subject: string
-  /** The checked answers, or `null` when there were none. */
-  answers: Record<string, Answer> | null
+  /** The checked answers: `{}` when there were none. */
+  answers: Record<string, Answer>
   decision: string | null
+  /** The id of withheld content, when the decision withheld some. Left off otherwise. */
+  withheld?: string
   /** How long Jev took; `null` when it wasn't called. */
   latencyMs: number | null
-  /** Why the call failed, with the key masked; `null` for an answer. */
+  /** Why the call failed, or why its `decide` did, with the key masked; `null` for a call that came to a decision. */
   error: string | null
 }
 
@@ -154,15 +204,21 @@ export interface JudgeDeps {
   settings: () => Promise<JudgeSettings>
   /** Where each call is recorded. It is called, never waited for, and may throw or reject: nothing comes of it. */
   log: (line: LogLine) => void | Promise<void>
-  /** The clock, in ms since the epoch. For tests. */
+  /** The wall clock, in ms since the epoch: for `at`, `lastOkAt` and `retry-after` dates. For tests. */
   now?: () => number
+  /** A monotonic clock, in ms: for the back-off, the time limit and the latencies. Defaults to `performance.now()`. */
+  tick?: () => number
 }
 
 /** The most of `state`, as JSON text in UTF-8: Jev's own limit is 32k tokens for `state` and the longest question. */
 export const MAX_STATE_BYTES = 100 * 1024
+/** The most of the whole request body, `state` and the questions together, in UTF-8. */
+export const MAX_BODY_BYTES = 256 * 1024
 
-/** How many answered calls the latencies are over. */
-const LATENCY_WINDOW = 100
+/** How many calls the status is over: the latencies of the answered ones, and how many calls and failures there were. */
+const WINDOW = 100
+/** The time a `decide` gets at the least, when Jev used up the call's time limit: enough for a quick one, and no more. */
+const DECIDE_FLOOR_MS = 50
 /** `retry-after`, in ms: the least, the most and the guess when it says nothing usable. */
 const BACK_OFF = { min: 1_000, max: 60_000, fallback: 5_000 } as const
 /** The most of an error body that is read, and of an answer. */
@@ -178,8 +234,8 @@ const CANCELLED = 'the call to the judge was cancelled'
 const MASKED = '‹key›'
 
 const QUESTION_ID = /^[a-z][a-z0-9_]*$/
-/** A choice's option: letters, digits and underscores, with spaces and hyphens after the first character, up to 64 in all. */
-const CHOICE_OPTION = /^[A-Za-z0-9_][A-Za-z0-9_ -]{0,63}$/
+/** C0 and C1 control characters, and DEL. */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/
 /** What a header value can safely be for a bearer token: visible ASCII, no spaces. */
 const HEADER_SAFE = /^[\x21-\x7e]+$/
 
@@ -203,9 +259,17 @@ function describe(error: unknown): string {
 
 // --- checking the request -------------------------------------------------------------------------
 
-type Checked<T> = { ok: true, value: T } | { ok: false, message: string }
+type Checked<T> = { ok: true, value: T } | { ok: false, message: string, tooBig?: true }
 
 const bad = (message: string): { ok: false, message: string } => ({ ok: false, message })
+
+/**
+ * Whether `option` can be a choice's option. It is what Jev is asked to pick between, so it should mean something to it (a
+ * file path, a name, a word): 1–64 characters with no whitespace at either end, no control characters, and not `__proto__`.
+ */
+function isOption(option: string): boolean {
+  return option.length >= 1 && option.length <= 64 && option === option.trim() && !CONTROL.test(option) && option !== '__proto__'
+}
 
 /**
  * The questions as they will go on the wire: only the fields Jev knows, and every rule of the spec checked. The first
@@ -237,16 +301,17 @@ function checkQuestions(questions: unknown): Checked<Record<string, Question>> {
       if (!isRecord(criteria)) return bad(`question ${name} needs criteria: an object of 2–255 options, each a description or null`)
       const options = Object.keys(criteria)
       if (options.length < 2 || options.length > 255) return bad(`question ${name}: a choice needs 2–255 options, got ${options.length}`)
-      const described: Record<string, string | null> = {}
+      const described: Array<[string, string | null]> = []
       for (const option of options) {
-        if (!CHOICE_OPTION.test(option) || option === '__proto__') {
-          return bad(`question ${name}: option ${JSON.stringify(option.length > 40 ? `${option.slice(0, 40)}…` : option)} is not allowed: options are 1–64 characters of letters, digits, _, - and spaces, not starting with a space or -`)
+        if (!isOption(option)) {
+          return bad(`question ${name}: option ${JSON.stringify(option.length > 40 ? `${option.slice(0, 40)}…` : option)} is not allowed: options are 1–64 characters with no whitespace at either end and no control characters, and not __proto__`)
         }
         const description = criteria[option]
         if (description !== null && !isText(description)) return bad(`question ${name}: the description of option ${JSON.stringify(option)} must be a non-empty string or null`)
-        described[option] = description
+        described.push([option, description])
       }
-      wire[id] = { type, instructions, criteria: described }
+      // `fromEntries` defines each option as a property of its own, whatever it is called.
+      wire[id] = { type, instructions, criteria: Object.fromEntries(described) }
     } else {
       if (!Array.isArray(criteria)) return bad(`question ${name} needs criteria: a list of 2–10 levels, from low to high`)
       if (criteria.length < 2 || criteria.length > 10) return bad(`question ${name}: a score needs 2–10 levels, got ${criteria.length}`)
@@ -264,7 +329,7 @@ function checkQuestions(questions: unknown): Checked<Record<string, Question>> {
 /** The JSON text of `state`, if it is a string, an object or an array that JSON can hold, within the limit. */
 function checkState(state: unknown): Checked<string> {
   const shape = 'state must be a string, an object or an array that can be written as JSON'
-  if (typeof state === 'string' && state.length > MAX_STATE_BYTES) return bad(tooBig(state.length))
+  if (typeof state === 'string' && state.length > MAX_STATE_BYTES) return tooBig(`state is ${kb(state.length)} KB of JSON and the most is 100 KB: send the part that matters`)
   let text: string | undefined
   try {
     text = JSON.stringify(state)
@@ -275,12 +340,15 @@ function checkState(state: unknown): Checked<string> {
   // whatever a `toJSON` turned into one of them do not.
   if (text === undefined || (text[0] !== '"' && text[0] !== '{' && text[0] !== '[')) return bad(shape)
   const bytes = Buffer.byteLength(text)
-  if (bytes > MAX_STATE_BYTES) return bad(tooBig(bytes))
+  if (bytes > MAX_STATE_BYTES) return tooBig(`state is ${kb(bytes)} KB of JSON and the most is 100 KB: send the part that matters`)
   return { ok: true, value: text }
 }
 
-function tooBig(bytes: number): string {
-  return `state is ${Math.ceil(bytes / 1024)} KB of JSON and the most is 100 KB: send the part that matters`
+const kb = (bytes: number): number => Math.ceil(bytes / 1024)
+
+/** A refusal for being too big: says nothing about Jev. */
+function tooBig(message: string): { ok: false, message: string, tooBig: true } {
+  return { ok: false, message, tooBig: true }
 }
 
 // --- checking the answer --------------------------------------------------------------------------
@@ -442,77 +510,148 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   })
 }
 
-/** `nearest-rank` percentile of an ascending list. */
+/** A signal that aborts after `ms`, which a clock reading can leave fractional or negative: `AbortSignal.timeout` takes whole numbers. */
+function limitSignal(ms: number): AbortSignal {
+  return AbortSignal.timeout(Number.isFinite(ms) ? Math.max(0, Math.ceil(ms)) : 0)
+}
+
+/** `promise`, or a rejection with `what` once `ms` have passed. */
+function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(what)), Number.isFinite(ms) ? Math.max(0, ms) : 0)
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error: unknown) => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+/** The nearest-rank percentile of an ascending list. */
 function percentile(sorted: readonly number[], p: number): number {
   return sorted[Math.max(0, Math.ceil(p * sorted.length / 100) - 1)]!
 }
 
+/** Whether a `400`'s body says TypeSafe's `max_tokens_exceeded`: the request was too big for it. */
+function isTooManyTokens(text: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return isRecord(parsed) && isRecord(parsed.detail) && parsed.detail.error_type === 'max_tokens_exceeded'
+  } catch {
+    return false
+  }
+}
+
+/** `text` cut to the length of an error excerpt. */
+function clip(text: string): string {
+  return text.length > EXCERPT_CHARS ? `${text.slice(0, EXCERPT_CHARS - 1)}…` : text
+}
+
 /**
  * What a call came to, before it is logged and turned into a result. `effect` says what it means for the status:
- * `failed` for a call that was sent and got no answers (or could not be sent for a reason that is Jev's side of things:
- * a key it can't use, a time out), `none` for one that says nothing about Jev (a request refused as written, no key, a
- * cancel, a call skipped in a back-off).
+ * `failed` for a call that tried Jev and got no answers (or could not try for a reason that is Jev's side of things: a
+ * key it can't use, a time out), `none` for one that says nothing about Jev (a request refused as written or as too big,
+ * no key, a cancel, a call skipped in a back-off).
  */
 type Outcome =
   | { kind: 'answers', answers: Record<string, Answer>, latencyMs: number }
-  | { kind: 'failure', reason: 'unavailable' | 'invalid', message: string, effect: 'failed' | 'none', latencyMs: number | null }
+  | { kind: 'failure', reason: 'unavailable' | 'invalid', message: string, effect: 'failed' | 'none', latencyMs: number | null, tooBig?: true }
 
-function failure(reason: 'unavailable' | 'invalid', message: string, effect: 'failed' | 'none', latencyMs: number | null = null): Outcome {
-  return { kind: 'failure', reason, message, effect, latencyMs }
+function failure(reason: 'unavailable' | 'invalid', message: string, effect: 'failed' | 'none', latencyMs: number | null = null, tooBig = false): Outcome {
+  return { kind: 'failure', reason, message, effect, latencyMs, ...tooBig ? { tooBig: true as const } : {} }
 }
 
-/** What goes with one call while it runs: how to hide the key once there is one. */
+/** What goes with one call while it runs. */
 interface Scope {
+  /** Hides the key, once there is one. */
   mask: (text: string) => string
+  /** Whether the key was looked up, so `mask` is as good as it will get. */
+  keyLooked: boolean
+  /** When the call's time limit ends, on the monotonic clock, and how long that limit is. */
+  deadline: number
+  limit: number
 }
 
 export function createJudge(deps: JudgeDeps): Judge {
   const now = deps.now ?? Date.now
+  const tick = deps.tick ?? (() => performance.now())
   const endpoint = `${deps.baseUrl.replace(/\/+$/, '')}/v1/systemone`
 
   /** The latencies of the last answered calls, oldest first. */
   const latencies: number[] = []
-  /** Jev is out of use until this time: a `429` or `529` said so. */
-  let skipUntil = 0
+  /** The last calls that tried Jev, oldest first: whether each returned answers. */
+  const recent: boolean[] = []
+  /** Jev is out of use until this time, on the monotonic clock: a `429` or `529` said so. */
+  let skipUntil = Number.NEGATIVE_INFINITY
+  /** The time limit of the settings last read: what a lookup that never answers is held to. Before any, the shipped one. */
+  let lastLimit = DEFAULT_SETTINGS.timeoutMs
   let lastFailed = false
   let lastOkAt: number | undefined
   let lastError: string | undefined
   let lastErrorAt: number | undefined
 
   /** The call itself, up to what it came to. It may throw only for a mistake in this file. */
-  async function run(request: JudgeRequest, scope: Scope): Promise<Outcome> {
+  async function run(request: JudgeRequest<Decision>, scope: Scope, begun: number): Promise<Outcome> {
     const questions = checkQuestions(request.questions)
     if (!questions.ok) return failure('invalid', questions.message, 'none')
     const state = checkState(request.state)
-    if (!state.ok) return failure('invalid', state.message, 'none')
-    if (request.signal?.aborted) return failure('unavailable', CANCELLED, 'none')
+    if (!state.ok) return failure('invalid', state.message, 'none', null, state.tooBig === true)
+    const cancelled = () => failure('unavailable', CANCELLED, 'none')
+    if (request.signal?.aborted) return cancelled()
 
-    // A call in a back-off is answered before anything else is looked up.
-    const waiting = skipUntil - now()
+    // A call in a back-off is answered before anything else is looked up. A clock that went back can't make the wait longer
+    // than a back-off ever is.
+    let waiting = skipUntil - tick()
+    if (waiting > BACK_OFF.max) {
+      skipUntil = tick() + BACK_OFF.max
+      waiting = BACK_OFF.max
+    }
     if (waiting > 0) {
       return failure('unavailable', `TypeSafe asked for a pause: skipping the judge for another ${Math.ceil(waiting / 1000)} s`, 'none')
     }
 
+    // The settings are read from the config store, which may be queued behind something that never ends: the lookup is held
+    // to the time limit the settings last had, and to the caller's signal.
+    const lookupLimit = lastLimit
+    const lookupTimeout = limitSignal(lookupLimit)
+    const lookupGuard = request.signal === undefined ? lookupTimeout : AbortSignal.any([request.signal, lookupTimeout])
     let settings: JudgeSettings
     try {
-      settings = await deps.settings()
+      settings = await untilAborted(Promise.resolve().then(deps.settings), lookupGuard)
     } catch {
+      if (request.signal?.aborted) return cancelled()
+      if (lookupTimeout.aborted) return failure('unavailable', `reading the judge settings timed out after ${lookupLimit} ms`, 'failed')
       return failure('unavailable', 'could not read the judge settings', 'failed')
     }
+    if (typeof settings.timeoutMs !== 'number' || !Number.isFinite(settings.timeoutMs) || settings.timeoutMs <= 0) {
+      return failure('unavailable', 'could not read the judge settings', 'failed')
+    }
+    lastLimit = settings.timeoutMs
+    // From here on the whole call has `timeoutMs`, counted from when it began: what the settings lookup took is not
+    // given back, so a slow store can't stretch the call.
+    scope.limit = settings.timeoutMs
+    scope.deadline = begun + settings.timeoutMs
 
-    // From here on the whole call has `timeoutMs`: the key lookup too, so a credential store that hangs can't hang a gate.
-    const timeout = AbortSignal.timeout(settings.timeoutMs)
+    const body = `{"model":${JSON.stringify(settings.model)},"state":${state.value},"questions":${JSON.stringify(questions.value)}}`
+    const bodyBytes = Buffer.byteLength(body)
+    if (bodyBytes > MAX_BODY_BYTES) {
+      return failure('invalid', `the request is ${kb(bodyBytes)} KB and the most is 256 KB: send less`, 'none', null, true)
+    }
+
+    const timeout = limitSignal(scope.deadline - tick())
     const signal = request.signal === undefined ? timeout : AbortSignal.any([request.signal, timeout])
-    const timedOut = (what: string, latencyMs: number | null = null) => failure('unavailable', `${what} timed out after ${settings.timeoutMs} ms`, 'failed', latencyMs)
+    const timedOut = (what: string, latencyMs: number | null = null) => failure('unavailable', `${what} timed out after ${scope.limit} ms`, 'failed', latencyMs)
 
+    // So a credential store that hangs can't hang a gate: the key lookup is inside the time limit too.
     let key: string | undefined
     try {
       key = cleanKey(await untilAborted(Promise.resolve().then(deps.key), signal))
     } catch {
-      if (request.signal?.aborted) return failure('unavailable', CANCELLED, 'none')
+      if (request.signal?.aborted) return cancelled()
       if (timeout.aborted) return timedOut('reading the TypeSafe key')
       // What the credential store said is not repeated: it may be a line of the file the key is in.
       return failure('unavailable', 'could not read the TypeSafe key from the credential store', 'failed')
+    } finally {
+      scope.keyLooked = true
     }
     if (key === undefined) return failure('unavailable', NO_KEY, 'none')
     if (!HEADER_SAFE.test(key)) {
@@ -520,8 +659,8 @@ export function createJudge(deps: JudgeDeps): Judge {
     }
     scope.mask = maskerFor(key)
 
-    const body = `{"model":${JSON.stringify(settings.model)},"state":${state.value},"questions":${JSON.stringify(questions.value)}}`
-    const started = now()
+    const started = tick()
+    const elapsed = () => Math.max(0, Math.round(tick() - started))
     let status: number
     let retryAfter: string | null
     let text = ''
@@ -543,18 +682,14 @@ export function createJudge(deps: JudgeDeps): Judge {
         ({ text, truncated } = await readText(response, response.ok ? MAX_ANSWER_BYTES : MAX_ERROR_BYTES))
       }
     } catch (error) {
-      const latencyMs = now() - started
-      if (request.signal?.aborted) return failure('unavailable', CANCELLED, 'none', latencyMs)
-      if (timeout.aborted) return timedOut('the call to TypeSafe', latencyMs)
-      return failure('unavailable', `could not reach TypeSafe: ${describeNetworkError(error)}`, 'failed', latencyMs)
+      if (request.signal?.aborted) return failure('unavailable', CANCELLED, 'none', elapsed())
+      if (timeout.aborted) return timedOut('the call to TypeSafe', elapsed())
+      return failure('unavailable', `could not reach TypeSafe: ${describeNetworkError(error)}`, 'failed', elapsed())
     }
-    const latencyMs = now() - started
+    const latencyMs = elapsed()
 
     /** The start of an error body, with the key hidden first, whitespace made plain and the whole cut to 200 characters. */
-    const excerpt = (): string => {
-      const flat = scope.mask(refusalText(text)).replace(/[\s\x00-\x1f\x7f]+/g, ' ').trim()
-      return flat.length > EXCERPT_CHARS ? `${flat.slice(0, EXCERPT_CHARS - 1)}…` : flat
-    }
+    const excerpt = (): string => clip(scope.mask(refusalText(text)).replace(/[\s\x00-\x1f\x7f]+/g, ' ').trim())
     const detail = (): string => {
       const shown = excerpt()
       return shown === '' ? '' : `: ${shown}`
@@ -563,13 +698,17 @@ export function createJudge(deps: JudgeDeps): Judge {
     if (status === 401) return failure('unavailable', 'the TypeSafe key was refused', 'failed', latencyMs)
     if (status === 429 || status === 529) {
       const pause = backOffMs(retryAfter, now())
-      skipUntil = Math.max(skipUntil, now() + pause)
+      skipUntil = Math.max(skipUntil, tick() + pause)
       const why = status === 429 ? 'is rate-limiting the judge' : 'is overloaded'
       return failure('unavailable', `TypeSafe ${why} (HTTP ${status}): skipping it for ${Math.ceil(pause / 1000)} s`, 'failed', latencyMs)
     }
     // TypeSafe says 422 for a request that fails its schema and 400 for one its own rules refuse (an unknown model, too many
-    // score levels, too many tokens): either way the request, as written, is what it won't take.
-    if (status === 400 || status === 422) return failure('invalid', `TypeSafe refused the request (HTTP ${status})${detail()}`, 'failed', latencyMs)
+    // score levels, too many tokens): either way the request, as written, is what it won't take. One that is too big for it
+    // is no sign that Jev is down, so the status doesn't take it as one; any other is, so a typo'd model shows on the page.
+    if (status === 400 || status === 422) {
+      const big = status === 400 && isTooManyTokens(text)
+      return failure('invalid', `TypeSafe refused the request (HTTP ${status})${detail()}`, big ? 'none' : 'failed', latencyMs, big)
+    }
     if (status < 200 || status > 299) return failure('unavailable', `TypeSafe answered HTTP ${status}${detail()}`, 'failed', latencyMs)
 
     const malformed = (problem: string) => failure('unavailable', `the judge's answer was malformed: ${problem}`, 'failed', latencyMs)
@@ -585,77 +724,135 @@ export function createJudge(deps: JudgeDeps): Judge {
     return { kind: 'answers', answers: checked.answers, latencyMs }
   }
 
-  /** Record the call in the status and the log, and make the result. */
-  function settle(request: JudgeRequest, at: number, outcome: Outcome, scope: Scope): JudgeResult {
+  /** Put a call into the status: the window of calls, the latencies, the last success and the last error. */
+  function record(outcome: Outcome, message: string | undefined): void {
+    if (outcome.kind === 'answers') {
+      latencies.push(outcome.latencyMs)
+      if (latencies.length > WINDOW) latencies.shift()
+      recent.push(true)
+      lastFailed = false
+      lastOkAt = now()
+    } else if (outcome.effect === 'failed') {
+      recent.push(false)
+      lastFailed = true
+      lastError = message
+      lastErrorAt = now()
+    }
+    if (recent.length > WINDOW) recent.shift()
+  }
+
+  /**
+   * Make the result of a call and write its line. The status is updated first, then the key is looked up for the mask if the
+   * call ended before it was (and has text of the caller's to hide it from), then `decide` is called, and the line is
+   * written last, without waiting for it.
+   */
+  async function settle<D extends Decision>(request: JudgeRequest<D>, at: number, outcome: Outcome, scope: Scope): Promise<Asked<D>> {
+    const message = outcome.kind === 'failure' ? scope.mask(outcome.message) : undefined
+    record(outcome, message)
+
     const agentId = request.agent?.id
+    const given = (value: unknown): value is string => typeof value === 'string' && value !== ''
+    const hasText = given(request.subject) || given(request.tool) || given(request.callId) || typeof agentId === 'string' || typeof agentId === 'number'
+    if (!scope.keyLooked && (hasText || typeof request.decide === 'function')) {
+      scope.keyLooked = true
+      try {
+        const key = cleanKey(await within(Promise.resolve().then(deps.key), Math.max(DECIDE_FLOOR_MS, scope.deadline - tick()), 'the key lookup took too long'))
+        if (key !== undefined) scope.mask = maskerFor(key)
+      } catch {
+        // No key to hide, or none that could be found in time.
+      }
+    }
+
+    let result: JudgeResult
+    if (outcome.kind === 'answers') {
+      result = { ok: true, answers: outcome.answers, latencyMs: outcome.latencyMs }
+    } else {
+      result = { ok: false, reason: outcome.reason, message: scope.mask(outcome.message), ...outcome.tooBig === true ? { tooBig: true as const } : {} }
+    }
+
     const line: LogLine = {
       at,
       purpose: request.purpose,
-      agent: typeof agentId === 'string' ? agentId : typeof agentId === 'number' ? String(agentId) : null,
-      child: request.agent !== undefined && !isTopLevelAgent(request.agent),
-      tool: typeof request.tool === 'string' ? request.tool : null,
-      callId: typeof request.callId === 'string' ? request.callId : null,
       subject: scope.mask(typeof request.subject === 'string' ? request.subject : ''),
-      answers: null,
+      answers: outcome.kind === 'answers' ? structuredClone(outcome.answers) : {},
       decision: null,
       latencyMs: outcome.latencyMs,
-      error: null,
+      error: result.ok ? null : result.message,
     }
-    let result: JudgeResult
-    if (outcome.kind === 'answers') {
-      latencies.push(outcome.latencyMs)
-      if (latencies.length > LATENCY_WINDOW) latencies.shift()
-      lastFailed = false
-      lastOkAt = now()
-      line.answers = structuredClone(outcome.answers)
-      result = { ok: true, answers: outcome.answers, latencyMs: outcome.latencyMs }
-    } else {
-      const message = scope.mask(outcome.message)
-      if (outcome.effect === 'failed') {
-        lastFailed = true
-        lastError = message
-        lastErrorAt = now()
+    if (request.agent !== undefined) {
+      if (typeof agentId === 'string' || typeof agentId === 'number') line.agent = scope.mask(String(agentId))
+      line.child = !isTopLevelAgent(request.agent)
+    }
+    if (given(request.tool)) line.tool = scope.mask(request.tool)
+    if (given(request.callId)) line.callId = scope.mask(request.callId)
+
+    let decided: D | undefined
+    if (typeof request.decide === 'function') {
+      const hook = request.decide
+      try {
+        const value: unknown = await within(
+          Promise.resolve().then(() => hook(result)),
+          Math.max(DECIDE_FLOOR_MS, scope.deadline - tick()),
+          'it took longer than the time limit',
+        )
+        const said = value as Partial<Decision> | null
+        if (said === null || typeof said !== 'object' || typeof said.decision !== 'string' || (said.withheld !== undefined && typeof said.withheld !== 'string')) {
+          throw new Error('it returned no decision')
+        }
+        decided = value as D
+        line.decision = scope.mask(decided.decision)
+        if (decided.withheld !== undefined) line.withheld = decided.withheld
+      } catch (error) {
+        const problem = `decide failed: ${clip(scope.mask(describe(error)))}`
+        line.error = line.error === null ? problem : `${line.error}; ${problem}`
       }
-      line.error = message
-      result = { ok: false, reason: outcome.reason, message }
     }
+
     try {
       Promise.resolve(deps.log(line)).catch(() => {})
     } catch {
       // A log that can't be written to is not a reason to fail a call.
     }
-    return result
+    return decided === undefined ? result : { ...result, decided }
   }
 
   return {
-    async ask(request) {
+    async ask<D extends Decision = Decision>(request: JudgeRequest<D>): Promise<Asked<D>> {
       const at = now()
-      const scope: Scope = { mask: text => text }
+      const begun = tick()
+      const scope: Scope = { mask: text => text, keyLooked: false, deadline: begun + lastLimit, limit: lastLimit }
       let outcome: Outcome
       try {
-        outcome = await run(request, scope)
+        outcome = await run(request as JudgeRequest<Decision>, scope, begun)
       } catch (error) {
         outcome = failure('unavailable', `the judge failed unexpectedly: ${describe(error)}`, 'failed')
       }
-      return settle(request, at, outcome, scope)
+      try {
+        return await settle(request, at, outcome, scope)
+      } catch (error) {
+        // A mistake in settling: the call has still to come back, and as a failure.
+        return { ok: false, reason: 'unavailable', message: clip(scope.mask(`the judge failed unexpectedly: ${describe(error)}`)) }
+      }
     },
 
     async status() {
       let keySet = false
       try {
-        keySet = cleanKey(await deps.key()) !== undefined
+        keySet = cleanKey(await untilAborted(Promise.resolve().then(deps.key), limitSignal(lastLimit))) !== undefined
       } catch {
-        // Not a key we can use.
+        // Not a key we can use, or not one in time.
       }
       const sorted = [...latencies].sort((a, b) => a - b)
       return {
         keySet,
-        state: !keySet ? 'no-key' : lastFailed || skipUntil > now() ? 'unavailable' : 'ok',
+        state: !keySet ? 'no-key' : lastFailed || skipUntil > tick() ? 'unavailable' : 'ok',
         ...lastError === undefined ? {} : { lastError },
         ...lastErrorAt === undefined ? {} : { lastErrorAt },
         ...lastOkAt === undefined ? {} : { lastOkAt },
         p50: sorted.length === 0 ? null : percentile(sorted, 50),
         p95: sorted.length === 0 ? null : percentile(sorted, 95),
+        calls: recent.length,
+        failures: recent.filter(answered => !answered).length,
       }
     },
   }

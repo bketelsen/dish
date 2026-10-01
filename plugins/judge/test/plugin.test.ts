@@ -470,6 +470,139 @@ test('a store that throws instead of rejecting still gives the default', async (
   }
 })
 
+// --- a store that is slow, or never answers ---------------------------------------------------------
+
+/** A logger that keeps what it is told. */
+function collector(): { warn(format: string, ...args: unknown[]): void, lines: string[] } {
+  const lines: string[] = []
+  return { lines, warn: (format, ...args) => { lines.push(format.replace(/%s/g, () => String(args.shift()))) } }
+}
+
+/** A store whose reads are answered by `answer`, counting them. */
+function countingStore(answer: (call: number) => Promise<string | undefined>): { store: () => { read(path: string): Promise<string | undefined> }, reads: () => number } {
+  let reads = 0
+  return { store: () => ({ read: () => answer(++reads) }), reads: () => reads }
+}
+
+const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+const wait = <T>() => new Promise<T>(() => {})
+
+test('the read budget is 200 ms', () => {
+  assert.equal(plugin.SETTINGS_READ_BUDGET_MS, 200)
+})
+
+test('a store that never answers: after the budget settings() gives the shipped default, says so once, and asks the store once', async () => {
+  const log = collector()
+  const { store, reads } = countingStore(() => wait())
+  const settings = plugin.createSettingsReader(store, log, 40)
+  const started = performance.now()
+  assert.equal(await settings(), DEFAULT_SETTINGS)
+  const elapsed = performance.now() - started
+  assert.ok(elapsed >= 35 && elapsed < 40 + 150, `took ${elapsed} ms`)
+  assert.equal(log.lines.length, 1, log.lines.join('\n'))
+  assert.match(log.lines[0]!, /took more than 40 ms; using the shipped default until it answers/)
+  // more calls, one at a time and together, join the read that is going: the store is not asked again and again
+  assert.equal(await settings(), DEFAULT_SETTINGS)
+  await Promise.all([settings(), settings(), settings()])
+  assert.equal(reads(), 1)
+  assert.equal(log.lines.length, 1, 'said once')
+})
+
+test('a store that is slow but within the budget gives what it read, and a later edit shows at once', async () => {
+  const log = collector()
+  let text = shippedWith((d) => { d.timeoutMs = 3000 })
+  const { store, reads } = countingStore(async () => { const now = text; await pause(20); return now })
+  const settings = plugin.createSettingsReader(store, log, 500)
+  assert.equal((await settings()).timeoutMs, 3000)
+  text = shippedWith((d) => { d.timeoutMs = 4000 })
+  assert.equal((await settings()).timeoutMs, 4000, 'calls that are one after the other each read the store')
+  assert.equal(reads(), 2)
+  assert.deepEqual(log.lines, [])
+})
+
+test('past the budget the settings last read are used, not the default, and a read that ends late is kept for the next call', async () => {
+  const log = collector()
+  const texts = [
+    shippedWith((d) => { d.timeoutMs = 3000 }),   // read 1: fast
+    shippedWith((d) => { d.timeoutMs = 4000 }),   // read 2: ends after the budget
+  ]
+  const { store, reads } = countingStore(async (call) => {
+    if (call === 1) return texts[0]
+    if (call === 2) { await pause(120); return texts[1] }
+    return wait()                                  // read 3 and on: never
+  })
+  const settings = plugin.createSettingsReader(store, log, 40)
+  assert.equal((await settings()).timeoutMs, 3000)
+  // read 2 is slow: the call gets the settings of read 1
+  assert.equal((await settings()).timeoutMs, 3000)
+  assert.equal(log.lines.length, 1, log.lines.join('\n'))
+  assert.match(log.lines[0]!, /took more than 40 ms; using the settings last read until it answers/)
+  // it ends, late, and its settings are what the next call gets when the store has stopped answering
+  await pause(150)
+  assert.equal((await settings()).timeoutMs, 4000)
+  assert.equal(reads(), 3)
+})
+
+test('with nothing read yet, a read that ends late is the cache too', async () => {
+  const log = collector()
+  const { store } = countingStore(async (call) => {
+    if (call === 1) { await pause(100); return shippedWith((d) => { d.timeoutMs = 5000 }) }
+    return wait()
+  })
+  const settings = plugin.createSettingsReader(store, log, 30)
+  assert.equal(await settings(), DEFAULT_SETTINGS)
+  await pause(120)
+  assert.equal((await settings()).timeoutMs, 5000)
+})
+
+test('a read that ends late with a file that is not valid, or an error, does not replace the settings last read', async () => {
+  const log = collector()
+  const { store } = countingStore(async (call) => {
+    if (call === 1) return shippedWith((d) => { d.timeoutMs = 3000 })
+    if (call === 2) { await pause(80); return 'tools: [' }
+    if (call === 3) { await pause(80); throw new Error('git is broken') }
+    return wait()
+  })
+  const settings = plugin.createSettingsReader(store, log, 30)
+  assert.equal((await settings()).timeoutMs, 3000)
+  assert.equal((await settings()).timeoutMs, 3000)
+  await pause(100)
+  assert.equal((await settings()).timeoutMs, 3000)      // read 3, which ends in an error
+  await pause(100)
+  assert.equal((await settings()).timeoutMs, 3000)      // read 4, which never answers
+})
+
+test('the store going away is the default, not a cache', async () => {
+  const log = collector()
+  let present = true
+  const store = () => present ? { read: async () => shippedWith((d) => { d.timeoutMs = 3000 }) } : undefined
+  const settings = plugin.createSettingsReader(store, log, 40)
+  assert.equal((await settings()).timeoutMs, 3000)
+  present = false
+  assert.equal(await settings(), DEFAULT_SETTINGS)
+})
+
+test('the plugin gives the shipped default after the read budget when the store never answers, and the store is asked once', async () => {
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  let reads = 0
+  await provideStub(ctx, 'dishConfig', readerOf(() => { reads++; return wait() }))
+  const handle = mountJudge(ctx, (await dirs()).state)
+  try {
+    await handle
+    const started = performance.now()
+    assert.equal(await ctx.dishJudge.settings(), DEFAULT_SETTINGS)
+    const elapsed = performance.now() - started
+    assert.ok(elapsed >= plugin.SETTINGS_READ_BUDGET_MS - 20 && elapsed < plugin.SETTINGS_READ_BUDGET_MS + 250, `took ${elapsed} ms`)
+    assert.equal(await ctx.dishJudge.settings(), DEFAULT_SETTINGS)
+    assert.equal(reads, 1)
+    assert.equal(judgeLines(logs).length, 1, logs.join('\n'))
+    assert.match(judgeLines(logs)[0]!, /took more than 200 ms/)
+  } finally {
+    await handle.dispose()
+  }
+})
+
 // --- logging --------------------------------------------------------------------------------------
 
 test('with terminal on, the plugin prints its own messages to stderr as dish-judge; with it off, it prints nothing', async () => {

@@ -179,6 +179,40 @@ test('live: a 1 ms time limit is unavailable, as a timeout', { skip: SKIP, timeo
   noLeak([result, lines, await judge.status()])
 })
 
+test('live: a request that is too many tokens for TypeSafe is a 400 max_tokens_exceeded: invalid and tooBig, and the status is left alone', { skip: SKIP, timeout: 30_000 }, async () => {
+  const { judge, lines } = client(KEY!, 10_000)
+  const ok = await judge.ask({ state: STATE, questions: { serves_task: QUESTIONS.serves_task! }, purpose: 'ask' })
+  assert.equal(ok.ok, true, ok.ok ? '' : safe(ok.message))
+  const before = await judge.status()
+  // about 200 KB of instructions: under the client's 256 KB limit for a request, over TypeSafe's 32k tokens
+  const long: Question = { type: 'noul', instructions: `Is \`command\` harmless? ${'The quick brown fox jumps over the lazy dog. '.repeat(4500)}` }
+  const result = await judge.ask({ state: STATE, questions: { long }, purpose: 'ask' })
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  const raw = await lastExchange()
+  console.log('live: ~200 KB of instructions → HTTP', raw?.status, '→', `${result.reason}${result.tooBig ? ' tooBig' : ''}: ${safe(result.message)}`)
+  assert.equal(raw?.status, 400)
+  assert.equal(result.reason, 'invalid')
+  assert.equal(result.tooBig, true)
+  assert.deepEqual(await judge.status(), before, 'the status is as it was')
+  assert.equal(lines.length, 2)
+  noLeak([ok, result, lines, before])
+})
+
+test('live: decide puts the decision on the line', { skip: SKIP, timeout: 30_000 }, async () => {
+  const { judge, lines } = client(KEY!, 10_000)
+  const result = await judge.ask({
+    state: STATE, questions: QUESTIONS, purpose: 'command', tool: 'bash', callId: 'live-1', subject: 'git status',
+    decide: (settled) => ({ decision: settled.ok ? 'allow' : 'ask' }),
+  })
+  assert.equal(result.ok, true, result.ok ? '' : safe(result.message))
+  assert.deepEqual(result.decided, { decision: 'allow' })
+  assert.equal(lines.length, 1)
+  assert.equal(lines[0]!.decision, 'allow')
+  assert.deepEqual(Object.keys(lines[0]!.answers).sort(), ['effect', 'risk', 'serves_task'])
+  noLeak([result, lines])
+})
+
 test('live: a request TypeSafe refuses (an unknown model) is a 400, which is invalid, with its message', { skip: SKIP, timeout: 30_000 }, async () => {
   const lines: LogLine[] = []
   const judge = createJudge({
@@ -195,5 +229,7 @@ test('live: a request TypeSafe refuses (an unknown model) is a 400, which is inv
   assert.equal(raw?.status, 400)
   assert.equal(result.reason, 'invalid')
   assert.match(result.message, /Unknown model: jev-0\.0\.0-does-not-exist/)
+  assert.equal(result.tooBig, undefined)
+  assert.equal((await judge.status()).state, 'unavailable', 'a typo\'d model shows')
   noLeak([result, lines, await judge.status()])
 })

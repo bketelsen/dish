@@ -27,7 +27,7 @@ import { DEFAULT_SETTINGS, DEFAULT_TEXT, JUDGE_SPEC, parseSettings } from './set
 import type { JudgeSettings } from './settings.ts'
 
 export { createJudge } from './client.ts'
-export type { Answer, Judge, JudgeAgent, JudgeDeps, JudgeRequest, JudgeResult, JudgeStatus, JsonValue, LogLine, Purpose, Question } from './client.ts'
+export type { Answer, Asked, Decision, Judge, JudgeAgent, JudgeDeps, JudgeRequest, JudgeResult, JudgeStatus, JsonValue, LogLine, Purpose, Question } from './client.ts'
 export type { CommandSettings, JudgeSettings, ParseResult, ScreeningSettings, ToolSettings } from './settings.ts'
 
 export const name = 'dish-judge'
@@ -125,17 +125,30 @@ function describe(error: unknown): string {
 }
 
 /** What the settings need of the store: its reads. */
-type Reader = { read(path: string): Promise<string | undefined> }
+export type Reader = { read(path: string): Promise<string | undefined> }
 
-interface Logger {
+export interface Logger {
   warn(format: string, ...args: unknown[]): void
 }
 
 /**
+ * How long a call to `settings()` waits for the store before it answers without it: 200 ms. A read of one small file from a
+ * local git repository takes a few milliseconds, so this is a store that is stuck, not one that is slow, and it is a tenth
+ * of the shipped `timeoutMs`, which is what a gate has to spare: dish-config's reads queue behind its git commands, and
+ * those have no time limit of their own.
+ */
+export const SETTINGS_READ_BUDGET_MS = 200
+
+/**
  * `settings()` over a store that may or may not be there, looked up on every call. Each distinct problem is logged
  * once, and none of it is thrown: every gate reads this on every call, and the shipped default always works.
+ *
+ * It also never waits for the store longer than `budgetMs`. Past that it answers with the last settings it read from the
+ * store (the shipped default if it has read none) and says so once. The read goes on, and its result is kept for the next
+ * call; calls that come while one is going join it rather than start another, so a store that never answers is not asked
+ * again and again.
  */
-function createSettingsReader(store: () => Reader | undefined, logger: Logger): () => Promise<JudgeSettings> {
+export function createSettingsReader(store: () => Reader | undefined, logger: Logger, budgetMs = SETTINGS_READ_BUDGET_MS): () => Promise<JudgeSettings> {
   const told = new Set<string>()
   /** Say `message` once. A logger that throws is not worth a failed call. */
   const tell = (message: string): void => {
@@ -147,7 +160,9 @@ function createSettingsReader(store: () => Reader | undefined, logger: Logger): 
       // Nothing to do about it.
     }
   }
-  return async () => {
+  /** The last settings that were read from the store and passed `parseSettings`. */
+  let lastGood: JudgeSettings | undefined
+  const read = async (): Promise<JudgeSettings> => {
     try {
       const reader = store()
       if (reader === undefined) {
@@ -170,11 +185,24 @@ function createSettingsReader(store: () => Reader | undefined, logger: Logger): 
         tell(`judge.yaml in the config store is not valid, so the shipped default is used: ${parsed.problem}`)
         return DEFAULT_SETTINGS
       }
+      lastGood = parsed.settings
       return parsed.settings
     } catch (error) {
       tell(`could not get the judge settings (${describe(error)}); using the shipped default`)
       return DEFAULT_SETTINGS
     }
+  }
+  let reading: Promise<JudgeSettings> | undefined
+  return () => {
+    reading ??= read().finally(() => { reading = undefined })
+    const mine = reading
+    return new Promise<JudgeSettings>((resolve) => {
+      const timer = setTimeout(() => {
+        tell(`reading judge.yaml from the config store took more than ${budgetMs} ms; using ${lastGood === undefined ? 'the shipped default' : 'the settings last read'} until it answers`)
+        resolve(lastGood ?? DEFAULT_SETTINGS)
+      }, budgetMs)
+      mine.then((settings) => { clearTimeout(timer); resolve(settings) }, () => { clearTimeout(timer); resolve(lastGood ?? DEFAULT_SETTINGS) })
+    })
   }
 }
 
