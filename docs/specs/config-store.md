@@ -66,9 +66,9 @@ Each write is atomic, and a commit lands only if `main` is still where the write
   - Writing a path that no claimed namespace owns is refused.
   - Releasing a claim (the plugin unloads) leaves its files untouched.
 - **Commit**: one atomic change to one or more documents, carrying:
-  - an author: `{ kind: 'user' }`, or `{ kind: 'agent', sessionId, role }`
+  - an author: `{ kind: 'user' }`, `{ kind: 'agent', sessionId, role }`, or `{ kind: 'system' }` for the store's own commits (the root commit and `seed`); git records `user` as the user identity, and `agent` and `system` as the agent identity
   - a message, generated as `<paths>: <summary>` plus an optional note
-  - trailers: `Dish-Author-Kind`, `Dish-Session`
+  - trailers: `Dish-Author-Kind`, `Dish-Session` and `Dish-Role` (agent only), `Dish-Note` (when there's a note)
 - **Proposal**: a branch `proposal/<id>` whose commits sit on top of the `main` commit it was based on. Metadata (title, rationale, author session, created, status) is stored in the tip commit's message trailers, so the branch alone carries everything.
 
 ## Service: `dishConfig`
@@ -79,12 +79,12 @@ Provided by the `dish-config` plugin. The shape below is the contract; names may
 interface DishConfig {
   claim(spec: NamespaceSpec): () => void               // effect-scoped; returns a disposer
 
-  read(path: string, ref?: string): Promise<string | undefined>        // ref defaults to main
+  read(path: string, ref?: string): Promise<string | undefined>        // ref: "main" (default) or a full commit id; anything else is NOT_FOUND
   list(prefix: string, ref?: string): Promise<string[]>
   head(): Promise<string>                               // current main commit id
 
-  /** Atomic multi-document commit to main. */
-  write(changes: Change[], meta: WriteMeta): Promise<CommitInfo>
+  /** Atomic multi-document commit to main. Resolves `undefined`, with no commit, when the changes leave main as it is. */
+  write(changes: Change[], meta: WriteMeta): Promise<CommitInfo | undefined>
   /** One-time defaults: writes only documents that don't exist yet. */
   seed(defaults: Record<string, string>, owner: string): Promise<CommitInfo | undefined>
   revert(commit: string, meta: WriteMeta): Promise<CommitInfo>   // new commit restoring what `commit` changed
@@ -201,6 +201,7 @@ The store's stable error codes:
 - `CONFLICT`: the path changed since `base`
 - `INVALID`: the namespace rejected the document; carries the owner's message
 - `UNOWNED`: no namespace claims the path
+- `FORBIDDEN`: an agent writing to a namespace whose `agent` policy doesn't allow it
 - `SECRET`: a likely credential was found
 - `TOO_LARGE`
 - `LOCKED`: another process holds the store
