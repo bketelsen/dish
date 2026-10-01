@@ -92,7 +92,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   if (config.terminal) printOwnLogs(ctx, name)
 
   const directory = resolve(stateDirectoryPath(text(config.stateDirectory)))
+  // Told on every look at a bad file. The next successful snapshot replaces the file, so one report per agent says it;
+  // the looks that repeat are those of an agent that can't be snapshotted yet, one for each of its steps.
+  const invalid = new Set<string>()
   const files = new SnapshotFiles(join(directory, 'agents'), (agentId) => {
+    if (invalid.has(agentId)) return
+    invalid.add(agentId)
     // Told while a snapshot is being taken, which must not fail for a log line.
     try {
       logger.warn('the snapshot file of agent %s is not valid; taking a new snapshot', agentId)

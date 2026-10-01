@@ -9,17 +9,22 @@
  *   these are for pages and for `crew`, which can say what went wrong.
  * - `snapshot(agent, role)` is for the agent's own step, which a prompt must never fail, so it doesn't reject
  *   because of the snapshot files or the store. At worst it returns the shipped defaults, with `commit: null`, and
- *   logs why (a role that has no text at all is the one thing it still rejects for).
+ *   logs why. It still rejects when there is no text to give: for a name that isn't a role, and for a crew role
+ *   with no shipped default (one that exists only in the store) while the store can't supply its document.
  *
  * A snapshot is the store's `main` commit when the agent was first asked about, kept in `SnapshotFiles`; its texts
  * are read at that commit, which never changes. In detail:
  *
  * - one in-memory promise per agent id, so concurrent first calls share one snapshot, and later calls read no files;
- * - a record whose commit the store doesn't have is replaced by a fresh snapshot;
+ * - the role in the record decides, not the role of the call (after a restart the first call would otherwise
+ *   choose it). A record whose role is not a role, or has no text at its commit, is replaced by a fresh snapshot
+ *   for the call's role, as is a record whose commit the store doesn't have;
  * - a record that can't be read at all (permissions, say) is not replaced, because a rename over it would destroy
  *   the original. The agent gets a fresh snapshot from memory, for this process only;
  * - when the store can't answer for a record that has a commit, the agent gets the defaults for now and nothing is
- *   remembered, neither in memory nor on disk, so its own text is back as soon as the store answers.
+ *   remembered, neither in memory nor on disk, so its own text is back as soon as the store answers;
+ * - each kind of trouble is logged once per agent, until the agent has a snapshot again or is dropped, and the
+ *   return from the defaults to its own text is logged once, because dsh records it as a new system message.
  *
  * @module dish-prompts/service
  */
@@ -50,8 +55,10 @@ export interface DishPrompts {
   persona(role: string): Promise<Persona>
   /**
    * The agent's snapshot: taken on the first call for that agent, the same for its whole life, even across a restart.
-   * The role is the one of the first call. Never rejects because of the snapshot files or the store; see the module
-   * comment. Rejects like `persona` for a role that has no text.
+   * The role is the one in the agent's record if it has a usable one, else the one of the call. Never rejects
+   * because of the snapshot files or the store; see the module comment. Rejects like `persona` for a name that isn't a
+   * role, and for a crew role that has no shipped default (one that exists only in the store) while the store can't
+   * supply its document.
    */
   snapshot(agent: { id: string }, role: string): Promise<Persona>
   /** Forget the agent's snapshot (on `/clear`); its next call takes a new one. Never rejects. */
@@ -68,6 +75,7 @@ export type SnapshotStore = Pick<SnapshotFiles, 'get' | 'put' | 'drop'>
 
 export interface ServiceLogger {
   warn(format: string, ...args: unknown[]): void
+  info(format: string, ...args: unknown[]): void
 }
 
 export interface ServiceOptions {
@@ -124,14 +132,22 @@ export function createDishPrompts(options: ServiceOptions): DishPrompts {
     }
   }
 
+  const info = (format: string, ...args: unknown[]): void => {
+    try {
+      options.logger.info(format, ...args)
+    } catch {
+      // As above.
+    }
+  }
+
   /** One in-memory promise per agent id: the agent's snapshot, from its first call until it is dropped. */
   const agents = new Map<string, Promise<Taken>>()
   /** The drops that are still working, so a snapshot that follows one waits for it. */
   const dropping = new Map<string, Promise<void>>()
   /** Document paths already reported as missing from the store. */
   const missing = new Set<string>()
-  /** Agents already reported as served the defaults because the store couldn't answer. */
-  const degradedAgents = new Set<string>()
+  /** What has been reported about each agent, by kind, until it has a snapshot again or is dropped. */
+  const reported = new Map<string, Set<string>>()
 
   /** `role`'s shipped text, for a document that isn't in the store. @throws `Error` for a role with none. */
   function fallback(role: Role, stored: boolean): string {
@@ -161,34 +177,79 @@ export function createDishPrompts(options: ServiceOptions): DishPrompts {
     return { own, common }
   }
 
-  /** The agent is served the defaults, because the store couldn't answer: said once until it can. */
-  function degraded(id: string, why: string): void {
-    if (degradedAgents.has(id)) return
-    degradedAgents.add(id)
-    warn('cannot read the prompts for agent %s from the store (%s); it gets the shipped defaults for now', id, why)
+  /** A warning about the agent, unless this kind of trouble has already been reported since it last had a snapshot. */
+  function reportOnce(id: string, kind: string, format: string, ...args: unknown[]): void {
+    let kinds = reported.get(id)
+    if (kinds === undefined) {
+      kinds = new Set()
+      reported.set(id, kinds)
+    }
+    if (kinds.has(kind)) return
+    kinds.add(kind)
+    warn(format, ...args)
   }
 
-  /** The snapshot a record stands for, or `undefined` if its commit is not in the store. */
-  async function keep(id: string, role: Role, record: SnapshotRecord, reader: StoreReader | undefined): Promise<Taken | undefined> {
-    const { commit } = record
+  /** The agent is served the defaults, because the store couldn't answer. */
+  function degraded(id: string, why: string): void {
+    reportOnce(id, 'degraded', 'cannot read the prompts for agent %s from the store (%s); it gets the shipped defaults for now', id, why)
+  }
+
+  /**
+   * The agent has a snapshot for good: what was reported about it is forgotten. If it had been served the defaults
+   * and now moves to the text of `commit`, say so once: dsh records the change as a new system message.
+   */
+  function settled(id: string, commit: string | null): void {
+    const wasDegraded = reported.get(id)?.has('degraded') === true
+    reported.delete(id)
+    if (wasDegraded && commit !== null) {
+      info('the prompt of agent %s moved from the shipped defaults to its snapshot at %s; dsh records the change as a new system message', id, commit)
+    }
+  }
+
+  /**
+   * The snapshot a record stands for, for the role in the record, or `undefined` if the record is no use: its role
+   * isn't one, there is no text for it at its commit, or the store doesn't have its commit.
+   */
+  async function keep(id: string, record: SnapshotRecord, reader: StoreReader | undefined): Promise<Taken | undefined> {
+    const { role, commit } = record
+    try {
+      checkRole(role)
+    } catch (error) {
+      reportOnce(id, 'record', 'the snapshot of agent %s is for "%s", which is not a role (%s); taking a new one', id, role, describe(error))
+      return undefined
+    }
     // Pinned to the defaults (the store wasn't there when the agent began): the defaults are the plugin's, and don't change.
-    if (commit === null) return { persona: compose(role, undefined, null), final: true }
+    if (commit === null) {
+      if (defaultText(role) === undefined) {
+        reportOnce(id, 'record', 'the snapshot of agent %s is for role "%s", which has no shipped text and no commit to read it at; taking a new one', id, role)
+        return undefined
+      }
+      settled(id, null)
+      return { persona: compose(role, undefined, null), final: true }
+    }
     if (reader === undefined) {
+      // For a store-only role this throws: there is nothing to give, and the record stays as it is.
+      const persona = compose(role, undefined, null)
       degraded(id, 'the store is not available')
-      return { persona: compose(role, undefined, null), final: false }
+      return { persona, final: false }
     }
     let documents: Documents
     try {
       documents = await readDocuments(reader, role, commit)
     } catch (error) {
       if (errorCode(error) === 'NOT_FOUND') {
-        warn('the snapshot of agent %s is at commit %s, which the store does not have; taking a new one', id, commit)
+        reportOnce(id, 'commit', 'the snapshot of agent %s is at commit %s, which the store does not have; taking a new one', id, commit)
         return undefined
       }
+      const persona = compose(role, undefined, null)
       degraded(id, describe(error))
-      return { persona: compose(role, undefined, null), final: false }
+      return { persona, final: false }
     }
-    degradedAgents.delete(id)
+    if (documents.own === undefined && defaultText(role) === undefined) {
+      reportOnce(id, 'record', 'the snapshot of agent %s is for role "%s", which has no text at commit %s; taking a new one', id, role, commit)
+      return undefined
+    }
+    settled(id, commit)
     return { persona: compose(role, documents, commit), final: true }
   }
 
@@ -201,12 +262,13 @@ export function createDishPrompts(options: ServiceOptions): DishPrompts {
         commit = await reader.head()
         documents = await readDocuments(reader, role, commit)
       } catch (error) {
+        const persona = compose(role, undefined, null)
         degraded(id, describe(error))
-        return { persona: compose(role, undefined, null), final: false }
+        return { persona, final: false }
       }
     }
-    degradedAgents.delete(id)
     const persona = compose(role, documents, commit)
+    settled(id, commit)
     if (writable) {
       try {
         await files.put(id, { role, commit, takenAt: Date.now() })
@@ -228,10 +290,10 @@ export function createDishPrompts(options: ServiceOptions): DishPrompts {
     } catch (error) {
       // Unreadable, not absent: a new record would be renamed over the original and destroy it.
       writable = false
-      warn('cannot read the snapshot of agent %s (%s); it gets the current prompts for this run only, and its file is left alone', id, describe(error))
+      reportOnce(id, 'read', 'cannot read the snapshot of agent %s (%s); it gets the current prompts for this run only, and its file is left alone', id, describe(error))
     }
     if (record !== undefined) {
-      const kept = await keep(id, role, record, reader)
+      const kept = await keep(id, record, reader)
       if (kept !== undefined) return kept
     }
     return fresh(id, role, reader, writable)
@@ -288,7 +350,7 @@ export function createDishPrompts(options: ServiceOptions): DishPrompts {
       }
       const pending = agents.get(id)
       agents.delete(id)
-      degradedAgents.delete(id)
+      reported.delete(id)
       const before = dropping.get(id)
       // Wait for a snapshot that is still being taken (its write must not land after the removal), and for an
       // earlier drop. Nothing here rejects: a snapshot's failure is its caller's.

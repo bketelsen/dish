@@ -13,6 +13,7 @@ import {
   userWrite, waitFor, watchLogs, withEnv,
 } from './helpers.ts'
 import type { Dirs } from './helpers.ts'
+import type { DishConfigService } from 'dish-config'
 
 const DAY = 24 * 60 * 60 * 1000
 const AGENT = { kind: 'agent', sessionId: 's1', role: 'coder' } as const
@@ -392,6 +393,37 @@ test('a snapshot file that is not valid is logged by the plugin, and replaced', 
     assert.ok(logs.some(line => line.startsWith('[dish-prompts] warn:') && line.includes('a1')), logs.join('\n'))
     assert.equal((await new SnapshotFiles(where.agents).get('a1'))?.commit, null)
     assert.equal(logs.filter(line => line.includes('a1')).length, 1, logs.join('\n'))
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('a bad snapshot file is reported once per agent, though every step looks at it until the agent can be snapshotted', async () => {
+  const where = await dirs()
+  await mkdir(where.agents, { recursive: true })
+  await writeFile(join(where.agents, snapshotFile('a1')), 'garbage')
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  // A store that is there but can not say where `main` is: the agent is served the defaults, and nothing is written over the file.
+  ctx.provide('dishConfig', {
+    claim: () => () => {},
+    seed: () => Promise.resolve(undefined),
+    head: () => Promise.reject(new Error('git is broken')),
+    read: () => Promise.reject(new Error('git is broken')),
+    list: () => Promise.reject(new Error('git is broken')),
+  } as unknown as DishConfigService)
+  const handle = mountPrompts(ctx, where.state)
+  try {
+    await handle
+    for (let step = 0; step < 5; step++) assert.equal((await ctx.dishPrompts.snapshot({ id: 'a1' }, 'main')).commit, null)
+    assert.equal(await readFile(join(where.agents, snapshotFile('a1')), 'utf8'), 'garbage')
+    const about = (pattern: RegExp) => logs.filter(line => line.startsWith('[dish-prompts] warn:') && line.includes('a1') && pattern.test(line))
+    assert.equal(about(/not valid/).length, 1, logs.join('\n'))
+    assert.equal(about(/shipped defaults for now/).length, 1, logs.join('\n'))
+    // Another agent with the same trouble is reported on its own.
+    await writeFile(join(where.agents, snapshotFile('a2')), 'garbage')
+    for (let step = 0; step < 3; step++) await ctx.dishPrompts.snapshot({ id: 'a2' }, 'main')
+    assert.equal(logs.filter(line => line.includes('a2') && /not valid/.test(line)).length, 1, logs.join('\n'))
   } finally {
     await handle.dispose()
   }

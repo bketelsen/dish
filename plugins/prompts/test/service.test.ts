@@ -27,6 +27,8 @@ interface Harness {
   dirs: Dirs
   /** What the services built here logged as warnings. */
   warnings: string[]
+  /** And as info lines. */
+  infos: string[]
 }
 
 /** Run `body` with dish-config's real plugin mounted in a fresh `Context` on a temp repository. */
@@ -38,7 +40,7 @@ async function withStore(body: (harness: Harness) => Promise<void>): Promise<voi
     await handle
     const store = ctx.dishConfig
     for (const spec of namespaceSpecs('dish-prompts')) ctx.effect(() => store.claim(spec))
-    await body({ ctx, store, dirs: where, warnings: [] })
+    await body({ ctx, store, dirs: where, warnings: [], infos: [] })
   } finally {
     await handle.dispose()
   }
@@ -54,7 +56,10 @@ function serviceFor(harness: Harness, overrides: ServiceOverrides = {}): DishPro
   return createDishPrompts({
     store: overrides.store ?? (() => harness.ctx.get('dishConfig')),
     files: overrides.files ?? new SnapshotFiles(harness.dirs.agents),
-    logger: { warn: (...args: [string, ...unknown[]]) => { harness.warnings.push(format(...args)) } },
+    logger: {
+      warn: (...args: [string, ...unknown[]]) => { harness.warnings.push(format(...args)) },
+      info: (...args: [string, ...unknown[]]) => { harness.infos.push(format(...args)) },
+    },
   })
 }
 
@@ -87,7 +92,7 @@ function notFound(): Error {
 
 test('roles without a store is common, main and the shipped crew, sorted', async () => {
   const where = await dirs()
-  const prompts = createDishPrompts({ store: () => undefined, files: new SnapshotFiles(where.agents), logger: { warn() {} } })
+  const prompts = createDishPrompts({ store: () => undefined, files: new SnapshotFiles(where.agents), logger: { warn() {}, info() {} } })
   assert.deepEqual(await prompts.roles(), ['common', 'main', ...SORTED_CREW])
 })
 
@@ -196,7 +201,7 @@ test('persona refuses common, an invalid role name, and anything that is not a s
 
 test('persona without a store is the shipped defaults, commit null; an unknown crew role throws', async () => {
   const where = await dirs()
-  const prompts = createDishPrompts({ store: () => undefined, files: new SnapshotFiles(where.agents), logger: { warn() {} } })
+  const prompts = createDishPrompts({ store: () => undefined, files: new SnapshotFiles(where.agents), logger: { warn() {}, info() {} } })
   assert.deepEqual(await prompts.persona('main'), { prefix: DEFAULTS.main, suffix: DEFAULTS.common, commit: null })
   assert.deepEqual(await prompts.persona('reviewer'), { prefix: DEFAULTS.reviewer, suffix: DEFAULTS.common, commit: null })
   await assert.rejects(prompts.persona('data-2'), { message: 'unknown role "data-2"' })
@@ -518,6 +523,177 @@ test('snapshot refuses an agent without an id', async () => {
     const prompts = serviceFor(harness)
     await assert.rejects(prompts.snapshot({} as { id: string }, 'main'), TypeError)
     await assert.rejects(prompts.snapshot({ id: '' }, 'main'), TypeError)
+  })
+})
+
+// --- the recorded role ----------------------------------------------------------------------------
+
+test('after a restart the role in the record decides, not the role of the first call', async () => {
+  await withStore(async (harness) => {
+    await userWrite(harness.store, 'main', MAIN_ONE)
+    await userWrite(harness.store, 'coder', 'coder one')
+    const old = await serviceFor(harness).snapshot({ id: 'r1' }, 'main')
+    assert.equal(old.prefix, MAIN_ONE)
+    await userWrite(harness.store, 'main', MAIN_TWO)
+    await userWrite(harness.store, 'coder', 'coder two')
+    const restarted = serviceFor(harness)
+    // Called as another role, it is still main's text at the old commit.
+    assert.deepEqual(await restarted.snapshot({ id: 'r1' }, 'coder'), old)
+    // And so it is from the record, however the first call after the next restart asks.
+    assert.deepEqual(await serviceFor(harness).snapshot({ id: 'r1' }, 'reviewer'), old)
+    assert.equal((await new SnapshotFiles(harness.dirs.agents).get('r1'))?.role, 'main')
+  })
+})
+
+test('a store-only role keeps the text it had at the recorded commit, whatever the call asks for', async () => {
+  await withStore(async (harness) => {
+    await userWrite(harness.store, 'data-2', 'we model data')
+    const old = await serviceFor(harness).snapshot({ id: 'r1' }, 'data-2')
+    await harness.store.write([{ path: pathFor('data-2'), delete: true }], { author: { kind: 'user' } })
+    assert.deepEqual(await serviceFor(harness).snapshot({ id: 'r1' }, 'main'), old)
+  })
+})
+
+test('a record whose role is not a role, or has no text at its commit, is replaced by a snapshot for the call\'s role', async () => {
+  await withStore(async (harness) => {
+    const head = await harness.store.head()
+    const files = new SnapshotFiles(harness.dirs.agents)
+    const cases: Array<[string, string | null]> = [
+      ['Bad Role', head], ['common', head], ['../x', head],
+      // A crew role with no default and no document at the commit; and with commit null, which can never have had one.
+      ['data-2', head], ['data-2', null],
+    ]
+    for (const [index, [role, commit]] of cases.entries()) {
+      const id = `bad-${index}`
+      await files.put(id, { role, commit, takenAt: 1 })
+      const prompts = serviceFor(harness)
+      assert.deepEqual(await prompts.snapshot({ id }, 'coder'), { prefix: DEFAULTS.coder, suffix: DEFAULTS.common, commit: head }, `${role} ${String(commit)}`)
+      const record = await files.get(id)
+      assert.equal(record?.role, 'coder')
+      assert.equal(record.commit, head)
+      assert.equal(harness.warnings.filter(line => line.includes(id)).length, 1, harness.warnings.join('\n'))
+    }
+  })
+})
+
+test('a record for a store-only role is not replaced while the store can not supply its text', async () => {
+  await withStore(async (harness) => {
+    await userWrite(harness.store, 'data-2', 'we model data')
+    const pinned = await serviceFor(harness).snapshot({ id: 'r1' }, 'data-2')
+    const files = spy(new SnapshotFiles(harness.dirs.agents))
+    const without = serviceFor(harness, { store: () => undefined, files })
+    await assert.rejects(without.snapshot({ id: 'r1' }, 'main'), { message: 'unknown role "data-2"' })
+    assert.equal(files.calls.put, 0)
+    assert.equal((await new SnapshotFiles(harness.dirs.agents).get('r1'))?.role, 'data-2')
+    // The store back: the text it had.
+    assert.deepEqual(await serviceFor(harness).snapshot({ id: 'r1' }, 'main'), pinned)
+  })
+})
+
+// --- one report per agent, and the recovery -------------------------------------------------------
+
+/** The warnings that mention `id`, as a count of those that also match `pattern`. */
+function count(lines: string[], id: string, pattern: RegExp): number {
+  return lines.filter(line => line.includes(id) && pattern.test(line)).length
+}
+
+test('an agent served the defaults is reported once, not on every step', async () => {
+  await withStore(async (harness) => {
+    await userWrite(harness.store, 'main', MAIN_ONE)
+    const pinned = await serviceFor(harness).snapshot({ id: 'a1' }, 'main')
+    const files = new SnapshotFiles(harness.dirs.agents)
+    // A commit the store lost, a store that can not give a head, and the steps of an agent, one after the other.
+    await files.put('a2', { role: 'main', commit: 'f'.repeat(40), takenAt: 1 })
+    const flaky = readerWith(harness.store, { head: () => Promise.reject(new Error('boom')) })
+    const prompts = serviceFor(harness, { store: () => flaky })
+    for (let step = 0; step < 5; step++) {
+      assert.equal((await prompts.snapshot({ id: 'a2' }, 'main')).commit, null)
+    }
+    assert.equal(count(harness.warnings, 'a2', /does not have/), 1, harness.warnings.join('\n'))
+    assert.equal(count(harness.warnings, 'a2', /shipped defaults for now/), 1, harness.warnings.join('\n'))
+    assert.equal(harness.warnings.filter(line => line.includes('a2')).length, 2, harness.warnings.join('\n'))
+    // One for an agent that has a record and a store that is gone, too.
+    const gone = serviceFor(harness, { store: () => undefined })
+    for (let step = 0; step < 5; step++) assert.equal((await gone.snapshot({ id: 'a1' }, 'main')).commit, null)
+    assert.equal(count(harness.warnings, 'a1', /shipped defaults for now/), 1, harness.warnings.join('\n'))
+    assert.ok(pinned.commit)
+  })
+})
+
+test('a snapshot file that can not be read is reported once, while the agent is still being served defaults', async () => {
+  await withStore(async (harness) => {
+    await mkdir(harness.dirs.state, { recursive: true })
+    await writeFile(harness.dirs.agents, 'in the way')
+    let failing = true
+    const flaky = readerWith(harness.store, { head: () => failing ? Promise.reject(new Error('boom')) : harness.store.head() })
+    const prompts = serviceFor(harness, { store: () => flaky })
+    for (let step = 0; step < 4; step++) await prompts.snapshot({ id: 'a1' }, 'main')
+    assert.equal(count(harness.warnings, 'a1', /cannot read the snapshot/), 1, harness.warnings.join('\n'))
+    assert.equal(count(harness.warnings, 'a1', /shipped defaults for now/), 1, harness.warnings.join('\n'))
+
+    // A success clears what was said: the same trouble after a drop is reported again.
+    failing = false
+    await userWrite(harness.store, 'main', MAIN_ONE)
+    assert.equal((await prompts.snapshot({ id: 'a1' }, 'main')).prefix, MAIN_ONE)
+    await prompts.drop({ id: 'a1' })
+    failing = true
+    for (let step = 0; step < 3; step++) await prompts.snapshot({ id: 'a1' }, 'main')
+    assert.equal(count(harness.warnings, 'a1', /cannot read the snapshot/), 2, harness.warnings.join('\n'))
+    assert.equal(count(harness.warnings, 'a1', /shipped defaults for now/), 2, harness.warnings.join('\n'))
+  })
+})
+
+test('a drop clears what was reported about the agent', async () => {
+  await withStore(async (harness) => {
+    await new SnapshotFiles(harness.dirs.agents).put('a1', { role: 'main', commit: 'f'.repeat(40), takenAt: 1 })
+    const flaky = readerWith(harness.store, { head: () => Promise.reject(new Error('boom')) })
+    const prompts = serviceFor(harness, { store: () => flaky })
+    for (let step = 0; step < 3; step++) await prompts.snapshot({ id: 'a1' }, 'main')
+    assert.equal(count(harness.warnings, 'a1', /does not have/), 1, harness.warnings.join('\n'))
+    assert.equal(count(harness.warnings, 'a1', /shipped defaults for now/), 1, harness.warnings.join('\n'))
+    // The drop removes the record and what was said about it: the same agent, still without a head, is reported afresh.
+    await prompts.drop({ id: 'a1' })
+    for (let step = 0; step < 3; step++) await prompts.snapshot({ id: 'a1' }, 'main')
+    assert.equal(count(harness.warnings, 'a1', /does not have/), 1, harness.warnings.join('\n'))
+    assert.equal(count(harness.warnings, 'a1', /shipped defaults for now/), 2, harness.warnings.join('\n'))
+  })
+})
+
+test('when a degraded agent is served its own text again, one info line says so', async () => {
+  await withStore(async (harness) => {
+    await userWrite(harness.store, 'main', MAIN_ONE)
+    const pinned = await serviceFor(harness).snapshot({ id: 'a1' }, 'main')
+    await userWrite(harness.store, 'main', MAIN_TWO)
+    let current: StoreReader | undefined
+    const prompts = serviceFor(harness, { store: () => current })
+    for (let step = 0; step < 3; step++) await prompts.snapshot({ id: 'a1' }, 'main')
+    assert.equal(harness.infos.length, 0)
+    current = harness.store
+    assert.deepEqual(await prompts.snapshot({ id: 'a1' }, 'main'), pinned)
+    assert.equal(harness.infos.length, 1, harness.infos.join('\n'))
+    assert.ok(harness.infos[0]!.includes('a1') && harness.infos[0]!.includes(pinned.commit!), harness.infos[0])
+    assert.match(harness.infos[0]!, /shipped defaults/)
+    // Once: later steps, and a step of an agent that was never degraded, say nothing.
+    await prompts.snapshot({ id: 'a1' }, 'main')
+    await prompts.snapshot({ id: 'a2' }, 'main')
+    assert.equal(harness.infos.length, 1, harness.infos.join('\n'))
+  })
+})
+
+test('a first snapshot that had to wait for the store is reported when it is finally taken', async () => {
+  await withStore(async (harness) => {
+    let failing = true
+    const flaky = readerWith(harness.store, { head: () => failing ? Promise.reject(new Error('boom')) : harness.store.head() })
+    const prompts = serviceFor(harness, { store: () => flaky })
+    await userWrite(harness.store, 'main', MAIN_ONE)
+    for (let step = 0; step < 3; step++) assert.equal((await prompts.snapshot({ id: 'a1' }, 'main')).commit, null)
+    failing = false
+    const taken = await prompts.snapshot({ id: 'a1' }, 'main')
+    assert.equal(taken.prefix, MAIN_ONE)
+    assert.equal(harness.infos.length, 1, harness.infos.join('\n'))
+    assert.ok(harness.infos[0]!.includes('a1') && harness.infos[0]!.includes(taken.commit!), harness.infos[0])
+    await prompts.snapshot({ id: 'a1' }, 'main')
+    assert.equal(harness.infos.length, 1)
   })
 })
 
