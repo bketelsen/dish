@@ -611,8 +611,6 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
   // (`tools/post-execute`) and the tool `ask_judge` are registered here: above the prune, and with no `await` anywhere in this
   // function, so that a load that is slow can never leave a window in which the plugin is there and no gate is. They use
   // `ctx.judge`, `settings` and `log`, which are all there by now. Do not put an `await` in this function.
-  // The result screen (see `screen.ts`): a `tools/post-execute` listener, not prepended.
-  registerResultScreen(ctx)
   // -----------------------------------------------------------------------------------------------------------------
 
   // The command gate (see `gate.ts`): a prepended `tools/pre-execute` listener for the tools in `tools.gated`, and a
@@ -631,6 +629,10 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
   ctx.inject(['tools'], (child) => {
     child.tools.register(askJudgeTool(() => ctx.get('judge')))
   })
+
+  // The result screen (see `screen.ts`): a `tools/post-execute` listener, not prepended. It looks the client, the settings and
+  // the log up with `ctx.get` on each result.
+  registerResultScreen(ctx)
 
   // In the background. A failure is logged, and the plugin works all the same: old files that stay are only disk.
   return pruneAtLoad(judgeLog, { keepMs: KEEP_LOG_MS, slowAfterMs: internals.pruneSlowAfterMs ?? PRUNE_SLOW_AFTER_MS, directory, logger })
