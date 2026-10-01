@@ -3,6 +3,11 @@
  * dish-judge masks them out of its decision log (`maskSecrets`). Both start from the same patterns, so what the store
  * would refuse is what the log hides.
  *
+ * A known limit, which the guard and the mask share: a token that follows a letter or digit is not a match (that is what keeps
+ * `risk-…` and `xghp_…` from matching), so a fragment that is too short to be a token on its own (`ghp_` and 29 letters),
+ * glued to the front of one (a TypeSafe key), leaves that one undetected and unmasked: it follows a letter. With 30 or more,
+ * the first one's length is made up by the letters of the second's prefix, and both are found.
+ *
  * @module dish-kit/secrets
  */
 
@@ -147,11 +152,14 @@ const PATTERNS: readonly SecretPattern[] = [
     // - or, with no END line, the characters a key can be made of: base64, the `Proc-Type: 4,ENCRYPTED` and `DEK-Info:`
     //   lines of an old key, the dots, brackets, `@` and `<>` of a PGP `Version:` or `Comment:` line, spaces and line
     //   breaks, and the backslash of a `\n` that is written out. The first other character ends it, so that
-    //   `grep "-----BEGIN RSA PRIVATE KEY-----" ~/.ssh/id_rsa | wc -l` keeps all but the header. It stops before a token
-    //   (a prefix with the body to go with it), so that the token is at the end of the mask and is masked in its turn: the
-    //   letters of `ghp`, `github`, `sk-` and `apikey` are among the characters, and it would otherwise run into the token and
-    //   stop at its `_`, leaving the rest of the token. A prefix with no token behind it (`risk-free`) is not a place to stop.
-    mask: new RegExp(String.raw`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----(?:(?:(?!-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY)[\s\S]){0,8192}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----|(?:(?!gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|sk-[A-Za-z0-9_-]{32}|${APIKEY_START})[A-Za-z0-9+\/=:,\s\\.()@<>-]){0,8192})`),
+    //   `grep "-----BEGIN RSA PRIVATE KEY-----" ~/.ssh/id_rsa | wc -l` keeps all but the header. It stops before another
+    //   private key header, which is a key of its own and is masked on its own (the dashes, capitals and space of a header
+    //   are among the characters: a run that took the header in would end 8 KB from the first one, and the key after it
+    //   would be masked only as far as that, its end in the clear). And it stops before a token (a prefix with the body to
+    //   go with it), so that the token is at the end of the mask and is masked in its turn: the letters of `ghp`, `github`,
+    //   `sk-` and `apikey` are among the characters, and it would otherwise run into the token and stop at its `_`, leaving
+    //   the rest of the token. A prefix with no token behind it (`risk-free`) is not a place to stop.
+    mask: new RegExp(String.raw`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----(?:(?:(?!-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY)[\s\S]){0,8192}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----|(?:(?!-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|sk-[A-Za-z0-9_-]{32}|${APIKEY_START})[A-Za-z0-9+\/=:,\s\\.()@<>-]){0,8192})`),
   },
   // AKIA is a long-term access key, ASIA a temporary one.
   { label: 'an AWS access key ID', before: NOT_AFTER_UPPER, body: /(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])/ },
@@ -199,9 +207,10 @@ const MASKERS: readonly Masker[] = PATTERNS.map(({ label, before, body, mask, mo
 })
 
 /**
- * The source of each pattern `maskSecrets` looks for a secret at the end of a mask with. None starts with a lookbehind: it
- * is built from the pattern's own parts, with no `before`, and not by cutting a lookbehind off the front of one's source.
- * Exported for the test that says so.
+ * The source of each pattern `maskSecrets` looks for a secret with where a lookbehind would refuse it: at the end of a mask,
+ * and in the last few characters of a match, where a token starts that the match's body took the first letters of. None
+ * starts with a lookbehind: each is built from the pattern's own parts, with no `before`, and not by cutting a lookbehind
+ * off the front of one's source. Exported for the test that says so.
  * @internal
  */
 export const GLUED_SOURCES: readonly string[] = MASKERS.map(({ glued }) => glued.source)

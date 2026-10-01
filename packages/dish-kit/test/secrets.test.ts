@@ -389,8 +389,9 @@ test('a token after a key that has no END line is masked, whatever the key ends 
     ['a GitHub token glued to a short body', `${PEM}\nMIIEowIBAAKCAQEAabc${GH}`, PEM_MASK + GH_MASK],
     ['a fine-grained token glued to the base64', `${PEM_CUT}${PAT}`, PEM_MASK + PAT_MASK],
     ['an sk- key with underscores glued to the base64', `${PEM_CUT}${SK_U}`, PEM_MASK + SK_MASK],
-    ['a cut key, a whole key, then AKIA and a token', `${PEM_CUT}\n${PEM_BLOCK}\n${AKIA}${GH}`, PEM_MASK + GH_MASK],
-    ['two cut keys, then a token', `${PEM_CUT}\n${PEM_CUT}${GH2}`, PEM_MASK + GH_MASK],
+    // A cut key stops at the next real header, which is a key of its own, with its own mask.
+    ['a cut key, a whole key, then AKIA and a token', `${PEM_CUT}\n${PEM_BLOCK}\n${AKIA}${GH}`, `${PEM_MASK}${PEM_MASK}\n${AKIA_MASK}${GH_MASK}`],
+    ['two cut keys, then a token', `${PEM_CUT}\n${PEM_CUT}${GH2}`, PEM_MASK + PEM_MASK + GH_MASK],
     ['a token, a cut key, a token', `${GH} ${PEM_CUT}${PAT}`, `${GH_MASK} ${PEM_MASK}${PAT_MASK}`],
     ['AKIA, then a TypeSafe key', `${PEM_CUT}\n${AKIA}${APIKEY}`, PEM_MASK + KEY_MASK],
     ['a TypeSafe key glued to the base64', `${PEM_CUT}${APIKEY}`, PEM_MASK + KEY_MASK],
@@ -417,7 +418,7 @@ test('a fake BEGIN line in the middle of a key does not end the mask: the rest o
   // A real header does end the search for an END line: it is a key of its own, with its own. The cut one is masked up to it,
   // and through it, as the characters of a key, and the quote ends the mask.
   const twice = maskSecrets(`${PEM}\n${PEM_BODY}\n${PEM_BLOCK}"and after`)
-  assert.equal(twice, `${PEM_MASK}"and after`)
+  assert.equal(twice, `${PEM_MASK}${PEM_MASK}"and after`)
   assertNoBodies(twice, 'a cut key and a whole one')
 })
 
@@ -439,6 +440,45 @@ test('a quote, a bar or a semicolon still ends a header with no END line, so the
   assert.equal(maskSecrets(`echo ${PEM}| ls`), `echo ${PEM_MASK}| ls`)
   assert.equal(maskSecrets(`echo '${PEM}' && cat k`), `echo '${PEM_MASK}' && cat k`)
   assert.equal(maskSecrets(`${PEM}\n${PEM_BODY}"; echo ${PEM_HALF}`), `${PEM_MASK}"; echo ${PEM_HALF}`)
+})
+
+test('a cut key stops at the next real header, which is a key of its own: nothing of the second is left, wherever it starts', () => {
+  // The characters a key is made of include `-`, capitals and a space, which is a header. A cut key's run of them would
+  // eat a header that came after it, the scan would go on from the end of the run, and the key after the header would be
+  // masked only as far as the run went (8 KB from the first header): the rest of it, and its END line, in the clear.
+  const body = 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASC'.repeat(94) // about 3 KB
+  const second = `-----BEGIN OPENSSH PRIVATE KEY-----\n${body}\n-----END OPENSSH PRIVATE KEY-----`
+  for (const gap of [0, 20, 4000, 8000, 8050, 8099, 8100, 8101, 8150, 8160, 8170]) {
+    const text = `${PEM}\n${'x'.repeat(gap)}${second}`
+    const masked = maskSecrets(text)
+    assert.equal(masked, PEM_MASK + PEM_MASK, `the second header at ${PEM.length + 1 + gap}`)
+  }
+  // Past the 8 KB that a cut key is masked for, what is between the two is not: it is not a secret, and the second key is.
+  for (const gap of [8192, 8200, 9000, 20_000]) {
+    const masked = maskSecrets(`${PEM}\n${'x'.repeat(gap)}${second}`)
+    assert.ok(masked.startsWith(PEM_MASK) && masked.endsWith(PEM_MASK), `the second header at ${PEM.length + 1 + gap}`)
+    assert.ok(!masked.includes(body.slice(0, 40)) && !masked.includes('END OPENSSH'), `nothing of the second key is left, with its header at ${gap}`)
+    assert.equal(masked.split('‹secret:').length - 1, 2)
+  }
+  // Each of several, one after the other, and with other things between them.
+  const three = `${PEM}\n${body}\n${PEM}\n${body}\n${second}\n${PEM}\n${AKIA} ${GH}`
+  const masked = maskSecrets(three)
+  assert.ok(!masked.includes(body.slice(0, 40)) && !masked.includes('END OPENSSH') && !masked.includes(AKIA_BODY) && !masked.includes(GH_BODY), masked)
+  assert.equal(secretKind(masked), undefined)
+  assert.equal(maskSecrets(masked), masked)
+  // A text whose cut key is followed by a header of another kind (a public key is no private key) is not cut short by it.
+  const pub = maskSecrets(`${PEM}\n${PEM_BODY}\n-----BEGIN PUBLIC KEY-----\n${PEM_HALF}\n-----END PUBLIC KEY-----"`)
+  assert.equal(pub, `${PEM_MASK}"`)
+})
+
+test('a megabyte of private key headers with no END, one after the other, is scanned in a bounded time, however they are joined', () => {
+  for (const unit of ['-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n', '-----BEGIN RSA PRIVATE KEY----- ', '-----BEGIN PRIVATE KEY-----AKIA']) {
+    const text = unit.repeat((4 * MEGABYTE) / unit.length)
+    let masked = ''
+    const time = took(() => { masked = maskSecrets(text) })
+    assert.ok(time < 1_000, `maskSecrets took ${time.toFixed(0)} ms for ${JSON.stringify(unit)}`)
+    assert.equal(secretKind(masked), undefined)
+  }
 })
 
 test('private keys are masked next to other secrets: before them, after them, over them', () => {
@@ -544,6 +584,44 @@ test('a key whose last digit is the first letter of the next key: both are maske
   const masked = maskSecrets(text)
   assert.equal(masked, KEY_MASK + KEY_MASK)
   assert.equal(maskSecrets(masked), masked)
+})
+
+test('no pattern that looks for a secret at the end of a mask starts with a lookbehind', () => {
+  assert.equal(GLUED_SOURCES.length, 6)
+  for (const source of GLUED_SOURCES) {
+    assert.ok(!source.startsWith('(?<'), source)
+    assert.doesNotThrow(() => new RegExp(source, 'y'), source)
+  }
+})
+
+test('a token glued to a letter that is not part of a secret is still not a match', () => {
+  assert.equal(maskSecrets(`x${GH}${GH2}`), `x${GH}${GH2}`)
+  assert.equal(secretKind(`x${GH}${GH2}`), undefined)
+})
+
+test('matches that overlap become one mask over all of them, so no tail of either is left', () => {
+  // The sk- pattern takes `_` and letters, so it runs over the whole of the GitHub token that follows it, which is a
+  // match of its own that starts inside the sk- match.
+  const nested = `${SK}_${GH}`
+  assert.equal(secretKind(nested), 'a GitHub token')
+  assert.equal(maskSecrets(nested), SK_MASK)
+  // The kind is the one that starts first.
+  assert.equal(maskSecrets(`sk-${GH}`), SK_MASK)
+  // A partial overlap: the sk- match runs on through `-----BEGIN` (its characters include `-`), where a private key header
+  // starts and then goes on past it. One mask covers both, so that neither ` PRIVATE KEY-----` nor the key's tail is left.
+  const partial = `${SK}${PEM}`
+  assert.equal(secretKind(partial), 'an sk- API key')
+  assert.equal(maskSecrets(partial), SK_MASK)
+  assert.equal(maskSecrets(`${SK}${PEM_BLOCK}`), SK_MASK)
+  // A match that starts in the last 6 characters of another and runs past it is not merged into it, as the ones above are:
+  // it is a token that the first one's body took the first letters of, and a mask of its own, under its own kind.
+  assert.equal(maskSecrets(`${PAT}${SK}`), PAT_MASK + SK_MASK)
+  assert.equal(maskSecrets(`${GH}${GH2}`), GH_MASK + GH_MASK)
+})
+
+test('a text with two different secrets masks both', () => {
+  assert.equal(maskSecrets(`aws ${AKIA} and github ${GH}`), `aws ${AKIA_MASK} and github ${GH_MASK}`)
+  assert.equal(maskSecrets(`${SK} ${GH} ${AKIA}\n${PEM_BLOCK}`), `${SK_MASK} ${GH_MASK} ${AKIA_MASK}\n${PEM_MASK}`)
 })
 
 // --- idempotence and completeness -------------------------------------------------------------------
