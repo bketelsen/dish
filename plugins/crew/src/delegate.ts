@@ -172,8 +172,13 @@ function mainModel(agent: Agent): string | undefined {
   return given(agent.options?.model)
 }
 
-/** What `dishPrompts.persona` says of a role with no document in the store and no shipped default (`service.ts`' `fallback`). */
-const MISSING_DOCUMENT = /^unknown role "/
+/**
+ * The `code` of the error `dishPrompts.persona` throws for a role with no document in the store and no shipped default: the
+ * value of dish-prompts' `UNKNOWN_ROLE`, which a test keeps the same. It is read off the error, never matched by `instanceof`
+ * (the error may be of another copy of a module) or by its words, and it is spelled out here because the row loads nothing of
+ * dish-prompts.
+ */
+const UNKNOWN_ROLE = 'UNKNOWN_ROLE'
 
 /** Run a read of the crew's record, and refuse, closed, if it can't be read: the limits and the reviewer rule depend on it. */
 async function readRecord<T>(read: () => Promise<T>): Promise<T> {
@@ -271,19 +276,26 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     }
   }
 
-  /** The work the reviewer reviews, for `reviews`: the main agent's own, or a crew child of this session. */
-  async function reviewedWork(call: Call, reviews: string): Promise<ReviewedWork> {
+  /**
+   * The work the reviewer reviews, for `reviews`: the main agent's own, or a crew child of this session.
+   * @param followUp - the refusals' lead-in and advice when this is for a follow-up, whose work can't be changed, so that
+   * the advice for a start (to set `reviews` differently) isn't given to it.
+   */
+  async function reviewedWork(call: Call, reviews: string, followUp?: { lead: string, again: string }): Promise<ReviewedWork> {
     if (reviews === 'main') {
       const model = mainModel(call.agent)
       if (model === undefined) {
-        throw new Error('can\'t tell which model you (the main agent) run on, so no reviewer family can be chosen to differ from it; '
-          + 'review a crew child\'s work instead (set reviews to its id).')
+        throw new Error(followUp === undefined
+          ? 'can\'t tell which model you (the main agent) run on, so no reviewer family can be chosen to differ from it; '
+            + 'review a crew child\'s work instead (set reviews to its id).'
+          : `${followUp.lead} can't tell which model you (the main agent) run on, so there's no checking that it differs from the reviewer's. ${followUp.again}`)
       }
       return { model }
     }
     const child = await ownChild(call, reviews, '`reviews`', 'Use one of those ids, or "main" to review your own work.')
     // A reviewer's report is a review: what a review of it would add is the work, which it already looked at.
     if (child.reviews !== undefined || (Object.hasOwn(call.settings.roles, child.role) && call.settings.roles[child.role]!.reviews)) {
+      if (followUp !== undefined) throw new Error(`${followUp.lead} the work it reviewed (${quoted(reviews)}) is itself a review, not work. ${followUp.again}`)
       throw new Error(`\`reviews\` ${quoted(reviews)} is ${article(child.role)} «${child.title}», whose report is a review, not work; `
         + (child.reviews === undefined
           ? 'review the work itself instead (its id, or "main" for your own).'
@@ -397,8 +409,9 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
         throw new Error(`the work child ${target.id} reviewed (${quoted(reviews)}) is no longer in the record, so there is nothing to check its model against. ${again}`)
       }
     }
-    const checked = chooseRoute({ settings: call.settings, role: call.role, override: target.model, reviewed: await reviewedWork(call, reviews) })
-    if (!checked.ok) throw new Error(`can't send a follow-up to ${call.role} child ${target.id}: ${checked.problem} ${again}`)
+    const lead = `can't send a follow-up to ${call.role} child ${target.id}:`
+    const checked = chooseRoute({ settings: call.settings, role: call.role, override: target.model, reviewed: await reviewedWork(call, reviews, { lead, again }) })
+    if (!checked.ok) throw new Error(`${lead} ${checked.problem} ${again}`)
   }
 
   /** Steps 5 and 8 for a follow-up. Inside the session's lock. */
@@ -519,9 +532,9 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
           try {
             persona = await call.prompts.persona(call.role)
           } catch (error) {
-            // The service rejects `unknown role "<r>"` for a role that has neither a document nor a shipped default, and
-            // otherwise only when it can't read the store: advice to write a document would be wrong for that.
-            throw new Error(MISSING_DOCUMENT.test(describe(error))
+            // The service rejects with the code `UNKNOWN_ROLE` for a role that has neither a document nor a shipped default,
+            // and otherwise only when it can't read the store: advice to write a document would be wrong for that.
+            throw new Error((error as { code?: unknown } | null)?.code === UNKNOWN_ROLE
               ? `role ${call.role} has no prompt (${describe(error)}): add prompts/crew/${call.role}.md to the config store, then delegate again.`
                 + `${ctx.get('dishConfig') === undefined ? ' dish-config is not running, so only the shipped prompts exist.' : ''}`
               : `could not read the prompt of role ${call.role} (${describe(error)}), so nothing was started. Try again, or tell the user.`, { cause: error })

@@ -50,7 +50,7 @@ export interface DishPrompts {
   /**
    * The texts on `main` right now, with the shipped default for a document that is missing.
    * @throws `Error` for `common` (it isn't a role of its own), for a name that can't be a role, and for a crew role
-   * with neither a document nor a default. A failure of the store is passed on.
+   * with neither a document nor a default: that one has the `code` `UNKNOWN_ROLE`. A failure of the store is passed on.
    */
   persona(role: string): Promise<Persona>
   /**
@@ -104,6 +104,13 @@ interface Taken {
   persona: Persona
   final: boolean
 }
+
+/**
+ * The `code` of the error `persona` and `snapshot` throw for a crew role that has neither a document in the store nor a shipped
+ * default. A caller in another module tells that failure from a store that can't be read by this string, not by `instanceof`
+ * (separate copies of a module have separate classes) or by the message.
+ */
+export const UNKNOWN_ROLE = 'UNKNOWN_ROLE'
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -160,7 +167,7 @@ export function createDishPrompts(options: ServiceOptions): DishPrompts {
   /** `role`'s shipped text, for a document that isn't in the store. @throws `Error` for a role with none. */
   function fallback(role: Role, stored: boolean): string {
     const text = defaultText(role)
-    if (text === undefined) throw new Error(`unknown role "${role}"`)
+    if (text === undefined) throw Object.assign(new Error(`unknown role "${role}"`), { code: UNKNOWN_ROLE })
     const path = pathFor(role)
     if (stored && !missing.has(path)) {
       missing.add(path)

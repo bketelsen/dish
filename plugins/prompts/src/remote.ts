@@ -273,8 +273,9 @@ export class PromptsRemote extends TypertRemoteService {
         return await buildPreview(this.ctx, prompts, name, this.onFallback)
       } catch (error) {
         // A crew role that exists only in the store can be deleted after the check above: the service then has no
-        // text for it, and says so with a plain `Error` (it has no code to match on), which the gateway would fold
-        // into `gateway/internal`. That one case, by its exact message, is the same answer as the check's.
+        // text for it, and says so with an `Error` the gateway would fold into `gateway/internal`. That one case, by its
+        // exact message, is the same answer as the check's. (The service's error now has the code `UNKNOWN_ROLE`; the
+        // message is still what is matched here, so that a service that doesn't set the code is handled all the same.)
         if (error instanceof Error && error.message === `unknown role "${asked}"`) throw none()
         throw error
       }

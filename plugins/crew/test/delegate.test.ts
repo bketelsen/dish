@@ -74,7 +74,7 @@ interface World {
     resolveFails: Error | undefined
     /** How long `startContinuable` takes. */
     startMs: number
-    /** Roles `persona()` refuses, as the real service does for a role with no document and no default. */
+    /** Roles `persona()` refuses as the real service does for a role with no document and no default: `unknown role` with the code `UNKNOWN_ROLE`. */
     noPrompt: Set<string>
     /** An error `persona()` throws instead, as it does when the store can't be read. */
     promptFails: Error | undefined
@@ -103,7 +103,7 @@ async function world(options: Options = {}): Promise<World> {
   const directory = await tempDir()
   const records = options.records ?? new CrewRecords(directory)
   const ctx = new Context()
-  ctx.provide('systemPrompt', { tools() {}, section() {}, getSectionOrder: () => 1 } as never)
+  await provide(ctx, 'systemPrompt', { tools() {}, section() {}, getSectionOrder: () => 1 })
   disposables.push(await ctx.plugin(ToolRuntime, {}))
   let owner!: Context
   disposables.push(await ctx.plugin({ name: 'scope-owner', inject: ['tools'], apply(own: Context) { owner = own } } as never, undefined as never))
@@ -157,7 +157,7 @@ async function world(options: Options = {}): Promise<World> {
       async persona(role: string) {
         personaAsked.push(role)
         if (stub.promptFails !== undefined) throw stub.promptFails
-        if (stub.noPrompt.has(role)) throw new Error(`unknown role "${role}"`)
+        if (stub.noPrompt.has(role)) throw Object.assign(new Error(`unknown role "${role}"`), { code: 'UNKNOWN_ROLE' })
         return { prefix: `You are the ${role}. {{model}}`, suffix: 'common rules', commit: null }
       },
     })
@@ -266,7 +266,7 @@ test('the description still stands when the crew service is missing at registrat
 
 test('the tool goes when the row does', async () => {
   const ctx = new Context()
-  ctx.provide('systemPrompt', { tools() {}, section() {}, getSectionOrder: () => 1 } as never)
+  await provide(ctx, 'systemPrompt', { tools() {}, section() {}, getSectionOrder: () => 1 })
   disposables.push(await ctx.plugin(ToolRuntime, {}))
   await provide(ctx, 'subagents', {})
   await provide(ctx, 'llm', {})
@@ -368,8 +368,23 @@ test('a prompt that can\'t be read because the store failed is not a missing doc
   assert.deepEqual(await w.records.children(SESSION), [])
 })
 
+test('a missing document is told by the error\'s code, not by its words', async () => {
+  const w = await world()
+  // The same words with no code: some other failure, so no advice to write a document.
+  w.stub.promptFails = new Error('unknown role "coder"')
+  const message = await refusal(w.delegate(CODER))
+  assert.match(message, /^could not read the prompt of role coder/)
+  assert.doesNotMatch(message, /prompts\/crew\/coder\.md/)
+  // The code with other words is a missing document.
+  w.stub.promptFails = Object.assign(new Error('nothing for this one'), { code: 'UNKNOWN_ROLE' })
+  assert.match(await refusal(w.delegate(CODER)), /^role coder has no prompt.*prompts\/crew\/coder\.md/)
+})
+
 test('with the real dish-prompts service: a role it has no text for is a missing document, and one it has starts with the shipped prompt', async () => {
   const w = await world({ realPrompts: true, settings: settingsFrom((d) => { d.roles.tester = { tier: 'mid', family: 'anthropic', tools: ['read'] } }) })
+  // The code the row checks for is the one the service gives: the row can't import it (it loads nothing of dish-prompts).
+  assert.equal(promptsPlugin.UNKNOWN_ROLE, 'UNKNOWN_ROLE')
+  await assert.rejects(w.ctx.dishPrompts.persona('tester'), { code: promptsPlugin.UNKNOWN_ROLE })
   const message = await refusal(w.delegate({ role: 'tester', title: 'test it', task: 'Test.' }))
   assert.match(message, /^role tester has no prompt/)
   assert.match(message, /prompts\/crew\/tester\.md/)
@@ -1114,6 +1129,35 @@ test('a reviewer follow-up whose model crew.yaml has since dropped is refused, w
   const message = await refusal(w.delegate({ ...REVIEW, to: reviewer.child }))
   assert.match(message, /gpt-5\.6-sol/)
   assert.match(message, /start a new reviewer/i)
+})
+
+test('a reviewer follow-up whose reviewed work is itself a review is refused with advice for a follow-up: start a new reviewer', async () => {
+  const w = await world()
+  await w.seed({ id: 'r0', role: 'reviewer', model: 'gpt-5.6-sol', family: 'openai', reviews: 'main' }, 'idle')
+  await w.seed({ id: 'r1', role: 'reviewer', model: 'claude-sonnet-5.5', family: 'anthropic', reviews: 'r0', last: 'finished' }, 'idle')
+  const message = await refusal(w.delegate({ ...REVIEW, to: 'r1' }))
+  assert.match(message, /^can't send a follow-up to reviewer child r1/)
+  assert.match(message, /itself a review/)
+  assert.match(message, /Start a new reviewer instead/)
+  // Not the advice for a start: that would have the model re-point a follow-up, which isn't allowed.
+  assert.doesNotMatch(message, /review the work it reviewed/)
+  assert.doesNotMatch(message, /set reviews/)
+  assert.equal(w.sends.length, 0)
+})
+
+test('a reviewer follow-up when the main agent\'s model can\'t be told is refused with advice for a follow-up too', async () => {
+  const w = await world()
+  w.mainModel.current = 'claude-opus-5.5'
+  const reviewer = await w.delegate({ ...REVIEW, reviews: 'main' })
+  w.agents.set(reviewer.child, { status: 'idle' })
+  await w.records.endRun(reviewer.child, { stopReason: 'completed', closing: 'x' })
+  w.mainModel.current = undefined
+  const message = await refusal(w.delegate({ ...REVIEW, to: reviewer.child }))
+  assert.match(message, /^can't send a follow-up to reviewer child /)
+  assert.match(message, /can't tell which model you/)
+  assert.match(message, /Start a new reviewer instead/)
+  assert.doesNotMatch(message, /set reviews/)
+  assert.equal(w.sends.length, 0)
 })
 
 // --- a start that fails ----------------------------------------------------------------------------------------

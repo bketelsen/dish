@@ -28,6 +28,7 @@ import { createDishPrompts } from './service.ts'
 import { SnapshotFiles } from './snapshots.ts'
 
 export type { DishPrompts, Persona } from './service.ts'
+export { UNKNOWN_ROLE } from './service.ts'
 
 export const name = 'dish-prompts'
 

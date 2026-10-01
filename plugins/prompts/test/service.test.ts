@@ -7,7 +7,7 @@ import { Context } from '@deepseek-ai/cordis'
 import type { DishConfigService } from 'dish-config'
 import { DEFAULTS } from '../src/defaults.ts'
 import { CREW_ROLES, namespaceSpecs, pathFor } from '../src/roles.ts'
-import { createDishPrompts } from '../src/service.ts'
+import { UNKNOWN_ROLE, createDishPrompts } from '../src/service.ts'
 import type { DishPrompts, SnapshotStore, StoreReader } from '../src/service.ts'
 import { SnapshotFiles } from '../src/snapshots.ts'
 import { COMMIT, dirs, mountConfig, snapshotFile, userWrite } from './helpers.ts'
@@ -156,10 +156,33 @@ test('persona is the role\'s document as a prefix and common as the suffix, at t
   })
 })
 
+test('UNKNOWN_ROLE is the code of the error for a role with no text anywhere, and of no other failure', async () => {
+  // The code is a string a caller in another module reads off the error (`instanceof` doesn't cross module copies).
+  assert.equal(UNKNOWN_ROLE, 'UNKNOWN_ROLE')
+  await withStore(async (harness) => {
+    const codeOf = async (promise: Promise<unknown>): Promise<unknown> => {
+      try {
+        await promise
+      } catch (error) {
+        return (error as { code?: unknown }).code
+      }
+      return assert.fail('expected a rejection')
+    }
+    const prompts = serviceFor(harness)
+    assert.equal(await codeOf(prompts.persona('data-2')), UNKNOWN_ROLE)
+    assert.equal(await codeOf(prompts.snapshot({ id: 'a1' }, 'data-2')), UNKNOWN_ROLE)
+    // Not a role at all, `common`, and a store that fails: each is another error.
+    assert.equal(await codeOf(prompts.persona('Bad Role')), undefined)
+    assert.equal(await codeOf(prompts.persona('common')), undefined)
+    const broken = serviceFor(harness, { store: () => readerWith(harness.store, { head: () => Promise.reject(new Error('the store is down')) }) })
+    assert.equal(await codeOf(broken.persona('coder')), undefined)
+  })
+})
+
 test('persona of a crew role nobody shipped works once it has a document, and is unknown before', async () => {
   await withStore(async (harness) => {
     const prompts = serviceFor(harness)
-    await assert.rejects(prompts.persona('data-2'), { message: 'unknown role "data-2"' })
+    await assert.rejects(prompts.persona('data-2'), { message: 'unknown role "data-2"', code: 'UNKNOWN_ROLE' })
     await userWrite(harness.store, 'data-2', 'we model data')
     const persona = await prompts.persona('data-2')
     assert.equal(persona.prefix, 'we model data')
@@ -204,7 +227,7 @@ test('persona without a store is the shipped defaults, commit null; an unknown c
   const prompts = createDishPrompts({ store: () => undefined, files: new SnapshotFiles(where.agents), logger: { warn() {}, info() {} } })
   assert.deepEqual(await prompts.persona('main'), { prefix: DEFAULTS.main, suffix: DEFAULTS.common, commit: null })
   assert.deepEqual(await prompts.persona('reviewer'), { prefix: DEFAULTS.reviewer, suffix: DEFAULTS.common, commit: null })
-  await assert.rejects(prompts.persona('data-2'), { message: 'unknown role "data-2"' })
+  await assert.rejects(prompts.persona('data-2'), { message: 'unknown role "data-2"', code: 'UNKNOWN_ROLE' })
   await assert.rejects(prompts.persona('common'), /common/)
 })
 
@@ -506,8 +529,8 @@ test('a role with no text anywhere rejects the snapshot, caches nothing and writ
   await withStore(async (harness) => {
     const files = spy(new SnapshotFiles(harness.dirs.agents))
     const prompts = serviceFor(harness, { files })
-    await assert.rejects(prompts.snapshot({ id: 'a1' }, 'data-2'), { message: 'unknown role "data-2"' })
-    await assert.rejects(prompts.snapshot({ id: 'a1' }, 'data-2'), { message: 'unknown role "data-2"' })
+    await assert.rejects(prompts.snapshot({ id: 'a1' }, 'data-2'), { message: 'unknown role "data-2"', code: 'UNKNOWN_ROLE' })
+    await assert.rejects(prompts.snapshot({ id: 'a1' }, 'data-2'), { message: 'unknown role "data-2"', code: 'UNKNOWN_ROLE' })
     await assert.rejects(prompts.snapshot({ id: 'a1' }, 'common'), /common/)
     await assert.rejects(prompts.snapshot({ id: 'a1' }, 'Bad Role'), /invalid role/)
     assert.equal(files.calls.put, 0)
@@ -582,7 +605,7 @@ test('a record for a store-only role is not replaced while the store can not sup
     const pinned = await serviceFor(harness).snapshot({ id: 'r1' }, 'data-2')
     const files = spy(new SnapshotFiles(harness.dirs.agents))
     const without = serviceFor(harness, { store: () => undefined, files })
-    await assert.rejects(without.snapshot({ id: 'r1' }, 'main'), { message: 'unknown role "data-2"' })
+    await assert.rejects(without.snapshot({ id: 'r1' }, 'main'), { message: 'unknown role "data-2"', code: 'UNKNOWN_ROLE' })
     assert.equal(files.calls.put, 0)
     assert.equal((await new SnapshotFiles(harness.dirs.agents).get('r1'))?.role, 'data-2')
     // The store back: the text it had.

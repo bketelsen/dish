@@ -142,7 +142,7 @@ test('roles() and persona() follow the store: a person\'s edits show at once', a
     assert.deepEqual(await prompts.roles(), ['common', 'main', 'architect', 'coder', 'data-2', 'ops', 'researcher', 'reviewer', 'writer'])
     assert.equal((await prompts.persona('data-2')).prefix, 'we model data')
     await assert.rejects(prompts.persona('common'))
-    await assert.rejects(prompts.persona('nobody'), { message: 'unknown role "nobody"' })
+    await assert.rejects(prompts.persona('nobody'), { message: 'unknown role "nobody"', code: plugin.UNKNOWN_ROLE })
   })
 })
 
