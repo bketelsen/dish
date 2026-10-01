@@ -356,6 +356,15 @@ test('checkContent refuses a TypeSafe API key, whole or cut, naming the kind and
   }
 })
 
+test('checkContent refuses what the secret scan cannot read, and does not throw out of it', () => {
+  // A scan that fails (V8 throws on a text long enough for a regular expression that loops) is not a clean one. Here the
+  // path throws when it is read, which is what the scan sees of one.
+  const unreadable = { toString: () => { throw new Error('the engine ran out of stack') } } as unknown as string
+  const error = refusal(unreadable, 'text')
+  assert.equal(error.code, 'SECRET')
+  assert.equal(error.message, 'the document path looks like an unreadable secret scan')
+})
+
 test('secretKind names the kind of the first secret in a text, or nothing', () => {
   assert.equal(secretKind(`key ${GH}`), 'a GitHub token')
   assert.equal(secretKind(`key ${AKIA}`), 'an AWS access key ID')

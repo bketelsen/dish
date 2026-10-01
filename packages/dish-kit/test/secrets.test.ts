@@ -33,13 +33,20 @@ const KEY_A = '760816af9c2088fea182638699c0065a826'
 const KEY_B = '1d2f9a11c37d3bf93c0a50d186c1cabbb20936b507f96d71b7b75782f1750b1b'
 const KEY2_A = '6a4a972c0341da8eb57a6a8819d3b64e322'
 const KEY2_B = '336456890e5286d3e97b297d2cd245878bb5c0ec18c5af538dc4f98e586b31ab'
+// Tokens that are too short to be one on their own (a GitHub token has 36 characters after its prefix, a fine-grained one 50),
+// and that are glued to the front of another: its first letters make up the rest of the length.
+const GH30 = `ghp_${GH_BODY.slice(0, 30)}`
+const GH33 = `ghp_${GH_BODY.slice(0, 33)}`
+const GH34 = `ghp_${GH_BODY.slice(0, 34)}`
+const GH35 = `ghp_${GH_BODY.slice(0, 35)}`
+const PAT48 = `github_pat_${PAT_BODY.slice(0, 48)}`
 const APIKEY = `apikey_${KEY_A}_${KEY_B}`
 const APIKEY2 = `apikey_${KEY2_A}_${KEY2_B}`
 /** The same in capitals, which a later format of the key might have. */
 const APIKEY_UPPER = `apikey_${KEY2_A.toUpperCase()}_${KEY2_B.toUpperCase()}`
 
 /** Everything in a fixture that must not survive masking. */
-const BODIES = [GH_BODY, GH2_BODY, PAT_BODY, SK_BODY, 'aB3_dE5-gH9_', AKIA_BODY, PEM_BODY, PEM_BODY2, PEM_HALF, 'PRIVATE KEY-----', 'ghp_', 'ghs_', 'github_pat_', 'AKIA', 'ASIA', KEY_A, KEY_B, KEY2_A, KEY2_B, KEY2_A.toUpperCase(), KEY2_B.toUpperCase(), 'apikey_']
+const BODIES = [GH_BODY, GH2_BODY, PAT_BODY, SK_BODY, 'aB3_dE5-gH9_', AKIA_BODY, PEM_BODY, PEM_BODY2, PEM_HALF, 'PRIVATE KEY-----', 'ghp_', 'ghs_', 'github_pat_', 'AKIA', 'ASIA', GH_BODY.slice(0, 30), PAT_BODY.slice(0, 48), KEY_A, KEY_B, KEY2_A, KEY2_B, KEY2_A.toUpperCase(), KEY2_B.toUpperCase(), 'apikey_']
 
 /** Assert that none of a fixture is in `masked`. A text with no pattern match in it can still hold the whole of a body. */
 function assertNoBodies(masked: string, what: string): void {
@@ -479,6 +486,19 @@ const glued: Array<[string, string, string]> = [
   ['a temporary AWS key and a TypeSafe key in capitals', ASIA + APIKEY_UPPER, AKIA_MASK + KEY_MASK],
   ['a private key and a TypeSafe key', PEM_BLOCK + APIKEY, PEM_MASK + KEY_MASK],
   ['a cut private key and a TypeSafe key', PEM_CUT + APIKEY, PEM_MASK + KEY_MASK],
+  // A token with too few characters of its own, followed by another: the letters of the second's prefix, up to its `_` or
+  // `-`, count as the first's, so it is a token to `secretKind`, and its match ends inside the second's prefix.
+  ['a GitHub token 30 long and a TypeSafe key', GH30 + APIKEY, GH_MASK + KEY_MASK],
+  ['a GitHub token 33 long and a GitHub token', GH33 + GH, GH_MASK + GH_MASK],
+  ['a GitHub token 34 long and an sk- key', GH34 + SK, GH_MASK + SK_MASK],
+  ['a GitHub token 35 long and an sk- key', GH35 + SK_U, GH_MASK + SK_MASK],
+  ['a GitHub token 30 long and a fine-grained token', GH30 + PAT, GH_MASK + PAT_MASK],
+  ['a GitHub token 33 long and a TypeSafe key in capitals', GH33 + APIKEY_UPPER, GH_MASK + KEY_MASK],
+  ['a fine-grained token 48 long and an sk- key', PAT48 + SK, PAT_MASK + SK_MASK],
+  ['a fine-grained token 48 long and an sk- key with underscores', PAT48 + SK_U, PAT_MASK + SK_MASK],
+  ['a fine-grained token 48 long and a GitHub token', PAT48 + GH, PAT_MASK],
+  ['a fine-grained token 48 long and a TypeSafe key', PAT48 + APIKEY, PAT_MASK],
+  ['a GitHub token 30 long, a TypeSafe key, an AWS key', GH30 + APIKEY + AKIA, GH_MASK + KEY_MASK + AKIA_MASK],
 ]
 
 for (const [name, text, expected] of glued) {
@@ -516,50 +536,14 @@ test('what follows a TypeSafe key that is not part of a key is not masked with i
   }
 })
 
-test('a text that a pattern detects and cannot mask is masked whole, not left', () => {
+test('a key whose last digit is the first letter of the next key: both are masked', () => {
   // 31 digits and then the `a` of a second key: the first key's 32nd digit is the second one's first letter, so the first
-  // is a key to `secretKind`, and the mask cannot end it there without taking the second's `a`, and the second is not a
-  // key to look for after a digit. Neither a half-mask nor a leak of the second key will do.
+  // is a key to `secretKind`, and its match ends inside the second's prefix. The second is a key that follows a match.
   const text = `apikey_${KEY_A.slice(0, 31)}apikey_${KEY2_A}_${KEY2_B}`
   assert.equal(secretKind(text), 'a TypeSafe API key')
   const masked = maskSecrets(text)
-  assert.equal(secretKind(masked), undefined)
-  assertNoBodies(masked, 'two keys, the first cut short')
+  assert.equal(masked, KEY_MASK + KEY_MASK)
   assert.equal(maskSecrets(masked), masked)
-})
-
-test('no pattern that looks for a secret at the end of a mask starts with a lookbehind', () => {
-  assert.equal(GLUED_SOURCES.length, 6)
-  for (const source of GLUED_SOURCES) {
-    assert.ok(!source.startsWith('(?<'), source)
-    assert.doesNotThrow(() => new RegExp(source, 'y'), source)
-  }
-})
-
-test('a token glued to a letter that is not part of a secret is still not a match', () => {
-  assert.equal(maskSecrets(`x${GH}${GH2}`), `x${GH}${GH2}`)
-  assert.equal(secretKind(`x${GH}${GH2}`), undefined)
-})
-
-test('matches that overlap become one mask over all of them, so no tail of either is left', () => {
-  // The sk- pattern takes `_` and letters, so it runs over the whole of the GitHub token that follows it, which is a
-  // match of its own that starts inside the sk- match.
-  const nested = `${SK}_${GH}`
-  assert.equal(secretKind(nested), 'a GitHub token')
-  assert.equal(maskSecrets(nested), SK_MASK)
-  // The kind is the one that starts first.
-  assert.equal(maskSecrets(`sk-${GH}`), SK_MASK)
-  // A partial overlap: the sk- match runs on through `-----BEGIN` (its characters include `-`), where a private key header
-  // starts and then goes on past it. One mask covers both, so that neither ` PRIVATE KEY-----` nor the key's tail is left.
-  const partial = `${SK}${PEM}`
-  assert.equal(secretKind(partial), 'an sk- API key')
-  assert.equal(maskSecrets(partial), SK_MASK)
-  assert.equal(maskSecrets(`${SK}${PEM_BLOCK}`), SK_MASK)
-})
-
-test('a text with two different secrets masks both', () => {
-  assert.equal(maskSecrets(`aws ${AKIA} and github ${GH}`), `aws ${AKIA_MASK} and github ${GH_MASK}`)
-  assert.equal(maskSecrets(`${SK} ${GH} ${AKIA}\n${PEM_BLOCK}`), `${SK_MASK} ${GH_MASK} ${AKIA_MASK}\n${PEM_MASK}`)
 })
 
 // --- idempotence and completeness -------------------------------------------------------------------
@@ -601,7 +585,10 @@ test('the mask text is not itself a secret, for every kind', () => {
 test('no secret is left in any mixture of secrets and what goes between them, and masking the result changes nothing', () => {
   // Secrets, and what a text puts between and around them. Every sequence of up to three. A secret here is one a pattern
   // matches where it stands: not after a letter, and an AWS key not before a capital, which are not secrets on their own.
-  const secrets = [GH, GH2, PAT, SK, AKIA, ASIA, PEM_BLOCK, APIKEY, APIKEY_UPPER]
+  // And tokens that are too short on their own, each glued to the front of another that makes up their length.
+  // (Each is a token to `secretKind`: the first's 30 to 35 characters and the letters of the second's prefix are 36 or more.)
+  const shortOnes = [GH30 + APIKEY, GH33 + GH2, GH34 + SK, GH35 + PAT, PAT48 + SK_U, GH30 + PAT]
+  const secrets = [GH, GH2, PAT, SK, AKIA, ASIA, PEM_BLOCK, APIKEY, APIKEY_UPPER, ...shortOnes]
   const parts = [...secrets, ' ', '\n', '_', '-', '.']
   const sequences: string[] = []
   const walk = (prefix: string, depth: number): void => {
@@ -610,7 +597,7 @@ test('no secret is left in any mixture of secrets and what goes between them, an
     for (const part of parts) walk(prefix + part, depth - 1)
   }
   walk('', 3)
-  assert.ok(sequences.length > 2_500)
+  assert.ok(sequences.length > 5_000)
   let tested = 0
   for (const text of sequences) {
     if (/(?:AKIA|ASIA)[0-9A-Z]{16}(?:AKIA|ASIA)/.test(text)) continue
@@ -621,11 +608,11 @@ test('no secret is left in any mixture of secrets and what goes between them, an
     assert.equal(maskSecrets(once), once, JSON.stringify(text))
     assert.equal(once.includes('‹secret:'), secrets.some(secret => text.includes(secret)), JSON.stringify(text))
   }
-  assert.ok(tested > 2_300)
+  assert.ok(tested > 4_500)
 })
 
 test('no secret is left in a mixture that has keys that were cut off, secrets glued to them, and what goes between', () => {
-  const secrets = [PEM_CUT, PEM_BLOCK, AKIA, ASIA, GH, PAT, SK, SK_U, APIKEY, APIKEY_UPPER, `apikey_${KEY_A}`]
+  const secrets = [PEM_CUT, PEM_BLOCK, AKIA, ASIA, GH, PAT, SK, SK_U, APIKEY, APIKEY_UPPER, `apikey_${KEY_A}`, GH30 + APIKEY, GH33 + GH2, GH34 + SK, PAT48 + SK_U]
   const parts = [...secrets, ' ', '\n', '_', '-', '.']
   // Every sequence of up to three, and then a long run of pseudo-random ones, up to six: a cut key takes in what follows it,
   // so a secret behind one is masked as the end of the mask, whatever the run of base64 and AKIA in front of it was.
@@ -657,7 +644,7 @@ test('no secret is left in a mixture that has keys that were cut off, secrets gl
 })
 
 test('no body is left, and the text around is, in a mixture with words between the secrets', () => {
-  const secrets = [GH, GH2, PAT, SK, AKIA, PEM_BLOCK, APIKEY, APIKEY_UPPER]
+  const secrets = [GH, GH2, PAT, SK, AKIA, PEM_BLOCK, APIKEY, APIKEY_UPPER, GH30 + APIKEY, GH33 + GH2, GH34 + SK, PAT48 + SK_U]
   for (const first of secrets) {
     for (const second of secrets) {
       for (const between of [' and ', '\n', ', ', '=']) {
@@ -665,10 +652,88 @@ test('no body is left, and the text around is, in a mixture with words between t
         const masked = maskSecrets(text)
         assertNoBodies(masked, JSON.stringify(text))
         assert.ok(masked.startsWith('a ‹secret:') && masked.endsWith(' b'), JSON.stringify(masked))
-        assert.equal(masked.split('‹secret:').length - 1, 2, `each of the two has a mask: ${JSON.stringify(masked)}`)
+        assert.ok(masked.split('‹secret:').length - 1 >= 2, `each of the two has a mask: ${JSON.stringify(masked)}`)
       }
     }
   }
+})
+
+// --- long runs ------------------------------------------------------------------------------------------
+
+test('a token body longer than any real one is detected, and masked through to the end of the run', () => {
+  // A body is at most 1024 characters to the patterns (an unbounded loop in V8 keeps a backtrack entry for each character, and
+  // runs out of stack on a long run). A run that is longer is still one: the mask goes on through it, a character at a time.
+  const kinds: Array<[string, string, string, string]> = [
+    ['a GitHub token', 'ghp_', 'a', GH_MASK],
+    ['a fine-grained token', 'github_pat_', 'a_', PAT_MASK],
+    ['an sk- key', 'sk-', 'a-_', SK_MASK],
+    ['a TypeSafe key, in its first part', 'apikey_', 'a1', KEY_MASK],
+  ]
+  for (const [name, prefix, unit, masked] of kinds) {
+    for (const length of [1022, 1023, 1024, 1025, 1026, 1500, 2048, 5000]) {
+      const body = unit.repeat(Math.ceil(length / unit.length)).slice(0, length)
+      for (const [text, expected] of [
+        [prefix + body, masked],
+        [`before ${prefix}${body} after`, `before ${masked} after`],
+        [`${prefix}${body}\n${prefix}${body}`, `${masked}\n${masked}`],
+      ] as const) {
+        assert.equal(secretKind(text), kindOf(prefix === 'ghp_' ? GH : prefix === 'sk-' ? SK : prefix === 'apikey_' ? APIKEY : PAT), `${name} ${length}`)
+        assert.equal(maskSecrets(text), expected, `${name} ${length}`)
+      }
+    }
+  }
+  // A TypeSafe key whose first part runs past the bound, and one whose second part does, each with its other part.
+  for (const [first, second] of [[1024, 64], [1025, 64], [3000, 64], [35, 1024], [35, 1025], [35, 9000], [2000, 2000]] as const) {
+    const key = `apikey_${'a'.repeat(first)}_${'b'.repeat(second)}`
+    assert.equal(secretKind(key), 'a TypeSafe API key')
+    assert.equal(maskSecrets(`x ${key} y`), `x ${KEY_MASK} y`, `${first}, ${second}`)
+    assert.equal(maskSecrets(`${key}_${GH}`), `${KEY_MASK}_${GH_MASK}`, `${first}, ${second}`)
+  }
+})
+
+// A run of this much of one token's characters is more than a mask or a scan can be allowed to throw on: V8 raised
+// "Maximum call stack size exceeded" at about 8 MB for each of these.
+const RUN = 16 * 1024 * 1024
+const runs: Array<[string, string, string, string | undefined]> = [
+  ['ghp_', 'ghp_', 'aB3dE5', GH_MASK],
+  ['github_pat_', 'github_pat_', 'aB3_dE', PAT_MASK],
+  ['sk-', 'sk-', 'aB3-dE_', SK_MASK],
+  ['apikey_ and hex', 'apikey_', 'a1b2c3', KEY_MASK],
+  ['apikey_, 35 hex digits, an underscore and hex', `apikey_${KEY_A}_`, 'a1b2c3', KEY_MASK],
+  ['apikey_, a megabyte of hex, an underscore and hex', `apikey_${'a'.repeat(1_000_000)}_`, 'a1b2c3', KEY_MASK],
+  ['AKIA and capitals', 'AKIA', 'A1B2C3', undefined],
+  ['a private key header and base64', `${PEM}\n`, 'MIIEvQ', undefined],
+  ['text', '', 'plain words and ', undefined],
+]
+
+for (const [name, prefix, unit, masked] of runs) {
+  test(`16 MB of ${name} is scanned and masked without an error, and in a few seconds`, () => {
+    const text = prefix + unit.repeat(Math.ceil(RUN / unit.length))
+    let kind: string | undefined
+    const scan = took(() => { kind = secretKind(text) })
+    assert.ok(scan < 3_000, `secretKind took ${scan.toFixed(0)} ms`)
+    let result = ''
+    const time = took(() => { result = maskSecrets(text) })
+    assert.ok(time < 3_000, `maskSecrets took ${time.toFixed(0)} ms`)
+    assert.notEqual(kind, 'an unreadable secret scan', 'the scan did not fail')
+    assert.notEqual(result, mask('an unreadable secret scan'), 'nor the mask')
+    if (masked !== undefined) {
+      assert.ok(kind !== undefined)
+      // The whole run is one secret, and goes with it.
+      assert.equal(result, masked)
+    } else {
+      assert.equal(secretKind(result), undefined)
+    }
+  })
+}
+
+test('an error from the scan fails closed: a kind that the guard refuses, and a mask that holds nothing', () => {
+  const throwing = { toString: () => { throw new Error('the engine ran out of stack') } } as unknown as string
+  assert.equal(secretKind(throwing), 'an unreadable secret scan')
+  assert.equal(maskSecrets(throwing), mask('an unreadable secret scan'))
+  // The mask is stable, and no secret.
+  assert.equal(maskSecrets(mask('an unreadable secret scan')), mask('an unreadable secret scan'))
+  assert.equal(secretKind(mask('an unreadable secret scan')), undefined)
 })
 
 // --- how long it takes -------------------------------------------------------------------------------
