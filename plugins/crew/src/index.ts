@@ -52,6 +52,8 @@ export interface DishCrew {
    * logged). Once it has resolved it is gone from here: the run is in `records`.
    */
   whenRecorded(childId: string): Promise<EndedRun | undefined> | undefined
+  /** The `ctx.subagents` provider the crew's children are created on: the `subagentProvider` setting. The preset row can't see the host's config. */
+  readonly subagentProvider: string
 }
 
 // Here, with the type, so that whoever imports it also gets `ctx.get('dishCrew')` typed.
@@ -352,7 +354,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
 
   try {
-    ctx.provide('dishCrew', { settings, records, whenRecorded: (childId: string) => pending.get(childId) })
+    ctx.provide('dishCrew', { settings, records, whenRecorded: (childId: string) => pending.get(childId), subagentProvider: text(config.subagentProvider) ?? 'spawn' })
   } catch (error) {
     // Unloaded while it was pruning: the plugin is going away, and didn't fail.
     if (unloaded(error)) return

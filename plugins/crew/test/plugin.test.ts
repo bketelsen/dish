@@ -70,9 +70,28 @@ test('dishCrew is provided when the plugin loads, with settings(), and goes when
   const handle = mountCrew(ctx, where.data)
   await handle
   const service: DishCrew = ctx.dishCrew
-  assert.deepEqual(Object.keys(service), ['settings', 'records', 'whenRecorded'])
+  assert.deepEqual(Object.keys(service), ['settings', 'records', 'whenRecorded', 'subagentProvider'])
   await handle.dispose()
   assert.equal(ctx.get('dishCrew'), undefined)
+})
+
+test('dishCrew gives the subagent provider setting to the preset row, which can\'t see the host\'s config: spawn by default', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const handle = mountCrew(ctx, where.data)
+  await handle
+  assert.equal(ctx.dishCrew.subagentProvider, 'spawn')
+  await handle.dispose()
+  const other = new Context()
+  const again = mountCrew(other, where.data, { subagentProvider: ' fork ' })
+  await again
+  assert.equal(other.dishCrew.subagentProvider, 'fork')
+  await again.dispose()
+  const blank = new Context()
+  const last = mountCrew(blank, where.data, { subagentProvider: '  ' })
+  await last
+  assert.equal(blank.dishCrew.subagentProvider, 'spawn')
+  await last.dispose()
 })
 
 // --- with the store -------------------------------------------------------------------------------
