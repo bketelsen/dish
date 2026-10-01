@@ -1,6 +1,6 @@
 # Spec: role prompts (`dish-prompts`)
 
-Status: draft, 2026-10-01. Implements roadmap step 3. Builds on the [design](../design.md) (every agent's prompt editable in the web UI, stored and versioned) and the [config store](config-store.md).
+Status: implemented 2026-10-01 (branch `prompts`). Implements roadmap step 3. Builds on the [design](../design.md) (every agent's prompt editable in the web UI, stored and versioned) and the [config store](config-store.md).
 
 ## Summary
 
@@ -200,4 +200,13 @@ By hand in the browser: the preview path first (see the open items), then the ed
 
 - ~~Package subpath as a row name.~~ Works: `dish-copilot/catalog` already loads that way. A preset's rows go through the same loader; the live check confirms it.
 - ~~`interpolate: false` on an assembled section.~~ Works: `AssembledSection` carries `interpolate`, `renderPrompt` honors it, and the waterfall's `assembly.variables` holds the resolved values the lenient interpolation needs.
-- The preview path (above): checked live first.
+- ~~The preview path.~~ Works: checked in a scratch dsh and then on the real install, with no fallback. The preview has dsh's identity line, then the role text, dsh's guidance, and `common.md` last.
+
+## Notes from the build
+
+- **`/clear` doesn't take a new snapshot yet.** dsh 0.2.0-rc.2's agent loop only publishes `agent/created` with `startup` or `resume`, so the `clear` handler never runs. A cleared session keeps its prompt; a new chat picks up edits.
+- **Crew role names** can't be `common` or `main`; `prompts/crew/main.md` would never be reachable.
+- **A bad `role` on the persona row** fails the preset's row audit, so the whole dish preset won't mount (dsh reports it broken).
+- **`variables()`** returns `{ variables, fallback }`, and the page doesn't warn about unknown names when `fallback` is true.
+- **The Prompts page shows a role's history itself.** A settings section can only `close`, so it can't link to the History page. The diff view moved to `dish-kit/ui`, so both pages share it.
+- **The dish preset is generated** from the installed dsh's `standard` preset (`pnpm --filter dish-prompts sync-preset`). The drift test reads the standard preset through `@deepseek-ai/dsh` itself, not a pinned copy.
