@@ -6,7 +6,7 @@ The proposed build order for the system in [docs/design.md](docs/design.md). Eac
 |---|---|---|---|
 | — | `copilot`: Copilot sign-in card, live model catalog | models | done |
 | 1 | **Spike: specialist identity and keeping the chat open.** Can a delegated child get its role's prompt, tools and model? Does the main agent stay responsive while children work? | Everything else assumes yes. | done: yes to both, see the design doc's spike results |
-| 2 | `dish-kit` + `config-store` ([spec](docs/specs/config-store.md)): XDG paths and the git-backed versioned config store. Move the Copilot cache to the XDG cache directory. | The foundation every plugin uses. | next: spec drafted |
+| 2 | `dish-kit` + `config-store` ([spec](docs/specs/config-store.md)): XDG paths and the git-backed versioned config store. Move the Copilot cache to the XDG cache directory. | The foundation every plugin uses. | next: [plan](docs/plans/2026-09-30-config-store.md) written |
 | 3 | `prompts`: role prompts with a web UI editor, history, diff and revert | The first plugin on `config-store`, and small. | |
 | 4 | `crew`: roles, model tiers, the cross-family reviewer rule, the `delegate` tool | Lets you talk to a delegating main agent. | |
 | 5 | **VM deployment**: service unit, Tailscale HTTPS, dish checkout and profile install | Workspaces and triggers need to live where they'll run. | |
