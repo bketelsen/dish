@@ -21,9 +21,10 @@ after(async () => {
 })
 
 /** The calling agent as the tools see it: `exec.agent.session.header`, as dsh builds it (a top-level session has no `delegationDepth`). */
-function agent(sessionId: string, delegationDepth?: number): ToolRunContext {
-  const header = delegationDepth === undefined ? { id: sessionId } : { id: sessionId, delegationDepth }
-  return { agent: { id: sessionId, session: { header } } } as unknown as ToolRunContext
+function agent(sessionId: string, delegationDepth?: number, more: { origin?: string, options?: Record<string, unknown> } = {}): ToolRunContext {
+  const { options, ...extra } = more
+  const header = { id: sessionId, ...(delegationDepth === undefined ? {} : { delegationDepth }), ...extra }
+  return { agent: { id: sessionId, session: { header }, ...(options === undefined ? {} : { options }) } } as unknown as ToolRunContext
 }
 
 /** A top-level agent in session `sessionId`, with an explicit depth of zero. */
@@ -105,6 +106,11 @@ test('there are exactly four tools, whose output schemas the tool registry accep
   assert.match(propose, /initiate/)
   assert.match(propose, /STALE/)
   assert.match(description('config_read'), /`commit`/)
+  assert.match(description('config_read'), /oldest/)
+  // The `base` parameter: the oldest commit when several documents were read, and the commit a write returned for the next one.
+  const base = JSON.stringify((tools.find(tool => tool.name === 'config_write')!.parameters as { properties: Record<string, unknown> }).properties.base)
+  assert.match(base, /oldest/)
+  assert.match(base, /returned/)
   assert.match(description('config_list'), /closed to agents/)
 })
 
@@ -225,6 +231,27 @@ test('a call with no agent at all is refused the same way', async () => {
   }
 })
 
+test('an agent that dsh marks as a subagent in any other way is refused too: runtime subagentDepth, or origin "subagent"', async () => {
+  const { store, call } = await setup()
+  const head = await store.head()
+  const marked: Array<[string, ToolRunContext]> = [
+    ['options.subagentDepth 1', agent('s', undefined, { options: { subagentDepth: 1 } })],
+    ['options.subagentDepth 1, header depth 0', agent('s', 0, { options: { subagentDepth: 1 } })],
+    ['options.subagentDepth 2', agent('s', 0, { options: { subagentDepth: 2 } })],
+    ['options.subagentDepth garbage', agent('s', 0, { options: { subagentDepth: 'one' } })],
+    ['header origin subagent', agent('s', undefined, { origin: 'subagent' })],
+    ['header origin subagent, depth 0', agent('s', 0, { origin: 'subagent' })],
+  ]
+  for (const [what, exec] of marked) {
+    for (const [name, args] of CALLS) await assert.rejects(call(name, args, exec), refused(), `${name}: ${what}`)
+  }
+  assert.equal(await store.head(), head)
+  assert.deepEqual(await store.proposals(), [])
+  // Zero runtime depth, or other options, are the main agent.
+  const ok = await call('config_write', { changes: [{ path: 't/a.md', text: 'x' }] }, agent('s', undefined, { options: { subagentDepth: 0, model: 'm' } }))
+  assert.match(ok.commit, COMMIT)
+})
+
 test('a top-level agent whose header has no delegationDepth is the main agent', async () => {
   const { call } = await setup()
   const result = await call('config_write', { changes: [{ path: 't/a.md', text: 'x' }] }, agent('sess-top', undefined))
@@ -262,7 +289,8 @@ test('in a propose-only namespace config_write is FORBIDDEN and config_propose w
   const { store, call } = await setup()
   await store.write([{ path: 'p/direction.md', text: 'old' }], { author: USERA })
   const head = await store.head()
-  await assert.rejects(call('config_write', { changes: [{ path: 'p/direction.md', text: 'new' }] }), failsWith('FORBIDDEN'))
+  const forbidden = await call('config_write', { changes: [{ path: 'p/direction.md', text: 'new' }] }).then(() => undefined, (error: unknown) => error)
+  assert.match((forbidden as Error).message, /^FORBIDDEN: .*allows agents to "propose" only/)
   assert.equal(await store.head(), head)
 
   const proposed = await call('config_propose', { title: 'New direction', rationale: 'Because.', changes: [{ path: 'p/direction.md', text: 'new' }] })
@@ -278,6 +306,10 @@ test('an agent can neither write nor propose in a namespace it has none of, nor 
   const head = await store.head()
   await assert.rejects(call('config_write', { changes: [{ path: 'secret/k.md', text: 'x' }] }), failsWith('FORBIDDEN'))
   await assert.rejects(call('config_propose', { title: 'a title', rationale: '', changes: [{ path: 'secret/k.md', text: 'x' }] }), failsWith('FORBIDDEN'))
+  // The message says what is so: "none" is not something an agent is allowed to do.
+  const none = await call('config_write', { changes: [{ path: 'secret/k.md', text: 'x' }] }).then(() => undefined, (error: unknown) => error)
+  assert.match((none as Error).message, /closed to agents/)
+  assert.doesNotMatch((none as Error).message, /allows agents to/)
   await assert.rejects(call('config_write', { changes: [{ path: 'nowhere/x.md', text: 'x' }] }), failsWith('UNOWNED'))
   assert.equal(await store.head(), head)
   assert.deepEqual(await store.proposals(), [])
@@ -298,8 +330,31 @@ test('config_read on a namespace that is none for agents is FORBIDDEN, whether o
   // No telling a document that is there from one that is not.
   await assert.rejects(call('config_read', { path: 'secret/none.md' }), failsWith('FORBIDDEN'))
   await assert.rejects(call('config_read', { path: 'nowhere/x.md' }), failsWith('UNOWNED'))
-  await assert.rejects(call('config_read', { path: '../etc/passwd' }), failsWith('UNOWNED'))
-  await assert.rejects(call('config_read', { path: '' }), failsWith('UNOWNED'))
+})
+
+test('config_read on something that cannot be a path is INVALID with the reason, as a write says, not UNOWNED', async () => {
+  const { call } = await setup()
+  const cases: Array<[string, RegExp]> = [
+    ['/t/a.md', /absolute/],
+    ['t/', /ends with a slash/],
+    ['t//a.md', /empty segment/],
+    ['t/../a.md', /"\.\." segment/],
+    ['../etc/passwd', /"\.\." segment/],
+    ['', /empty/],
+    ['t\\a.md', /backslash/],
+    ['t/a\n.md', /control character/],
+  ]
+  for (const [path, reason] of cases) {
+    await assert.rejects(call('config_read', { path }), error => {
+      assert.ok(error instanceof Error)
+      assert.match(error.message, /^INVALID: invalid path /, JSON.stringify(path))
+      assert.match(error.message, reason, JSON.stringify(path))
+      assert.doesNotMatch(error.message, /UNOWNED|owns/, JSON.stringify(path))
+      return true
+    })
+  }
+  // Even where it is in a closed namespace: the shape of a path tells nothing about what exists.
+  await assert.rejects(call('config_read', { path: 'secret/' }), failsWith('INVALID'))
 })
 
 test('config_list hides what agents may not touch, filters by prefix, and says which commit it listed', async () => {
@@ -319,6 +374,25 @@ test('config_list hides what agents may not touch, filters by prefix, and says w
   // A prefix inside a hidden namespace lists nothing, and does not say there is something.
   assert.deepEqual((await call('config_list', { prefix: 'secret/' })).paths, [])
   assert.deepEqual((await call('config_list', { prefix: 'nothing/' })).paths, [])
+})
+
+test('config_list takes a leading slash as the root, and refuses a prefix that cannot be a path', async () => {
+  const { store, call } = await setup()
+  const info = await store.write([{ path: 't/a.md', text: '1' }, { path: 'p/c.md', text: '2' }, { path: 'crew.yaml', text: '3' }], { author: USERA })
+  assert.deepEqual(await call('config_list', { prefix: '/' }), { paths: ['crew.yaml', 'p/c.md', 't/a.md'], commit: info!.id })
+  assert.deepEqual((await call('config_list', { prefix: '/t/' })).paths, ['t/a.md'])
+  assert.deepEqual((await call('config_list', { prefix: '/t' })).paths, ['t/a.md'])
+  assert.deepEqual((await call('config_list', { prefix: '/crew.yaml' })).paths, ['crew.yaml'])
+  for (const prefix of ['.', './', '..', '../t/', '//t/', 't//', 't/./', '\\', 't\\', 't/a\n']) {
+    await assert.rejects(call('config_list', { prefix }), error => {
+      assert.ok(error instanceof Error)
+      assert.match(error.message, /^INVALID: invalid prefix /, JSON.stringify(prefix))
+      return true
+    })
+  }
+  // A path-shaped prefix that matches nothing lists nothing: there are no wildcards.
+  assert.deepEqual((await call('config_list', { prefix: '*' })).paths, [])
+  assert.deepEqual((await call('config_list', { prefix: 't/*' })).paths, [])
 })
 
 test('config_list hides documents that no namespace owns any more', async () => {
@@ -368,14 +442,14 @@ const forbiddenService = {
   propose: untouchable,
 }
 
-test('a change with both text and delete, or with neither, is refused before the store is called', async () => {
+test('a change with a text and delete: true, or with neither, is refused before the store is called', async () => {
   const registry = new NamespaceRegistry()
   registry.claim(ns('t/', 'write'))
   const tools = toolDefinitions(forbiddenService, registry)
   const run = (name: string, args: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute(args, main())
   const bad: Array<Record<string, unknown>> = [
     { path: 't/a.md', text: 'x', delete: true },
-    { path: 't/a.md', text: '', delete: true },
+    { path: 't/a.md', text: ' ', delete: true },
     { path: 't/a.md' },
     { path: 't/a.md', delete: false },
   ]
@@ -393,14 +467,47 @@ test('the malformed-change message names the change, never its text', async () =
       assert.ok(error instanceof Error)
       assert.match(error.message, /^INVALID: /)
       assert.match(error.message, /t\/a\.md/)
-      assert.match(error.message, /text/)
-      assert.match(error.message, /delete/)
+      assert.match(error.message, /both `text` and `delete: true`/)
+      assert.match(error.message, /to delete, send only `delete: true`/)
+      assert.match(error.message, /to replace, send only `text`/)
+      // Nothing that makes an empty text sound like a way to delete, or a way out.
+      assert.doesNotMatch(error.message, /empty/)
       assert.ok(!error.message.includes('private words'))
+      return true
+    })
+  await assert.rejects(
+    call('config_write', { changes: [{ path: 't/a.md', delete: false }] }),
+    error => {
+      assert.ok(error instanceof Error)
+      assert.match(error.message, /^INVALID: /)
+      assert.match(error.message, /neither `text` nor `delete: true`/)
+      assert.doesNotMatch(error.message, /empty/)
       return true
     })
 })
 
-test('text may be empty, and delete: false beside a text is just a write', async () => {
+test('delete: true with an empty text is a delete, in a write and in a proposal; the document is not emptied', async () => {
+  const { store, call } = await setup()
+  await store.write([{ path: 't/a.md', text: 'one' }, { path: 't/b.md', text: 'two' }, { path: 't/c.md', text: 'three' }], { author: USERA })
+  // A model that fills in every field: text '' and delete true.
+  const removed = await call('config_write', { changes: [{ path: 't/a.md', text: '', delete: true }, { path: 't/b.md', delete: true }] })
+  assert.deepEqual(removed.paths, ['t/a.md', 't/b.md'])
+  assert.equal(await store.read('t/a.md'), undefined)
+  assert.equal(await store.read('t/b.md'), undefined)
+  // The same for a proposal: its tip lacks the document, rather than holding an empty one.
+  const proposed = await call('config_propose', { title: 'Drop c', rationale: 'unused', changes: [{ path: 't/c.md', text: '', delete: true }] })
+  const [proposal] = await store.proposals()
+  assert.equal(proposal!.id, proposed.proposal)
+  assert.equal(await store.read('t/c.md', proposal!.base), 'three')
+  assert.equal(await store.read('t/c.md', proposal!.tip), undefined)
+  // Deleting what is not there is still the store's NOT_FOUND.
+  await assert.rejects(call('config_write', { changes: [{ path: 't/a.md', text: '', delete: true }] }), failsWith('NOT_FOUND'))
+  // And an empty text alone still writes an empty document.
+  await call('config_write', { changes: [{ path: 't/c.md', text: '' }] })
+  assert.equal(await store.read('t/c.md'), '')
+})
+
+test('text alone may be empty, and delete: false beside a text is just a write', async () => {
   const { store, call } = await setup()
   await call('config_write', { changes: [{ path: 't/a.md', text: '' }] })
   assert.equal(await store.read('t/a.md'), '')
@@ -484,6 +591,9 @@ test('the plugin registers the tools when a tools service is there, and a call t
     const service = ctx.dishConfig
     service.claim(ns('t/', 'write'))
     const signal = new AbortController().signal
+    const valueOf = (result: unknown): unknown => (result as { value: unknown }).value
+    const textOf = (result: { content: Array<{ type: string, text?: string }> }): string =>
+      result.content.map(block => block.type === 'text' ? block.text ?? '' : '').join('\n')
     const run = (name: string, args: unknown, who: ToolRunContext) =>
       ctx.tools.execute({ callId: `c-${name}` as never, name, arguments: args, agent: who.agent, signal })
 
@@ -500,6 +610,40 @@ test('the plugin registers the tools when a tools service is there, and a call t
     const text = read.content.map(block => block.type === 'text' ? block.text : '').join('\n')
     assert.ok(text.includes('hello'))
     assert.ok(text.includes(value!.commit), 'the model is shown the full commit id to pass as base')
+
+    // A missing document reads as null (the schema allows it), at the head it was read from.
+    const missing = await run('config_read', { path: 't/none.md' }, main('sess-e2e'))
+    assert.equal(missing.isError, false)
+    assert.deepEqual(valueOf(missing), { path: 't/none.md', text: null, commit: value!.commit })
+    assert.ok(textOf(missing).includes('does not exist'))
+
+    // Listing: the paths an agent may see, and the commit.
+    const listed = await run('config_list', { prefix: 't/' }, main('sess-e2e'))
+    assert.equal(listed.isError, false)
+    assert.deepEqual(valueOf(listed), { paths: ['t/a.md'], commit: value!.commit })
+    assert.ok(textOf(listed).includes('t/a.md'))
+    const none = await run('config_list', { prefix: 'nothing/' }, main('sess-e2e'))
+    assert.equal(none.isError, false)
+    assert.deepEqual(valueOf(none), { paths: [], commit: value!.commit })
+    assert.match(textOf(none), /no documents/)
+
+    // A proposal.
+    const proposed = await run('config_propose', { title: 'Add c', rationale: 'It is missing.', changes: [{ path: 't/c.md', text: 'c' }] }, main('sess-e2e'))
+    assert.equal(proposed.isError, false)
+    const proposal = valueOf(proposed) as { proposal: string, paths: string[] }
+    assert.match(proposal.proposal, /^[0-9a-f]{8}$/)
+    assert.deepEqual(proposal.paths, ['t/c.md'])
+    assert.ok(textOf(proposed).includes(proposal.proposal))
+    assert.equal((await service.proposals('open'))[0]?.id, proposal.proposal)
+    assert.equal(await service.read('t/c.md'), undefined)
+
+    // A delete through the registry, the way a model fills the fields in.
+    const deleted = await run('config_write', { changes: [{ path: 't/a.md', text: '', delete: true }], note: '', base: '' }, main('sess-e2e'))
+    assert.equal(deleted.isError, false)
+    assert.deepEqual((valueOf(deleted) as { paths: string[] }).paths, ['t/a.md'])
+    assert.equal(await service.read('t/a.md'), undefined)
+    // Put it back for what follows.
+    await service.write([{ path: 't/a.md', text: 'hello' }], { author: USERA })
 
     // A child is refused through the registry too, with the message the model reads.
     const refusedCall = await run('config_write', { changes: [{ path: 't/b.md', text: 'x' }] }, child())

@@ -1054,7 +1054,9 @@ export class ConfigStore {
   private requireAgentMay(owners: Map<string, NamespaceSpec>, rule: AgentRule): void {
     for (const [path, spec] of owners) {
       if (!rule.allowed.includes(spec.agent)) {
-        throw new ConfigStoreError('FORBIDDEN', `agents may not ${rule.verb} ${label(path)}: the ${spec.owner} namespace allows agents to "${spec.agent}" only`)
+        // `none` allows nothing, so "allows agents to none only" would read as an odd kind of permission.
+        const why = spec.agent === 'none' ? 'is closed to agents' : `allows agents to "${spec.agent}" only`
+        throw new ConfigStoreError('FORBIDDEN', `agents may not ${rule.verb} ${label(path)}: the ${spec.owner} namespace ${why}`)
       }
     }
   }

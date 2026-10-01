@@ -10,8 +10,7 @@
  * - the plugin emits `dish-config/changed`, `dish-config/proposal` and
  *   `dish-config/remote` as the store reports them, so consumers re-read
  *   instead of caching;
- * - `main` is pushed to a remote after each commit, when one is configured.
- *
+ * - `main` is pushed to a remote after each commit, when one is configured;
  * - when a `tools` service is there, the main agent gets `config_read`, `config_list`, `config_write` and
  *   `config_propose` (see `tools.ts`); the store itself needs no `tools` service.
  *

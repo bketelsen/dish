@@ -16,6 +16,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ConfigStoreError } from './store/errors.ts'
+import { pathProblem } from './store/git.ts'
 import type { NamespaceRegistry } from './store/namespaces.ts'
 import type { Change, ConfigStore, EditAuthor } from './store/store.ts'
 
@@ -28,13 +29,21 @@ const SHOWN_PATH_CHARS = 80
 
 /**
  * The author of this call: the main agent of its session.
- * @throws a plain `Error` unless the caller is a top-level agent (no `delegationDepth`, or zero).
+ *
+ * The main agent is the one that nothing marks as a child. dsh marks a child twice, and dsh's own depth rule takes the
+ * larger of the two: the session header's `delegationDepth`, and the runtime `options.subagentDepth` (which a resumed
+ * child can have where its header says otherwise). A session also records `origin: 'subagent'`. Any of them, or a value
+ * that is none of the shapes dsh writes, makes the caller not the main agent.
+ * @throws a plain `Error` unless the caller is a top-level agent.
  */
 function mainAuthor(exec: ToolRunContext): EditAuthor {
   const header = exec.agent?.session?.header
   if (header === undefined) throw new Error(MAIN_ONLY)
-  const depth: unknown = header.delegationDepth
-  if (depth !== undefined && depth !== 0) throw new Error(MAIN_ONLY)
+  const options: { subagentDepth?: unknown } | undefined = exec.agent?.options
+  const topLevel = (depth: unknown): boolean => depth === undefined || depth === 0
+  if (!topLevel(header.delegationDepth) || !topLevel(options?.subagentDepth) || header.origin === 'subagent') {
+    throw new Error(MAIN_ONLY)
+  }
   return { kind: 'agent', sessionId: header.id, role: 'main' }
 }
 
@@ -65,20 +74,42 @@ interface ChangeArg {
 }
 
 /**
- * The store's changes for the model's: each is exactly one of a `text` (which may be empty) or `delete: true`.
- * `delete: false` is no delete, so a model that fills every field in still gets what it meant.
- * @throws `INVALID` for a change that is both, or neither. The message names the change, never its text.
+ * The store's changes for the model's:
+ * - `delete: true` with no `text`, or with `text: ''`, is a delete. Models fill in every field, so a delete often comes
+ *   with an empty `text`, and meaning anything else by it would turn a deletion into a document emptied but kept;
+ * - `delete: true` with a `text` that says something is both a write and a delete, and is refused;
+ * - a `text` alone, even an empty one, is a write of that document;
+ * - `delete: false` is no delete.
+ * @throws `INVALID` for a change that has both, or neither. The message names the change, never its text.
  */
 function toChanges(items: readonly ChangeArg[]): Change[] {
   return items.map((item, index) => {
-    const hasText = item.text !== undefined
-    const deletes = item.delete === true
-    if (hasText === deletes) {
-      throw new ConfigStoreError('INVALID', `change ${index + 1} (${shown(item.path)}) has ${hasText ? 'both' : 'neither'}: `
-        + 'give exactly one of `text` (the whole new document, which may be empty) or `delete: true`')
+    const named = `change ${index + 1} (${shown(item.path)})`
+    if (item.delete === true) {
+      if (item.text !== undefined && item.text !== '') {
+        throw new ConfigStoreError('INVALID', `${named} has both \`text\` and \`delete: true\`; to delete, send only \`delete: true\`; to replace, send only \`text\``)
+      }
+      return { path: item.path, delete: true }
     }
-    return deletes ? { path: item.path, delete: true } : { path: item.path, text: item.text! }
+    if (item.text === undefined) {
+      throw new ConfigStoreError('INVALID', `${named} has neither \`text\` nor \`delete: true\`; to replace the document send \`text\`, to delete it send \`delete: true\``)
+    }
+    return { path: item.path, text: item.text }
   })
+}
+
+/**
+ * The prefix `config_list` hands the store. A leading slash is the root, so `/` is everything and `/t/` is `t/`; a
+ * trailing slash only marks a directory. What is left must be a path (or nothing): `.`, `..` and the like would match
+ * nothing, and a list that is empty because the question was malformed is worse than an error.
+ * @throws `INVALID` for a prefix that cannot be a path.
+ */
+function listPrefix(prefix: string): string {
+  const stripped = prefix.startsWith('/') ? prefix.slice(1) : prefix
+  const bare = stripped.endsWith('/') ? stripped.slice(0, -1) : stripped
+  const problem = stripped === '' ? undefined : pathProblem(bare)
+  if (problem !== undefined) throw new ConfigStoreError('INVALID', `invalid prefix ${shown(prefix)}: ${problem}`)
+  return stripped
 }
 
 /** The `changes` parameter, which `config_write` and `config_propose` share. */
@@ -86,15 +117,15 @@ function changesParameter(what: string) {
   return {
     type: 'array',
     required: true,
-    description: `${what} Each change has a \`path\` and exactly one of \`text\` (the whole new content of the document, which may `
-      + 'be empty) or `delete: true` (remove the document; leave `text` out).',
+    description: `${what} Each change has a \`path\` and either \`text\` (the whole new content of the document; \`''\` leaves it `
+      + 'there, empty) or `delete: true` (remove the document, and send no `text`).',
     items: {
       type: 'object',
       additionalProperties: false,
       properties: {
         path: { type: 'string', required: true, description: 'The document path, such as `prompts/main.md`. `config_list` shows what exists.' },
-        text: { type: 'string', description: 'The whole new content of the document. Leave out when deleting.' },
-        delete: { type: 'boolean', description: 'true to delete the document. Leave out when writing.' },
+        text: { type: 'string', description: 'The whole new content of the document. Send none when deleting.' },
+        delete: { type: 'boolean', description: 'true to delete the document. Leave out (or false) when writing.' },
       },
     },
   } as const
@@ -121,6 +152,7 @@ export function toolDefinitions(service: ToolStore, registry: Pick<NamespaceRegi
       + 'Returns its `text`, which is null if there is no such document, and `commit`, the main commit it was read at. '
       + 'Before changing a document, read it, and pass that `commit` as `base` to `config_write`: then a change the user '
       + 'made in the UI in the meantime is reported as a CONFLICT instead of being overwritten. '
+      + 'If you read several documents, at different commits, pass the oldest of those commits. '
       + 'Documents in a namespace that is closed to agents are refused (FORBIDDEN). `config_list` shows what exists.',
     parameters: {
       path: { type: 'string', required: true, description: 'The document path, such as `prompts/main.md`.' },
@@ -142,6 +174,9 @@ export function toolDefinitions(service: ToolStore, registry: Pick<NamespaceRegi
     async execute(args, exec) {
       mainAuthor(exec)
       return guarded(async () => {
+        // The shape of a path says nothing about what exists, so this is said before anything about owners.
+        const problem = pathProblem(args.path)
+        if (problem !== undefined) throw new ConfigStoreError('INVALID', `invalid path ${shown(args.path)}: ${problem}`)
         const owner = registry.ownerOf(args.path)
         if (owner === undefined) throw new ConfigStoreError('UNOWNED', `no config namespace owns ${shown(args.path)}`)
         if (owner.agent === 'none') {
@@ -157,7 +192,7 @@ export function toolDefinitions(service: ToolStore, registry: Pick<NamespaceRegi
 
   const list = defineTool({
     name: 'config_list',
-    description: 'List the config documents on main under a prefix: a directory such as `prompts/`, one path, or an empty string for all of them. '
+    description: 'List the config documents on main under a prefix: a directory such as `prompts/`, one path, or an empty string for all of them (no wildcards). '
       + 'Returns the `paths` and the `commit` they were listed at. '
       + 'Only documents you may read or change appear; documents in a namespace that is closed to agents are left out.',
     parameters: {
@@ -179,8 +214,9 @@ export function toolDefinitions(service: ToolStore, registry: Pick<NamespaceRegi
     async execute(args, exec) {
       mainAuthor(exec)
       return guarded(async () => {
+        const prefix = listPrefix(args.prefix)
         const commit = await service.head()
-        const paths = await service.list(args.prefix, commit)
+        const paths = await service.list(prefix, commit)
         return { paths: paths.filter(visible), commit }
       })
     },
@@ -203,7 +239,9 @@ export function toolDefinitions(service: ToolStore, registry: Pick<NamespaceRegi
       base: {
         type: 'string',
         description: 'The `commit` that `config_read` returned for the document(s) you are changing, in full. Optional but strongly recommended: '
-          + 'without it a change made since your read is overwritten silently. Leave empty for none.',
+          + 'without it a change made since your read is overwritten silently. If you read several documents, at different commits, '
+          + 'pass the oldest of those commits. After a `config_write` of your own, use the `commit` it returned as the next `base`. '
+          + 'Leave empty for none.',
       },
     },
     output: {
