@@ -13,6 +13,7 @@ pnpm dsh plugin --profile web add ./plugins/copilot
 pnpm dsh plugin --profile web add ./plugins/config
 pnpm dsh plugin --profile web add ./plugins/prompts
 pnpm dsh plugin --profile web add ./plugins/crew
+pnpm dsh plugin --profile web add ./plugins/judge
 pnpm web            # = dsh web; prints the UI URL (with its access token)
 ```
 
@@ -39,6 +40,7 @@ Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, termin
 | [`config`](plugins/config) | The versioned config store other plugins keep what you author in: a bare git repo pushed to GitHub, namespaces per plugin, main-agent tools with proposal branches, and a Settings → History page. |
 | [`prompts`](plugins/prompts) | Every agent's persona text in the config store: role prompts plus shared house rules, edited on Settings → Prompts with preview, default diff and history. Each agent keeps the prompt it started with. |
 | [`crew`](plugins/crew) | The crew the main agent delegates to: a `delegate` tool with roles, model tiers and a reviewer that never shares the reviewed work's model family, `crew.yaml` in the config store, saved reports and role-named finish notices. Ships the **dish** preset for the main agent. |
+| [`judge`](plugins/judge) | TypeSafe's Jev in front of every agent's risky edges: a gate on each shell command (read-only, reversible or irreversible, and does it serve the task), an answerer for crew children's approvals, a screen on web and MCP results for injected instructions, `ask_judge` for every agent, and Settings → Judge with the key, thresholds and a decision log. |
 
 ## Writing another plugin
 

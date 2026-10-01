@@ -98,6 +98,8 @@ Everything here is edited and watched on a **Families** page in the web UI.
 
 ## The judge (Jev)
 
+Built as `dish-judge`: the [judge spec](specs/judge.md) is the current design, and this section the original idea.
+
 [TypeSafe's Jev](https://typesafe.ai) is a judge built into the harness, not a crew member. It doesn't write. It answers typed questions in about 300 ms, with probabilities the code thresholds:
 - **noul**: yes/no, as the probability of yes
 - **choice**: one of your options, with a probability per option and a confidence

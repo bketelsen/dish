@@ -1,6 +1,6 @@
 # Spec: the judge (`dish-judge`)
 
-Status: draft, 2026-10-01. Implements roadmap step 4a. Builds on:
+Status: implemented, 2026-10-01 (see [notes from the build](#notes-from-the-build)). Implements roadmap step 4a. Builds on:
 - the [design](../design.md), "The judge";
 - the [config store](config-store.md) and [crew](crew.md) specs;
 - the research notes on [TypeSafe Jev](../research/2026-10-01-typesafe-jev.md) and dsh's seams (summarized below).
@@ -340,3 +340,16 @@ Whatever leaves `dishJudge` that came from outside the code (log lines, withheld
 - **Latency.** Every shell command gains ~70–500 ms, and screened results a little more.
 - **The approval wording dsh shows the model** for a fall-through ("the user rejected …") can't carry the judge's verdict. That's why the gate uses `ask` with its own `displayReason`.
 - **Children's prompt.** Children are told by dsh that "operations that require approval are rejected automatically". That's now wrong, and harmless: the judge decides either way.
+
+## Notes from the build
+
+Installed on the web profile and verified live on 2026-10-01. What the build changed or learned, beyond what the sections above now say:
+- **The live API answers `400`, not `422`,** for an unknown model or a state over its token limit, and an error can echo part of the request. The client reads only the error's words, and treats `400` and `422` alike (see [the research note](../research/2026-10-01-typesafe-jev.md#live-findings)).
+- **Thresholds:** `reversible` ships at 0.90, not 0.95. Live, `npm test` and `npm run build` sat 0.00–0.03 above 0.95 and could flip to "ask".
+- **`git push --dry-run` runs.** Jev reads it as read-only (0.96), which is right; a real `git push` asks (irreversible 0.98), and a child's is refused (1.00).
+- **The escalation is named in the effect question.** Without it the gate's verdict didn't really cover the extra access. With it, `npm install` with full access asks.
+- **The screen needed criteria and a framing strip.** dsh's own web notice scored 0.60 on a clean search, and legitimate `llms.txt` and `AGENTS.md` files were withheld at the bare question. Live, a page quoting real injection payloads came back with a warning (0.80), which is right for a page that discusses them.
+- **Crew children are switched to `ask` only when their parent asks,** and crew refuses a child's approval requests whenever dish-judge isn't loaded. A child resumed at `ask` would otherwise wait for ever on a browser prompt nobody sees.
+- **Secrets are masked before anything is sent to TypeSafe,** not only in the log. The shared secret patterns (in `dish-kit`) gained TypeSafe keys, escaped tokens, glued tokens and whole private keys, and never throw.
+- **`crew.yaml` was updated at install by the main agent** with `config_write` (an agent commit, reviewed in History), since the store has no remote for a person's write to it.
+- **Not exercised live:** withholding a real page, since no public page carries a clear injection. The live screen tests cover it against Jev with test content.
