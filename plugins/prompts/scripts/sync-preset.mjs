@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Generates presets/dish.patch.yml, the dish preset, from the standard preset of
-// the installed @deepseek-ai/dsh-web-app.
+// the @deepseek-ai/dsh-web-app that the workspace's dsh resolves.
 //
 //   node scripts/sync-preset.mjs          write presets/dish.patch.yml
 //   node scripts/sync-preset.mjs --check  exit 1 if the committed file differs from a fresh one
@@ -17,6 +17,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const WORKSPACE_DIR = resolve(PLUGIN_DIR, '..', '..')
 const OUTPUT = join(PLUGIN_DIR, 'presets', 'dish.patch.yml')
 const WEB_APP = '@deepseek-ai/dsh-web-app'
 const SYNC = 'pnpm --filter dish-prompts sync-preset'
@@ -114,15 +115,21 @@ export function generate(standardText, version) {
 }
 
 /**
- * The standard preset as the installed dsh-web-app ships it.
+ * The standard preset as the dsh-web-app that dsh itself resolves ships it.
  *
- * @returns {{ text: string, version: string, path: string }}
+ * At runtime dsh finds its web-app bundle from its own installation, so that is
+ * the copy to follow: found through the workspace's `@deepseek-ai/dsh`, not
+ * through anything this package pins. A dsh upgrade then moves the standard
+ * preset, and the drift check sees it.
+ *
+ * @returns {{ text: string, version: string, path: string, packagePath: string }}
  */
 export function readStandard() {
-  const packagePath = createRequire(join(PLUGIN_DIR, 'package.json')).resolve(`${WEB_APP}/package.json`)
+  const dsh = createRequire(join(WORKSPACE_DIR, 'package.json')).resolve('@deepseek-ai/dsh/package.json')
+  const packagePath = createRequire(dsh).resolve(`${WEB_APP}/package.json`)
   const path = join(dirname(packagePath), 'presets', 'standard.patch.yml')
   const { version } = JSON.parse(readFileSync(packagePath, 'utf8'))
-  return { text: readFileSync(path, 'utf8'), version, path }
+  return { text: readFileSync(path, 'utf8'), version, path, packagePath }
 }
 
 /** The command line. Returns the exit code. */

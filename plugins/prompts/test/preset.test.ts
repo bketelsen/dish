@@ -19,17 +19,33 @@ const SYNC = 'pnpm --filter dish-prompts sync-preset'
 const PERSONA_NAME = "'@deepseek-ai/dsh-persona'"
 const DESCRIPTION = 'The dish main agent: your prompts from Settings → Prompts, on the standard tool set.'
 
-/** The standard preset's file text and its dsh-web-app version, read from the installed package. */
+/** The standard preset's file text and its dsh-web-app version, read from the dsh-web-app that dsh itself resolves. */
 const standard = readStandard()
 
 // --- the drift check -------------------------------------------------------------------------
 
-test('the committed dish preset is what generate makes from the installed standard preset', () => {
+test('the committed dish preset is what generate makes from the standard preset dsh resolves', () => {
   assert.equal(
     generate(standard.text, standard.version),
     readFileSync(COMMITTED, 'utf8'),
     `presets/dish.patch.yml has drifted from @deepseek-ai/dsh-web-app ${standard.version}'s standard preset. Run \`${SYNC}\` and commit the result.`,
   )
+})
+
+test('the standard preset is read from the dsh-web-app that dsh resolves, so a dsh upgrade is what moves it', () => {
+  const dsh = createRequire(join(PLUGIN, '..', '..', 'package.json')).resolve('@deepseek-ai/dsh/package.json')
+  const dshWebApp = realpathSync(createRequire(dsh).resolve('@deepseek-ai/dsh-web-app/package.json'))
+  assert.equal(realpathSync(standard.packagePath), dshWebApp)
+  assert.equal(realpathSync(standard.path), join(dirname(dshWebApp), 'presets', 'standard.patch.yml'))
+  const wanted: string = JSON.parse(readFileSync(dsh, 'utf8')).dependencies['@deepseek-ai/dsh-web-app']
+  if (/^\d/.test(wanted)) assert.equal(standard.version, wanted, 'dsh pins an exact dsh-web-app')
+})
+
+test('this package does not pin its own dsh-web-app, which would hide a dsh upgrade from the drift check', () => {
+  const manifest = JSON.parse(readFileSync(join(PLUGIN, 'package.json'), 'utf8'))
+  for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+    assert.ok(!(manifest[field] ?? {})['@deepseek-ai/dsh-web-app'], field)
+  }
 })
 
 /** Every `name:` line of a preset's plugin list (nested groups too), in order. The wrapper's own come before `plugins:`. */
@@ -60,11 +76,16 @@ interface YamlParser {
   load(text: string, options: { schema: unknown }): unknown
 }
 
-/** js-yaml is not a dependency of this package: dsh's preset registry brings it. Reach it from the web app's own directory, where pnpm lets it be found. */
+/**
+ * js-yaml is not a dependency of this package. dsh's agent preset registry declares it, so follow the chain of declared
+ * dependencies from the dsh-web-app dsh resolves: web app, then agent preset, then its registry, then js-yaml.
+ */
 function findYaml(): YamlParser | undefined {
   try {
-    const webApp = realpathSync(createRequire(import.meta.url).resolve('@deepseek-ai/dsh-web-app/package.json'))
-    return createRequire(webApp)('js-yaml') as YamlParser
+    const next = (from: string, name: string) => realpathSync(createRequire(from).resolve(`${name}/package.json`))
+    const agentPreset = next(standard.packagePath, '@deepseek-ai/dsh-agent-preset')
+    const registry = next(agentPreset, '@deepseek-ai/dsh-agent-preset-registry')
+    return createRequire(registry)('js-yaml') as YamlParser
   } catch {
     return undefined
   }
@@ -73,13 +94,18 @@ function findYaml(): YamlParser | undefined {
 const yaml = findYaml()
 
 test('the dish preset parses as YAML with its !!js tags, and its list is the standard list with the persona swapped', {
-  skip: yaml === undefined ? 'no YAML parser (js-yaml) is installed transitively' : false,
+  skip: yaml === undefined ? 'js-yaml could not be reached through dsh-agent-preset-registry' : false,
 }, () => {
   const parse = (text: string): any => yaml!.load(text, {
     schema: yaml!.DEFAULT_SCHEMA.extend([new yaml!.Type('tag:yaml.org,2002:js', { kind: 'scalar', construct: data => ({ js: data }) })]),
   })
   const dish = parse(generate(standard.text, standard.version))
   const stock = parse(standard.text)
+
+  // The wrapper is fixed. A preset-level key dsh adds to its own row would be dropped by it, so fail instead.
+  const known = ['id', 'name', 'description', 'order', 'plugins']
+  const unknown = Object.keys(stock[0].insert[0].config).filter(key => !known.includes(key))
+  assert.deepEqual(unknown, [], `dsh's standard preset has config keys the dish preset's wrapper doesn't carry: update WRAPPER in scripts/sync-preset.mjs to carry ${unknown.join(', ')}`)
 
   assert.equal(dish.length, 1)
   assert.equal(dish[0].insert.length, 1)
