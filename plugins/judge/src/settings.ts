@@ -12,6 +12,7 @@
  */
 import { readFileSync } from 'node:fs'
 import type { NamespaceSpec } from 'dish-config'
+import { maskSecrets, secretKind } from 'dish-kit'
 import { JSON_SCHEMA, load, YAMLException } from 'js-yaml'
 
 /** The thresholds a shell command is let through on. */
@@ -66,24 +67,33 @@ const SHOWN = 40
 /** The longest a YAML parser's own reason is shown. */
 const REASON = 160
 
-/** `text`, cut to `length` characters with `…` where it was cut. */
+/**
+ * `text` as a message may show it: any credential in it hidden (`maskSecrets`, before the cut, so that a cut can't leave
+ * the start of one that no pattern would match), then cut to `length` characters with `…` where it was cut.
+ */
 function truncate(text: string, length = SHOWN): string {
-  return text.length > length ? `${text.slice(0, length)}…` : text
+  const safe = maskSecrets(text)
+  return safe.length > length ? `${safe.slice(0, length)}…` : safe
 }
 
-/** `value` as a message shows it: a string quoted and cut short, a collection by its kind, anything else as it is. */
+/** `JSON.stringify` of a string, with the characters it leaves as they are but a terminal or an editor would act on (DEL, C1, the line separators) escaped too. */
+function quoted(text: string): string {
+  return JSON.stringify(text).replace(/[\u007f-\u009f\u2028\u2029]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`)
+}
+
+/** `value` as a message shows it: a string quoted, masked and cut short, a collection by its kind, anything else as it is. */
 function shown(value: unknown): string {
-  if (typeof value === 'string') return JSON.stringify(truncate(value))
+  if (typeof value === 'string') return quoted(truncate(value))
   if (Array.isArray(value)) return 'a list'
   if (value !== null && typeof value === 'object') return 'a mapping'
   return String(value)
 }
 
-/** The path of `key` under `path`: `commands.readOnly`, or `["odd name"]` for a name that isn't plain. */
+/** The path of `key` under `path`: `commands.readOnly`, or `["odd name"]` for a name that isn't plain (or has a credential in it). */
 function at(path: string, key: string): string {
   const cut = truncate(key)
   if (/^[A-Za-z0-9_-]+$/.test(key) && cut === key) return path === '' ? key : `${path}.${key}`
-  return `${path}[${JSON.stringify(cut)}]`
+  return `${path}[${quoted(cut)}]`
 }
 
 /** A refusal: carries the message `parseSettings` returns. Thrown to leave the checks at the first problem. */
@@ -124,10 +134,20 @@ function unpadded(value: string, path: string): string {
   return value
 }
 
-/** A string with something in it and no whitespace around it: a model id. */
-function plainString(value: unknown, path: string, what: string): string {
-  if (typeof value !== 'string' || value.trim() === '') refuse(path, `must be ${what} (got ${shown(value)})`)
-  return unpadded(value, path)
+/** What a model id can be: Jev's ids and the likes of them (`jev-1.13.0`, `org/model:tag`), and nothing a header or a log would have to escape. */
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/
+
+/**
+ * A model id: letters, digits and `. _ : / -`, starting with a letter or a digit, at most 128 characters. It is sent to the
+ * API in every request, so a value that is a credential is refused without being shown.
+ */
+function modelId(value: unknown, path: string): string {
+  if (typeof value !== 'string' || value.trim() === '') refuse(path, `must be a model id (got ${shown(value)})`)
+  unpadded(value, path)
+  const kind = secretKind(value)
+  if (kind !== undefined) refuse(path, `must be a model id, and this looks like ${kind}: it is not shown`)
+  if (!MODEL_ID.test(value)) refuse(path, `must be a model id: letters, digits and . _ : / - only, starting with a letter or digit, at most 128 characters (got ${shown(value)})`)
+  return value
 }
 
 /** A whole number from `min` to `max`. */
@@ -148,9 +168,12 @@ function threshold(value: unknown, path: string): number {
 
 /**
  * A tool name as `tools.gated` and `tools.screened` list them: a plain name, or a prefix ending in `*` that matches every
- * name starting with it. The `*` is only a wildcard at the end, and a name has no whitespace in it.
+ * name starting with it. A name is printable ASCII with no space in it, and has at least one character before the `*`: a
+ * lone `*` would be every tool, which is a decision for a list of names, not a wildcard.
  */
-const TOOL_NAME = /^[^\s*]*\*?$/
+const TOOL_NAME = /^[\x21-\x29\x2b-\x7e]+\*?$/
+/** The longest a tool name or prefix can be, `*` included. Providers' own limits are 64. */
+const MAX_TOOL_NAME = 128
 
 function parseToolList(value: unknown, path: string): string[] {
   if (!Array.isArray(value)) refuse(path, `must be a list of tool names (got ${shown(value)})`)
@@ -160,7 +183,9 @@ function parseToolList(value: unknown, path: string): string[] {
     const wanted = 'a tool name or a prefix ending in *'
     if (typeof item !== 'string' || item.trim() === '') refuse(own, `must be ${wanted} (got ${shown(item)})`)
     unpadded(item, own)
-    if (!TOOL_NAME.test(item)) refuse(own, `must be ${wanted} (got ${shown(item)})`)
+    if (item === '*') refuse(own, 'a lone * is not allowed: list tools by name, or by a prefix such as mcp__*')
+    if (!TOOL_NAME.test(item)) refuse(own, `must be ${wanted}: printable ASCII with no spaces, and a * only at the end (got ${shown(item)})`)
+    if (item.length > MAX_TOOL_NAME) refuse(own, `must be at most ${MAX_TOOL_NAME} characters (got ${shown(item)})`)
     return item
   })
 }
@@ -229,7 +254,7 @@ export function parseSettings(text: string): ParseResult {
     }
     if (!isMapping(document)) refuse('', `must be a mapping of settings (got ${shown(document)})`)
     noOtherKeys(document, '', TOP_KEYS)
-    const model = plainString(required(document, 'model', '', 'a model id'), 'model', 'a model id')
+    const model = modelId(required(document, 'model', '', 'a model id'), 'model')
     const timeoutMs = wholeNumber(required(document, 'timeoutMs', '', `milliseconds, ${TIMEOUT_MS.min} to ${TIMEOUT_MS.max}`), 'timeoutMs', TIMEOUT_MS)
     const commands = parseCommands(required(document, 'commands', '', 'readOnly, reversible and servesTask'))
     const screening = parseScreening(required(document, 'screening', '', 'withhold, warn and chunkChars'))

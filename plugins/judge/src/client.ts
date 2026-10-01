@@ -36,11 +36,13 @@
 
 import { isTopLevelAgent } from 'dish-kit'
 import type { AgentLike } from 'dish-kit'
+// Types only, so that this file does not load the log: the one line type and its parts are the log's.
+import type { JsonValue, JudgeLogLine, JudgePurpose } from './log.ts'
 import { DEFAULT_SETTINGS } from './settings.ts'
 import type { JudgeSettings } from './settings.ts'
 
 /** Anything JSON can hold. */
-export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
+export type { JsonValue }
 
 /** What Jev is asked about the state. A noul is a yes/no, a choice picks an option, a score places the state on a scale. */
 export type Question =
@@ -58,7 +60,7 @@ export type Answer =
   | { type: 'score', score: number, probabilities: Record<string, number>, confidence: number }
 
 /** Why a call is made: who is asking, for the log and for the page's filters. */
-export type Purpose = 'command' | 'approval' | 'screen' | 'ask'
+export type Purpose = JudgePurpose
 
 /**
  * Who is asking: any dsh `Agent` fits. Only what the log needs is read: its `id` (the session id) and whether it is a
@@ -169,31 +171,13 @@ declare module '@deepseek-ai/cordis' {
 }
 
 /**
- * One line of the decision log. The client writes one for every call it handles; `decision` and `withheld` are what the
- * caller's `decide` said, and `decision` is `null` without one (or when it failed).
+ * One line of the decision log: the log's own line type, so that what the client writes is what the log takes, with no
+ * cast between them. The client writes one for every call it handles. `decision` and `withheld` are what the caller's
+ * `decide` said, and `decision` is `null` without one (or when it failed); `answers` is `{}` when there were none;
+ * `agent`, `child`, `tool`, `callId` and `withheld` are left off, never `null`; `latencyMs` is `null` when Jev wasn't
+ * called. `answersCut` is the log's own, set only when it cuts a line down.
  */
-export interface LogLine {
-  /** When the call began, in ms since the epoch. */
-  at: number
-  purpose: Purpose
-  /** The asking agent's session id. Left off with no agent. */
-  agent?: string
-  /** Whether the asker is a child: an agent that isn't plainly the main one counts as one. Left off with no agent. */
-  child?: boolean
-  /** Left off when the caller gave none. */
-  tool?: string
-  callId?: string
-  subject: string
-  /** The checked answers: `{}` when there were none. */
-  answers: Record<string, Answer>
-  decision: string | null
-  /** The id of withheld content, when the decision withheld some. Left off otherwise. */
-  withheld?: string
-  /** How long Jev took; `null` when it wasn't called. */
-  latencyMs: number | null
-  /** Why the call failed, or why its `decide` did, with the key masked; `null` for a call that came to a decision. */
-  error: string | null
-}
+export type LogLine = JudgeLogLine
 
 export interface JudgeDeps {
   /** The TypeSafe API, with no trailing slash needed: the call is `<baseUrl>/v1/systemone`. */
@@ -404,6 +388,22 @@ function checkAnswers(body: unknown, questions: Record<string, Question>): { ok:
 function maskerFor(key: string): (text: string) => string {
   const forms = [...new Set([key, JSON.stringify(key).slice(1, -1), encodeURIComponent(key)])].sort((a, b) => b.length - a.length)
   return text => forms.reduce((masked, form) => masked.split(form).join(MASKED), text)
+}
+
+/**
+ * A function that hides the key as it is now, in the forms `maskerFor` does, for a caller that has text of its own to keep
+ * (the log's withheld content, which the client doesn't write). The key is looked up, not kept, and the lookup is given
+ * `ms`: no key, a lookup that fails, and one that takes longer all give a function that changes nothing, so that the caller
+ * can go on with the masking that needs no key. Never rejects.
+ */
+export async function currentKeyMask(lookup: () => Promise<string | undefined>, ms: number): Promise<(text: string) => string> {
+  try {
+    const key = cleanKey(await within(Promise.resolve().then(lookup), ms, 'the key lookup took too long'))
+    if (key !== undefined) return maskerFor(key)
+  } catch {
+    // No key to hide, or none that could be found in time.
+  }
+  return text => text
 }
 
 /** What a key lookup gave, as a key: trimmed, and nothing if nothing is left. */
@@ -755,12 +755,7 @@ export function createJudge(deps: JudgeDeps): Judge {
     const hasText = given(request.subject) || given(request.tool) || given(request.callId) || typeof agentId === 'string' || typeof agentId === 'number'
     if (!scope.keyLooked && (hasText || typeof request.decide === 'function')) {
       scope.keyLooked = true
-      try {
-        const key = cleanKey(await within(Promise.resolve().then(deps.key), Math.max(DECIDE_FLOOR_MS, scope.deadline - tick()), 'the key lookup took too long'))
-        if (key !== undefined) scope.mask = maskerFor(key)
-      } catch {
-        // No key to hide, or none that could be found in time.
-      }
+      scope.mask = await currentKeyMask(deps.key, Math.max(DECIDE_FLOOR_MS, scope.deadline - tick()))
     }
 
     let result: JudgeResult
