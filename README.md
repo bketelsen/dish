@@ -42,7 +42,7 @@ Plugins run as plain `.ts` through Node's type stripping, so stick to erasable s
 
 ### Things that aren't obvious
 
-- **Browser code must be pre-bundled.** A plugin's `./client` export is loaded by dsh's own module loader, not by Node, so it can't be raw `.ts`. `plugins/copilot/scripts/build-client.mjs` is a reusable esbuild script for that; the plugin's README explains the wiring.
-- **`dsh web` prints no plugin logs.** The web profile mounts no console log exporter. A plugin that needs to reach the terminal has to register its own `ctx.logger.exporter(...)` (see `plugins/copilot/src/terminal.ts`).
+- **Browser code must be pre-bundled.** A plugin's `./client` export is loaded by dsh's own module loader, not by Node, so it can't be raw `.ts`. `packages/dish-kit/scripts/build-client.mjs` is a reusable esbuild script for that, run from the plugin's directory; `plugins/copilot/README.md` explains the wiring.
+- **`dsh web` prints no plugin logs.** The web profile mounts no console log exporter. A plugin that needs to reach the terminal has to register its own `ctx.logger.exporter(...)` (`printOwnLogs()` in `packages/dish-kit/src/terminal.ts` does this).
 - **Upstream reference.** The dsh docs worth reading are `docs/user/develop/` (tutorials), `docs/cookbook/` (tools, remote APIs, settings cards), and each package's `README.md`. `.agents/notes/` records the reasoning behind upstream design decisions.
 - **State lives in `~/.dsh`**: `profiles/<name>/` holds profile manifests and user patches, and `.credentials.yaml` holds stored keys and sign-ins.

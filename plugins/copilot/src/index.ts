@@ -24,9 +24,9 @@ import type { Context, Logger } from '@deepseek-ai/cordis'
 import type { AuthorizationInteraction } from '@deepseek-ai/dsh-authorization'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import Schema from '@deepseek-ai/schemastery'
+import { printOwnLogs } from 'dish-kit'
 import type {} from './catalog.ts'
 import { CopilotRemote, KEY } from './remote.ts'
-import { printOwnLogs } from './terminal.ts'
 
 export const name = 'dish-copilot'
 export const inject = ['authorization', 'credentials', 'settings']

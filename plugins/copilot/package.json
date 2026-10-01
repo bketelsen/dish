@@ -31,7 +31,8 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "~3.18.4"
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "dish-kit": "workspace:*"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
@@ -60,8 +61,8 @@
     "esbuild": "^0.25.0"
   },
   "scripts": {
-    "build": "node scripts/build-client.mjs",
-    "dev": "node scripts/build-client.mjs --watch",
+    "build": "node ../../packages/dish-kit/scripts/build-client.mjs",
+    "dev": "node ../../packages/dish-kit/scripts/build-client.mjs --watch",
     "typecheck": "tsc -p tsconfig.client.json"
   }
 }

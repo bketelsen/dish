@@ -25,7 +25,7 @@
  * @module dish-copilot/catalog
  */
 
-import { readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { findPackageJSON } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -34,8 +34,8 @@ import type { Context, Logger } from '@deepseek-ai/cordis'
 import type { CredentialKey } from '@deepseek-ai/dsh-credentials'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import Schema from '@deepseek-ai/schemastery'
+import { printOwnLogs, xdgPaths } from 'dish-kit'
 import { listLiveModels, type LiveModel } from './copilot-api.ts'
-import { printOwnLogs } from './terminal.ts'
 
 export const name = 'dish-copilot-catalog'
 
@@ -86,7 +86,7 @@ interface Addition {
   vision: boolean
 }
 
-interface Cache {
+export interface Cache {
   version: 1
   report: CatalogReport
   additions: Addition[]
@@ -96,15 +96,18 @@ interface Cache {
 type CatalogModel = Record<string, unknown> & { id: string, api: string }
 
 export interface Config {
-  cacheFile: string
+  cacheFile?: string
+  legacyCacheFile?: string
   refreshOnStart: boolean
   updateRoute: boolean
   terminal: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
-  cacheFile: Schema.string().required()
-    .description('Where the last refresh is cached, so additions survive restarts.'),
+  cacheFile: Schema.string()
+    .description('Where the last refresh is cached, so additions survive restarts. Defaults to copilot-models.json in the XDG cache directory for dish.'),
+  legacyCacheFile: Schema.string()
+    .description('An older cache location, read once when cacheFile does not exist yet. Never written or deleted.'),
   refreshOnStart: Schema.boolean().default(true)
     .description('Refresh from Copilot at startup when signed in.'),
   updateRoute: Schema.boolean().default(true)
@@ -117,19 +120,15 @@ export async function apply(ctx: Context, config: Config) {
   const logger = ctx.logger(name)
   if (config.terminal) printOwnLogs(ctx, name)
 
+  const cacheFile = config.cacheFile || join(xdgPaths('dish').cache, 'copilot-models.json')
   let record: Record<string, CatalogModel> | undefined
-  let cache: Cache | undefined
   try {
     record = await piAiCopilotCatalog()
   } catch (error) {
     logger.warn('cannot patch pi-ai\'s Copilot catalog, so new models will not be added: %s', error)
   }
-  try {
-    cache = JSON.parse(await readFile(config.cacheFile, 'utf8')) as Cache
-    if (cache.version !== 1) cache = undefined
-  } catch {
-    // No cache yet, or unreadable: the first refresh writes one.
-  }
+  // No cache yet, or unreadable: the first refresh writes one.
+  const cache = await readCache(cacheFile, config.legacyCacheFile || undefined)
 
   // Ids this plugin put into the catalog, so a refresh can take them back out
   // and never mistakes one for a native entry.
@@ -157,7 +156,7 @@ export async function apply(ctx: Context, config: Config) {
         : Object.keys(record).filter(id => !applied.has(id) && !available.includes(id)).sort(byId),
       routeUpdated: config.updateRoute && await updateRoute(ctx, available),
     }
-    await writeCache(config.cacheFile, { version: 1, report, additions })
+    await writeCache(cacheFile, { version: 1, report, additions })
     last = report
     logger.info('%d models available%s%s%s', available.length,
       report.added.length > 0 ? `; added ${report.added.join(', ')}` : '',
@@ -317,8 +316,34 @@ interface RouteProfile {
   modelOverrides?: Record<string, Record<string, unknown>>
 }
 
-async function writeCache(file: string, cache: Cache): Promise<void> {
+/**
+ * Read the cache `file`. Only when it does not exist, read `legacy` instead,
+ * so a cache from an older location is found once; the first refresh then
+ * writes `file`, and `legacy` is never consulted again. Never writes or
+ * deletes either file.
+ * @returns the cache, or `undefined` if there is none, or it is corrupt or of another version.
+ */
+export async function readCache(file: string, legacy?: string): Promise<Cache | undefined> {
+  let text: string
+  try {
+    text = await readFile(file, 'utf8')
+  } catch (error) {
+    if (legacy === undefined || (error as NodeJS.ErrnoException).code !== 'ENOENT') return undefined
+    return readCache(legacy)
+  }
+  try {
+    const cache = JSON.parse(text) as Partial<Cache> | null
+    if (cache?.version !== 1 || typeof cache.report !== 'object' || !Array.isArray(cache.additions)) return undefined
+    return cache as Cache
+  } catch {
+    return undefined
+  }
+}
+
+/** Write the cache atomically, creating its directory (`~/.cache/dish` may not exist yet). */
+export async function writeCache(file: string, cache: Cache): Promise<void> {
   const temporary = `${file}.${process.pid}.tmp`
+  await mkdir(dirname(file), { recursive: true })
   await writeFile(temporary, `${JSON.stringify(cache, null, 2)}\n`)
   await rename(temporary, file)
 }

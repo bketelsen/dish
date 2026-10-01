@@ -13,7 +13,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { AuthorizationInteraction } from '@deepseek-ai/dsh-authorization'
 import type { CredentialKey } from '@deepseek-ai/dsh-credentials'
-import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { markRemote } from 'dish-kit'
 import type {} from './catalog.ts'
 import { NAMESPACE, type CopilotStatus, type SignInEvent } from './protocol.ts'
 
@@ -130,26 +131,3 @@ markRemote(CopilotRemote, 'signIn', { mode: 'stream' })
 markRemote(CopilotRemote, 'cancel')
 markRemote(CopilotRemote, 'signOut')
 markRemote(CopilotRemote, 'refreshModels')
-
-/**
- * Apply `@Remote` (or `@Remote({ mode: 'stream' })`) to one method without
- * decorator syntax. The decorator only schedules an initializer that records
- * a marker on the instance's prototype, so running that initializer against a
- * bare prototype instance has the same effect as class construction would.
- */
-function markRemote(target: { prototype: object }, method: string, options?: { mode: 'stream' }): void {
-  const decorate = (options === undefined ? Remote : Remote(options)) as (
-    value: unknown, context: ClassMethodDecoratorContext) => void
-  const initializers: ((this: object) => void)[] = []
-  decorate(Reflect.get(target.prototype, method), {
-    kind: 'method',
-    name: method,
-    static: false,
-    private: false,
-    metadata: {},
-    access: { has: object => method in (object as object), get: object => Reflect.get(object as object, method) },
-    addInitializer: (initializer) => { initializers.push(initializer as (this: object) => void) },
-  } as ClassMethodDecoratorContext)
-  const instance = Object.create(target.prototype) as object
-  for (const initializer of initializers) initializer.call(instance)
-}

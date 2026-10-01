@@ -39,6 +39,9 @@ importers:
       '@deepseek-ai/schemastery':
         specifier: ~3.18.4
         version: 3.18.4
+      dish-kit:
+        specifier: workspace:*
+        version: link:../../packages/dish-kit
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: ~4.0.4
