@@ -738,8 +738,9 @@ test('an end that comes while the plugin unmounts is not heard, and the unmount 
   ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'c1 was being recorded' }])
   const unmounting = handle.dispose()
   // The unmount is waiting for c1. An end that comes now is one it would not wait for, if it were heard: it would be filed
-  // after the unmount's wait, with the plugin gone. cordis stops delivering a plugin's events once its disposal starts,
-  // whatever the order its effects were registered in, so this holds the two together: c2 is not heard, and c1 is waited for.
+  // after the unmount's wait, with the plugin gone. cordis removes the listeners in the same microtask batch as the flush
+  // takes its snapshot, whatever the order the effects were registered in, so this holds the two together: c2 (a turn
+  // later) is not heard, and c1 is waited for.
   await turn()
   ended(ctx, 'c2', 'completed', [{ type: 'text', text: 'c2 came while unmounting' }])
   await turn()

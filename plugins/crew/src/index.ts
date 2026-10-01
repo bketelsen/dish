@@ -254,9 +254,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return run
   }
 
-  // A shutdown waits for what is being recorded: a run that ended just before it is not lost. Registered before the
-  // listeners, so that it is disposed after them (a plugin's effects are disposed last first); cordis stops delivering a
-  // plugin's events as soon as its disposal starts, so nothing is heard that this does not wait for.
+  // A shutdown waits for what is being recorded: a run that ended just before it is not lost. cordis disposes a plugin's
+  // effects together, one microtask after dispose(), so removing the listeners and taking this snapshot of `chain` happen
+  // in the same batch: everything heard is in the snapshot, and nothing after it is heard, whatever the registration order.
   ctx.effect(() => async () => {
     await Promise.all([...chain.values()])
     await records.flush()
