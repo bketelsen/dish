@@ -138,13 +138,19 @@ Consumers re-read on these events rather than caching.
 - **`propose`** runs the checks of `write`, in the same order, with one difference: an agent needs the namespace's `agent` policy to be `write` or `propose` (a user may propose to any namespace). Then:
   - the **title** is one line (whitespace collapsed, cut to 120 characters) and not empty;
   - the **rationale** may run to many lines, at most 8 KiB, with no control characters but tab and newline, and **no line that starts like a `Dish-` trailer** (it would let a rationale forge the trailers);
+  - neither may contain git's "scissors" line (`# ------------------------ >8 ------------------------`), which hides the trailers from git's own reader;
   - neither may look like a secret, and a proposal that leaves the tree as it is is `INVALID`.
   Nothing reaches git before all of that passes.
+- **Staleness** is computed from the repository each time, never stored. For each path the proposal changes, compare its document on current `main` with its version at the base and with the proposal's:
+  - the same as at the base: still **pending**;
+  - the same as the proposal's (the user made the same edit, or deleted what the proposal deletes): already **applied**, no obstacle;
+  - anything else is a **conflict**, and one conflict makes the proposal **stale**.
+  A path the proposal adds is also a conflict when `main` has a file where it needs a directory, or documents under a path it needs for a file (the proposal's own deletions don't count).
 - **`accept`**:
   - **Only a user may accept.** An agent gets `FORBIDDEN`: the proposal is how an agent asks.
-  - If each changed path is still identical on `main` to its version at base, the proposal's tip versions of those paths are applied to current `main` as one commit (`Accept proposal <id>: <title>`, with `Dish-Proposal` and, for an agent's proposal, `Dish-Proposer-Session` and `Dish-Proposer-Role` trailers), and the branch is then deleted. Ownership, the content guard and the namespace's validator run again, as they are now.
-  - If `main` already holds the content (no commit would result), the branch is still deleted and accept returns `undefined`.
-  - Otherwise the proposal is marked **stale** (`dish-config/proposal` fires), `accept` fails with `STALE`, nothing is merged, and the branch is kept.
+  - If the proposal is stale, `dish-config/proposal` fires, `accept` fails with `STALE`, nothing is merged, and the branch is kept.
+  - Otherwise the tip's version of each **pending** path is applied to current `main` as one commit (`Accept proposal <id>: <title>`, with `Dish-Proposal` and, for an agent's proposal, `Dish-Proposer-Session` and `Dish-Proposer-Role` trailers), and the branch is then deleted. Ownership, the content guard and the namespace's validator run again, as they are now. The title and the proposer's session and role are scanned for secrets too (`SECRET`, branch kept); the rationale is never copied.
+  - If nothing is pending (`main` already holds the content), no commit is made: the branch is deleted and accept returns `undefined`.
 - **Rebuilding.** The agent that owns a stale proposal is told why. It rebuilds the proposal from current `main`, as a fresh proposal superseding the old one. You never resolve conflicts.
 - **`reject`** takes a reason (one line, at most 200 characters, not empty, no secret). The proposal moves to `refs/dish/rejected/<id>`, on a commit `Rejected: <reason>` that carries the reason as `Dish-Rejected`; the branch is deleted. The record stays in the repository, so the History page and the agent can see why, and `proposals('rejected')` lists it. A user may reject any proposal, stale ones included. **An agent may only withdraw its own session's proposals** (`FORBIDDEN` otherwise).
 

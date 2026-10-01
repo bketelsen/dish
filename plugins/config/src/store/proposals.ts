@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { ConfigStoreError } from './errors.ts'
+import { literal } from './git.ts'
 import type { Change, Git, GitIdentity } from './git.ts'
 import type { Author, CommitInfo, EditAuthor, LogRecord, Prepared, WriteMeta } from './store.ts'
 
@@ -100,6 +101,11 @@ const RATIONALE_CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/
  * indented in a log, so both are refused. The real trailers are the last paragraph, which no rationale can reach.
  */
 const FORGED_TRAILER = /^\s*Dish-[A-Za-z-]+\s*:/mi
+/**
+ * The line git's own tools cut a message at (`# ------------------------ >8 ------------------------`, with the
+ * comment character this store forces). In a title or rationale it would hide the trailers from git's reader.
+ */
+const SCISSORS = /^# -{24} >8 -{24}$/m
 
 function invalid(message: string): ConfigStoreError {
   return new ConfigStoreError('INVALID', message)
@@ -110,6 +116,7 @@ function rationaleProblem(text: string): string | undefined {
   if (Buffer.byteLength(text, 'utf8') > RATIONALE_MAX_BYTES) return 'is over 8 KiB'
   if (RATIONALE_CONTROL.test(text)) return 'contains control characters'
   if (FORGED_TRAILER.test(text)) return 'has a line that starts like a Dish- trailer'
+  if (SCISSORS.test(text)) return 'has git\'s scissors line ("# ------------------------ >8 ------------------------")'
   return undefined
 }
 
@@ -169,14 +176,17 @@ function parse(host: ProposalHost, id: string, record: LogRecord): Parsed | unde
   const parts = splitMessage(info.message)
   if (parts === undefined) return undefined
   const title = host.tidy(parts.title, TITLE_MAX_CHARS)
-  if (title === undefined || rationaleProblem(parts.rationale) !== undefined) return undefined
+  if (title === undefined || SCISSORS.test(title) || rationaleProblem(parts.rationale) !== undefined) return undefined
   return { id, tip: info.id, base: record.base, title, rationale: parts.rationale, author: info.author, created: info.time, paths: info.paths }
 }
 
-/** The ids and tips under `prefix`: commits whose ref name is 8 lowercase hex characters, and nothing else. */
-async function listRefs(git: Git, prefix: string): Promise<Found[]> {
+/**
+ * The ids and tips under `prefix` (or just `prefix` + `only`): commits whose ref name is 8
+ * lowercase hex characters, and nothing else. A tag or a tree under there is not a proposal.
+ */
+async function listRefs(git: Git, prefix: string, only = ''): Promise<Found[]> {
   // `%00` between the fields and a newline after each ref (which a ref name can't contain).
-  const output = (await git.run(['for-each-ref', '--format=%(refname)%00%(objectname)%00%(objecttype)', prefix])).stdout
+  const output = (await git.run(['for-each-ref', '--format=%(refname)%00%(objectname)%00%(objecttype)', `${prefix}${only}`])).stdout
   const found: Found[] = []
   for (const line of output.split('\n')) {
     if (line === '') continue
@@ -226,13 +236,101 @@ async function loadRejected(host: ProposalHost, found: Found[]): Promise<Array<P
 /** The proposal at `refs/heads/proposal/<id>`, if there is a well-formed one. */
 async function findHead(host: ProposalHost, id: unknown): Promise<Parsed | undefined> {
   if (typeof id !== 'string' || !PROPOSAL_ID.test(id)) return undefined
-  const tip = await host.git.resolve(`${HEAD_PREFIX}${id}`)
-  return tip === undefined ? undefined : (await loadHeads(host, [{ id, tip }]))[0]
+  const found = (await listRefs(host.git, HEAD_PREFIX, id)).find(entry => entry.id === id)
+  return found === undefined ? undefined : (await loadHeads(host, [found]))[0]
 }
 
-/** The paths of `proposal` that have changed on `main` since its base: stale if there are any. */
-function changedSince(host: ProposalHost, proposal: Parsed, head: string): Promise<string[]> {
-  return host.git.changedPaths(proposal.base, head, proposal.paths)
+// --- staleness ------------------------------------------------------------------------------------
+
+/** What a commit has at a path: a blob or a tree (a path with nothing there has no entry). */
+interface Entry {
+  type: string
+  oid: string
+}
+
+/**
+ * What `commit` has at each of `paths`, exactly those paths and not what is under them. Git
+ * also lists the directories it passes on the way, which nobody asks about.
+ */
+async function entriesAt(git: Git, commit: string, paths: string[]): Promise<Map<string, Entry>> {
+  const entries = new Map<string, Entry>()
+  if (paths.length === 0) return entries
+  // `-t`: a path that is a directory and the parent of another path is shown, not only passed through.
+  const output = (await git.run(['ls-tree', '-t', '-z', commit, '--', ...paths.map(literal)])).stdout
+  for (const record of output.split('\0')) {
+    if (record === '') continue
+    const tab = record.indexOf('\t')
+    const [, type, oid] = record.slice(0, tab).split(' ') as [string, string, string]
+    entries.set(record.slice(tab + 1), { type, oid })
+  }
+  return entries
+}
+
+/** The directories above `path`, nearest last: `a/b/c` has `a` and `a/b`. */
+function ancestorsOf(path: string): string[] {
+  const found: string[] = []
+  for (let at = path.indexOf('/'); at !== -1; at = path.indexOf('/', at + 1)) found.push(path.slice(0, at))
+  return found
+}
+
+/** What `main` has done to a proposal's paths since its base. */
+interface Standing {
+  /** Still as they were at the base: what accept applies. */
+  pending: string[]
+  /** Changed on `main` to something that is neither their base version nor the proposal's, or no longer fitting its tree: the proposal is stale if there are any. */
+  conflicting: string[]
+}
+
+/**
+ * Compare each path of `proposal` as `head` (the tip of `main`) has it with its base version
+ * and with the proposal's. A document is the same when its blob is; a deleted one is the same
+ * as one that was never there.
+ * - as at the base: `pending`, to be applied;
+ * - as the proposal has it already (main took the same text, or deleted what the proposal deletes): nothing to apply, and no obstacle;
+ * - anything else: `conflicting`.
+ * A path that is still pending but whose new version cannot go into `head`'s tree conflicts as
+ * well: a file in the way of a directory the proposal adds (an ancestor of the path is a file on
+ * `main`), or a directory in the way of a file (documents on `main` under the path that the
+ * proposal does not delete). The proposal's own deletions go first, so those never count.
+ */
+async function standing(host: ProposalHost, proposal: Parsed, head: string): Promise<Standing> {
+  const { paths, base, tip } = proposal
+  if (head === base || paths.length === 0) return { pending: paths, conflicting: [] }
+  const blob = (entries: Map<string, Entry>, path: string): string | undefined => {
+    const entry = entries.get(path)
+    return entry?.type === 'blob' ? entry.oid : undefined
+  }
+  const atBase = await entriesAt(host.git, base, paths)
+  const atTip = await entriesAt(host.git, tip, paths)
+  const above = new Set(paths.filter(path => blob(atTip, path) !== undefined).flatMap(ancestorsOf))
+  const atHead = await entriesAt(host.git, head, [...paths, ...above])
+
+  const pending: string[] = []
+  const conflicting: string[] = []
+  for (const path of paths) {
+    const here = blob(atHead, path)
+    if (here === blob(atBase, path)) pending.push(path)
+    else if (here !== blob(atTip, path)) conflicting.push(path)
+  }
+  const removed = new Set(pending.filter(path => blob(atTip, path) === undefined))
+  const fits: string[] = []
+  for (const path of pending) {
+    if (blob(atTip, path) === undefined) {
+      fits.push(path)
+      continue
+    }
+    const blocked = ancestorsOf(path).some(parent => atHead.get(parent)?.type === 'blob' && !removed.has(parent))
+      || (atHead.get(path)?.type === 'tree' && (await host.git.listPaths(head, path)).some(below => !removed.has(below)))
+    if (blocked) conflicting.push(path)
+    else fits.push(path)
+  }
+  return { pending: fits, conflicting: conflicting.sort() }
+}
+
+/** `STALE`, and `onProposal` told: a proposal that cannot be applied as it is. */
+function stale(host: ProposalHost, proposal: Parsed, why: string): ConfigStoreError {
+  host.notify(proposal.id, 'stale')
+  return new ConfigStoreError('STALE', `proposal ${proposal.id} is stale: ${why}; nothing was merged`)
 }
 
 function describe(proposal: Parsed, status: ProposalStatus, reason?: string): ProposalInfo {
@@ -256,6 +354,7 @@ export async function proposeChanges(host: ProposalHost, changes: Change[], meta
   const prepared = host.prepare(changes, { author: meta?.author }, 'propose')
   const title = host.line('title', meta.title, TITLE_MAX_CHARS)
   if (title === undefined) throw invalid('title must not be empty')
+  if (SCISSORS.test(title)) throw invalid('title is git\'s scissors line ("# ------------------------ >8 ------------------------")')
   const rationale = checkRationale(host, meta.rationale)
 
   const base = await host.mainCommit()
@@ -283,7 +382,8 @@ export async function proposeChanges(host: ProposalHost, changes: Change[], meta
 /**
  * The proposals, newest first (by when they were proposed). `open` and `stale` come from
  * `refs/heads/proposal/`, `rejected` from `refs/dish/rejected/`; without `status`, all three.
- * A proposal is stale when a path it changes has changed on `main` since its base.
+ * A proposal is stale when a path it changes conflicts with `main` (see `standing`): changed there
+ * to something other than the proposal's version, or no longer fitting its tree.
  * A ref that holds no well-formed proposal is not listed.
  * @throws `INVALID` for a `status` that is none of the three.
  */
@@ -295,7 +395,7 @@ export async function listProposals(host: ProposalHost, status?: ProposalStatus)
   if (status !== 'rejected') {
     const head = await host.mainCommit()
     for (const proposal of await loadHeads(host, await listRefs(host.git, HEAD_PREFIX))) {
-      const state = (await changedSince(host, proposal, head)).length > 0 ? 'stale' : 'open'
+      const state = (await standing(host, proposal, head)).conflicting.length > 0 ? 'stale' : 'open'
       if (status === undefined || status === state) listed.push(describe(proposal, state))
     }
   }
@@ -315,11 +415,15 @@ async function dropBranch(host: ProposalHost, ref: string, tip: string): Promise
 
 /**
  * Apply a proposal to `main` and delete its branch. Only a user may accept (`FORBIDDEN`).
- * If a path it changes has changed on `main` since its base, nothing is merged: `STALE`,
+ * If a path it changes conflicts with `main` (see `standing`), nothing is merged: `STALE`,
  * `onProposal(id, 'stale')`, and the branch is kept. Otherwise the tip's version of each
- * path goes through `write`'s checks (ownership, guard and validators as they are now) as one
- * commit whose base is the proposal's, `Accept proposal <id>: <title>`.
- * @returns the commit, or `undefined` when `main` already holds the content (the branch is deleted all the same).
+ * path that is still as it was at the base (a deletion where the tip has none; paths `main`
+ * already has as proposed are left out) goes through `write`'s checks (ownership, guard and
+ * validators as they are now) as one commit, `Accept proposal <id>: <title>`, written with the
+ * `main` it was compared on as its base. What goes onto `main` besides documents, the title and the proposer's
+ * session and role, is checked for secrets first (`SECRET`; the branch stays, for a user to
+ * reject). The rationale is never copied.
+ * @returns the commit, or `undefined` when nothing was left to apply (the branch is deleted all the same).
  * @throws `NOT_FOUND` if there is no such proposal (a rejected one is gone as far as this goes).
  */
 export async function acceptProposal(host: ProposalHost, id: string, meta: AcceptMeta): Promise<CommitInfo | undefined> {
@@ -328,27 +432,42 @@ export async function acceptProposal(host: ProposalHost, id: string, meta: Accep
   const proposal = await findHead(host, id)
   if (proposal === undefined) throw new ConfigStoreError('NOT_FOUND', `no open proposal ${JSON.stringify(id)}`)
 
-  const stale = await changedSince(host, proposal, await host.mainCommit())
-  if (stale.length > 0) {
-    host.notify(id, 'stale')
-    throw new ConfigStoreError('STALE', `proposal ${id} is stale: ${host.pathList(stale)} changed on main since ${proposal.base.slice(0, 7)}; nothing was merged`)
+  const head = await host.mainCommit()
+  const { pending, conflicting } = await standing(host, proposal, head)
+  if (conflicting.length > 0) {
+    throw stale(host, proposal, `${host.pathList(conflicting)} conflicts with changes made on main since ${proposal.base.slice(0, 7)}`)
+  }
+  // The documents are scanned by the pipeline below; these are the other things that land on `main`. A branch
+  // comes from anyone who can write the repository, and the guard may have grown since it was made.
+  host.scan('title', proposal.title)
+  if (proposal.author.kind === 'agent') {
+    host.scan('sessionId', proposal.author.sessionId)
+    host.scan('role', proposal.author.role ?? 'main')
   }
 
   let commit: CommitInfo | undefined
-  // A proposal that changes nothing (only an outside writer can make one) has nothing to apply.
-  if (proposal.paths.length > 0) {
+  if (pending.length > 0) {
     const changes: Change[] = []
-    for (const path of proposal.paths) {
+    for (const path of pending) {
       const text = await host.git.readBlob(proposal.tip, path)
       changes.push(text === undefined ? { path, delete: true } : { path, text })
     }
-    const prepared = host.prepare(changes, { author, base: proposal.base }, 'write')
+    // The base is the `main` the paths were just compared on, not the proposal's: against that one a document that gave
+    // way to a directory (or the reverse) would always read as changed. If `main` moves before the commit, a path
+    // that changed is a `CONFLICT`, as for any write.
+    const prepared = host.prepare(changes, { author, base: head }, 'write')
     prepared.subject = () => `Accept proposal ${id}: ${proposal.title}`
     prepared.trailers = [`Dish-Proposal: ${id}`]
     if (proposal.author.kind === 'agent') {
       prepared.trailers.push(`Dish-Proposer-Session: ${proposal.author.sessionId}`, `Dish-Proposer-Role: ${proposal.author.role ?? 'main'}`)
     }
-    commit = await host.commit(prepared)
+    try {
+      commit = await host.commit(prepared)
+    } catch (error) {
+      // The only `INVALID` left here is the tree refusing a path (a file in a directory's way that `standing` could not see).
+      if (error instanceof ConfigStoreError && error.code === 'INVALID') throw stale(host, proposal, `its paths no longer fit main's tree (${error.message})`)
+      throw error
+    }
   }
   // `main` has the content now, and that is what accept is for: failing to delete the branch only leaves one to reject.
   if (!(await dropBranch(host, `${HEAD_PREFIX}${id}`, proposal.tip))) {

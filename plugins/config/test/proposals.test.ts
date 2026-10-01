@@ -3,9 +3,11 @@ import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { once } from 'node:events'
 import { syncBuiltinESMExports } from 'node:module'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import type { Change, Git } from '../src/store/git.ts'
 import type { Author, CommitInfo, ConfigStore, EditAuthor, ProposalEvent, ProposalInfo } from '../src/store/store.ts'
-import { AGENTA, USERA, isStoreError, ns, openAt, openStore } from './helpers.ts'
+import { AGENTA, USERA, isStoreError, ns, openAt, openStore, recorder, tempDir } from './helpers.ts'
 
 const MAIN = 'refs/heads/main'
 const HEADS = 'refs/heads/proposal/'
@@ -68,6 +70,20 @@ async function objects(git: Git): Promise<string> {
   return (await git.run(['count-objects', '-v'])).stdout
 }
 
+/** Run `body` with `text` as the user's global git config (`GIT_CONFIG_GLOBAL`, which the store's git children inherit). */
+async function withGlobalConfig<T>(text: string, body: () => Promise<T>): Promise<T> {
+  const config = join(await tempDir(), 'gitconfig')
+  await writeFile(config, text)
+  const previous = process.env.GIT_CONFIG_GLOBAL
+  process.env.GIT_CONFIG_GLOBAL = config
+  try {
+    return await body()
+  } finally {
+    if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL
+    else process.env.GIT_CONFIG_GLOBAL = previous
+  }
+}
+
 /** A refusal that left the repository exactly as it was: no object, no ref. */
 async function refusesCleanly(git: Git, attempt: () => Promise<unknown>, matches: (error: unknown) => boolean): Promise<void> {
   const before = [await objects(git), await refsUnder(git, 'refs/')]
@@ -96,6 +112,8 @@ interface Forged {
   base?: string
   message?: string
   changes?: Change[]
+  /** A tree to use as it is, instead of `base`'s with `changes`. */
+  tree?: string
   /** Where to point; default `refs/heads/proposal/<id>`. */
   ref?: string
   parents?: string[]
@@ -106,7 +124,7 @@ interface Forged {
 /** A commit shaped like a proposal, made with git directly and put on a ref, as an outside writer could. */
 async function forge(git: Git, options: Forged): Promise<string> {
   const base = options.base ?? await mainOf(git)
-  const tree = await git.buildTree(base, options.changes ?? [])
+  const tree = options.tree ?? await git.buildTree(base, options.changes ?? [])
   const message = options.message ?? `Forged\n\nDish-Author-Kind: user\nDish-Proposal: ${options.id}\nDish-Base: ${base}\n`
   const date = `${options.time ?? 1_700_000_000} +0000`
   const env = {
@@ -759,6 +777,266 @@ test('a rejected record made outside the store is read the same way', async () =
   assert.equal(item!.reason, 'not wanted')
   assert.equal(item!.tip, proposed)
   assert.equal(item!.base, head)
+})
+
+// --- what accept copies onto main ----------------------------------------------------------------
+
+test('accept scans what it copies onto main: a title, session or role that looks like a secret is SECRET, and the branch stays', async () => {
+  const { store, git } = await openAt({ claims: [ns('prompts/')] })
+  const head = await mainOf(git)
+  const aws = `AKIA${'A'.repeat(16)}`
+  const message = (id: string, title: string, session: string, role: string): string =>
+    `${title}\n\nDish-Author-Kind: agent\nDish-Session: ${session}\nDish-Role: ${role}\nDish-Proposal: ${id}\nDish-Base: ${head}\n`
+  const cases: Array<[string, string, string, string, string]> = [
+    ['aaaaaaaa', `Use ${TOKEN}`, 's1', 'coder', 'title'],
+    ['bbbbbbbb', 'Fine', aws, 'coder', 'sessionId'],
+    ['cccccccc', 'Fine', 's1', aws, 'role'],
+  ]
+  for (const [id, title, session, role] of cases) {
+    await forge(git, { id, changes: [file(`prompts/${id}`, '1')], message: message(id, title, session, role) })
+  }
+  // They are listed as they are; it is accept that refuses.
+  assert.equal((await store.proposals()).length, 3)
+  const before = [await objects(git), await refsUnder(git, 'refs/'), head]
+  for (const [id, , , , field] of cases) {
+    await assert.rejects(store.accept(id, { author: USERA }), (error: unknown) => {
+      isStoreError('SECRET', field)(error)
+      return !String((error as Error).message).includes(TOKEN) && !String((error as Error).message).includes(aws)
+    })
+  }
+  assert.deepEqual([await objects(git), await refsUnder(git, 'refs/'), await mainOf(git)], before, 'nothing written, every branch kept')
+  assert.equal((await store.proposals('open')).length, 3)
+  // The user can reject them.
+  await store.reject('aaaaaaaa', 'a token in the title', { author: USERA })
+  assert.equal((await store.proposals('rejected')).length, 1)
+
+  // The same shape with clean fields is accepted, and lands the proposer's session.
+  await forge(git, { id: 'dddddddd', changes: [file('prompts/d', '1')], message: message('dddddddd', 'Fine', 's1', 'coder') })
+  const accepted = await store.accept('dddddddd', { author: USERA })
+  assert.match(accepted!.message, /^Accept proposal dddddddd: Fine\n\n.*Dish-Proposer-Session: s1\nDish-Proposer-Role: coder\n$/s)
+})
+
+test('accept never copies the rationale onto main', async () => {
+  const { store, git } = await openAt({ claims: [ns('prompts/')] })
+  const head = await mainOf(git)
+  const rationale = `the token is ${TOKEN}`
+  await forge(git, {
+    id: 'eeeeeeee', changes: [file('prompts/e', '1')],
+    message: `Fine title\n\n${rationale}\n\nDish-Author-Kind: user\nDish-Proposal: eeeeeeee\nDish-Base: ${head}\n`,
+  })
+  assert.equal((await store.proposals())[0]!.rationale, rationale)
+  const accepted = await store.accept('eeeeeeee', { author: USERA })
+  assert.ok(accepted)
+  assert.ok(!accepted.message.includes('token'))
+  assert.ok(!(await git.run(['log', '--format=%B', MAIN])).stdout.includes(TOKEN))
+})
+
+// --- git's scissors line --------------------------------------------------------------------------
+
+test('git\'s scissors line in a title or rationale is INVALID, before git is touched', async () => {
+  const { store, git } = await openAt({ claims: [ns('prompts/')] })
+  const scissors = '# ------------------------ >8 ------------------------'
+  for (const rationale of [scissors, `above\n${scissors}\nbelow`, `${scissors}\nbelow`, `above\n\n${scissors}`, `above\n${scissors}`]) {
+    await refusesCleanly(git, () => make(store, [file('prompts/a', '1')], AGENTA, 'T', rationale), isStoreError('INVALID', 'rationale'))
+  }
+  await refusesCleanly(git, () => make(store, [file('prompts/a', '1')], AGENTA, scissors, ''), isStoreError('INVALID', 'title'))
+  await refusesCleanly(git, () => make(store, [file('prompts/a', '1')], AGENTA, scissors, 'because'), isStoreError('INVALID', 'title'))
+
+  // Near misses are not git's line, and read back.
+  const fine = await make(store, [file('prompts/b', '1')], AGENTA, `see ${scissors}`, `# ----------------------- >8 ------------------------\nsee ${scissors}\n#${scissors}`)
+  assert.deepEqual(await store.proposals(), [fine])
+})
+
+test('a branch with the scissors line in it is not listed, and is NOT_FOUND for accept and reject', async () => {
+  const { store, git } = await openAt({ claims: [ns('prompts/')] })
+  const head = await mainOf(git)
+  const scissors = '# ------------------------ >8 ------------------------'
+  await forge(git, { id: 'aaaaaaaa', changes: [file('prompts/a', '1')], message: `T\n\nabove\n${scissors}\nbelow\n\nDish-Author-Kind: user\nDish-Proposal: aaaaaaaa\nDish-Base: ${head}\n` })
+  await forge(git, { id: 'bbbbbbbb', changes: [file('prompts/b', '1')], message: `${scissors}\n\nDish-Author-Kind: user\nDish-Proposal: bbbbbbbb\nDish-Base: ${head}\n` })
+  assert.deepEqual(await store.proposals(), [])
+  await assert.rejects(store.accept('aaaaaaaa', { author: USERA }), isStoreError('NOT_FOUND'))
+  await assert.rejects(store.reject('bbbbbbbb', 'x', { author: USERA }), isStoreError('NOT_FOUND'))
+})
+
+// --- staleness: what main has done to the proposal's paths --------------------------------------------
+
+interface Case {
+  name: string
+  base: Change[]
+  proposal: Change[]
+  main: Change[]
+  /** Open: what accept returns (the paths it committed, or none), and what `main` holds after. Stale: the paths named in the refusal. */
+  open?: { committed: string[], after: Record<string, string | undefined> }
+  stale?: string[]
+}
+
+const staleness: Case[] = [
+  { name: 'main took the proposed text', base: [file('prompts/a', 'A')], proposal: [file('prompts/a', 'X')], main: [file('prompts/a', 'X')],
+    open: { committed: [], after: { 'prompts/a': 'X' } } },
+  { name: 'main changed the path another way', base: [file('prompts/a', 'A')], proposal: [file('prompts/a', 'X')], main: [file('prompts/a', 'Y')],
+    stale: ['prompts/a'] },
+  { name: 'main deleted a path the proposal modifies', base: [file('prompts/a', 'A')], proposal: [file('prompts/a', 'X')], main: [gone('prompts/a')],
+    stale: ['prompts/a'] },
+  { name: 'main modified a path the proposal deletes', base: [file('prompts/a', 'A')], proposal: [gone('prompts/a')], main: [file('prompts/a', 'Y')],
+    stale: ['prompts/a'] },
+  { name: 'main deleted a path the proposal deletes', base: [file('prompts/a', 'A'), file('prompts/b', 'B')], proposal: [gone('prompts/a')], main: [gone('prompts/a')],
+    open: { committed: [], after: { 'prompts/a': undefined, 'prompts/b': 'B' } } },
+  { name: 'main added the proposed file as proposed', base: [file('prompts/b', 'B')], proposal: [file('prompts/n', 'N')], main: [file('prompts/n', 'N')],
+    open: { committed: [], after: { 'prompts/n': 'N' } } },
+  { name: 'main added the proposed file differently', base: [file('prompts/b', 'B')], proposal: [file('prompts/n', 'N')], main: [file('prompts/n', 'M')],
+    stale: ['prompts/n'] },
+  { name: 'main applied one path of two', base: [file('prompts/a', 'A'), file('prompts/b', 'B')], proposal: [file('prompts/a', 'X'), file('prompts/b', 'Z')], main: [file('prompts/a', 'X')],
+    open: { committed: ['prompts/b'], after: { 'prompts/a': 'X', 'prompts/b': 'Z' } } },
+  { name: 'main applied one path of two and changed the other', base: [file('prompts/a', 'A'), file('prompts/b', 'B')], proposal: [file('prompts/a', 'X'), file('prompts/b', 'Z')], main: [file('prompts/a', 'X'), file('prompts/b', 'W')],
+    stale: ['prompts/b'] },
+  { name: 'main applied a deletion and a change, and left a third alone', base: [file('prompts/a', 'A'), file('prompts/b', 'B'), file('prompts/c', 'C')],
+    proposal: [gone('prompts/a'), file('prompts/b', 'Z'), file('prompts/c', 'Y')], main: [gone('prompts/a'), file('prompts/b', 'Z')],
+    open: { committed: ['prompts/c'], after: { 'prompts/a': undefined, 'prompts/b': 'Z', 'prompts/c': 'Y' } } },
+  { name: 'main changed an unrelated path', base: [file('prompts/a', 'A'), file('prompts/b', 'B')], proposal: [file('prompts/a', 'X')], main: [file('prompts/b', 'W')],
+    open: { committed: ['prompts/a'], after: { 'prompts/a': 'X', 'prompts/b': 'W' } } },
+]
+
+for (const item of staleness) {
+  test(`staleness: ${item.name}`, async () => {
+    const { seen, onProposal } = events()
+    const committed = recorder()
+    const { store, git } = await openAt({ claims: [ns('prompts/')], onProposal, onCommit: committed.onCommit })
+    await put(store, item.base)
+    const proposal = await make(store, item.proposal)
+    await put(store, item.main)
+    committed.seen.length = 0
+    const mainBefore = await mainOf(git)
+
+    const [listed] = await store.proposals()
+    assert.equal(listed!.status, item.stale === undefined ? 'open' : 'stale')
+    assert.deepEqual(listed!.paths, proposal.paths, 'the paths are the proposal\'s, whatever main did')
+
+    if (item.stale !== undefined) {
+      await assert.rejects(store.accept(proposal.id, { author: USERA }), (error: unknown) => {
+        isStoreError('STALE', ...item.stale!)(error)
+        // Only the conflicting paths are named.
+        for (const path of item.proposal.map(change => change.path)) {
+          if (!item.stale!.includes(path)) assert.ok(!(error as Error).message.includes(path), `${path} is not named`)
+        }
+        return true
+      })
+      assert.equal(await mainOf(git), mainBefore)
+      assert.equal(await git.resolve(`${HEADS}${proposal.id}`), proposal.tip, 'the branch is kept')
+      assert.deepEqual(seen, [[proposal.id, 'open'], [proposal.id, 'stale']])
+      return
+    }
+    const result = await store.accept(proposal.id, { author: USERA })
+    if (item.open!.committed.length === 0) {
+      assert.equal(result, undefined, 'nothing left to apply: no commit')
+      assert.equal(await mainOf(git), mainBefore)
+      assert.deepEqual(committed.seen, [])
+    } else {
+      assert.ok(result)
+      assert.deepEqual(result.paths, item.open!.committed)
+      assert.deepEqual(committed.seen, [result])
+      assert.match(result.message, new RegExp(`^Accept proposal ${proposal.id}: A title\\n`))
+    }
+    for (const [path, text] of Object.entries(item.open!.after)) assert.equal(await store.read(path), text, path)
+    assert.deepEqual(await refsUnder(git, HEADS), [], 'the branch is gone')
+    assert.deepEqual(seen, [[proposal.id, 'open'], [proposal.id, 'accepted']])
+  })
+}
+
+// --- staleness: files and directories ---------------------------------------------------------------
+
+test('a file on main where the proposal adds a directory, or a directory where it adds a file, makes it stale', async () => {
+  const { store, git } = await openAt({ claims: [ns('x/')] })
+  await put(store, [file('x/keep', 'K'), file('x/dir/one', '1')])
+  const under = await make(store, [file('x/a/b', 'B')])
+  const over = await make(store, [file('x/d', 'D')])
+  const swap = await make(store, [gone('x/dir/one'), file('x/dir', 'now a file')])
+  const status = async (): Promise<Record<string, string>> => Object.fromEntries((await store.proposals()).map(item => [item.id, item.status]))
+  assert.deepEqual(await status(), { [under.id]: 'open', [over.id]: 'open', [swap.id]: 'open' })
+
+  await put(store, [file('x/a', 'a file now'), file('x/d/e', 'a directory now'), file('x/dir/new', 'a new child')])
+  assert.deepEqual(await status(), { [under.id]: 'stale', [over.id]: 'stale', [swap.id]: 'stale' })
+  const before = [await objects(git), await refsUnder(git, 'refs/'), await mainOf(git)]
+  for (const proposal of [under, over, swap]) await assert.rejects(store.accept(proposal.id, { author: USERA }), isStoreError('STALE', proposal.paths[0]!))
+  assert.deepEqual([await objects(git), await refsUnder(git, 'refs/'), await mainOf(git)], before, 'a refused accept writes nothing')
+})
+
+test('a proposal that swaps a file and a directory still accepts after main edits something else', async () => {
+  const { store } = await openAt({ claims: [ns('x/')] })
+  await put(store, [file('x/s', 'S'), file('x/dir/one', '1'), file('x/dir/two', '2'), file('x/other', 'O')])
+  const toDir = await make(store, [gone('x/s'), file('x/s/t', 'T')])
+  const toFile = await make(store, [gone('x/dir/one'), gone('x/dir/two'), file('x/dir', 'now a file')])
+  await put(store, [file('x/other', 'O2')])
+  assert.deepEqual((await store.proposals()).map(item => item.status), ['open', 'open'])
+  assert.ok(await store.accept(toDir.id, { author: USERA }))
+  assert.ok(await store.accept(toFile.id, { author: USERA }))
+  assert.deepEqual(await store.list(''), ['x/dir', 'x/other', 'x/s/t'])
+})
+
+test('a directory that main has emptied, or a file that main has removed, is no obstacle', async () => {
+  const { store } = await openAt({ claims: [ns('x/')] })
+  await put(store, [file('x/dir/one', '1'), file('x/f', 'F'), file('x/other', 'O')])
+  const toFile = await make(store, [gone('x/dir/one'), file('x/dir', 'now a file')])
+  const toDir = await make(store, [gone('x/f'), file('x/f/g', 'G')])
+  // Main already did the deleting half of both; and changed something else.
+  await put(store, [gone('x/dir/one'), gone('x/f'), file('x/other', 'O2')])
+  assert.deepEqual((await store.proposals()).map(item => item.status), ['open', 'open'])
+  assert.ok(await store.accept(toFile.id, { author: USERA }))
+  assert.ok(await store.accept(toDir.id, { author: USERA }))
+  assert.deepEqual(await store.list(''), ['x/dir', 'x/f/g', 'x/other'])
+})
+
+test('a branch the tree refuses at accept time is STALE, not a raw INVALID, and stays', async () => {
+  const { seen, onProposal } = events()
+  const { store, git } = await openAt({ claims: [ns('prompts/')], onProposal })
+  // `git~1` is how Windows can spell `.git`: buildTree refuses it, though neither the guard nor the listing can tell.
+  const blob = (await git.run(['hash-object', '-w', '--stdin'], { input: 'x' })).stdout.trim()
+  const inner = (await git.run(['mktree'], { input: `100644 blob ${blob}\tx\n` })).stdout.trim()
+  const middle = (await git.run(['mktree'], { input: `040000 tree ${inner}\tgit~1\n` })).stdout.trim()
+  const tree = (await git.run(['mktree'], { input: `040000 tree ${middle}\tprompts\n` })).stdout.trim()
+  await forge(git, { id: 'aaaaaaaa', tree })
+  assert.deepEqual((await store.proposals()).map(item => [item.id, item.status, item.paths]), [['aaaaaaaa', 'open', ['prompts/git~1/x']]])
+  const head = await mainOf(git)
+  await assert.rejects(store.accept('aaaaaaaa', { author: USERA }), isStoreError('STALE', 'aaaaaaaa'))
+  assert.equal(await mainOf(git), head)
+  assert.ok(await git.resolve(`${HEADS}aaaaaaaa`))
+  assert.deepEqual(seen, [['aaaaaaaa', 'stale']])
+})
+
+// --- the user's git config ------------------------------------------------------------------------------
+
+test('trailers are read whatever separators the user\'s git config sets', async () => {
+  const { store } = await openAt({ claims: [ns('prompts/')] })
+  await withGlobalConfig('[trailer]\n\tseparators = "="\n', async () => {
+    const proposal = await make(store, [file('prompts/a', '1')], AGENTA, 'Title', 'because')
+    assert.deepEqual(proposal.author, AGENTA)
+    assert.deepEqual(await store.proposals('open'), [proposal])
+    const accepted = await store.accept(proposal.id, { author: USERA })
+    assert.ok(accepted)
+    assert.deepEqual(accepted.author, USERA)
+    const [newest] = await store.history()
+    assert.deepEqual(newest, accepted)
+    const other = await make(store, [file('prompts/b', '1')], AGENTA)
+    await store.reject(other.id, 'no', { author: USERA })
+    assert.deepEqual((await store.proposals('rejected')).map(item => [item.id, item.reason]), [[other.id, 'no']])
+  })
+})
+
+// --- refs that are not branches -------------------------------------------------------------------------
+
+test('an annotated tag under proposal/ is not a proposal: not listed, NOT_FOUND for accept and reject', async () => {
+  const { store, git, repository } = await openAt({ claims: [ns('prompts/')] })
+  const head = await mainOf(git)
+  const tip = await forge(git, { id: 'bbbbbbbb', changes: [file('prompts/a', '1')] })
+  const tag = (await git.run(['mktag'], { input: `object ${tip}\ntype commit\ntag t\ntagger x <x@x> 0 +0000\n\nmsg\n` })).stdout.trim()
+  // `update-ref` refuses a tag on a branch ref, so write the loose ref as an outside tool could.
+  const loose = join(repository, `${HEADS}cccccccc`)
+  await mkdir(dirname(loose), { recursive: true })
+  await writeFile(loose, `${tag}\n`)
+  assert.deepEqual((await store.proposals()).map(item => item.id), ['bbbbbbbb'])
+  await assert.rejects(store.accept('cccccccc', { author: USERA }), isStoreError('NOT_FOUND'))
+  await assert.rejects(store.reject('cccccccc', 'x', { author: USERA }), isStoreError('NOT_FOUND'))
+  assert.equal(await mainOf(git), head)
+  assert.equal((await git.run(['rev-parse', `${HEADS}cccccccc`])).stdout.trim(), tag, 'the ref is untouched')
 })
 
 // --- events -------------------------------------------------------------------------------------

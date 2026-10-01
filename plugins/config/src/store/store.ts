@@ -640,8 +640,8 @@ export class ConfigStore {
    * `write` or `propose` (`FORBIDDEN`), and users may propose to any namespace; then the
    * title (one line, whitespace collapsed, cut to 120 characters, not empty) and the
    * rationale (any lines, at most 8 KiB, no control characters but tab and newline, no line
-   * that starts like a `Dish-` trailer), each refused if it looks like a secret
-   * (`INVALID`, `SECRET`). Nothing reaches git before they all pass. A proposal that would
+   * that starts like a `Dish-` trailer), neither holding git's scissors line, each refused
+   * if it looks like a secret (`INVALID`, `SECRET`). Nothing reaches git before they all pass. A proposal that would
    * leave the tree as it is is `INVALID`.
    * @returns the proposal, as `proposals` lists it.
    */
@@ -651,8 +651,9 @@ export class ConfigStore {
 
   /**
    * The proposals, newest first; `status` picks `open`, `stale` or `rejected` (all three if
-   * omitted; `INVALID` for anything else). Stale means a path the proposal changes has changed
-   * on `main` since its base. Computed on every call. A ref under `proposal/` or
+   * omitted; `INVALID` for anything else). Stale means a path the proposal changes conflicts with
+   * `main`: changed there to something other than the proposal's version, or no longer fitting
+   * its tree (a file where it needs a directory, or the reverse). Computed on every call. A ref under `proposal/` or
    * `refs/dish/rejected/` that holds no well-formed proposal is left out, not an error.
    */
   proposals(status?: ProposalStatus): Promise<ProposalInfo[]> {
@@ -660,14 +661,15 @@ export class ConfigStore {
   }
 
   /**
-   * Put a proposal on `main` and delete its branch. Only a user may (`FORBIDDEN`). If a path it
-   * changes has changed on `main` since its base: `STALE`, `onProposal(id, 'stale')`, nothing
-   * merged, the branch kept. Otherwise the tip's version of each path (a deletion where the tip
-   * has none) goes through the pipeline of `write`, so ownership, the guard and the
-   * validators apply as they are now, as one commit `Accept proposal <id>: <title>` with
-   * the proposal's base, and `Dish-Proposal` and (for an agent's proposal)
-   * `Dish-Proposer-Session` and `Dish-Proposer-Role` trailers.
-   * @returns the commit, or `undefined` when `main` already holds the content: the branch is deleted all the same.
+   * Put a proposal on `main` and delete its branch. Only a user may (`FORBIDDEN`). If the proposal
+   * is stale (see `proposals`): `STALE`, `onProposal(id, 'stale')`, nothing merged, the branch kept.
+   * Otherwise the tip's version of each path still as it was at the proposal's base (a deletion where
+   * the tip has none; what `main` already has as proposed is left out) goes through the pipeline of
+   * `write`, so ownership, the guard and the validators apply as they are now, as one commit
+   * `Accept proposal <id>: <title>` with `Dish-Proposal` and (for an agent's proposal)
+   * `Dish-Proposer-Session` and `Dish-Proposer-Role` trailers. The title, session and role are
+   * scanned for secrets first (`SECRET`, the branch kept); the rationale is never copied.
+   * @returns the commit, or `undefined` when nothing was left to apply: the branch is deleted all the same.
    * @throws `NOT_FOUND` if there is no such proposal.
    */
   accept(id: string, meta: AcceptMeta): Promise<CommitInfo | undefined> {
@@ -847,10 +849,11 @@ export class ConfigStore {
   /** `readCommits`, with each commit's parents and the trailers the proposals read. */
   private async readRecords(revisions: string[], pathspec: string[]): Promise<LogRecord[]> {
     // Options and config so that nothing in a user's git config changes the records: `log.showSignature`, `i18n.logOutputEncoding`,
-    // `log.follow` (a single path would follow renames) and `core.commentChar`/`commentString` (a `Dish-` or `D` comment string
-    // would make git skip every trailer line, and so turn every author into the system).
+    // `log.follow` (a single path would follow renames), `core.commentChar`/`commentString` (a `Dish-` or `D` comment string
+    // would make git skip every trailer line, and so turn every author into the system) and `trailer.separators` (`=` alone
+    // would make `Dish-Author-Kind: user` no trailer at all).
     const args = [
-      '-c', 'core.commentChar=#', 'log', '-z', '--first-parent', '--no-follow', '--no-show-signature', '--encoding=UTF-8',
+      '-c', 'core.commentChar=#', '-c', 'trailer.separators=:', 'log', '-z', '--first-parent', '--no-follow', '--no-show-signature', '--encoding=UTF-8',
       `--format=${LOG_FORMAT}`,
     ]
     const fields = (await this.git.run([...args, ...revisions, '--', ...pathspec])).stdout.split('\0')
