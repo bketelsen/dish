@@ -117,3 +117,16 @@ export function shippedWith(change: (document: Record<string, any>) => void): st
   change(document)
   return render(document)
 }
+
+/**
+ * Provide the stub of a service from a plugin of its own, a sibling of whatever is mounted next: how dsh's services reach a
+ * preset row. A row can't read such a service as a property of its context (cordis refuses an un-injected service that no
+ * ancestor provides), only through `ctx.get` or `inject`; a stub provided at the root would hide a row that does it wrong.
+ * Dispose the handle to take the service away.
+ */
+export async function provideStub(ctx: Context, name: string, value: unknown): Promise<{ dispose(): Promise<void> | void }> {
+  return ctx.plugin({
+    name: `stub-${name}`,
+    apply(own: Context) { (own as unknown as { provide(name: string, value: unknown): void }).provide(name, value) },
+  } as never, undefined as never)
+}

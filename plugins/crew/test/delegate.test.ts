@@ -6,12 +6,13 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import { ToolRuntime, assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ContinuableStartSpec } from '@deepseek-ai/dsh-subagent'
+import * as promptsPlugin from 'dish-prompts'
 import * as row from '../src/delegate.ts'
 import { CrewRecords } from '../src/record.ts'
 import type { ChildRecord } from '../src/record.ts'
 import { DEFAULT_SETTINGS, parseSettings } from '../src/settings.ts'
 import type { CrewSettings } from '../src/settings.ts'
-import { shippedWith, tempDir, watchLogs } from './helpers.ts'
+import { provideStub, shippedWith, tempDir, watchLogs } from './helpers.ts'
 
 /** What the preset's agents can see: the standard tools, less what dish removes, plus a global one. */
 const GLOBAL_TOOLS = ['glob']
@@ -43,7 +44,11 @@ interface Options {
   records?: CrewRecords
   dishCrew?: boolean
   dishPrompts?: boolean
+  /** Mount the real dish-prompts plugin instead of a stub (with no store: the shipped prompts). */
+  realPrompts?: boolean
   dishConfig?: boolean
+  /** Whether dsh's agent registry is there. */
+  agents?: boolean
 }
 
 /** Everything a test of the `delegate` tool stands on: a real Context, the real tool registry, and recording stubs for the rest. */
@@ -69,8 +74,10 @@ interface World {
     resolveFails: Error | undefined
     /** How long `startContinuable` takes. */
     startMs: number
-    /** Roles `persona()` refuses. */
+    /** Roles `persona()` refuses, as the real service does for a role with no document and no default. */
     noPrompt: Set<string>
+    /** An error `persona()` throws instead, as it does when the store can't be read. */
+    promptFails: Error | undefined
     /** The status a started child has in `ctx.agents` once started. */
     startedStatus: 'running' | 'idle'
   }
@@ -86,6 +93,11 @@ interface World {
 }
 
 let counter = 0
+
+/** Provide a service the way dsh does, from a plugin of its own (see `provideStub`), and take it away when the test file is done. */
+async function provide(ctx: Context, name: string, value: unknown): Promise<void> {
+  disposables.push(await provideStub(ctx, name, value))
+}
 
 async function world(options: Options = {}): Promise<World> {
   const directory = await tempDir()
@@ -109,20 +121,17 @@ async function world(options: Options = {}): Promise<World> {
   const resolves: World['resolves'] = []
   const personaAsked: string[] = []
   const recordedAtStart = new Map<string, ChildRecord | undefined>()
-  const stub: World['stub'] = { startFails: undefined, sendFails: undefined, resolveFails: undefined, startMs: 0, noPrompt: new Set(), startedStatus: 'running' }
+  const stub: World['stub'] = { startFails: undefined, sendFails: undefined, resolveFails: undefined, startMs: 0, noPrompt: new Set(), promptFails: undefined, startedStatus: 'running' }
 
-  const provide = (name: string, value: unknown): void => {
-    (ctx as unknown as { provide(name: string, value: unknown): void }).provide(name, value)
-  }
-  provide('agents', { get: (id: string) => agents.get(id) })
-  provide('llm', {
+  if (options.agents !== false) await provide(ctx, 'agents', { get: (id: string) => agents.get(id) })
+  await provide(ctx, 'llm', {
     async resolveCallConfig(config: Record<string, unknown>, signal?: AbortSignal) {
       resolves.push({ config, signal })
       if (stub.resolveFails !== undefined) throw stub.resolveFails
       return config
     },
   })
-  provide('subagents', {
+  await provide(ctx, 'subagents', {
     async startContinuable(spec: ContinuableStartSpec) {
       starts.push(spec)
       recordedAtStart.set(String(spec.childId), (await records.lookup(String(spec.childId)))?.record)
@@ -139,18 +148,21 @@ async function world(options: Options = {}): Promise<World> {
     },
   })
   if (options.dishCrew !== false) {
-    provide('dishCrew', { settings: async () => settings.current, records, whenRecorded: () => undefined, subagentProvider: 'spawn' })
+    await provide(ctx, 'dishCrew', { settings: async () => settings.current, records, whenRecorded: () => undefined, subagentProvider: 'spawn' })
   }
-  if (options.dishPrompts !== false) {
-    provide('dishPrompts', {
+  if (options.realPrompts === true) {
+    disposables.push(await ctx.plugin(promptsPlugin, { terminal: false, stateDirectory: await tempDir() } as promptsPlugin.Config))
+  } else if (options.dishPrompts !== false) {
+    await provide(ctx, 'dishPrompts', {
       async persona(role: string) {
         personaAsked.push(role)
-        if (stub.noPrompt.has(role)) throw new Error(`"${role}" has no document and no default`)
+        if (stub.promptFails !== undefined) throw stub.promptFails
+        if (stub.noPrompt.has(role)) throw new Error(`unknown role "${role}"`)
         return { prefix: `You are the ${role}. {{model}}`, suffix: 'common rules', commit: null }
       },
     })
   }
-  if (options.dishConfig === true) provide('dishConfig', {})
+  if (options.dishConfig === true) await provide(ctx, 'dishConfig', {})
 
   disposables.push(await ctx.plugin(row, {} as never))
 
@@ -256,11 +268,8 @@ test('the tool goes when the row does', async () => {
   const ctx = new Context()
   ctx.provide('systemPrompt', { tools() {}, section() {}, getSectionOrder: () => 1 } as never)
   disposables.push(await ctx.plugin(ToolRuntime, {}))
-  const provide = (name: string, value: unknown): void => {
-    (ctx as unknown as { provide(name: string, value: unknown): void }).provide(name, value)
-  }
-  provide('subagents', {})
-  provide('llm', {})
+  await provide(ctx, 'subagents', {})
+  await provide(ctx, 'llm', {})
   const handle = await ctx.plugin(row, {} as never)
   assert.ok(ctx.tools.get('delegate'))
   await handle.dispose()
@@ -299,6 +308,20 @@ test('a missing dishCrew or dishPrompts is an error that names the plugin that i
   assert.equal(noPrompts.starts.length, 0)
 })
 
+test('without dsh\'s agent registry nobody can be counted as running, so the call is refused, not let through', async () => {
+  const w = await world({ agents: false })
+  const message = await refusal(w.delegate(CODER))
+  assert.match(message, /agent registry/)
+  assert.match(message, /nothing was started/)
+  assert.match(message, /Try again, or tell the user/)
+  assert.equal(w.starts.length, 0)
+  assert.deepEqual(await w.records.children(SESSION), [])
+  // A follow-up needs the count as much as a start does.
+  await w.seed({ id: 'c1', role: 'coder', last: 'finished' }, 'absent')
+  assert.match(await refusal(w.delegate({ ...CODER, to: 'c1' })), /agent registry/)
+  assert.equal(w.sends.length, 0)
+})
+
 test('an empty role, title or task is refused', async () => {
   const w = await world()
   assert.match(await refusal(w.delegate({ ...CODER, task: '  ' })), /task is empty/)
@@ -322,13 +345,40 @@ test('a role with no prompt is refused, saying which document it needs', async (
   const w = await world()
   w.stub.noPrompt.add('coder')
   const message = await refusal(w.delegate(CODER))
+  assert.match(message, /^role coder has no prompt/)
   assert.match(message, /prompts\/crew\/coder\.md/)
-  assert.match(message, /has no document and no default/)
+  assert.match(message, /unknown role "coder"/)
   assert.equal(w.starts.length, 0)
   assert.deepEqual(await w.records.children(SESSION), [])
   // Another role is not affected.
   await w.delegate(RESEARCHER)
   assert.equal(w.starts.length, 1)
+})
+
+test('a prompt that can\'t be read because the store failed is not a missing document, and the advice is not to write one', async () => {
+  const w = await world()
+  w.stub.promptFails = new Error('could not read the config store: lock held')
+  const message = await refusal(w.delegate(CODER))
+  assert.match(message, /^could not read the prompt of role coder/)
+  assert.match(message, /lock held/)
+  assert.match(message, /Try again, or tell the user/)
+  assert.doesNotMatch(message, /prompts\/crew\/coder\.md/)
+  assert.doesNotMatch(message, /dish-config is not running/)
+  assert.equal(w.starts.length, 0)
+  assert.deepEqual(await w.records.children(SESSION), [])
+})
+
+test('with the real dish-prompts service: a role it has no text for is a missing document, and one it has starts with the shipped prompt', async () => {
+  const w = await world({ realPrompts: true, settings: settingsFrom((d) => { d.roles.tester = { tier: 'mid', family: 'anthropic', tools: ['read'] } }) })
+  const message = await refusal(w.delegate({ role: 'tester', title: 'test it', task: 'Test.' }))
+  assert.match(message, /^role tester has no prompt/)
+  assert.match(message, /prompts\/crew\/tester\.md/)
+  assert.match(message, /dish-config is not running/)
+  assert.equal(w.starts.length, 0)
+  await w.delegate(RESEARCHER)
+  const shipped = w.ctx.dishPrompts.defaultText('researcher')
+  assert.ok(shipped)
+  assert.equal(w.starts[0]!.request.persona, shipped)
 })
 
 test('the refusal for a missing prompt says when the config store isn\'t running', async () => {
@@ -499,7 +549,10 @@ test('the checks run in the spec\'s order, each before the next', async () => {
   assert.match(await refusal(w.delegate({ ...CODER, to: 'nobody' })), /not a crew child of this session/)
   // 4. limits before the model.
   assert.match(await refusal(w.delegate({ ...CODER, model: 'llama-9' })), /a coder is running/)
-  assert.match(await refusal(w.delegate({ role: 'reviewer', title: 't', task: 't', reviews: 'nobody', model: 'llama-9' })), /not a crew child of this session|llama-9/)
+  // The reviewer's `reviews` is looked up before its model override is judged.
+  const reviewing = await refusal(w.delegate({ role: 'reviewer', title: 't', task: 't', reviews: 'nobody', model: 'llama-9' }))
+  assert.match(reviewing, /"nobody" is not a crew child of this session/)
+  assert.doesNotMatch(reviewing, /llama-9/)
   // 5. model before the route.
   w.stub.resolveFails = new Error('down')
   assert.match(await refusal(w.delegate({ ...RESEARCHER, model: 'llama-9' })), /llama-9/)
@@ -774,6 +827,51 @@ test('a follow-up is checked against the limits like a start', async () => {
   assert.match(await refusal(full.delegate({ ...RESEARCHER, to: reader.child })), /^4 crew children are running/)
 })
 
+test('a follow-up to a child that is running adds no running child: it is sent, whatever the limits are', async () => {
+  const w = await world()
+  // The one writer is running, and so it is the one the follow-up is for.
+  const coder = await w.delegate(CODER)
+  const result = await w.delegate({ ...CODER, task: 'Also handle logout.', to: coder.child })
+  assert.equal(result.child, coder.child)
+  assert.equal(w.sends.length, 1)
+  assert.deepEqual(w.sends[0]!.content, [{ type: 'text', text: 'Also handle logout.' }])
+  const [record] = await w.records.children(SESSION)
+  assert.equal(record!.followUps, 1)
+  // The running limit is full of children, this one among them: a message to one of them is still fine.
+  const full = await world()
+  const first = await full.delegate(RESEARCHER)
+  for (let n = 2; n <= 4; n++) await full.delegate({ ...RESEARCHER, title: `busy ${n}` })
+  await refusal(full.delegate({ ...RESEARCHER, title: 'one too many' }))
+  await full.delegate({ ...RESEARCHER, to: first.child })
+  assert.equal(full.sends.length, 1)
+})
+
+test('a follow-up to a finished coder while another coder runs is refused, naming the other and not the target', async () => {
+  const w = await world()
+  const first = await w.delegate(CODER)
+  w.agents.set(first.child, { status: 'idle' })
+  await w.records.endRun(first.child, { stopReason: 'completed', closing: 'x' })
+  const second = await w.delegate({ ...CODER, title: 'second one' })
+  const message = await refusal(w.delegate({ ...CODER, to: first.child }))
+  assert.match(message, /^a coder is running \(child /)
+  assert.ok(message.includes(second.child), message)
+  assert.ok(message.includes('«second one»'), message)
+  assert.ok(!message.includes(first.child), message)
+  assert.equal(w.sends.length, 0)
+  // With room for two writers, the other coder is no obstacle, and neither is a follow-up to the one that is running.
+  const two = await world({ settings: settingsFrom((d) => { d.limits = { running: 4, writers: 2, perSession: 30 } }) })
+  const a = await two.delegate(CODER)
+  const b = await two.delegate({ ...CODER, title: 'b' })
+  await two.delegate({ ...CODER, to: a.child })
+  await two.delegate({ ...CODER, to: b.child })
+  assert.equal(two.sends.length, 2)
+  // A third running writer takes the room: another coder, finished, can't be written to; the running ones still can.
+  const c = await two.seed({ id: 'finished-coder', last: 'finished' }, 'idle')
+  assert.match(await refusal(two.delegate({ ...CODER, to: c.id })), /^2 writing children are running/)
+  await two.delegate({ ...CODER, to: a.child })
+  assert.equal(two.sends.length, 3)
+})
+
 test('a follow-up is not a delegation: the per-session limit does not apply to it', async () => {
   const w = await world({ settings: settingsFrom((d) => { d.limits = { running: 4, writers: 1, perSession: 1 } }) })
   const only = await w.delegate(RESEARCHER)
@@ -819,6 +917,7 @@ test('a follow-up that can\'t be sent is refused, and not counted', async () => 
   const message = await refusal(w.delegate({ ...RESEARCHER, to: started.child }))
   assert.match(message, /could not send the follow-up to child /)
   assert.match(message, /subagent is unavailable/)
+  assert.match(message, /start a new researcher/)
   const [record] = await w.records.children(SESSION)
   assert.equal(record!.followUps, 0)
   assert.equal(record!.last, 'finished')
@@ -928,11 +1027,45 @@ test('reviews "main" when the main agent\'s model can\'t be told is refused, and
   assert.equal(w.starts.length, 0)
 })
 
-test('a reviewer of a reviewer, and of a child that was started on a model crew.yaml no longer lists, is still outside the vendor', async () => {
+test('a child that was started on a model crew.yaml no longer lists is still reviewed from outside its vendor', async () => {
   const w = await world()
   await w.seed({ id: 'old', role: 'coder', model: 'claude-3-haiku', family: 'anthropic' }, 'idle')
   const result = await w.delegate({ ...REVIEW, reviews: 'old' })
   assert.equal(result.model, 'gpt-5.6-sol')
+})
+
+test('reviews can\'t name a reviewer: its report is a review, so the work it reviewed is what to review', async () => {
+  const w = await world()
+  const coder = await w.delegate(CODER)
+  const first = await w.delegate({ ...REVIEW, reviews: coder.child })
+  const message = await refusal(w.delegate({ ...REVIEW, title: 'review the review', reviews: first.child }))
+  assert.match(message, /is a reviewer/)
+  assert.match(message, new RegExp(`review the work it reviewed: ${coder.child}`))
+  // A reviewer of the main agent's work points back at "main".
+  w.agents.clear()
+  const ofMain = await w.delegate({ ...REVIEW, title: 'review main', reviews: 'main' })
+  assert.match(await refusal(w.delegate({ ...REVIEW, title: 'again', reviews: ofMain.child })), /review the work it reviewed: main/)
+  // A reviewer the record has no work for (the role is the reviewer's, the record says nothing) is refused all the same.
+  await w.seed({ id: 'bare', role: 'reviewer', model: 'gpt-5.6-sol', family: 'openai' }, 'idle')
+  const bare = await refusal(w.delegate({ ...REVIEW, title: 'third', reviews: 'bare' }))
+  assert.match(bare, /is a reviewer/)
+  assert.match(bare, /review the work itself/)
+  assert.equal(w.starts.length, 3)
+})
+
+test('a reviewer follow-up whose reviewed child is no longer in the record is refused, saying so and to start a new reviewer', async () => {
+  const w = await world()
+  await w.seed({ id: 'r1', role: 'reviewer', model: 'gpt-5.6-sol', family: 'openai', reviews: 'gone-child', last: 'finished' }, 'idle')
+  const message = await refusal(w.delegate({ ...REVIEW, to: 'r1' }))
+  assert.match(message, /no longer in the record/)
+  assert.match(message, /gone-child/)
+  assert.match(message, /start a new reviewer/i)
+  assert.doesNotMatch(message, /Use one of those ids/)
+  assert.equal(w.sends.length, 0)
+  // A child of another session is as gone.
+  await w.seed({ id: 'theirs', role: 'coder' }, 'idle', 'another-session')
+  await w.seed({ id: 'r2', role: 'reviewer', model: 'gpt-5.6-sol', family: 'openai', reviews: 'theirs', last: 'finished' }, 'idle')
+  assert.match(await refusal(w.delegate({ ...REVIEW, to: 'r2' })), /no longer in the record/)
 })
 
 test('a reviewer follow-up is checked against the work as it is now: the main agent switching to the reviewer\'s family refuses it', async () => {
@@ -1010,6 +1143,7 @@ test('a failed start is recorded as failed, with its error, and counts as a dele
   assert.match(message, /could not start the coder/)
   assert.match(message, /provider spawn is down/)
   assert.match(message, /counts as a delegation/)
+  assert.match(message, /Try again, or tell the user/)
   const [record] = await w.records.children(SESSION)
   assert.ok(record, 'the child was recorded before the start')
   assert.equal(record.id, String(w.starts[0]!.childId))
@@ -1065,6 +1199,7 @@ test('if the record can\'t be written, nothing is started', async () => {
   assert.match(message, /could not record the delegation/)
   assert.match(message, /read-only file system/)
   assert.match(message, /nothing was started/)
+  assert.match(message, /Try again, or tell the user/)
   assert.equal(w.starts.length, 0)
 })
 

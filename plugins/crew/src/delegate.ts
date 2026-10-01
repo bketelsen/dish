@@ -24,7 +24,11 @@
  * its record when it ends. A child that dsh then refuses is ended in the record as failed, and counts as a delegation.
  *
  * What counts as running: the child's agent is stepping, or the record says running and the agent exists (accepted, not
- * stepping yet). A record that says running with no agent is a crash's, and isn't running.
+ * stepping yet). A record that says running with no agent is a crash's, and isn't running. A follow-up's own target is left
+ * out of the count: a message to a child that is running adds no running child, and one to a child that isn't adds one.
+ * Who is running comes from dsh's agent registry, read with `ctx.get` like every service the row doesn't `inject`
+ * (`dishCrew`, `dishPrompts`, `dishConfig` and `agents` come from plugins that are siblings of the row's, and cordis lets a
+ * row read those only that way); a registry that isn't there refuses the call, as nobody counted is not nobody running.
  *
  * The row also rewrites the finish notices of this agent's crew children, so that each names its role, title and model and
  * where its report is (`notice.ts`): one `agent/pre-step` listener, registered here so that it is the preset's and hears
@@ -55,7 +59,7 @@ import { listed, truncate } from './text.ts'
 
 export const name = 'dish-crew-delegate'
 
-/** The services the row needs of dsh. `dishCrew` and `dishPrompts` are read by name on every call. */
+/** The services the row needs of dsh. `dishCrew`, `dishPrompts`, `dishConfig` and `agents` are read by name (`ctx.get`) on every call. */
 export const inject = ['tools', 'subagents', 'llm']
 
 /** The row has nothing to configure: roles, models and limits are in `crew.yaml`. */
@@ -168,6 +172,9 @@ function mainModel(agent: Agent): string | undefined {
   return given(agent.options?.model)
 }
 
+/** What `dishPrompts.persona` says of a role with no document in the store and no shipped default (`service.ts`' `fallback`). */
+const MISSING_DOCUMENT = /^unknown role "/
+
 /** Run a read of the crew's record, and refuse, closed, if it can't be read: the limits and the reviewer rule depend on it. */
 async function readRecord<T>(read: () => Promise<T>): Promise<T> {
   try {
@@ -199,6 +206,7 @@ interface Call {
   sessionId: string
   crew: DishCrew
   prompts: DishPrompts
+  agents: Context['agents']
   settings: CrewSettings
   role: string
   roleSettings: RoleSettings
@@ -234,15 +242,16 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       + hint)
   }
 
-  const isRunning = (child: ChildRecord): boolean => {
-    const live = ctx.agents.get(child.id as SessionId)
+  /** Whether the child's agent is stepping, or is accepted (the record says running and the agent exists). */
+  const isRunning = (call: Call, child: ChildRecord): boolean => {
+    const live = call.agents.get(child.id as SessionId)
     return live?.status === 'running' || (child.last === 'running' && live !== undefined)
   }
 
-  /** Step 4. @throws a refusal that says who is running and what to do. */
+  /** Step 4, over `children`: those of the session the call adds to, less a follow-up's own target. @throws a refusal that says who is running and what to do. */
   function enforceLimits(call: Call, children: readonly ChildRecord[], isStart: boolean): void {
     const { limits } = call.settings
-    const running = children.filter(isRunning)
+    const running = children.filter(child => isRunning(call, child))
     if (running.length >= limits.running) {
       throw new Error(`${countOf(running.length, 'crew child is', 'crew children are')} running, which is the limit (limits.running in crew.yaml is ${limits.running}): ${whoList(running)}. `
         + 'Wait for a notice, then delegate again.')
@@ -273,6 +282,13 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       return { model }
     }
     const child = await ownChild(call, reviews, '`reviews`', 'Use one of those ids, or "main" to review your own work.')
+    // A reviewer's report is a review: what a review of it would add is the work, which it already looked at.
+    if (child.reviews !== undefined || (Object.hasOwn(call.settings.roles, child.role) && call.settings.roles[child.role]!.reviews)) {
+      throw new Error(`\`reviews\` ${quoted(reviews)} is ${article(child.role)} «${child.title}», whose report is a review, not work; `
+        + (child.reviews === undefined
+          ? 'review the work itself instead (its id, or "main" for your own).'
+          : `review the work it reviewed: ${child.reviews}.`))
+    }
     return { model: child.model, family: child.family }
   }
 
@@ -333,7 +349,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
         id: childId, role: call.role, title, model: route.model, family: route.family, ...reviews === undefined ? {} : { reviews },
       })
     } catch (error) {
-      throw new Error(`could not record the delegation, so nothing was started: ${describe(error)}`, { cause: error })
+      throw new Error(`could not record the delegation, so nothing was started: ${describe(error)}. Try again, or tell the user.`, { cause: error })
     }
     try {
       await ctx.subagents.startContinuable({
@@ -355,7 +371,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       await markFailed(call, childId, message)
       const tools = unknownTools(error)
       throw new Error(tools === undefined
-        ? `could not start the ${call.role}: ${message}. The start failed and counts as a delegation.`
+        ? `could not start the ${call.role}: ${message}. The start failed and counts as a delegation. Try again, or tell the user.`
         : `role ${call.role}'s tools include ${tools.join(', ')}, which a child can't be given here; `
           + `remove ${tools.length === 1 ? 'it' : 'them'} from roles.${call.role}.tools in crew.yaml. Nothing was started; the start failed and counts as a delegation.`,
       { cause: error })
@@ -375,6 +391,12 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     }
     const reviews = target.reviews ?? call.reviews
     if (reviews === undefined) throw new Error(`the ${call.role} role needs reviews, and child ${target.id} has none recorded. ${again}`)
+    if (reviews !== 'main') {
+      const found = await readRecord(() => call.crew.records.lookup(reviews))
+      if (found === undefined || found.sessionId !== call.sessionId) {
+        throw new Error(`the work child ${target.id} reviewed (${quoted(reviews)}) is no longer in the record, so there is nothing to check its model against. ${again}`)
+      }
+    }
     const checked = chooseRoute({ settings: call.settings, role: call.role, override: target.model, reviewed: await reviewedWork(call, reviews) })
     if (!checked.ok) throw new Error(`can't send a follow-up to ${call.role} child ${target.id}: ${checked.problem} ${again}`)
   }
@@ -393,7 +415,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     try {
       await ctx.subagents.sendMessage(call.agent, target.id as SessionId, [{ type: 'text', text: call.task }], { signal: call.signal })
     } catch (error) {
-      throw new Error(`could not send the follow-up to child ${target.id}: ${describe(error)}`, { cause: error })
+      throw new Error(`could not send the follow-up to child ${target.id}: ${describe(error)}. Try again, or start a new ${call.role} (leave to out): a child that never started can't be resumed.`, { cause: error })
     }
     // Sent. A record that can't be updated is logged, not thrown: an error would have the model send it again.
     try {
@@ -418,6 +440,10 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       throw new Error('delegate can\'t run: the dishPrompts service is not available, so the dish-prompts plugin is not running. '
         + 'Every child\'s prompt comes from it. Enable the dish-prompts plugin.')
     }
+    const agents = ctx.get('agents')
+    if (agents === undefined) {
+      throw new Error('delegate can\'t run: dsh\'s agent registry (the agents service) is not available, so nobody can be counted as running; nothing was started or sent. Try again, or tell the user.')
+    }
     const settings = await crew.settings()
     const role = given(args.role)
     if (role === undefined) throw new Error(`role is empty; the roles in crew.yaml are: ${listed(Object.keys(settings.roles))}. Use one of those.`)
@@ -427,7 +453,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     const task = given(args.task)
     if (task === undefined) throw new Error('task is empty: give the child the complete, self-contained brief.')
     return {
-      agent, signal, crew, prompts, settings, role, roleSettings: settings.roles[role]!, task: args.task,
+      agent, signal, crew, prompts, agents, settings, role, roleSettings: settings.roles[role]!, task: args.task,
       sessionId: String(agent.id), title: titleOf(args.title), to: given(args.to), reviews: given(args.reviews), model: given(args.model),
     }
   }
@@ -493,8 +519,12 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
           try {
             persona = await call.prompts.persona(call.role)
           } catch (error) {
-            throw new Error(`role ${call.role} has no prompt (${describe(error)}): add prompts/crew/${call.role}.md to the config store, then delegate again.`
-              + `${ctx.get('dishConfig') === undefined ? ' dish-config is not running, so only the shipped prompts exist.' : ''}`, { cause: error })
+            // The service rejects `unknown role "<r>"` for a role that has neither a document nor a shipped default, and
+            // otherwise only when it can't read the store: advice to write a document would be wrong for that.
+            throw new Error(MISSING_DOCUMENT.test(describe(error))
+              ? `role ${call.role} has no prompt (${describe(error)}): add prompts/crew/${call.role}.md to the config store, then delegate again.`
+                + `${ctx.get('dishConfig') === undefined ? ' dish-config is not running, so only the shipped prompts exist.' : ''}`
+              : `could not read the prompt of role ${call.role} (${describe(error)}), so nothing was started. Try again, or tell the user.`, { cause: error })
           }
         } else {
           target = await ownChild(call, call.to, '`to`', 'Use one of those ids, or leave `to` out to start a new child.')
@@ -507,7 +537,9 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
         return exclusive(call.sessionId, async () => {
           call.signal.throwIfAborted()
           const children = await readRecord(() => call.crew.records.children(call.sessionId))
-          enforceLimits(call, children, target === undefined)
+          // A follow-up adds no running child if its target is running, and one if it isn't: either way, what it is checked
+          // against is everyone else.
+          enforceLimits(call, target === undefined ? children : children.filter(child => child.id !== target.id), target === undefined)
           return target === undefined ? start(call, persona!, title!) : followUp(call, target)
         })
       },

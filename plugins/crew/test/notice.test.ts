@@ -13,7 +13,7 @@ import { noticeText, rewriteNotices } from '../src/notice.ts'
 import { CrewRecords } from '../src/record.ts'
 import type { ChildRecord, EndedRun, NewChild } from '../src/record.ts'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
-import { tempDir, watchLogs } from './helpers.ts'
+import { provideStub, tempDir, watchLogs } from './helpers.ts'
 
 const SESSION = 'session-main'
 const WHO = 'coder «add login» (claude-sonnet-5.5)'
@@ -467,14 +467,15 @@ async function wired(options: { dishCrew?: boolean } = {}): Promise<Wired> {
   const recording = new Map<string, Promise<EndedRun | undefined>>()
   const ctx = new Context()
   const logs = watchLogs(ctx)
-  const provide = (name: string, value: unknown): void => {
-    (ctx as unknown as { provide(name: string, value: unknown): void }).provide(name, value)
+  // As dsh's services reach a row: from plugins of their own, so that the listener can only read `dishCrew` with `ctx.get`.
+  const provide = async (name: string, value: unknown): Promise<void> => {
+    disposables.push(await provideStub(ctx, name, value))
   }
-  provide('tools', { register: () => () => {} })
-  provide('llm', {})
-  provide('subagents', {})
+  await provide('tools', { register: () => () => {} })
+  await provide('llm', {})
+  await provide('subagents', {})
   if (options.dishCrew !== false) {
-    provide('dishCrew', { settings: async () => DEFAULT_SETTINGS, records, whenRecorded: (id: string) => recording.get(id), subagentProvider: 'spawn' })
+    await provide('dishCrew', { settings: async () => DEFAULT_SETTINGS, records, whenRecorded: (id: string) => recording.get(id), subagentProvider: 'spawn' })
   }
   let owner!: Context
   disposables.push(await ctx.plugin({ name: 'scope-owner', inject: ['tools'], apply(own: Context) { owner = own } } as never, undefined as never))
