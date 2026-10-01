@@ -6,49 +6,72 @@
  * @module dish-kit/secrets
  */
 
+/**
+ * Not right after a letter or digit, unless that one comes right after a backslash. A token in a string that holds an
+ * escape (`"x\nghp_…"`, `printf 'x\tsk-…'`) follows a letter, the `n` or `t` of the escape, and is a token all the same.
+ * The backslash is what tells the two apart: `xghp_…` and `\ncghp_…` still follow a letter, and a plain one blocks a match.
+ */
+const NOT_AFTER_ALNUM = /(?<!(?<!\\)[A-Za-z0-9])/
+/** The same for capitals and digits only, which is what an AWS key's neighbour is judged by. */
+const NOT_AFTER_UPPER = /(?<!(?<!\\)[A-Z0-9])/
+
 interface SecretPattern {
   /** What the match looks like, in words: "looks like <label>". */
   label: string
-  /** What `secretKind` looks for. It stops at the first match, so how far a match reaches doesn't matter to it. */
-  pattern: RegExp
+  /** What must not be right before a match. It is an assertion, so it takes no characters of the text. */
+  before?: RegExp
+  /** What a match is, after `before`. What `secretKind` looks for. It stops at the first match, so how far a match reaches doesn't matter to it. */
+  body: RegExp
   /**
-   * What `maskSecrets` looks for instead, where a match has to reach a different distance than a detection needs. It
-   * matches wherever `pattern` does, so a text one finds a secret in is a text the other masks something in.
+   * What `maskSecrets` looks for in place of `body`, where a match has to reach a different distance than a detection
+   * needs. It matches wherever `body` does, so a text one finds a secret in is a text the other masks something in.
    */
   mask?: RegExp
 }
 
 // No `\b` anchors: `_` is a word character, so `\b` would let `TOKEN_ghp_...` and `_ghp_..._` through. A lookbehind
 // for a letter or digit still keeps `risk-...`, `task-...` and `xghp_...` from matching.
-const SECRET_PATTERNS: readonly SecretPattern[] = [
+const PATTERNS: readonly SecretPattern[] = [
   {
     label: 'a GitHub token',
-    pattern: /(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,}/,
+    before: NOT_AFTER_ALNUM,
+    body: /gh[pousr]_[A-Za-z0-9]{36,}/,
     // The body is as short as it can be and stops before another token's prefix. The greedy body above eats the letters
     // of a token that follows it (`ghp_<A>ghp_<B>`), stops at that token's `_`, and so leaves all of its body unmasked.
-    mask: /(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,}?(?=gh[pousr]_|github_pat_|sk-|[^A-Za-z0-9]|$)/,
+    mask: /gh[pousr]_[A-Za-z0-9]{36,}?(?=gh[pousr]_|github_pat_|sk-|[^A-Za-z0-9]|$)/,
   },
   {
     // Real fine-grained tokens have 82 characters after the prefix; 50 leaves room without matching `github_pat_token_for_deploy_scripts`.
     label: 'a GitHub fine-grained token',
-    pattern: /(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{50,}/,
+    before: NOT_AFTER_ALNUM,
+    body: /github_pat_[A-Za-z0-9_]{50,}/,
     // As the GitHub token's: stops before an `sk-` key that follows it. A `ghp_` after it is inside its characters already.
-    mask: /(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{50,}?(?=sk-|[^A-Za-z0-9_]|$)/,
+    mask: /github_pat_[A-Za-z0-9_]{50,}?(?=sk-|[^A-Za-z0-9_]|$)/,
   },
-  { label: 'an sk- API key', pattern: /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{32,}/ },
+  { label: 'an sk- API key', before: NOT_AFTER_ALNUM, body: /sk-[A-Za-z0-9_-]{32,}/ },
   {
     // Any PEM private key header: RSA, EC, OPENSSH, ENCRYPTED, and PGP's `PRIVATE KEY BLOCK`. The gaps are bounded so
     // that a long near-miss (`-----BEGIN ` and a megabyte of `PRIVATE KEY`) takes a fixed time for each start, not time
     // for every pair of positions in it. No real header has a word that long before `PRIVATE KEY`.
     label: 'a private key',
-    pattern: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----/,
-    // The key is the header and what follows it: to its END line, or, if there is none within 8 KB (a key that was cut
-    // off, or a header that's quoted), for 8 KB. A header and no body would leave the key itself in the text.
-    mask: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----(?:[\s\S]{0,8192}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----|[\s\S]{0,8192})/,
+    body: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----/,
+    // The key is the header and what follows it, up to 8 KB:
+    // - to its END line, if there is one before another `-----BEGIN` (whatever is between: PGP armor has `Version:` and
+    //   `Comment:` lines with dots and brackets in them). The gap stops at the next BEGIN so that a text with many headers
+    //   and no END lines is scanned once, not once for each header, which would be 8 KB for every 28 characters;
+    // - or, with no END line, the characters a key can be made of: base64, the `Proc-Type: 4,ENCRYPTED` and `DEK-Info:`
+    //   lines of an old key, spaces and line breaks, and the backslash of a `\n` that is written out. The first other
+    //   character ends it, so `grep "-----BEGIN RSA PRIVATE KEY-----" ~/.ssh/id_rsa | wc -l` keeps all but the header.
+    mask: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----(?:(?:(?!-----BEGIN)[\s\S]){0,8192}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----|[A-Za-z0-9+\/=:,\s\\-]{0,8192})/,
   },
   // AKIA is a long-term access key, ASIA a temporary one.
-  { label: 'an AWS access key ID', pattern: /(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])/ },
+  { label: 'an AWS access key ID', before: NOT_AFTER_UPPER, body: /(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])/ },
 ]
+
+const SECRET_PATTERNS: ReadonlyArray<{ label: string, pattern: RegExp }> = PATTERNS.map(({ label, before, body }) => ({
+  label,
+  pattern: new RegExp((before?.source ?? '') + body.source),
+}))
 
 /**
  * What kind of credential `text` looks like, in words ("a GitHub token"), or
@@ -58,21 +81,26 @@ export function secretKind(text: string): string | undefined {
   return SECRET_PATTERNS.find(({ pattern }) => pattern.test(text))?.label
 }
 
-/** A leading lookbehind: `(?<![A-Za-z0-9])`. */
-const LEADING_LOOKBEHIND = /^\(\?<![^)]*\)/
-
 interface Masker {
   label: string
   /** Every match in a text. `matchAll` works on a copy, so this holds no `lastIndex` between calls. */
   scan: RegExp
-  /** The match that starts exactly where `lastIndex` is, with no lookbehind: for a secret that sits right at the end of a mask. */
+  /** The match that starts exactly where `lastIndex` is, with nothing required before it: for a secret that sits right at the end of a mask. */
   glued: RegExp
 }
 
-const MASKERS: readonly Masker[] = SECRET_PATTERNS.map(({ label, pattern, mask }) => {
-  const source = (mask ?? pattern).source
-  return { label, scan: new RegExp(source, 'g'), glued: new RegExp(source.replace(LEADING_LOOKBEHIND, ''), 'y') }
+const MASKERS: readonly Masker[] = PATTERNS.map(({ label, before, body, mask }) => {
+  const match = mask ?? body
+  return { label, scan: new RegExp((before?.source ?? '') + match.source, 'g'), glued: new RegExp(match.source, 'y') }
 })
+
+/**
+ * The source of each pattern `maskSecrets` looks for a secret at the end of a mask with. None starts with a lookbehind: it
+ * is built from the pattern's own parts, with no `before`, and not by cutting a lookbehind off the front of one's source.
+ * Exported for the test that says so.
+ * @internal
+ */
+export const GLUED_SOURCES: readonly string[] = MASKERS.map(({ glued }) => glued.source)
 
 /** What replaces a secret of kind `label`. It holds nothing of the secret, and no pattern matches it or any part of it. */
 function maskFor(label: string): string {

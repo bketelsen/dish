@@ -302,6 +302,33 @@ for (const { name, text, secret, label } of wrapped) {
   })
 }
 
+// In a YAML double-quoted string or a JSON one, a line break is written `\n`: a backslash and a letter. The letter is right in
+// front of whatever follows, and used to hide a token there from the guard, though a parser reads it as a token on its own line.
+const escapedIn: Array<{ name: string, text: string, secret: string, label: string }> = [
+  { name: 'ghp_ token after \\n in a YAML double-quoted string', text: `note: "first line\\n${GH}"`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token after \\t in a YAML double-quoted string', text: `note: "first\\t${GH}"`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token after \\r\\n in a YAML double-quoted string', text: `note: "first line\\r\\n${GH}"`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token after an escaped backslash and n', text: `note: "first line\\\\n${GH}"`, secret: GH, label: 'a GitHub token' },
+  { name: 'github_pat_ token after \\n', text: `note: "x\\n${PAT}"`, secret: PAT, label: 'a GitHub fine-grained token' },
+  { name: 'sk- key after \\t in a JSON object', text: `{"key": "x\\t${SK}"}`, secret: SK, label: 'an sk- API key' },
+  { name: 'sk- key after \\n in a JSON array', text: `["first\\n${SK}"]`, secret: SK, label: 'an sk- API key' },
+]
+
+for (const { name, text, secret, label } of escapedIn) {
+  test(`checkContent refuses a token that follows an escape sequence: ${name}`, () => {
+    const error = refusal('prompts/coder.md', `before\n${text}\nafter\n`)
+    assert.equal(error.code, 'SECRET')
+    assert.equal(error.message, `prompts/coder.md: looks like ${label}`)
+    assertNoLeak(error.message, secret)
+  })
+}
+
+test('checkContent allows a token-shaped run that follows a plain letter, escape or not', () => {
+  for (const text of [`note: "x${GH}"`, `note: "first line\\nx${GH}"`, `{"key": "x${SK}"}`, `note: "first line\\n1${PAT}"`]) {
+    assert.doesNotThrow(() => checkContent('prompts/coder.md', text, MAX), text)
+  }
+})
+
 test('secretKind names the kind of the first secret in a text, or nothing', () => {
   assert.equal(secretKind(`key ${GH}`), 'a GitHub token')
   assert.equal(secretKind(`key ${AKIA}`), 'an AWS access key ID')
