@@ -214,12 +214,27 @@ The `dish-config` plugin's browser half adds **Settings → History**. It's mobi
 
 - **Log**: commits on `main`, filterable by namespace or path, each showing author (you or agent role + session link), time, paths and note.
 - **Commit view**: per-file diff, plus **Revert this commit**, which creates a new commit.
-- **Proposals tab**: open and stale proposals, each showing title, rationale, author session, its diff against current `main`, and **Accept** / **Reject** (with a reason).
+- **Proposals tab**: open and stale proposals, each showing title, rationale, author session, its diff (what it proposes: from the `main` commit it was made on to its tip), and **Accept** / **Reject** (with a reason).
 - **Remote status**: last pushed commit, how many commits are waiting to push, and the last error.
 
 Editors (Prompts, Families, Crew) belong to their own plugins. They read through `dishConfig`, write with `base`, and link to History filtered to their namespace.
 
-The UI talks to the server through a `dishConfig` Typert remote. A `watch()` stream pushes `changed` and `proposal` events, following the copilot card's pattern.
+The UI talks to the server through a Typert remote: Cordis service `dishConfigRemote`, wire namespace `dishConfig` (`src/remote.ts`; the wire types are in `src/protocol.ts`). Every call is made as the user. Parameters are plain JSON, and `''` means absent.
+
+| Method | Returns |
+|---|---|
+| `namespaces()` | `NamespaceInfo[]`: `{ prefix, owner, agent }` per claim, for the log's filter. A plain array, not an `Outcome`. |
+| `history(prefix, limit, before)` | `Outcome<CommitInfo[]>`. `prefix` ending in `/` filters by prefix, otherwise by path. `limit` of 0 or less is the default 50. `before` is the last id of the previous page. |
+| `commit(id)` | `Outcome<{ info, diffs }>` |
+| `revert(id)` | `Outcome<CommitInfo \| null>`: `null` when it was already reverted |
+| `proposals(status)` | `Outcome<ProposalInfo[]>`: `''` for all, else `open`, `stale` or `rejected` |
+| `proposal(id)` | `Outcome<{ info, diffs }>`: the diffs are what was proposed (its base to its tip), not against the current `main`, so a stale proposal doesn't look as if it undoes later edits |
+| `accept(id)` | `Outcome<CommitInfo \| null>`: `null` when `main` already had all of it |
+| `reject(id, reason)` | `Outcome<null>` |
+| `remoteStatus()` | `Outcome<RemoteStatus>` |
+| `watch(signal)` (stream) | `ConfigEvent`s: `{ kind: 'changed', commit, paths }`, `{ kind: 'proposal', id, status }`, `{ kind: 'remote', status }`. The first item is always the current remote status, so a page that opens in the middle of an outage shows it. A reader that falls behind keeps the newest 100 `changed`/`proposal` events and the latest `remote` status. |
+
+The store's refusals are results: `Outcome<T>` is `{ ok: true, value } | { ok: false, code, message }`, with the store's error `code` (`CONFLICT`, `STALE`, `NOT_FOUND`, ...) so the page can say what to do. The gateway folds anything a method throws into its own `gateway/internal` code and keeps only the message, which would lose the store's code. A failure that isn't the store's (it is closed, a bug) is still thrown.
 
 ## `dish-kit`
 
