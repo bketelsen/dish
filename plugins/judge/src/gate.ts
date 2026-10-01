@@ -144,6 +144,19 @@ export interface VerdictEntry {
    * `false` for an `ask` or a `deny`, and for a call with no escalation.
    */
   readonly escalationCovered: boolean
+  /**
+   * The tool the verdict is for (`exec.name`). An approval request is covered only if it is the same tool's: a verdict for
+   * `bash` says nothing about a `run_code` or a hook that asks under the same call id. Written by the gate; an entry with none
+   * (a test's, say) covers nothing.
+   */
+  readonly tool?: string
+  /**
+   * The `reason` dsh's tool gives when it asks to escalate this call, as it will arrive in the approval request:
+   * `escalate sandbox to <sandbox_permissions>: <justification>` (`approveEscalation` in `dsh-sandbox`, which `bash` and `pwsh`
+   * both call). Set when the call asked for an escalation. Only a request with exactly this reason is the escalation the judge
+   * was shown; an entry with none covers nothing.
+   */
+  readonly escalationReason?: string
   /** When it was written, on the cache's monotonic clock, in ms. */
   readonly at: number
   /** The gate's own: lets it see that it has already decided this call. The answerer ignores it. */
@@ -151,7 +164,7 @@ export interface VerdictEntry {
 }
 
 /** What `set` takes: the entry, and the clock supplies `at`. */
-export type VerdictInput = Pick<VerdictEntry, 'verdict' | 'escalationCovered' | 'memo'>
+export type VerdictInput = Pick<VerdictEntry, 'verdict' | 'escalationCovered' | 'tool' | 'escalationReason' | 'memo'>
 
 export interface VerdictCacheOptions {
   /** A monotonic clock, in ms. Defaults to `performance.now()`. For tests. */
@@ -211,6 +224,8 @@ export class VerdictCache {
     this.#entries.set(key, {
       verdict: input.verdict,
       escalationCovered: input.escalationCovered,
+      ...input.tool === undefined ? {} : { tool: input.tool },
+      ...input.escalationReason === undefined ? {} : { escalationReason: input.escalationReason },
       at: this.#now(),
       ...input.memo === undefined ? {} : { memo: input.memo },
     })
@@ -319,6 +334,18 @@ function escalationOf(args: unknown): string | undefined {
   return justification === undefined
     ? `sandbox_permissions: ${permissions}`
     : `sandbox_permissions: ${permissions}; justification: ${clip(justification, MAX_JUSTIFICATION_CHARS)}`
+}
+
+/**
+ * The `reason` dsh's tools put on the approval request for this call's escalation, or `undefined` if the call would not make one
+ * (no `sandbox_permissions`, or no `justification` to send with it: `bash` and `pwsh` ask only when they have both). It is the
+ * wording of `approveEscalation` in `dsh-sandbox`, with the arguments as the model gave them, not as they are shown to the judge.
+ */
+function escalationReasonOf(args: unknown): string | undefined {
+  if (!isRecord(args)) return undefined
+  const permissions = given(args.sandbox_permissions)
+  if (permissions === undefined || typeof args.justification !== 'string') return undefined
+  return `escalate sandbox to ${permissions}: ${args.justification}`
 }
 
 /** Where the command runs: `workdir` if the call names one (as `bash` and `pwsh` resolve it), else the session's cwd. */
@@ -497,6 +524,7 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     const args = exec.arguments
     const command = commandOf(exec.name, args)
     const escalation = shell ? escalationOf(args) : undefined
+    const escalationReason = shell ? escalationReasonOf(args) : undefined
     const sessionCwd = given(agent.session?.header?.cwd)
     const cwd = shell ? directoryOf(args, sessionCwd) : sessionCwd
     let workspace: string | undefined
@@ -551,6 +579,8 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
       deps.cache.set(owner, callId, {
         verdict: verdictOf(ours),
         escalationCovered: ours.kind === 'allow' && escalation !== undefined,
+        tool: exec.name,
+        ...escalationReason === undefined ? {} : { escalationReason },
         memo: { key, decision: ours },
       })
     }
@@ -564,7 +594,7 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     const theirs = await next()
     const final = stricter(ours, theirs)
     if (final.kind !== ours.kind) {
-      deps.cache.set(owner, callId, { verdict: verdictOf(final), escalationCovered: false, memo: { key, decision: ours } })
+      deps.cache.set(owner, callId, { verdict: verdictOf(final), escalationCovered: false, tool: exec.name, memo: { key, decision: ours } })
     }
     return final
   }

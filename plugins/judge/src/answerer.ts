@@ -9,7 +9,7 @@
  *
  * | The gate's verdict for this agent's call | Main agent | Child |
  * |---|---|---|
- * | `allow`, with the escalation it was shown (`escalationCovered`) | `allowed-once` | `allowed-once` |
+ * | `allow`, with the escalation it was shown (`escalationCovered`), and this is that escalation's request | `allowed-once` | `allowed-once` |
  * | `ask` (the gate's own, or another listener's: the cache keeps the stricter) | `next()`: you | `rejected` |
  * | `deny`, `allow` with nothing covered, or no entry at all | `next()`: you | `rejected` |
  * | the cache fails | `next()`: you | `rejected` |
@@ -22,6 +22,10 @@
  *   escalation in view. Anything else (`plugin_manager`, `run_code`, a tool not in `tools.gated`, the gate's own ask) is
  *   yours: the answerer makes no Jev call, and "the judge is unavailable" for an approval request is the gate's: its verdict
  *   was `ask` for you or `deny` for a child, which are the rows above.
+ * - **A covered entry covers one request.** The gate records the tool (`exec.name`) and the reason dsh's tool will put on the request
+ *   for the escalation (`escalate sandbox to <mode>: <justification>`, from `approveEscalation` in `dsh-sandbox`, which `bash` and
+ *   `pwsh` both call). Only a request with that tool name and exactly that reason is approved. A hook's ask, or `run_code`'s,
+ *   under the same call id is not the escalation the judge was shown.
  * - **The owner is always `verdictOwner(request.agent)`.** The cache is keyed by agent and call id, because a call id is the
  *   model provider's and two agents can use the same one at once: another agent's covered `allow` must not approve this
  *   agent's call.
@@ -55,6 +59,12 @@
  * other plugin's). Whatever goes wrong (no crew service, a record that can't be read, a lookup that hangs) leaves the
  * child at `never`, where nothing waits on anyone: it fails toward refusing, and says so once.
  *
+ * **Never more than its parent.** A child is switched to `ask` only if its parent's effective policy is `ask`: the parent's own
+ * override (`overrideOf`), else the deployment's default (`approval.config.policy`). The parent is the live agent its header names
+ * (`parentSession`, looked up in `ctx.agents`). A parent at `never` has its own escalations rejected, and shouldn't see its
+ * child's approved; one that can't be found or read counts as not at `ask`. A child that comes back already at `ask` (a follow-up
+ * to one that settled while this plugin was loaded, or a crash) whose parent isn't at `ask` is put back to `never`.
+ *
  * ### The risk, and what is done about it
  *
  * With a child at `ask` and no answerer of ours, dsh does not fail closed in the web profile. The waterfall goes on to the
@@ -65,12 +75,17 @@
  * a prompt nobody sees until someone interrupts it. Only a deployment with no browser answerer ends in dsh's own
  * `unavailable`.
  *
- * So the policy is only `ask` while this plugin is there: **when the plugin is disposed, every session it switched that is
- * still live gets `never` back** (`restore`, as an effect of the plugin). That covers the plugin being unloaded, uninstalled
- * or reloaded in a running dsh, and a clean shutdown, and the durable log then says `never` as well. What it can't cover is a
- * process that dies without disposing anything (a crash, `kill -9`) and is started again with dish-judge not loaded: a child
- * resumed then has `ask` in its log and no answerer. Closing that needs a listener that is there when this plugin is not (in
- * crew, which is what makes the children), so it is reported rather than done here.
+ * So the policy is only meant to be `ask` while this plugin is there, and two things keep it so:
+ *
+ * - **Here:** when the plugin is disposed (unloaded, disabled, uninstalled or reloaded in a running dsh, or a clean shutdown),
+ *   `restore` puts `never` back on every crew child it switched, or found at `ask`, **that is still live**, and from then on
+ *   switches nothing (a lookup that was in flight can't leave an `ask` behind). That is all it guarantees.
+ * - **In crew:** dish-crew's approval guard (`plugins/crew/src/guard.ts`) refuses a crew child's request whenever the `dishJudge`
+ *   service is absent. That is what covers the rest, which nothing here can reach: a child that has **settled** keeps `ask` in its
+ *   durable log (dsh-subagent flushes an idle child's final state and only then disposes it, so `agent/disposed` comes after the
+ *   last flush: nothing appended then is reliably kept, and this forgets the child), and so does one whose process died without
+ *   disposing anything. A follow-up
+ *   (`delegate` with `to`) resumes it at `ask`, and if dish-judge is not loaded then, this plugin does not run at all.
  *
  * @module dish-judge/answerer
  */
@@ -129,11 +144,28 @@ interface Verdict {
 const COVERED_WHY = 'the command gate approved this call, with the escalation it was shown'
 
 /**
- * The decision for one request: the table in the header. `entry` is the gate's verdict for this agent's call, or `undefined`.
- * A child is never `pass`.
+ * Whether `entry` covers this request: the gate allowed this agent's call with the escalation in view, and the request is that
+ * escalation, and nothing else that has the same call id. The request must be the same tool's, and carry exactly the reason
+ * dsh's tool gives when it asks to escalate the call (`escalate sandbox to <mode>: <justification>`, which the gate
+ * recorded from the arguments it judged). A hook's ask, or `run_code`'s, under a call id that bash's escalation also has, is
+ * not covered; and neither is any request when the entry has no tool or no reason to compare with.
  */
-function decide(topLevel: boolean, entry: VerdictEntry | undefined): Verdict {
-  if (entry?.verdict === 'allow' && entry.escalationCovered) return { decision: 'allowed-once', why: COVERED_WHY }
+function covers(entry: VerdictEntry | undefined, request: ApprovalAnswererRequest): boolean {
+  return entry !== undefined
+    && entry.verdict === 'allow'
+    && entry.escalationCovered
+    && entry.tool !== undefined
+    && entry.escalationReason !== undefined
+    && request.toolName === entry.tool
+    && request.reason === entry.escalationReason
+}
+
+/**
+ * The decision for one request: the table in the header. `entry` is the gate's verdict for this agent's call, or `undefined`,
+ * and `covered` is whether it covers this request. A child is never `pass`.
+ */
+function decide(topLevel: boolean, entry: VerdictEntry | undefined, covered: boolean): Verdict {
+  if (covered) return { decision: 'allowed-once', why: COVERED_WHY }
   if (topLevel) {
     if (entry === undefined) return { decision: 'pass', why: 'not a call the command gate judged; passed on to you' }
     if (entry.verdict === 'ask') return { decision: 'pass', why: 'the command gate asked you about this call; passed on to you' }
@@ -141,7 +173,8 @@ function decide(topLevel: boolean, entry: VerdictEntry | undefined): Verdict {
   }
   const nothing = 'it was refused, and a child never waits for you'
   if (entry === undefined) return { decision: 'rejected', why: `the judge did not approve this request: it is not a call the command gate judged; ${nothing}` }
-  return { decision: 'rejected', why: `the judge did not approve this request (the command gate's verdict for the call was ${entry.verdict}${entry.verdict === 'allow' ? ', with no escalation covered' : ''}); ${nothing}` }
+  const detail = entry.verdict !== 'allow' ? '' : entry.escalationCovered ? ', and this is not the escalation it was shown' : ', with no escalation covered'
+  return { decision: 'rejected', why: `the judge did not approve this request (the command gate's verdict for the call was ${entry.verdict}${detail}); ${nothing}` }
 }
 
 /**
@@ -170,7 +203,13 @@ export function approvalAnswerer(cache: Pick<VerdictCache, 'get'>, log: Answerer
       entry = undefined
     }
 
-    const verdict = decide(topLevel, entry)
+    let covered = false
+    try {
+      covered = covers(entry, request)
+    } catch {
+      // Nothing is covered by what can't be read.
+    }
+    const verdict = decide(topLevel, entry, covered)
 
     try {
       const tool = typeof request?.toolName === 'string' && request.toolName !== '' ? request.toolName : undefined
@@ -208,11 +247,21 @@ export interface CrewLookup {
   readonly records: { lookup(childId: string): Promise<unknown> }
 }
 
+/** What the policy reads of the approval service: a session's override, and the deployment's default policy. */
+export type ApprovalPolicies = Pick<ApprovalService, 'overrideOf'> & { readonly config?: { readonly policy?: 'ask' | 'never' } }
+
+/** What the policy reads of dsh's agent registry (`ctx.agents`): a live agent by id. */
+export interface LiveAgents {
+  get(id: string): unknown
+}
+
 export interface ChildPolicyDeps {
   /** The approval service, looked up on each call (it is a sibling's). Without one, there is no policy to switch. */
-  approval(): Pick<ApprovalService, 'overrideOf'> | undefined
+  approval(): ApprovalPolicies | undefined
   /** Crew's service, looked up on each call. Without one, no child is known to be crew's. */
   crew(): CrewLookup | undefined
+  /** The live agents, looked up on each call: a child's parent is one. Without them no child's parent can be read. */
+  agents(): LiveAgents | undefined
   /** Says a problem once, as the plugin's `warnOnce` does. */
   tell?: (message: string) => void
   /** How long a crew lookup may take. */
@@ -236,7 +285,7 @@ export interface ChildPolicy {
 }
 
 type Session = Parameters<typeof setApprovalPolicy>[0]
-type Approval = Pick<ApprovalService, 'overrideOf'>
+type Approval = ApprovalPolicies
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -265,21 +314,46 @@ async function isCrewChild(crew: CrewLookup, childId: string, budgetMs: number):
 export function childPolicy(deps: ChildPolicyDeps): ChildPolicy {
   const tell = deps.tell ?? (() => {})
   const budgetMs = deps.lookupBudgetMs ?? CREW_LOOKUP_BUDGET_MS
-  /** The sessions this switched, with the service that reads their policy, so that nothing is looked up when the plugin goes. */
+  /** The sessions this switched or found at `ask`, with the service that reads their policy, so that nothing is looked up when the plugin goes. */
   const switched = new Map<Session, Approval>()
+  /** Set by `restore`: from then on nothing is switched, so a lookup that ends after the plugin went can't leave an `ask` behind. */
+  let closed = false
+
+  /**
+   * The effective policy of the parent of `agent`: its own override, else the deployment's default. `undefined` if the parent can't
+   * be found (no registry, not live, no `parentSession` in the header) or read: that is not `ask`.
+   */
+  const parentPolicyOf = (agent: GateAgent, approval: Approval): 'ask' | 'never' | undefined => {
+    try {
+      const parentId = (agent.session as { header?: { parentSession?: unknown } } | undefined)?.header?.parentSession
+      if (typeof parentId !== 'string' || parentId === '') return undefined
+      const parent = deps.agents()?.get(parentId) as { session?: unknown } | undefined
+      const session = parent?.session as Session | undefined | null
+      if (session === undefined || session === null) return undefined
+      return approval.overrideOf(session) ?? approval.config?.policy ?? 'ask'
+    } catch {
+      return undefined
+    }
+  }
 
   return {
     async created(payload) {
       try {
         const agent = asAgent(payload?.agent)
-        const cancelled = (): boolean => payload.signal?.aborted === true
+        const cancelled = (): boolean => closed || payload.signal?.aborted === true
         if (agent === undefined || cancelled()) return undefined
         if (isTopLevelAgent(agent)) return undefined
         const approval = deps.approval()
         const session = (agent as { session?: unknown }).session as Session | undefined | null
         if (approval === undefined || session === undefined || session === null) return undefined
-        // Only the pin dsh-subagent made. On a resume the log may already say ask, and then there is nothing to do.
-        if (approval.overrideOf(session) !== 'never') return undefined
+        // The pin dsh-subagent made, or a crew child that a resume brings back at ask (a follow-up to one that settled while this
+        // was loaded, or a crash): that one is not switched again, but it is put back to never when the plugin goes.
+        const before = approval.overrideOf(session)
+        if (before !== 'never' && before !== 'ask') return undefined
+        // A child never gets more than its parent: a parent at never has its own escalations rejected, and would see its
+        // child's approved. Nothing to do for a child that is at never already, and crew need not be asked.
+        const wantsAsk = parentPolicyOf(agent, approval) === 'ask'
+        if (before === 'never' && !wantsAsk) return undefined
 
         const crew = deps.crew()
         if (crew === undefined) return undefined
@@ -288,17 +362,22 @@ export function childPolicy(deps: ChildPolicyDeps): ChildPolicy {
         try {
           known = id !== '' && await isCrewChild(crew, id, budgetMs)
         } catch (error) {
-          tell(`could not tell whether a new child agent is one of the crew's (${describe(error)}); its approval policy stays "never", so its escalations are refused`)
+          tell(`could not tell whether a new child agent is one of the crew's (${describe(error)}); its approval policy stays "${before}", so ${before === 'never' ? 'its escalations are refused' : 'check that dish-crew is running'}`)
           return undefined
         }
         if (!known || cancelled()) return undefined
-        // Someone else may have switched it while the record was read.
-        if (approval.overrideOf(session) !== 'never') return undefined
+        // Someone else may have changed it while the record was read.
+        if (approval.overrideOf(session) !== before) return undefined
 
-        setApprovalPolicy(session, 'ask')
-        switched.set(session, approval)
+        if (wantsAsk) {
+          if (before === 'never') setApprovalPolicy(session, 'ask')
+          switched.set(session, approval)
+        } else {
+          // At ask, with a parent that is not: back to never, and nothing for this to restore.
+          setApprovalPolicy(session, 'never')
+        }
       } catch (error) {
-        tell(`could not switch a crew child's approval policy to "ask" (${describe(error)}); it stays "never", so its escalations are refused`)
+        tell(`could not switch a crew child's approval policy (${describe(error)}); it stays as it was`)
       }
       return undefined
     },
@@ -313,6 +392,7 @@ export function childPolicy(deps: ChildPolicyDeps): ChildPolicy {
     },
 
     restore() {
+      closed = true
       for (const [session, approval] of [...switched]) {
         switched.delete(session)
         try {
@@ -357,6 +437,7 @@ export function registerApprovalAnswerer(ctx: Context, cache: VerdictCache, tell
   const policy = childPolicy({
     approval: () => ctx.get('approval'),
     crew: () => lookup.get('dishCrew') as CrewLookup | undefined,
+    agents: () => lookup.get('agents') as LiveAgents | undefined,
     ...tell === undefined ? {} : { tell },
   })
   ctx.on('agent/created', policy.created)

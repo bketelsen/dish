@@ -973,6 +973,51 @@ test('two agents with the same call id have entries of their own: one\'s allow d
   assert.equal(verdictOwner(undefined), '')
 })
 
+test('a verdict entry names the tool, and the reason dsh will give for the escalation only when the call asks for one', async () => {
+  const { gate, cache } = gateOf(() => answers(READ_ONLY, 0.95))
+  const plain = await run(gate, { callId: 'entry-plain' })
+  assert.equal(verdictFor(cache, plain.exec)?.tool, 'bash')
+  assert.equal(verdictFor(cache, plain.exec)?.escalationCovered, false)
+  assert.equal(verdictFor(cache, plain.exec)?.escalationReason, undefined)
+
+  const escalating = await run(gate, { callId: 'entry-esc', args: { command: 'npm publish', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'Needs the network to reach the registry' } })
+  assert.equal(verdictFor(cache, escalating.exec)?.escalationCovered, true)
+  assert.equal(verdictFor(cache, escalating.exec)?.escalationReason, 'escalate sandbox to danger-full-access: Needs the network to reach the registry', 'the wording of approveEscalation in dsh-sandbox')
+
+  const powershell = await run(gate, { callId: 'entry-pwsh', name: 'pwsh', args: { command: 'Get-ChildItem', description: 'x', sandbox_permissions: 'workspace-write', justification: 'writes a cache' } })
+  assert.equal(verdictFor(cache, powershell.exec)?.tool, 'pwsh')
+  assert.equal(verdictFor(cache, powershell.exec)?.escalationReason, 'escalate sandbox to workspace-write: writes a cache')
+
+  // The reason is what dsh will send, so it is whole, where what the judge reads is cut: a long justification is not clipped.
+  const long = 'j'.repeat(3000)
+  const lengthy = await run(gate, { callId: 'entry-long', args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access', justification: long } })
+  assert.equal(verdictFor(cache, lengthy.exec)?.escalationReason, `escalate sandbox to danger-full-access: ${long}`)
+
+  // As the model gave it, spaces and all: dsh puts the arguments in the reason as they are.
+  const padded = await run(gate, { callId: 'entry-padded', args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access', justification: '  needs the network \n' } })
+  assert.equal(verdictFor(cache, padded.exec)?.escalationReason, 'escalate sandbox to danger-full-access:   needs the network \n')
+
+  // No justification, or one that is not text: bash does not ask, so there is no request to match.
+  const bare = await run(gate, { callId: 'entry-bare', args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access' } })
+  assert.equal(verdictFor(cache, bare.exec)?.escalationReason, undefined)
+  const odd = await run(gate, { callId: 'entry-odd', args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access', justification: 7 } })
+  assert.equal(verdictFor(cache, odd.exec)?.escalationReason, undefined)
+})
+
+test('an ask or a deny keeps the tool, and covers no escalation, whatever the call asked for', async () => {
+  const { gate, cache } = gateOf(() => answers(IRREVERSIBLE, 0.9))
+  const asked = await run(gate, { callId: 'entry-ask', args: { command: 'git push', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'needs the network' } })
+  assert.equal(verdictFor(cache, asked.exec)?.verdict, 'ask')
+  assert.equal(verdictFor(cache, asked.exec)?.tool, 'bash')
+  assert.equal(verdictFor(cache, asked.exec)?.escalationCovered, false)
+  // Another listener that asks after the gate allowed turns the entry into an ask, and it is still bash's.
+  const allowing = gateOf(() => answers(READ_ONLY, 0.95))
+  const exec = execOf({ callId: 'entry-later', args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'needs the network' } })
+  const final = await allowing.gate(exec, () => Promise.resolve({ kind: 'ask', reason: 'a hook asks' } as PreToolDecision))
+  assert.equal(final.kind, 'ask')
+  assert.deepEqual([verdictFor(allowing.cache, exec)?.verdict, verdictFor(allowing.cache, exec)?.escalationCovered, verdictFor(allowing.cache, exec)?.tool], ['ask', false, 'bash'])
+})
+
 test('VerdictCache: the owner and the call id are both part of the key, whatever characters they have', () => {
   const cache = new VerdictCache()
   cache.set('a', 'b,c', { verdict: 'ask', escalationCovered: false })

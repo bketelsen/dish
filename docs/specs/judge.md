@@ -181,7 +181,7 @@ A host-level `tools/pre-execute` listener, prepended, for tools listed in `tools
 A host-level `approval/request` listener, prepended:
 
 1. **The command gate's own `ask`** (the cached verdict for this call id is "asks you"): `next()`, which falls through to you.
-2. **A call the gate already approved, that then escalates** (a bash call with `sandbox_permissions`): the gate saw the arguments, including the escalation, so its verdict covers it.
+2. **A call the gate already approved, that then escalates** (a bash call with `sandbox_permissions`): the gate saw the arguments, including the escalation, so its verdict covers it. It covers that escalation and nothing else under the same call id: the request must name the same tool, with exactly the reason dsh's tool gives (`escalate sandbox to <mode>: <justification>`), which the gate recorded from the arguments it judged.
    - Main agent: approved → `allowed-once`, otherwise `next()`.
    - Child: approved → `allowed-once`, otherwise `rejected`.
 3. **Any other request** (e.g. `plugin_manager`, `run_code`, or a tool not in `gated`):
@@ -189,7 +189,15 @@ A host-level `approval/request` listener, prepended:
    - Child: always `rejected`. Children must never wait on you.
 4. **Jev unavailable:** main agent `next()`, child `rejected`.
 
-**Children ask instead of being refused.** On `agent/created`, when the agent is a crew child and its policy is `never`, the plugin appends `approval/policy {ask}` to its session. This only applies to `origin: subagent` sessions that crew's record knows. It checks the current policy first, because `agent/created` fires again on resume. The crew prompts already say that a child should report a blocked action to the main agent.
+**Children ask instead of being refused.** On `agent/created`, when the agent is a crew child, its policy is `never`, and **its parent's effective policy is `ask`**, the plugin appends `approval/policy {ask}` to its session.
+- **Only crew's children:** `origin: subagent` sessions that crew's record knows (`records.lookup` of the child's id, with a 2 s limit).
+- **A child never gets more than its parent.** The parent is the live agent named by the child's header (`ctx.agents.get(parentSession)`), and its effective policy is its own `approval/policy` override, else the deployment's default. A parent at `never` has its own escalations rejected, so its child's aren't approved by the judge. A parent that can't be found or read leaves the child at `never`.
+- **It checks the current policy first,** because `agent/created` fires again on resume. A child that comes back already at `ask` (a follow-up to one that settled, or a crash) is kept at `ask` while its parent allows it, and is put back to `never` if its parent doesn't.
+- **With the judge gone, children don't wait on a human.** dsh puts a request from a child at `ask` to the browser when no answerer takes it, and nothing times it out. So:
+  - when the plugin is disposed, it puts `never` back on every crew child it switched, or found at `ask`, that is still live;
+  - a child that has settled keeps `ask` in its log (dsh flushes an idle child's final state before it disposes it, so nothing the plugin writes then is reliably kept). **dish-crew's approval guard** covers it: while `dishJudge` is absent, a request from a crew child is rejected (see the [crew spec](crew.md)).
+
+The crew prompts already say that a child should report a blocked action to the main agent.
 
 ## The result screen
 
