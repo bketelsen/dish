@@ -94,14 +94,12 @@ async function until(it: AsyncIterator<ConfigEvent>, want: (event: ConfigEvent) 
   }
 }
 
-/** Everything the stream has queued up right now (it is let to go quiet for a moment). */
-async function drain(it: AsyncIterator<ConfigEvent>): Promise<ConfigEvent[]> {
+/** Exactly `count` events, which must all be there; then the stream must have nothing more to say for a moment. */
+async function take(it: AsyncIterator<ConfigEvent>, count: number): Promise<ConfigEvent[]> {
   const seen: ConfigEvent[] = []
-  for (;;) {
-    const result = await within(it, 60)
-    if (result === TIMEOUT || result.done) return seen
-    seen.push(result.value)
-  }
+  while (seen.length < count) seen.push(await event(it))
+  assert.equal(await within(it, 60), TIMEOUT, 'no more events than expected')
+  return seen
 }
 
 // --- the wire contract ---------------------------------------------------------------------------
@@ -221,6 +219,41 @@ test('history: a prefix with a slash is a prefix, one without is a document, lim
     failed(await remote.history(5 as unknown as string, 0, ''), 'INVALID')
     failed(await remote.history('', 'ten' as unknown as number, ''), 'INVALID')
     failed(await remote.history('', 0, 7 as unknown as string), 'INVALID')
+  })
+})
+
+test('a missing argument is an absent one: the gateway passes undefined for what the client leaves out', async () => {
+  await withRemote({}, async (remote, service) => {
+    service.claim(ns('p/', 'propose'))
+    const proposed = await service.propose([{ path: 'p/x.md', text: 'one\n' }], { author: AGENTA, title: 'Add x', rationale: '' })
+    const missing = undefined as unknown as string
+    const noNumber = undefined as unknown as number
+
+    const log = ok(await remote.history('', 0, ''))
+    assert.equal(log.length, 2)
+    assert.deepEqual(ok(await remote.history('', 0, missing)), log)
+    assert.deepEqual(ok(await remote.history(missing, 0, '')), log)
+    assert.deepEqual(ok(await remote.history('', noNumber, '')), log)
+    assert.deepEqual(ok(await remote.history(missing, noNumber, missing)), log)
+    assert.deepEqual(ok(await remote.history('', noNumber, log[0]!.id)).map(info => info.id), [log[1]!.id])
+    assert.equal(ok(await remote.history('', noNumber, '')).length, 2, 'the default limit, not none')
+
+    assert.deepEqual(ok(await remote.proposals(missing)).map(info => info.id), [proposed.id])
+    // An absent id is an id nothing has, and an absent reason is an empty one.
+    failed(await remote.commit(missing), 'NOT_FOUND')
+    failed(await remote.revert(missing), 'NOT_FOUND')
+    failed(await remote.proposal(missing), 'NOT_FOUND')
+    failed(await remote.accept(missing), 'NOT_FOUND')
+    failed(await remote.reject(proposed.id, missing), 'INVALID')
+    failed(await remote.reject(missing, 'no'), 'NOT_FOUND')
+    assert.deepEqual(ok(await remote.proposals('open')).map(info => info.id), [proposed.id], 'nothing was rejected')
+
+    // Anything else that is not the right type is still refused.
+    failed(await remote.history('', 0, null as unknown as string), 'INVALID')
+    failed(await remote.history(null as unknown as string, 0, ''), 'INVALID')
+    failed(await remote.history('', null as unknown as number, ''), 'INVALID')
+    failed(await remote.proposals(null as unknown as string), 'INVALID')
+    failed(await remote.commit(null as unknown as string), 'INVALID')
   })
 })
 
@@ -561,7 +594,8 @@ test('watch keeps at most 100 pending changed/proposal events (the oldest are dr
     for (let i = 0; i < 10; i++) ctx.emit('dish-config/proposal', `p${i}`, 'open')
     ctx.emit('dish-config/remote', status(3))
 
-    const seen = await drain(watch.it)
+    // 100 of the changed/proposal events, and the one remote status: no more, no fewer.
+    const seen = await take(watch.it, 101)
     const remotes = seen.filter(item => item.kind === 'remote')
     assert.deepEqual(remotes, [{ kind: 'remote', status: status(3) }], 'only the latest remote status is kept')
     const rest = seen.filter(item => item.kind !== 'remote')

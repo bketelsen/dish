@@ -25,9 +25,13 @@ import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { markRemote } from 'dish-kit'
 import { ConfigStoreError } from './store/errors.ts'
 import type { ErrorCode as StoreErrorCode } from './store/errors.ts'
-import type { CommitInfo as StoreCommitInfo, FileDiff as StoreFileDiff, HistoryQuery, ProposalInfo as StoreProposalInfo, RemoteStatus as StoreRemoteStatus } from './store/store.ts'
+import type { NamespaceSpec } from './store/namespaces.ts'
+import type {
+  CommitInfo as StoreCommitInfo, FileDiff as StoreFileDiff, HistoryQuery, ProposalEvent as StoreProposalEvent,
+  ProposalInfo as StoreProposalInfo, ProposalStatus as StoreProposalStatus, RemoteStatus as StoreRemoteStatus,
+} from './store/store.ts'
 import { NAMESPACE } from './protocol.ts'
-import type { CommitInfo, ConfigEvent, ErrorCode, FileDiff, NamespaceInfo, Outcome, ProposalInfo, RemoteStatus } from './protocol.ts'
+import type { CommitInfo, ConfigEvent, ErrorCode, FileDiff, NamespaceInfo, Outcome, ProposalEvent, ProposalInfo, ProposalStatus, RemoteStatus } from './protocol.ts'
 
 /** The Cordis service key. (The wire namespace is `NAMESPACE`.) */
 export const SERVICE = 'dishConfigRemote'
@@ -50,6 +54,10 @@ export type WireMatchesStore = [
   Check<Same<StoreFileDiff, FileDiff>>,
   Check<Same<StoreProposalInfo, ProposalInfo>>,
   Check<Same<StoreRemoteStatus, RemoteStatus>>,
+  // The unions the page switches on, each checked on its own (a drift here would not show in the objects above).
+  Check<Same<StoreProposalEvent, ProposalEvent>>,
+  Check<Same<StoreProposalStatus, ProposalStatus>>,
+  Check<Same<NamespaceSpec['agent'], NamespaceInfo['agent']>>,
 ]
 
 export interface RemoteOptions {
@@ -66,9 +74,21 @@ function invalid(message: string): ConfigStoreError {
   return new ConfigStoreError('INVALID', message)
 }
 
-/** A string parameter. They arrive off the wire untyped, so a page that sends anything else gets `INVALID` and not a `TypeError`. */
+/**
+ * A string parameter. They arrive off the wire untyped: a missing one is `undefined` (the client leaves out an `undefined`
+ * positional, and the gateway hands the method `undefined` for an argument that is not there), which is as good as `''`,
+ * the page's own way to say "absent". Anything else that is not a string gets `INVALID`, not a `TypeError`.
+ */
 function text(name: string, value: unknown): string {
+  if (value === undefined) return ''
   if (typeof value !== 'string') throw invalid(`${name} must be a string`)
+  return value
+}
+
+/** A number parameter, with a missing one read as `0`, like `text`. */
+function count(name: string, value: unknown): number {
+  if (value === undefined) return 0
+  if (typeof value !== 'number') throw invalid(`${name} must be a number`)
   return value
 }
 
@@ -129,10 +149,10 @@ export class ConfigRemote extends TypertRemoteService {
     return outcome(async () => {
       const where = text('prefix', prefix)
       const below = text('before', before)
-      if (typeof limit !== 'number') throw invalid('limit must be a number')
+      const most = count('limit', limit)
       const query: HistoryQuery = {}
       if (where !== '') query[where.endsWith('/') ? 'prefix' : 'path'] = where
-      if (limit > 0) query.limit = limit
+      if (most > 0) query.limit = most
       if (below !== '') query.before = below
       return this.ctx.dishConfig.history(query)
     })
