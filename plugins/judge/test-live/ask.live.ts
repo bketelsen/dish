@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 import { after, test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
-import { ASK_JUDGE_TOOL, askJudgeTool } from '../src/ask.ts'
+import { ASK_JUDGE_DESCRIPTION, ASK_JUDGE_TOOL, askJudgeTool } from '../src/ask.ts'
 import { createJudge } from '../src/client.ts'
 import type { LogLine } from '../src/client.ts'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
@@ -224,6 +224,36 @@ test('live: a 5-level score of a diff against small, tested and named well order
   row('score: small, tested, named', 'normalized > 0.6', shown(high), lines[0]?.latencyMs ?? null)
   row('score: no test', 'between', shown(middle), lines[1]?.latencyMs ?? null)
   row('score: big, untested, x1/tmp2', 'normalized < 0.3', shown(low), lines[2]?.latencyMs ?? null)
+  assert.ok(high.normalized > 0.6, `good ${high.normalized}`)
+  assert.ok(low.normalized < 0.3, `bad ${low.normalized}`)
+  assert.ok(high.normalized > middle.normalized && middle.normalized > low.normalized, `good ${high.normalized}, no test ${middle.normalized}, bad ${low.normalized}`)
+  noLeak(good, noTest, bad, lines)
+})
+
+/** The tool description's own score example: described levels, one judgment. */
+const READY = {
+  instructions: 'How ready to merge is the change in `state`?',
+  criteria: ['not ready: broken or unclear', 'needs work: works but untested', 'nearly: tested, with naming or size problems', 'ready: small, tested and clearly named'],
+}
+
+test('live: the description\'s own score example (how ready to merge, four described levels) orders a good diff, one without a test and a bad one', { skip: SKIP, timeout: 30_000 }, async () => {
+  // The example is the one an agent reads: this checks that it is what is run.
+  for (const text of [READY.instructions, ...READY.criteria]) assert.ok(ASK_JUDGE_DESCRIPTION.includes(text), `the description does not have ${text}`)
+  const { call, lines } = await live()
+  const questions = { ready: { type: 'score', ...READY } }
+  const [good, noTest, bad] = [await call({ state: GOOD_DIFF, questions }), await call({ state: NO_TEST_DIFF, questions }), await call({ state: BAD_DIFF, questions })]
+  for (const result of [good, noTest, bad]) assert.equal(result.isError, false, textOf(result))
+  const [high, middle, low] = [good, noTest, bad].map(result => result.value.answers.ready)
+  for (const answer of [high, middle, low]) {
+    assert.equal(answer.type, 'score')
+    assert.ok(answer.score >= 0 && answer.score <= 3)
+    assert.equal(answer.normalized, Math.round(answer.score / 3 * 1000) / 1000)
+    assert.deepEqual(Object.keys(answer.probabilities).sort(), ['0', '1', '2', '3'])
+  }
+  const shown = (answer: any) => `${answer.score.toFixed(2)} -> ${answer.normalized.toFixed(3)} (conf ${answer.confidence.toFixed(2)})`
+  row('ready: small, tested, named', 'normalized > 0.6', shown(high), lines[0]?.latencyMs ?? null)
+  row('ready: no test', 'between', shown(middle), lines[1]?.latencyMs ?? null)
+  row('ready: big, untested, x1/tmp2', 'normalized < 0.3', shown(low), lines[2]?.latencyMs ?? null)
   assert.ok(high.normalized > 0.6, `good ${high.normalized}`)
   assert.ok(low.normalized < 0.3, `bad ${low.normalized}`)
   assert.ok(high.normalized > middle.normalized && middle.normalized > low.normalized, `good ${high.normalized}, no test ${middle.normalized}, bad ${low.normalized}`)

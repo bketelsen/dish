@@ -72,6 +72,9 @@ async function world(options: { key?: string | undefined, config?: Partial<plugi
   }
 }
 
+/** What an agent is told when the state is too big: send the part that matters, and dense text counts for more than its size. */
+const TOO_BIG = 'the state is too large for the judge: send a smaller excerpt with only the part that matters (at most about 100 KB of prose, less of code or JSON)'
+
 const NOUL = { complete: { type: 'noul', instructions: 'Does `state` handle every failure of the calls it makes?' } }
 const answered = (answers: Record<string, unknown>) => ({ kind: 'answer', body: jevBody(answers) }) as const
 
@@ -116,6 +119,11 @@ test('the description carries the three types, the phrasing advice, the numbers-
   assert.match(description, /always include `other`/i)
   assert.match(description, /arithmetic/)
   assert.match(description, /only what matters|filter/i)
+  // The state leaves the machine, and what the client masks first.
+  assert.match(description, /`state` goes to TypeSafe; known secret patterns are masked first, but leave other secrets out\./)
+  // The score example describes situations, and asks for one judgment, not a count.
+  assert.match(description, /How ready to merge is the change in `state`\?/)
+  assert.doesNotMatch(description, /How many of these/)
   // Jev isn't deterministic.
   assert.match(description, /isn't deterministic/)
   assert.match(description, /band/)
@@ -127,6 +135,18 @@ test('the description carries the three types, the phrasing advice, the numbers-
   assert.match(description, /normalized/)
   // It goes into every agent's prompt: it stays short.
   assert.ok(description.length <= 3000, `the description is ${description.length} characters`)
+})
+
+test('parallel ask_judge calls run together: the registry classifies a valid call as parallel, and an invalid one fails closed', async () => {
+  const w = await world()
+  const exec = (args: unknown) => ({ callId: 'c' as never, name: 'ask_judge', arguments: args, agent: MAIN as never, signal: new AbortController().signal })
+  assert.deepEqual(w.ctx.tools.executionMode(exec({ state: 'x', questions: NOUL })), { kind: 'parallel' })
+  assert.deepEqual(w.ctx.tools.executionMode(exec({ state: 42, questions: NOUL })), { kind: 'exclusive' })
+  // And they are one request each, answered under their own ids.
+  w.jev.always(answered({ complete: noulAnswer(0.5) }))
+  const results = await Promise.all([1, 2, 3].map(() => w.call({ state: 'x', questions: NOUL })))
+  assert.ok(results.every(result => !result.isError))
+  assert.equal(w.jev.requests.length, 3)
 })
 
 // --- the answers ----------------------------------------------------------------------------------
@@ -213,10 +233,10 @@ test('a question with more than the schema asks for is sent with only what Jev k
 
 // --- empty strings are absent ---------------------------------------------------------------------
 
-test('a noul\'s criteria that are empty are left out: an empty string, null, {}, [] and { true: "", false: "" }', async () => {
+test('a noul\'s criteria that are empty are left out: an empty string, null, {}, [], and { true, false } whose values are empty strings or null', async () => {
   const w = await world()
   w.jev.always(answered({ complete: noulAnswer(0.5) }))
-  const empties: unknown[] = ['', '  ', null, {}, [], { true: '', false: '' }, { true: ' ', false: '' }]
+  const empties: unknown[] = ['', '  ', null, {}, [], { true: '', false: '' }, { true: ' ', false: '' }, { true: null, false: null }, { true: null, false: '' }]
   for (const criteria of empties) {
     const result = await w.call({ state: 'x', questions: { complete: { type: 'noul', instructions: 'Is `state` complete?', criteria } } })
     assert.equal(result.isError, false, `${JSON.stringify(criteria)}: ${textOf(result)}`)
@@ -337,7 +357,7 @@ test('an empty state is refused: there is nothing to judge, and an answer about 
 test('a state of more than 100 KB is too large: the message says to send an excerpt, and the line says too-big', async () => {
   const w = await world()
   const message = await refused(w, { state: 'x'.repeat(100 * 1024 + 1), questions: NOUL })
-  assert.equal(message, 'the state is too large for the judge: send a smaller excerpt (at most about 100 KB)')
+  assert.equal(message, TOO_BIG)
   assert.equal(w.jev.requests.length, 0)
   const [line] = await w.lines()
   assert.equal(line!.decision, 'too-big')
@@ -347,8 +367,20 @@ test('TypeSafe\'s own max_tokens_exceeded is the same: too large, and the same w
   const w = await world()
   w.jev.always({ kind: 'status', status: 400, body: JSON.stringify({ detail: { error_type: 'max_tokens_exceeded' } }) })
   const message = await refused(w, { state: 'a state of a few thousand tokens', questions: NOUL })
-  assert.equal(message, 'the state is too large for the judge: send a smaller excerpt (at most about 100 KB)')
+  assert.equal(message, TOO_BIG)
   assert.equal(w.jev.requests.length, 1)
+  assert.equal((await w.lines())[0]!.decision, 'too-big')
+})
+
+test('a 90 KB state that TypeSafe refuses for its tokens (dense code or JSON) is too large, and says to send less of it than 100 KB', async () => {
+  const w = await world()
+  w.jev.always({ kind: 'status', status: 400, body: JSON.stringify({ detail: { error_type: 'max_tokens_exceeded' } }) })
+  // Under the client's own 100 KB, so it is sent, and TypeSafe is the one to say no.
+  const message = await refused(w, { state: 'const a=[1,2,3];'.repeat(Math.floor(90 * 1024 / 16)), questions: NOUL })
+  assert.equal(message, TOO_BIG)
+  assert.match(message, /less of code or JSON/)
+  assert.equal(w.jev.requests.length, 1, 'the client let it through')
+  assert.ok(w.jev.requests[0]!.text.length > 85 * 1024)
   assert.equal((await w.lines())[0]!.decision, 'too-big')
 })
 

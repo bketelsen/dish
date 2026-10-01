@@ -33,8 +33,11 @@ export const ASK_JUDGE_TOOL = 'ask_judge'
 /** The most questions in one call: a model that wants more splits them over calls. */
 export const MAX_QUESTIONS = 20
 
-/** What an agent is told about a state that is too big, whether this client or TypeSafe said so. */
-const TOO_BIG = 'the state is too large for the judge: send a smaller excerpt (at most about 100 KB)'
+/**
+ * What an agent is told about a state that is too big, whether this client or TypeSafe said so. TypeSafe counts tokens, so
+ * dense state (code, JSON) can be refused well under the client's 100 KB: the advice is to send less, not just under that.
+ */
+const TOO_BIG = 'the state is too large for the judge: send a smaller excerpt with only the part that matters (at most about 100 KB of prose, less of code or JSON)'
 
 /** What goes into every agent's prompt: kept to what changes how it asks. */
 export const ASK_JUDGE_DESCRIPTION = [
@@ -52,7 +55,9 @@ export const ASK_JUDGE_DESCRIPTION = [
   'Examples:',
   '- noul, `state` is a function: { "handled": { "type": "noul", "instructions": "Is every call in `state` that can fail inside a try/catch that handles or rethrows the error?" } }',
   '- choice, `state` is a stack trace: { "owner": { "type": "choice", "instructions": "Which file contains the code that threw the error in `state`?", "criteria": { "src/parse.ts": null, "src/render.ts": null, "other": null } } }',
-  '- score, `state` is a diff: { "quality": { "type": "score", "instructions": "How many of these does `state` meet: small, tested, named well?", "criteria": ["none of them", "one", "two", "all three"] } }',
+  '- score, `state` is a diff: { "ready": { "type": "score", "instructions": "How ready to merge is the change in `state`?", "criteria": ["not ready: broken or unclear", "needs work: works but untested", "nearly: tested, with naming or size problems", "ready: small, tested and clearly named"] } }',
+  '',
+  '`state` goes to TypeSafe; known secret patterns are masked first, but leave other secrets out.',
 ].join('\n')
 
 /** A plain object, like what `JSON.parse` makes or an object literal is. */
@@ -72,7 +77,7 @@ function refusal(message: string): Error {
 
 /**
  * One question with what the model left empty taken out: a noul's criteria that are an empty string, `null`, `{}`, `[]` or
- * `{ true: '', false: '' }` are not there, and a choice option's empty description is `null`. Anything that isn't the shape
+ * `{ true, false }` with only empty strings or `null` in it are not there, and a choice option's empty description is `null`. Anything that isn't the shape
  * of a question is left as it is, for the client to refuse in words.
  */
 function cleaned(question: unknown): unknown {
@@ -81,7 +86,7 @@ function cleaned(question: unknown): unknown {
   if (question.type === 'noul') {
     const empty = criteria === undefined || criteria === null || blank(criteria)
       || (Array.isArray(criteria) && criteria.length === 0)
-      || (isRecord(criteria) && Object.values(criteria).every(blank))
+      || (isRecord(criteria) && Object.values(criteria).every(value => value === null || blank(value)))
     if (!empty) return question
     const { criteria: _left, ...rest } = question
     return rest
@@ -166,6 +171,8 @@ export function askJudgeTool(judge: () => Judge | undefined): ToolDefinition {
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
+    // It mutates nothing of the parent's: each call is its own request, so parallel calls run together.
+    isConcurrencySafe: () => true,
     async execute(args, exec) {
       const questions = questionsFor(args.questions)
       const state = stateFor(args.state)
