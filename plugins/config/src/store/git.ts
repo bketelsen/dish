@@ -27,17 +27,51 @@ export interface RunResult {
   stderr: string
 }
 
+/**
+ * Variables that make git look somewhere other than `--git-dir`, change what a
+ * path or object id means, or stamp commits with someone else's time. A git
+ * hook or a developer's shell can leave any of them set, and git would then
+ * quietly write this store's objects, refs or index elsewhere. They are removed
+ * from every child's environment.
+ *
+ * Auth and diagnostics (`GIT_SSH*`, `GIT_ASKPASS`, `GIT_TRACE*`, `GIT_EXEC_PATH`,
+ * `GIT_CONFIG_GLOBAL`/`SYSTEM`/`NOSYSTEM`, `GIT_SSL_*`, `GIT_HTTP_*`,
+ * `GIT_PROXY_COMMAND`) are deliberately not listed: pushing needs them.
+ */
+export const GIT_ENV_DENYLIST: readonly string[] = [
+  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_WORK_TREE', 'GIT_LITERAL_PATHSPECS',
+  'GIT_ICASE_PATHSPECS', 'GIT_COMMON_DIR', 'GIT_QUARANTINE_PATH', 'GIT_AUTHOR_DATE', 'GIT_COMMITTER_DATE',
+  'GIT_DEFAULT_HASH', 'GIT_DIR', 'GIT_INDEX_FILE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS',
+  'GIT_CONFIG_COUNT', 'GIT_GRAFT_FILE', 'GIT_NO_REPLACE_OBJECTS', 'GIT_REPLACE_REF_BASE', 'GIT_PREFIX',
+  'GIT_SHALLOW_FILE', 'GIT_NAMESPACE', 'GIT_GLOB_PATHSPECS', 'GIT_NOGLOB_PATHSPECS', 'GIT_CEILING_DIRECTORIES',
+]
+
+/**
+ * The environment for a git child process: `base` without `GIT_ENV_DENYLIST`,
+ * then English messages and no credential prompts, then `extra` (so a caller
+ * can still set a denied name on purpose, as `buildTree` does with
+ * `GIT_INDEX_FILE`).
+ * @param extra - per-call variables, applied last.
+ * @param base - the inherited environment; defaults to this process's.
+ */
+export function gitEnv(extra: Record<string, string> = {}, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...base }
+  for (const name of GIT_ENV_DENYLIST) delete env[name]
+  return { ...env, LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0', ...extra }
+}
+
 const ZERO_OID = '0'.repeat(40)
 // Large enough that a long `git log` never trips execFile's default 1 MiB cap.
 const MAX_BUFFER = 256 * 1024 * 1024
 
 /**
- * Run `git` with `args`: no shell, English messages, and never a credential
- * prompt. Resolves with the exit code for any non-zero exit; rejects only when
- * git can't be run at all (missing binary, killed by a signal).
+ * Run `git` with `args`: no shell, a scrubbed environment (see `gitEnv`),
+ * English messages, and never a credential prompt. Resolves with the exit code
+ * for any non-zero exit; rejects only when git can't be run at all (missing
+ * binary, killed by a signal).
  */
 function exec(args: string[], options: RunOptions): Promise<RunResult> {
-  const env = { ...process.env, LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0', ...options.env }
+  const env = gitEnv(options.env)
   return new Promise((resolvePromise, reject) => {
     const child = execFile('git', args, { env, encoding: 'utf8', maxBuffer: MAX_BUFFER }, (error, stdout, stderr) => {
       if (error === null) return resolvePromise({ code: 0, stdout, stderr })
@@ -54,7 +88,8 @@ function exec(args: string[], options: RunOptions): Promise<RunResult> {
 /** Why `path` can't be a config document path, or `undefined` if it can. */
 function pathProblem(path: string): string | undefined {
   if (path === '') return 'empty'
-  if (path.includes('\0')) return 'contains a NUL byte'
+  // Control characters (newline, tab, NUL, DEL, ...) would let a path forge lines in commit messages and logs.
+  if (/[\x00-\x1f\x7f]/.test(path)) return 'contains a control character'
   if (path.includes('\\')) return 'contains a backslash'
   if (path.startsWith('/')) return 'absolute'
   if (path.endsWith('/')) return 'ends with a slash'
@@ -101,7 +136,8 @@ export class Git {
 
   /** Create the repository (bare, `HEAD` on `branch`). Safe to call on an existing one. */
   async initBare(branch: 'main'): Promise<void> {
-    const result = await exec(['init', '--bare', '-b', branch, this.gitDir], {})
+    // SHA-1 explicitly: a user's init.defaultObjectFormat=sha256 would break the 40-zero compare-and-swap, and GitHub is SHA-1.
+    const result = await exec(['init', '--bare', '--object-format=sha1', '-b', branch, this.gitDir], {})
     if (result.code !== 0) throw new Error(`git init failed (exit ${result.code}): ${result.stderr.trim()}`)
   }
 
@@ -162,7 +198,12 @@ export class Git {
           continue
         }
         const blob = (await this.run(['hash-object', '-w', '--no-filters', '--stdin'], { input: change.text })).stdout.trim()
-        const staged = await this.run(['update-index', '--add', '--cacheinfo', `100644,${blob},${change.path}`], { env, allowFail: true })
+        // protectHFS/protectNTFS: refuse the spellings of ".git" that macOS and Windows treat as the same
+        // directory. GitHub refuses a push containing one, which would wedge the push queue for good.
+        const staged = await this.run(
+          ['-c', 'core.protectHFS=true', '-c', 'core.protectNTFS=true',
+            'update-index', '--add', '--cacheinfo', `100644,${blob},${change.path}`],
+          { env, allowFail: true })
         if (staged.code !== 0) {
           throw new ConfigStoreError('INVALID', `cannot write ${JSON.stringify(change.path)}: ${staged.stderr.trim()}`)
         }
@@ -195,9 +236,12 @@ export class Git {
    * Move `ref` to `next` only if it currently holds `expected` (`null`: only
    * if it doesn't exist). `false` means the ref wasn't what was expected.
    * @param expected - a full object id, or `null`.
-   * @throws if the update fails for any other reason (bad ref name, missing object).
+   * @throws if `ref` doesn't start with `refs/`, or the update fails for any other
+   *   reason (bad ref name, missing object).
    */
   async casRef(ref: string, next: string, expected: string | null): Promise<boolean> {
+    // A short name like `main` would be written as `<gitDir>/main` and shadow `refs/heads/main` in lookups.
+    if (!ref.startsWith('refs/')) throw new Error(`casRef needs a full ref name starting with "refs/", got ${JSON.stringify(ref)}`)
     const result = await this.run(['update-ref', '--no-deref', '--', ref, next, expected ?? ZERO_OID], { allowFail: true })
     if (result.code === 0) return true
     // A lost race and a broken request both exit non-zero; only the first is `false`.

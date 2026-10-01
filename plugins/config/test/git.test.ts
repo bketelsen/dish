@@ -1,9 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile, readdir } from 'node:fs/promises'
+import { readFile, readdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { ConfigStoreError } from '../src/store/errors.ts'
-import { Git } from '../src/store/git.ts'
+import { GIT_ENV_DENYLIST, Git, gitEnv } from '../src/store/git.ts'
 import type { Change } from '../src/store/git.ts'
 import { USER, tempDir } from './helpers.ts'
 
@@ -28,6 +28,20 @@ async function commit(git: Git, changes: Change[], message = 'm'): Promise<strin
 
 async function indexLeftovers(dir: string): Promise<string[]> {
   return (await readdir(dir)).filter(name => name.startsWith('dish-index-'))
+}
+
+/** Run `fn` with `vars` set in this process's environment, then restore it. */
+async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const saved = Object.keys(vars).map(name => [name, process.env[name]] as const)
+  Object.assign(process.env, vars)
+  try {
+    return await fn()
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
 }
 
 test('initBare creates a bare repo on main; the empty tree is canonical; main is unborn', async () => {
@@ -170,6 +184,8 @@ test('buildTree rejects unsafe paths with INVALID before touching the repo', asy
   const bad = [
     '', '/abs.md', 'a/../b.md', '..', '../x', './a.md', 'a/./b.md', '.', 'a\\b.md', 'a\0b.md',
     'dir/', 'a//b.md', '.git', '.git/config', '.git/hooks/pre-commit', 'a/.git/x', '.GIT/x',
+    // Control characters: a newline could forge a trailer line in a later commit message.
+    'x\ny.md', 'x\ty.md', 'x\ry.md', 'x\x1fy.md', 'x\x7fy.md', 'prompts/a.md\nDish-Author-Kind: user',
   ]
   for (const path of bad) {
     await assert.rejects(git.buildTree(undefined, [{ path, text: 'x' }]), { code: 'INVALID' }, JSON.stringify(path))
@@ -286,3 +302,131 @@ test('ConfigStoreError carries a code and is an Error', () => {
   assert.equal(e.message, 'a.md changed')
   assert.equal(new ConfigStoreError('STALE').message, 'STALE')
 })
+
+test('control characters in a path are INVALID, with a clear reason', async () => {
+  const { git } = await newGit()
+  for (const path of ['x\ny.md', 'x\ty.md', 'a\0b.md', 'x\x7fy.md']) {
+    await assert.rejects(git.buildTree(undefined, [{ path, text: 'x' }]), { code: 'INVALID', message: /control character/ }, JSON.stringify(path))
+  }
+})
+
+test('HFS and NTFS spellings of .git are refused by git itself and reported as INVALID', async () => {
+  const { git } = await newGit()
+  // Not caught by the hand-written checks: git's own protectHFS/protectNTFS must catch them.
+  const spellings = ['.git\u200c/config', '.g\u200cit/config', '.GIT\u200c/x', 'a/.git\u200c/x', 'git~1/config', '.git./config', '.git /config']
+  for (const path of spellings) {
+    await assert.rejects(git.buildTree(undefined, [{ path, text: 'x' }]), { code: 'INVALID' }, JSON.stringify(path))
+  }
+})
+
+test('casRef only touches refs/..., so a short name can never shadow a branch', async () => {
+  const { git, dir } = await newGit()
+  const c = await commit(git, [{ path: 'a.md', text: '1' }])
+  const tree = await git.buildTree(c, [{ path: 'a.md', text: '2' }])
+  const c2 = await git.commitTree(tree, [c], 'second', USER)
+  for (const ref of ['main', 'HEAD', 'heads/main', '-x']) {
+    await assert.rejects(git.casRef(ref, c2, null), /refs\//, ref)
+    await assert.rejects(git.casRef(ref, c2, c), /refs\//, ref)
+  }
+  assert.deepEqual((await readdir(dir)).filter(name => name === 'main' || name === 'heads'), [])
+  assert.equal(await git.resolve(MAIN), c)
+  assert.equal(await git.casRef(MAIN, c2, c), true)
+})
+
+test('initBare pins SHA-1 even when the user config defaults new repos to SHA-256', async () => {
+  const config = join(await tempDir(), 'gitconfig')
+  await writeFile(config, '[init]\n\tdefaultObjectFormat = sha256\n')
+  const dir = join(await tempDir(), 'config.git')
+  const git = new Git(dir)
+  await withEnv({ GIT_CONFIG_GLOBAL: config }, async () => {
+    await git.initBare('main')
+    assert.equal(await git.emptyTree(), EMPTY_TREE)
+    const c = await commit(git, [{ path: 'a.md', text: '1' }])
+    assert.match(c, /^[0-9a-f]{40}$/)
+  })
+  assert.equal((await git.run(['rev-parse', '--show-object-format'])).stdout.trim(), 'sha1')
+})
+
+test('gitEnv drops variables that redirect a repository, keeps the ones auth needs, and applies overrides last', () => {
+  const kept = {
+    PATH: '/usr/bin', HOME: '/home/u', GIT_SSH_COMMAND: 'ssh -i k', GIT_SSH: '/bin/ssh', GIT_ASKPASS: '/bin/askpass',
+    GIT_TRACE: '/tmp/t', GIT_TRACE_PERFORMANCE: '1', GIT_EXEC_PATH: '/x', GIT_CONFIG_GLOBAL: '/g', GIT_CONFIG_SYSTEM: '/s',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_SSL_NO_VERIFY: '1', GIT_HTTP_LOW_SPEED_LIMIT: '1', GIT_PROXY_COMMAND: '/p',
+    GIT_AUTHOR_NAME: 'n',
+  }
+  const stray = Object.fromEntries(GIT_ENV_DENYLIST.map(name => [name, 'stray']))
+  const env = gitEnv({}, { ...kept, ...stray, LC_ALL: 'de_DE.UTF-8', GIT_TERMINAL_PROMPT: '1' })
+  for (const name of GIT_ENV_DENYLIST) assert.equal(env[name], undefined, name)
+  for (const [name, value] of Object.entries(kept)) assert.equal(env[name], value, name)
+  assert.equal(env.LC_ALL, 'C')
+  assert.equal(env.GIT_TERMINAL_PROMPT, '0')
+  // Per-call values go in after the scrub, so they can set a denied name on purpose.
+  const mine = gitEnv({ GIT_INDEX_FILE: '/idx', LC_ALL: 'POSIX' }, stray)
+  assert.equal(mine.GIT_INDEX_FILE, '/idx')
+  assert.equal(mine.LC_ALL, 'POSIX')
+  assert.equal(mine.GIT_DIR, undefined)
+  // The list itself is the contract (push code reuses it): losing a name is a regression.
+  for (const name of [
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_WORK_TREE', 'GIT_LITERAL_PATHSPECS', 'GIT_ICASE_PATHSPECS',
+    'GIT_COMMON_DIR', 'GIT_QUARANTINE_PATH', 'GIT_AUTHOR_DATE', 'GIT_COMMITTER_DATE', 'GIT_DEFAULT_HASH', 'GIT_DIR',
+    'GIT_INDEX_FILE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_GRAFT_FILE',
+    'GIT_NO_REPLACE_OBJECTS', 'GIT_REPLACE_REF_BASE', 'GIT_PREFIX', 'GIT_SHALLOW_FILE', 'GIT_NAMESPACE', 'GIT_GLOB_PATHSPECS',
+    'GIT_NOGLOB_PATHSPECS', 'GIT_CEILING_DIRECTORIES',
+  ]) assert.ok(GIT_ENV_DENYLIST.includes(name), name)
+})
+
+// What a git hook (or a developer's shell) can leave in the environment.
+const STRAY: Record<string, () => Promise<Record<string, string>>> = {
+  'object directory': async () => ({ GIT_OBJECT_DIRECTORY: await tempDir() }),
+  'alternate object directories': async () => ({ GIT_ALTERNATE_OBJECT_DIRECTORIES: await tempDir() }),
+  'work tree': async () => ({ GIT_WORK_TREE: await tempDir() }),
+  'literal pathspecs': async () => ({ GIT_LITERAL_PATHSPECS: '1' }),
+  'case-insensitive pathspecs': async () => ({ GIT_ICASE_PATHSPECS: '1' }),
+  'glob pathspecs': async () => ({ GIT_GLOB_PATHSPECS: '1' }),
+  'common dir': async () => ({ GIT_COMMON_DIR: await tempDir() }),
+  'quarantine': async () => ({ GIT_QUARANTINE_PATH: await tempDir() }),
+  'git dir': async () => ({ GIT_DIR: await tempDir() }),
+  'index file': async () => ({ GIT_INDEX_FILE: join(await tempDir(), 'index') }),
+  'namespace': async () => ({ GIT_NAMESPACE: 'elsewhere' }),
+  'default hash': async () => ({ GIT_DEFAULT_HASH: 'sha256' }),
+  'config count': async () => ({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.bare', GIT_CONFIG_VALUE_0: 'false' }),
+  'frozen dates': async () => ({ GIT_AUTHOR_DATE: '@1000000000 +0000', GIT_COMMITTER_DATE: '@1000000000 +0000' }),
+}
+const EACH = Object.values(STRAY)
+STRAY.everything = async () => Object.assign({}, ...(await Promise.all(EACH.map(make => make()))))
+STRAY['the usual hook leftovers'] = async () => ({
+  GIT_OBJECT_DIRECTORY: await tempDir(), GIT_WORK_TREE: await tempDir(), GIT_LITERAL_PATHSPECS: '1', GIT_AUTHOR_DATE: '@1000000000 +0000',
+})
+
+for (const [label, make] of Object.entries(STRAY)) {
+  test(`inherited GIT_* variables can't redirect or corrupt the store: ${label}`, async () => {
+    const vars = await make()
+    const dir = join(await tempDir(), 'config.git')
+    const git = new Git(dir)
+    await withEnv(vars, async () => {
+      await git.initBare('main')
+      assert.equal(await git.emptyTree(), EMPTY_TREE)
+      const c1 = await commit(git, [{ path: 'prompts/a.md', text: '1' }, { path: 'crew.yaml', text: 'x' }])
+      const c2 = await commit(git, [{ path: 'prompts/a.md', text: '2' }, { path: 'crew.yaml', delete: true }])
+      assert.equal(await git.resolve(MAIN), c2)
+      assert.equal(await git.readBlob(c2, 'prompts/a.md'), '2')
+      assert.deepEqual(await git.listPaths(c2, 'prompts/'), ['prompts/a.md'])
+      assert.deepEqual(await git.listPaths(c1, ''), ['crew.yaml', 'prompts/a.md'])
+      assert.deepEqual(await git.changedPaths(c1, c2), ['crew.yaml', 'prompts/a.md'])
+      assert.deepEqual(await git.changedPaths(c1, c2, ['prompts/a.md']), ['prompts/a.md'])
+      assert.deepEqual(await git.changedPaths(c1, c2, ['other']), [])
+      // Commit times are real, not frozen by an inherited GIT_AUTHOR_DATE / GIT_COMMITTER_DATE.
+      const [author, committer] = (await git.run(['log', '-1', '--format=%at %ct', c2])).stdout.trim().split(' ').map(Number)
+      assert.notEqual(author, 1000000000)
+      assert.notEqual(committer, 1000000000)
+      assert.ok(author! > 1_700_000_000 && committer! > 1_700_000_000)
+    })
+    // With the environment back to normal the repository must be whole.
+    await git.run(['fsck'])
+    assert.equal((await git.run(['rev-parse', '--show-object-format'])).stdout.trim(), 'sha1')
+    assert.deepEqual(await indexLeftovers(dir), [])
+    for (const value of Object.values(vars).filter(v => v.startsWith('/') && !v.endsWith('/index'))) {
+      assert.deepEqual(await readdir(value), [], `${value} was written to`)
+    }
+  })
+}
