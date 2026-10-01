@@ -199,7 +199,7 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
 2. **dsh's own home.** `~/.dsh` mixes dsh's config and data. Leave it, or point `DSH_HOME` somewhere XDG-shaped?
 3. **The VM.** OS, provisioning, and the service unit. Deferred from the brainstorm.
 4. **Gate environment.** Sandbox, timeouts, and whether gates need network or secrets.
-5. **Main-agent preset vs global `delegate`.** See the spike lessons above.
+5. ~~**Main-agent preset vs global `delegate`.**~~ Settled 2026-10-01: `delegate` is a row in the dish preset, which `crew` owns until `orchestrator` (see the [crew spec](specs/crew.md)).
 6. **Public access with GitHub sign-in, instead of Tailscale only** (raised 2026-09-30, to settle at deployment). You may make dish publicly reachable, signing in with GitHub and allowing only your account and members of the `frostyard` org, so others can use it. This would reopen several decisions:
    - **Access** (currently Tailscale only, Funnel only for webhooks): dsh's own token-in-URL auth would sit behind an OAuth front, either a proxy or a dsh plugin.
    - **Multi-user:**
