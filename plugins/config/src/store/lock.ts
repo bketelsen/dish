@@ -1,21 +1,31 @@
-import { open, readFile, unlink } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import { link, readFile, unlink, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
-import { join } from 'node:path'
-import { setTimeout as sleep } from 'node:timers/promises'
+import { join, resolve } from 'node:path'
 import { ConfigStoreError } from './errors.ts'
 
 const LOCK_FILE = 'dish.lock'
 const BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
-// Another process that has just created the lock may not have written it yet; see `readHolder`.
-const PARTIAL_WRITE_GRACE_MS = 25
+// The largest pid `process.kill` accepts; anything above throws ERR_INVALID_ARG_TYPE.
+const MAX_PID = 0x7fffffff
 
 /** What a lock file says about its holder. */
 interface Holder {
   pid: number
+  /** Random per `acquireLock` call: tells two holders with the same pid apart. */
+  nonce?: string
   /** Linux boot id, when the holder could read one. */
   bootId?: string
   host: string
 }
+
+/**
+ * The nonces of the locks this process holds, or is in the middle of creating. A lock that names this
+ * process's own pid but carries none of them was written by someone else who had the same pid: a
+ * container with its own pid namespace on a shared `boot_id`, say. That holder is not us, and can't be
+ * probed with `kill`, so the lock is stale.
+ */
+const ownNonces = new Set<string>()
 
 function errorCode(error: unknown): unknown {
   return (error as { code?: unknown }).code
@@ -39,34 +49,32 @@ function parseHolder(text: string): Holder | undefined {
     return undefined
   }
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
-  const { pid, bootId, host } = value as Record<string, unknown>
-  // pid <= 0 is never a process: kill(0) and kill(-n) would signal whole process groups.
-  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return undefined
+  const { pid, nonce, bootId, host } = value as Record<string, unknown>
+  // pid <= 0 is rejected because kill(0, 0) and kill(-n, 0) probe a whole process group, not one process;
+  // pid > MAX_PID because process.kill throws on it, which `isAlive` would read as "alive" and lock the store for good.
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || pid > MAX_PID) return undefined
   if (typeof host !== 'string') return undefined
+  if (nonce !== undefined && typeof nonce !== 'string') return undefined
   if (bootId !== undefined && typeof bootId !== 'string') return undefined
-  return bootId === undefined ? { pid, host } : { pid, bootId, host }
+  const holder: Holder = { pid, host }
+  if (nonce !== undefined) holder.nonce = nonce
+  if (bootId !== undefined) holder.bootId = bootId
+  return holder
 }
 
 /**
  * Read the lock file. Resolves `undefined` when it is gone, `null` when it is there but isn't a valid lock.
- * `open(path, 'wx')` and the write that follows are two steps, so a file that reads back empty or
- * unparseable may belong to a process caught between them. It gets one more look after a short wait before
- * being called garbage.
+ * A lock is only ever created complete (see `createLock`), so an unreadable one is garbage, not a holder mid-write.
  */
 async function readHolder(path: string): Promise<Holder | null | undefined> {
-  for (let attempt = 0; ; attempt++) {
-    let text: string
-    try {
-      text = await readFile(path, 'utf8')
-    } catch (error) {
-      if (errorCode(error) === 'ENOENT') return undefined
-      throw error
-    }
-    const holder = parseHolder(text)
-    if (holder !== undefined) return holder
-    if (attempt > 0) return null
-    await sleep(PARTIAL_WRITE_GRACE_MS)
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return undefined
+    throw error
   }
+  return parseHolder(text) ?? null
 }
 
 /** Whether a process with `pid` exists. `EPERM` means it exists under another user; any other surprise is treated as alive, the safe answer. */
@@ -81,34 +89,46 @@ function isAlive(pid: number): boolean {
 
 /**
  * Whether the holder is gone, so its lock can be taken over.
- * - A lock from another host is live: the store sits on a shared filesystem and that pid can't be probed from here.
- * - A different boot id means the machine rebooted since, so the pid (which may have been reused) says nothing.
+ * - Which machine: a boot id equal to this machine's means the holder is here, whatever its hostname says
+ *   (DHCP or NetworkManager can rename a host mid-boot). Without one to compare, or with a different one, a
+ *   lock from another host is live: the store may sit on a shared filesystem and that pid can't be probed.
+ * - A different boot id on this host means the machine rebooted since, so the pid (which may have been
+ *   reused) says nothing: stale.
+ * - On this machine, a lock that names our own pid but none of our nonces is another namespace's holder: stale.
  * - Otherwise the lock is stale exactly when its pid is not alive.
  */
 function isStale(holder: Holder, host: string, bootId: string | undefined): boolean {
-  if (holder.host !== host) return false
-  if (holder.bootId !== undefined && bootId !== undefined && holder.bootId !== bootId) return true
+  const comparable = holder.bootId !== undefined && bootId !== undefined
+  if (comparable && holder.bootId !== bootId) return holder.host === host
+  if (!comparable && holder.host !== host) return false
+  if (holder.pid === process.pid && !(holder.nonce !== undefined && ownNonces.has(holder.nonce))) return true
   return !isAlive(holder.pid)
 }
 
-/** Create the lock file exclusively and write `content` to it. Resolves `false` if it already exists. */
+/**
+ * Create the lock file with `content` already in it, or resolve `false` if a lock exists.
+ * The content goes into a temporary file first, which is then hard-linked to the lock path: `link` fails with
+ * `EEXIST` rather than replace anything, and the lock appears whole. Creating the lock empty with
+ * `open(path, 'wx')` and writing afterwards would leave a window in which a live holder's lock reads as empty
+ * garbage, and another process would take it over.
+ */
 async function createLock(path: string, content: string): Promise<boolean> {
-  let handle
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
   try {
-    handle = await open(path, 'wx')
+    await writeFile(tmp, content, { flag: 'wx' })
+  } catch (error) {
+    await unlink(tmp).catch(() => {})
+    throw error
+  }
+  try {
+    await link(tmp, path)
+    return true
   } catch (error) {
     if (errorCode(error) === 'EEXIST') return false
     throw error
+  } finally {
+    await unlink(tmp).catch(() => {})
   }
-  try {
-    await handle.writeFile(content)
-  } catch (error) {
-    await handle.close().catch(() => {})
-    await unlink(path).catch(() => {})
-    throw error
-  }
-  await handle.close()
-  return true
 }
 
 function locked(holder: Holder | null | undefined): ConfigStoreError {
@@ -119,54 +139,63 @@ function locked(holder: Holder | null | undefined): ConfigStoreError {
 }
 
 /**
- * Take the store's process lock, `<gitDir>/dish.lock`, created exclusively (`open(..., 'wx')`).
- * It holds JSON `{ pid, bootId?, host }`.
+ * Take the store's process lock, `<gitDir>/dish.lock`. It is created whole and exclusively: written to a
+ * temporary file, then hard-linked into place (see `createLock`). It holds JSON `{ pid, nonce, bootId?, host }`.
  *
- * - A lock whose holder is alive, or lives on another host, throws `ConfigStoreError('LOCKED')` naming the pid.
- * - A stale lock (unparseable; its pid dead; or from an earlier boot) is taken over: removed, then created anew.
- *   If another process creates it first, the lock is theirs and this throws `LOCKED`. Two processes taking over
- *   the *same* stale lock at the same instant can still both end up believing they hold it (one deletes the
- *   other's fresh lock). That race is tolerated: dish is a single-user tool, and it needs a crashed holder and
- *   two new processes starting within the same few milliseconds.
+ * - A lock whose holder is alive, or lives on another machine, throws `ConfigStoreError('LOCKED')` naming the pid.
+ * - A stale lock (unparseable; its pid dead; from an earlier boot; or naming our pid without our nonce) is taken
+ *   over: removed, then created anew. If another process creates it first, the lock is theirs and this throws
+ *   `LOCKED`. Two processes taking over the *same* stale lock at the same instant can still both end up believing
+ *   they hold it (one deletes the other's fresh lock). That race is tolerated: dish is a single-user tool, and it
+ *   needs a crashed holder and two new processes starting within the same few milliseconds.
  *
  * @param gitDir - the repository directory the lock lives in; it must exist.
  * @param pid - recorded as the holder; defaults to this process.
- * @returns a function that releases the lock. It removes the file only if it still names `pid` (a lock someone
- *   else has taken over is left alone), and calling it again does nothing.
+ * @returns a function that releases the lock. It removes the file only if it still carries `pid` and this call's
+ *   nonce (a lock someone else has taken over, or re-created, is left alone), and calling it again does nothing.
  */
 export async function acquireLock(gitDir: string, pid: number = process.pid): Promise<() => Promise<void>> {
-  const path = join(gitDir, LOCK_FILE)
+  const path = join(resolve(gitDir), LOCK_FILE)
   const host = hostname()
   const bootId = await currentBootId()
-  const content = JSON.stringify(bootId === undefined ? { pid, host } : { pid, bootId, host })
+  const nonce = randomBytes(8).toString('hex')
+  const content = JSON.stringify(bootId === undefined ? { pid, nonce, host } : { pid, nonce, bootId, host })
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (await createLock(path, content)) return releaser(path, pid)
-    const holder = await readHolder(path)
-    // Gone already (released between our create and read): try the create again.
-    if (holder === undefined) continue
-    if (holder !== null && !isStale(holder, host, bootId)) throw locked(holder)
-    // Stale. Second time round we already took over once and still lost the create: someone else owns it now.
-    if (attempt > 0) throw locked(holder)
-    await unlink(path).catch(error => {
-      if (errorCode(error) !== 'ENOENT') throw error
-    })
+  // Registered before the lock exists, so that no look at the file, however early, takes it for a stranger's.
+  ownNonces.add(nonce)
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (await createLock(path, content)) return releaser(path, pid, nonce)
+      const holder = await readHolder(path)
+      // Gone already (released between our create and read): try the create again.
+      if (holder === undefined) continue
+      if (holder !== null && !isStale(holder, host, bootId)) throw locked(holder)
+      // Stale. Second time round we already took over once and still lost the create: someone else owns it now.
+      if (attempt > 0) throw locked(holder)
+      await unlink(path).catch(error => {
+        if (errorCode(error) !== 'ENOENT') throw error
+      })
+    }
+    throw locked(await readHolder(path))
+  } catch (error) {
+    ownNonces.delete(nonce)
+    throw error
   }
-  throw locked(await readHolder(path))
 }
 
-function releaser(path: string, pid: number): () => Promise<void> {
+function releaser(path: string, pid: number, nonce: string): () => Promise<void> {
   let released = false
   return async () => {
     if (released) return
     const holder = await readHolder(path)
-    if (holder !== undefined && holder !== null && holder.pid === pid) {
+    if (holder !== undefined && holder !== null && holder.pid === pid && holder.nonce === nonce) {
       await unlink(path).catch(error => {
         if (errorCode(error) !== 'ENOENT') throw error
       })
     }
     // Only once it has worked, so a failed release can be retried.
     released = true
+    ownNonces.delete(nonce)
   }
 }
 
