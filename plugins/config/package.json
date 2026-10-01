@@ -9,9 +9,18 @@
     ".": "./src/index.ts"
   },
   "files": [
-    "src"
+    "src",
+    "cordis.patch.yml"
   ],
   "license": "MIT",
+  "keywords": [
+    "dsh-plugin"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "dependencies": {
     "@deepseek-ai/schemastery": "~3.18.4",
     "dish-kit": "workspace:*"

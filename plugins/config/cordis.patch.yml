@@ -1,0 +1,7 @@
+# The config store other dish plugins read and write through (the dishConfig
+# service). No config here on purpose: the remote is per machine, and two
+# machines pushing to one remote would diverge. Set `remote` on the dish-config
+# row in this machine's profile patch at install time.
+- insert:
+    - id: dish-config
+      name: dish-config
