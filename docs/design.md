@@ -140,12 +140,43 @@ Swapping a piece means keeping its service contract. For example:
 | Prompts | Every role's prompt is editable in the web UI and versioned. |
 | Storage | Config and runtime data kept apart; XDG defaults. |
 
-## Open questions and spikes
+## Spike results (2026-09-30)
 
-1. **Specialist identity for children (spike first).** dsh's in-process children join their *parent's* preset, so "spawn a coder" doesn't by itself give the child the coder prompt and tools. Options: a `crew` subagent provider that composes the child with its role, or scoping prompt sections and tools to the child agent when it starts. Everything else rests on this.
-2. **Keeping the chat open.** Confirm that background delegation (continuable children, jobs) keeps the main agent responsive in the web UI, and that completions arrive as notices.
-3. **Enforcing the reviewer's model.** Where `crew` intercepts a reviewer delegation to pin the cross-family model, and how a model id maps to a family.
-4. **Config backup.** Push the config repo to a private remote like the vault, or keep it local?
-5. **dsh's own home.** `~/.dsh` mixes dsh's config and data. Leave it, or point `DSH_HOME` somewhere XDG-shaped?
-6. **The VM.** OS, provisioning, and the service unit. Deferred from the brainstorm.
-7. **Gate environment.** Sandbox, timeouts, and whether gates need network or secrets.
+Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headless) and `spike-web` profiles. The results below were read from session logs, not from what the agents reported.
+
+**Specialist identity: solved without a custom provider.**
+- dsh's subagent service accepts three per-child options, all persisted, so a resumed child keeps its role:
+  - `persona` replaces the deployment persona for that child only.
+  - `toolFilter` removes tools from the child's prompt *and* blocks their execution.
+  - `agentOptions` sets the provider, model and effort.
+- `crew` builds its own `delegate(role, …)` tool on `ctx.subagents.startContinuable()`.
+- Verified per role:
+  - Persona text reached each child.
+  - Tool lists matched the filters (the researcher had no `bash`, `write`, `edit` or `delegate`).
+  - Models were assigned per tier.
+- **The reviewer was pinned cross-family by the harness:** coder on `gpt-5-mini`, reviewer automatically on `claude-haiku-4.5`. This also answers how the reviewer's model is enforced (former open question 3).
+
+**Keeping the chat open: confirmed live in the web UI.**
+- `delegate` returns at once and the main agent's turn ends.
+- A question asked mid-task was answered in 2 s while the coder ran.
+- The child's settlement notice started a new main-agent turn with no input from you. dsh documents this: a notice that reaches an idle parent starts one model request.
+
+**Lessons that shape the design:**
+- **Validate structurally; models fill every optional field.**
+  - GPT-5 mini passed an invented route (`openai/gpt-4o-mini`). The child failed after starting and the notice said only "left no closing message", so the main agent retried 67 times.
+  - Fix: `delegate` now checks the route synchronously (errors name the valid models), treats empty strings as absent, and caps children per agent.
+  - Generalization: anything a model can get wrong that costs quota gets a structural check.
+- **Don't trust the main agent's account of events.** When `delegate` failed to load, the main agent fabricated a plausible results table. The ledger and the inbox must record harness events (delegations, settlements, gate runs), not model claims.
+- **Child failure notices hide the cause.** `crew` should attach the child's error to the notice it sends the parent.
+- **The main agent's prompt must say "end your turn, you'll be notified".** In headless mode, without that instruction, it busy-polled `list_agents`. With it, in the web UI, it ended its turn properly.
+- **Children inherit the parent's other delegation tools** (`subagent`, `subagent_fork`, `workflow`). Depth limits make them fail, but they should be filtered out for children.
+- **Children can message the parent mid-task** (`send_message`). The coder used it unprompted, so personas should say when to.
+- **`delegate` is currently a global tool**, so every preset sees it. dsh presets can't extend one another, so a dedicated main-agent preset would mean copying `standard`'s tool list. Decide when `crew` is built properly.
+
+## Open questions
+
+1. **Config backup.** Push the config repo to a private remote like the vault, or keep it local?
+2. **dsh's own home.** `~/.dsh` mixes dsh's config and data. Leave it, or point `DSH_HOME` somewhere XDG-shaped?
+3. **The VM.** OS, provisioning, and the service unit. Deferred from the brainstorm.
+4. **Gate environment.** Sandbox, timeouts, and whether gates need network or secrets.
+5. **Main-agent preset vs global `delegate`.** See the spike lessons above.

@@ -1,0 +1,5 @@
+# Mounted after @deepseek-ai/dsh-base, which provides the tool registry and
+# the subagent service with its in-process `spawn` provider.
+- insert:
+    - id: dish-crew
+      name: dish-crew
