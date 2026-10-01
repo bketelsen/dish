@@ -1454,3 +1454,29 @@ test('the table is capped the moment it holds LOG_MAX lines with older ones behi
   assert.equal(made.state().decisions.next, undefined)
   assert.equal(made.state().decisions.capped, true)
 })
+
+test('the event for the page\'s own commit, landing while the follow-up read of the save is out, waits for it: no conflict beside "Saved"', async () => {
+  const { page, state, fake } = await opened()
+  page.face.editField('readOnly', '0.95')
+  const held = gate()
+  fake.gates.set('thresholds', held)
+  const reads = fake.calls.filter(c => c === 'thresholds').length
+  const saving = page.face.save()
+  await until('the follow-up read', () => fake.calls.filter(c => c === 'thresholds').length === reads + 1)
+  // The save has been answered and its read is out: the save is not over, so the form can't be edited and Save is off.
+  assert.equal(state().thresholds.busy, 'save')
+  assert.equal(canSave(state().thresholds), false)
+  page.face.editField('readOnly', '0.1')
+  assert.equal(state().thresholds.form.readOnly, '0.95')
+  await page.onConfigEvent(changed('judge.yaml'))
+  held.release()
+  await saving
+  const { thresholds } = state()
+  assert.equal(thresholds.conflict, undefined)
+  assert.equal(thresholds.dirty, false)
+  assert.equal(thresholds.busy, undefined)
+  assert.equal(thresholds.notice!.tone, 'success')
+  assert.equal(thresholds.saved!.commit, id(1))
+  assert.equal(thresholds.form.readOnly, '0.95')
+  assert.equal(canSave(thresholds), false, 'nothing left to save')
+})

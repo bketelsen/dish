@@ -19,8 +19,21 @@ import { JudgeRemote } from '../src/remote.ts'
 
 // What the page believes of the wires it doesn't own is checked here, where Node's types and the others' are both in reach:
 // this fails to compile if either side changes.
-type Same<A, B> = [A] extends [B] ? [B] extends [A] ? true : false : false
+type Same<A, B> = [A] extends [B] ? [B] extends [A] ? SameKeys<A, B> : false : false
+/** Mutual assignability lets a field that is optional on one side only through: the keys of two objects must be the same too. */
+type SameKeys<A, B> = [A] extends [object] ? [B] extends [object] ? ([keyof A] extends [keyof B] ? [keyof B] extends [keyof A] ? true : false : false) : true : true
 type Check<T extends true> = T
+/** The check itself: a field on one side only is a difference, optional or not (mutual assignability alone lets an optional one through). */
+export type SameSeesAnOptionalFieldOnOneSide = [
+  // @ts-expect-error an optional field the other side lacks
+  Check<Same<{ a: number }, { a: number, extra?: string }>>,
+  // @ts-expect-error the same, the other way round
+  Check<Same<{ a: number, extra?: string }, { a: number }>>,
+  // @ts-expect-error a field that is optional on one side and required on the other
+  Check<Same<{ a: number }, { a?: number }>>,
+  Check<Same<{ a: number, b?: string }, { b?: string, a: number }>>,
+]
+
 export type PageMatchesStore = [
   Check<Same<ConfigEvent, StoreEvent>>,
   Check<Same<CommitInfo, StoreCommit>>,

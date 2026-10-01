@@ -584,8 +584,8 @@ export function createJudgePage(api: JudgeApi, config?: ConfigCalls, credentials
     const sent = settingsOf(state.form)
     patchT({ busy: 'save', notice: undefined })
     const result = await settle(() => api.saveThresholds(sent, state.saved?.commit ?? '', state.note), 'save')
-    patchT({ busy: undefined })
     if (!result.ok) {
+      patchT({ busy: undefined })
       await refused(result)
       return
     }
@@ -599,6 +599,9 @@ export function createJudgePage(api: JudgeApi, config?: ConfigCalls, credentials
     // Nothing was typed since the save began (editing waits for it), and an edit another writer made right after is shown as it is.
     const generation = ++documentGeneration
     const read = await settle(() => api.thresholds())
+    // The save is over only now: until the form has what was saved, an event for this very commit is the page's own, and waits
+    // (`refreshThresholds` holds it while `busy` is `save`, and `settleEvents` reads it below).
+    patchT({ busy: undefined })
     if (read.ok && generation === documentGeneration) adopt(read.value)
     else if (!read.ok && generation === documentGeneration && commit !== null) {
       // The save is in; the form's own values are what was saved, and the commit is the one to save over from now on.

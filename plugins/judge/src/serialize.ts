@@ -17,7 +17,7 @@
 
 import { JSON_SCHEMA, load } from 'js-yaml'
 import { DEFAULT_TEXT, parseSettings } from './settings.ts'
-import type { JudgeSettings } from './settings.ts'
+import type { JudgeSettings, ParseResult } from './settings.ts'
 
 /** `key: value` with an optional trailing comment, at any indentation. A section's heading has no value. */
 const KEY_LINE = /^(\s*)([A-Za-z][A-Za-z0-9]*):(?:\s+(\S.*?))?(\s+#.*)?$/
@@ -70,10 +70,12 @@ function same(a: JudgeSettings, b: JudgeSettings): boolean {
 /**
  * `settings` as the text of `judge.yaml`: the shipped file with the values replaced, its comments and its order kept.
  * @param settings - settings that passed `parseSettings`.
+ * @param parse - what reads the text back for the check: `parseSettings`. A seam for a test to put a reader that disagrees in its
+ *   place, since a bug that would make the check fail can't be had from valid settings.
  * @throws a plain `Error` if the shipped file has a line this can't fill, or the text it made doesn't parse back to `settings`:
  *   both are bugs, and neither can come from what a person typed.
  */
-export function serializeSettings(settings: JudgeSettings): string {
+export function serializeSettings(settings: JudgeSettings, parse: (text: string) => ParseResult = parseSettings): string {
   const values = valuesOf(settings)
   const used = new Set<string>()
   let section = ''
@@ -102,7 +104,7 @@ export function serializeSettings(settings: JudgeSettings): string {
     if (!used.has(path)) throw new Error(`the shipped judge.yaml has no line for ${path}`)
   }
   const text = lines.join('\n')
-  const back = parseSettings(text)
+  const back = parse(text)
   if (!back.ok) throw new Error(`the settings were written as a judge.yaml that is not valid (${back.problem}); this is a bug`)
   if (!same(back.settings, settings)) throw new Error('the settings were written as a judge.yaml that says something else; this is a bug')
   return text

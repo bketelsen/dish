@@ -15,7 +15,9 @@ import * as plugin from '../src/index.ts'
 import type { JudgeLogLine } from '../src/log.ts'
 import type { ErrorCode, Outcome } from '../src/protocol.ts'
 import { JudgeRemote } from '../src/remote.ts'
-import { DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from '../src/settings.ts'
+import { serializeSettings } from '../src/serialize.ts'
+import { DEFAULT_SETTINGS, DEFAULT_TEXT, JUDGE_SPEC, parseSettings } from '../src/settings.ts'
+import type { JudgeSettings } from '../src/settings.ts'
 import { dirs, jevBody, mountConfig, mountJudge, noulAnswer, provideStub, seeded, startFakeJev, waitFor, watchLogs } from './helpers.ts'
 import type { Dirs, FakeJev } from './helpers.ts'
 
@@ -686,6 +688,40 @@ test('what the judge says in its status or its failure is masked once more on th
   } finally {
     await handle.dispose()
     for (const stub of stubs) await stub.dispose()
+  }
+})
+
+test('a serializer that fails makes the save fail loudly, as a thrown error and not as a refusal, and nothing is written', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const stored = mountConfig(ctx, where.repository)
+  await stored
+  const stubs = [
+    await provideStub(ctx, 'dishJudge', { settings: async () => DEFAULT_SETTINGS, log: {} }),
+    await provideStub(ctx, 'judge', { status: async () => ({}), ask: async () => ({}) }),
+  ]
+  const release = ctx.dishConfig.claim(JUDGE_SPEC)
+  // The real serializer, with a reader that disagrees about what it wrote: what a bug in it would look like.
+  const other = parseSettings(DEFAULT_TEXT)
+  assert.ok(other.ok)
+  const handle = ctx.plugin(JudgeRemote, { keyName: 'K', serialize: (settings: JudgeSettings) => serializeSettings(settings, () => other) } as never)
+  await handle
+  try {
+    const remote = await waitFor('the remote', () => ctx.get('dishJudgeRemote') as JudgeRemote | undefined)
+    const head = await ctx.dishConfig.head()
+    const settings = shipped()
+    settings.commands.readOnly = 0.97
+    await assert.rejects(() => remote.saveThresholds(settings, '', ''), /says something else; this is a bug/)
+    assert.equal(await ctx.dishConfig.head(), head, 'nothing was committed')
+    assert.equal(await ctx.dishConfig.read('judge.yaml'), undefined, 'and no file was written')
+    // What a person gets right is still a result: a value the check refuses never reaches the serializer.
+    settings.commands.readOnly = 2
+    assert.match(failed(await remote.saveThresholds(settings, '', ''), 'INVALID'), /^commands\.readOnly:/)
+  } finally {
+    await handle.dispose()
+    release()
+    for (const stub of stubs) await stub.dispose()
+    await stored.dispose()
   }
 })
 

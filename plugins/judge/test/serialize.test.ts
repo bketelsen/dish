@@ -151,3 +151,41 @@ test('the output is stable: serializing what was written gives the same text', (
   const once = serializeSettings(settings)
   assert.equal(serializeSettings(parsedBack(once)), once)
 })
+
+test('a text that does not parse back to what was given is a bug and throws, rather than hand a file that says something else', () => {
+  const settings = changed((s) => { s.commands.readOnly = 0.97 })
+  // The check's reader is a seam: here it reads another file than the one written.
+  const other = parseSettings(DEFAULT_TEXT)
+  assert.ok(other.ok)
+  assert.throws(() => serializeSettings(settings, () => other), /says something else; this is a bug/)
+  // A text the check refuses is a bug too, with its reason.
+  assert.throws(() => serializeSettings(settings, () => ({ ok: false, problem: 'model: broken' })), /not valid \(model: broken\); this is a bug/)
+  // With the real reader the same settings are fine.
+  assert.doesNotThrow(() => serializeSettings(settings))
+})
+
+test('the check compares every setting: a reader that changes any one of them is caught', () => {
+  const settings = changed((s) => { s.tools.gated = ['bash', 'pwsh', 'extra*'] })
+  const real = parseSettings(serializeSettings(settings))
+  assert.ok(real.ok)
+  const copy = (): Record<string, any> => JSON.parse(JSON.stringify(real.settings)) as Record<string, any>
+  const changes: Array<(s: Record<string, any>) => void> = [
+    (s) => { s.model = 'jev-9' },
+    (s) => { s.timeoutMs = 2001 },
+    (s) => { s.commands.readOnly = 0.91 },
+    (s) => { s.commands.reversible = 0.91 },
+    (s) => { s.commands.servesTask = 0.51 },
+    (s) => { s.screening.withhold = 0.91 },
+    (s) => { s.screening.warn = 0.49 },
+    (s) => { s.screening.chunkChars = 24001 },
+    (s) => { s.tools.gated.pop() },
+    (s) => { s.tools.screened.push('more') },
+  ]
+  for (const change of changes) {
+    const wrong = copy()
+    change(wrong)
+    const parsed = parseSettings(JSON.stringify(wrong))
+    assert.ok(parsed.ok)
+    assert.throws(() => serializeSettings(settings, () => parsed), /says something else/, JSON.stringify(wrong))
+  }
+})

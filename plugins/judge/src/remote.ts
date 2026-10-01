@@ -54,7 +54,9 @@ declare module '@deepseek-ai/cordis' {
 }
 
 // What the page is told must be what the server says: these fail to compile if either side drifts.
-type Same<A, B> = [A] extends [B] ? [B] extends [A] ? true : false : false
+type Same<A, B> = [A] extends [B] ? [B] extends [A] ? SameKeys<A, B> : false : false
+/** Mutual assignability lets a field that is optional on one side only through: the keys of two objects must be the same too. */
+type SameKeys<A, B> = [A] extends [object] ? [B] extends [object] ? ([keyof A] extends [keyof B] ? [keyof B] extends [keyof A] ? true : false : false) : true : true
 type Check<T extends true> = T
 /** `T` without `readonly`, all the way down. */
 type Writable<T> = T extends readonly (infer U)[] ? Writable<U>[] : T extends object ? { -readonly [K in keyof T]: Writable<T[K]> } : T
@@ -183,16 +185,20 @@ const PURPOSES: readonly string[] = JUDGE_PURPOSES
 export interface RemoteOptions {
   /** The credential's name in dsh's store: what the page sets and removes. Not the key. */
   keyName: string
+  /** What writes settings as the text of `judge.yaml`: `serializeSettings`. A seam for a test to make it fail. */
+  serialize?: (settings: JudgeSettings) => string
 }
 
 export class JudgeRemote extends TypertRemoteService {
   static inject = ['dishJudge', 'judge']
 
   private readonly keyName: string
+  private readonly serialize: (settings: JudgeSettings) => string
 
   constructor(ctx: Context, options: RemoteOptions) {
     super(ctx, SERVICE, { namespace: NAMESPACE })
     this.keyName = options.keyName
+    this.serialize = options.serialize ?? (settings => serializeSettings(settings))
   }
 
   /**
@@ -264,7 +270,7 @@ export class JudgeRemote extends TypertRemoteService {
       const meta: WriteMeta = { author: { kind: 'user' } }
       if (why !== '') meta.note = why
       if (from !== '') meta.base = from
-      return await store.write([{ path: 'judge.yaml', text: serializeSettings(checked) }], meta) ?? null
+      return await store.write([{ path: 'judge.yaml', text: this.serialize(checked) }], meta) ?? null
     })
   }
 
