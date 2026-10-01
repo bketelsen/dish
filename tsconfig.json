@@ -20,6 +20,7 @@
     "plugins/*/test"
   ],
   "exclude": [
-    "plugins/*/src/client"
+    "plugins/*/src/client",
+    "packages/*/src/ui"
   ]
 }

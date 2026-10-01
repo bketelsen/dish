@@ -3,7 +3,9 @@
  * plugin's id and removes it on unload.
  *
  * Colours come from `--dsw-alias-*` tokens only, so the page follows the theme. Nothing here sets a width wider than
- * its container: at phone width the page does not scroll sideways, and a diff scrolls inside its own box.
+ * its container: at phone width the page does not scroll sideways.
+ *
+ * The diff's own rules (`.dish-diff-*`) are dish-kit's, added by `DiffView`'s module when this bundle loads.
  */
 
 const css = `
@@ -250,71 +252,6 @@ const css = `
 .dish-history-notice-error {
   border-color: var(--dsw-alias-state-error-primary);
   color: var(--dsw-alias-state-error-primary);
-}
-.dish-history-diffs {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  min-width: 0;
-}
-.dish-history-file {
-  min-width: 0;
-  border: 0.5px solid var(--dsw-alias-border-l3);
-  border-radius: var(--dsw-radius-md);
-  overflow: hidden;
-}
-.dish-history-file-head {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px 8px;
-  padding: 6px 10px;
-  border-bottom: 0.5px solid var(--dsw-alias-border-l3);
-  background: var(--dsw-alias-bg-layer-1);
-}
-.dish-history-diff {
-  margin: 0;
-  max-width: 100%;
-  overflow-x: auto;
-  background: var(--dsw-alias-markdown-code-block);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  line-height: 18px;
-}
-.dish-history-diff:focus-visible {
-  outline: 1px solid var(--dsw-alias-state-business-primary);
-  outline-offset: -1px;
-}
-.dish-history-diff-lines {
-  display: inline-block;
-  min-width: 100%;
-  padding: 4px 0;
-  font: inherit;
-}
-.dish-history-line {
-  display: block;
-  min-height: 18px;
-  padding: 0 10px;
-  white-space: pre;
-  color: var(--dsw-alias-label-secondary);
-}
-.dish-history-line-meta,
-.dish-history-line-note {
-  color: var(--dsw-alias-label-tertiary);
-}
-.dish-history-line-hunk {
-  color: var(--dsw-alias-label-tertiary);
-  background: var(--dsw-alias-interactive-bg-hover);
-}
-.dish-history-line-add {
-  color: var(--dsw-alias-state-success-primary);
-  background: var(--dsw-alias-code-diff-added);
-  box-shadow: inset 3px 0 0 var(--dsw-alias-state-success-primary);
-}
-.dish-history-line-remove {
-  color: var(--dsw-alias-state-error-primary);
-  background: var(--dsw-alias-code-diff-deleted);
-  box-shadow: inset 3px 0 0 var(--dsw-alias-state-error-primary);
 }
 `
 

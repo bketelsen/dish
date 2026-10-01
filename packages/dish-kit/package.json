@@ -7,6 +7,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./client": "./src/client.ts",
+    "./ui": "./src/ui/index.ts",
+    "./ui/diff": "./src/ui/diff.ts",
     "./build-client": "./scripts/build-client.mjs"
   },
   "dependencies": {
@@ -14,10 +16,16 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-typert-protocol": "^0.2.0-rc.2"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2"
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
+    "@types/react": "~18.3.1"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.client.json"
   }
 }

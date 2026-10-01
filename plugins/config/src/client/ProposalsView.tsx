@@ -5,9 +5,9 @@
 
 import { useEffect, useState, type FormEvent } from 'react'
 import { Button, Input, Tag, type TagTone } from '@deepseek-ai/dsh-client-ui-primitives'
+import { DiffView } from 'dish-kit/ui'
 import type { ProposalInfo } from '../protocol.ts'
 import type { DiffState, HistoryActions, ProposalsState } from './controller.ts'
-import { DiffView } from './DiffView.tsx'
 import { authorLabel, relativeTime } from './format.ts'
 import { STALE_TEXT } from './outcome.ts'
 import { Group, LoadError, Paths } from './parts.tsx'

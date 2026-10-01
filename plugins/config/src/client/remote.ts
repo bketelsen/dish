@@ -11,9 +11,16 @@ import type {
   InvocationDescriptor, InvocationParameterDescriptor, RemoteResult, RemoteStreamHandle, TypertRemoteContribution,
 } from '@deepseek-ai/dsh-typert-protocol'
 import { jsonCodec, remoteContribution, remoteDescriptor } from 'dish-kit/client'
+import type { FileDiff as KitFileDiff } from 'dish-kit/ui'
 import {
   NAMESPACE, type CommitInfo, type ConfigEvent, type FileDiff, type NamespaceInfo, type Outcome, type ProposalInfo, type RemoteStatus,
 } from '../protocol.ts'
+
+// `DiffView` is dish-kit's, and dish-kit does not depend on dish-config, so it declares a `FileDiff` of its own. The page hands
+// it the store's: this fails to compile if the two shapes ever differ.
+type Same<A, B> = [A] extends [B] ? [B] extends [A] ? true : false : false
+type Check<T extends true> = T
+export type DiffViewTakesStoreDiffs = Check<Same<FileDiff, KitFileDiff>>
 
 /**
  * What the page calls. Every call but `namespaces` and `watch` resolves to `Outcome<...>` inside the gateway's

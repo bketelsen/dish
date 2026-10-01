@@ -2,8 +2,8 @@
 
 import { useState } from 'react'
 import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
+import { DiffView } from 'dish-kit/ui'
 import type { DetailState, HistoryActions } from './controller.ts'
-import { DiffView } from './DiffView.tsx'
 import { authorLabel, relativeTime, shortId, subjectOf } from './format.ts'
 import { LoadError, Paths } from './parts.tsx'
 
