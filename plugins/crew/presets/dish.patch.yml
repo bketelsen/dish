@@ -2,26 +2,33 @@
 # (presets/standard.patch.yml). Do not edit it by hand: the next run replaces
 # it, and the drift test fails until the committed file matches.
 #
-# The dish preset: the standard preset's plugin list, with its `persona` row
-# replaced by dish-prompts/persona, so the main agent's prompts come from
-# Settings → Prompts. Edits saved from Settings → Agent presets live in your
-# profile and override this row's `config.plugins` there.
+# The dish preset: the standard preset's plugin list, with three changes:
+#   - its `persona` row is replaced by dish-prompts/persona, so the main
+#     agent's prompts come from Settings → Prompts;
+#   - dish-crew/delegate follows it, which gives the main agent `delegate`;
+#   - dsh's own delegation (`subagent`, `subagent_fork` and the workflow
+#     engine) is disabled, so the main agent delegates through crew only.
+#     `send_message`, `interrupt_agent` and `list_agents` stay.
+# Edits saved from Settings → Agent presets live in your profile and override
+# this row's `config.plugins` there.
 #
 # After a dsh upgrade, regenerate it:
-#   pnpm --filter dish-prompts sync-preset
+#   pnpm --filter dish-crew sync-preset
 - insert:
     - id: preset-dish
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: dish
         name: dish
-        description: 'The dish main agent: your prompts from Settings → Prompts, on the standard tool set.'
+        description: 'The dish main agent: your prompts from Settings → Prompts, and a crew to delegate to, on the standard tool set without dsh''s own delegation tools.'
         order: 0
         plugins:
           - id: dish-persona
             name: dish-prompts/persona
             config:
               role: main
+          - id: dish-crew-delegate
+            name: dish-crew/delegate
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
@@ -98,6 +105,7 @@
                 name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
               - id: tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
+                disabled: true
                 config:
                   provider: spawn
                   toolName: subagent
@@ -105,6 +113,7 @@
                   backgroundMode: continuable
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
+                disabled: true
                 config:
                   provider: fork
                   toolName: subagent_fork
@@ -127,10 +136,12 @@
                   maxDepth: provider-managed
               - id: workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'
+                disabled: true
                 config:
                   provider: spawn
               - id: tool-workflow
                 name: '@deepseek-ai/dsh-tool-workflow'
+                disabled: true
               - id: tool-ralph
                 name: '@deepseek-ai/dsh-tool-ralph'
                 disabled: true
