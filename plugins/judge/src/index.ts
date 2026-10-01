@@ -241,13 +241,27 @@ export function warnOnce(logger: Logger): (message: string) => void {
 export const SETTINGS_READ_BUDGET_MS = 200
 
 /**
+ * How many budgets old a read that has not answered is before `settings()` stops waiting for it and reads again: 10, which
+ * is 2 s with the shipped budget and the same as the shipped `timeoutMs`, so a store that has kept a read for longer than a
+ * whole gate is allowed is one that is stuck, not slow. Sooner would pile reads up behind the git command that is holding
+ * the first; never would leave the settings at what they were when the store stopped, even if it came back.
+ */
+export const SETTINGS_RETRY_AFTER_BUDGETS = 10
+
+/** The most reads of the store that are waiting at once: the one that is current, and two that were let go of. A store that has kept three is not asked again until one answers. */
+const MAX_READS_AT_ONCE = 3
+
+/**
  * `settings()` over a store that may or may not be there, looked up on every call. Each distinct problem is logged
  * once, and none of it is thrown: every gate reads this on every call, and the shipped default always works.
  *
- * It also never waits for the store longer than `budgetMs`. Past that it answers with the last settings it read from the
- * store (the shipped default if it has read none) and says so once. The read goes on, and its result is kept for the next
- * call; calls that come while one is going join it rather than start another, so a store that never answers is not asked
- * again and again.
+ * It also never waits for the store longer than `budgetMs` for a read. Past that it answers with the last settings it read
+ * from the store (the shipped default if it has read none) and says so once. The read goes on, and its result is kept for
+ * the next call. Calls that come while a read is going join it, for what is left of its budget; calls that come after the
+ * budget is spent are answered at once, without joining it, so that a store that never answers costs no wait and no memory
+ * for each call. A read that is still going `SETTINGS_RETRY_AFTER_BUDGETS` budgets after it began is let go of (what it
+ * finds, if it does, is kept all the same, unless something newer is) and the next call reads again, with at most
+ * three reads waiting at once.
  */
 export function createSettingsReader(
   store: () => Reader | undefined,
@@ -258,7 +272,12 @@ export function createSettingsReader(
 ): () => Promise<JudgeSettings> {
   /** The last settings that were read from the store and passed `parseSettings`. */
   let lastGood: JudgeSettings | undefined
-  const read = async (): Promise<JudgeSettings> => {
+  /** Which read found them. Reads are numbered as they begin, and one that ends after a later one did can't put older settings over theirs. */
+  let lastGoodFrom = 0
+  let begun = 0
+  /** The reads that have begun and not ended. */
+  let waiting = 0
+  const read = async (number: number): Promise<JudgeSettings> => {
     try {
       const reader = store()
       if (reader === undefined) {
@@ -281,23 +300,40 @@ export function createSettingsReader(
         tell(`judge.yaml in the config store is not valid, so the shipped default is used: ${parsed.problem}`)
         return DEFAULT_SETTINGS
       }
-      lastGood = parsed.settings
+      if (number > lastGoodFrom) {
+        lastGood = parsed.settings
+        lastGoodFrom = number
+      }
       return parsed.settings
     } catch (error) {
       tell(`could not get the judge settings (${describe(error)}); using the shipped default`)
       return DEFAULT_SETTINGS
     }
   }
-  let reading: Promise<JudgeSettings> | undefined
+  /** The read that calls join: the newest, until it ends or is let go of. */
+  let current: { since: number, done: Promise<JudgeSettings> } | undefined
+  const begin = (): { since: number, done: Promise<JudgeSettings> } => {
+    waiting++
+    const mine = { since: performance.now(), done: undefined as unknown as Promise<JudgeSettings> }
+    mine.done = read(++begun).finally(() => {
+      waiting--
+      if (current === mine) current = undefined
+    })
+    current = mine
+    return mine
+  }
+  const fallback = (): JudgeSettings => {
+    tell(`reading judge.yaml from the config store took more than ${budgetMs} ms; using ${lastGood === undefined ? 'the shipped default' : 'the settings last read'} until it answers`)
+    return lastGood ?? DEFAULT_SETTINGS
+  }
   return () => {
-    reading ??= read().finally(() => { reading = undefined })
-    const mine = reading
+    if (current !== undefined && performance.now() - current.since >= budgetMs * SETTINGS_RETRY_AFTER_BUDGETS && waiting < MAX_READS_AT_ONCE) current = undefined
+    const mine = current ?? begin()
+    const left = budgetMs - (performance.now() - mine.since)
+    if (left <= 0) return Promise.resolve(fallback())
     return new Promise<JudgeSettings>((resolve) => {
-      const timer = setTimeout(() => {
-        tell(`reading judge.yaml from the config store took more than ${budgetMs} ms; using ${lastGood === undefined ? 'the shipped default' : 'the settings last read'} until it answers`)
-        resolve(lastGood ?? DEFAULT_SETTINGS)
-      }, budgetMs)
-      mine.then((settings) => { clearTimeout(timer); resolve(settings) }, () => { clearTimeout(timer); resolve(lastGood ?? DEFAULT_SETTINGS) })
+      const timer = setTimeout(() => { resolve(fallback()) }, left)
+      mine.done.then((settings) => { clearTimeout(timer); resolve(settings) }, () => { clearTimeout(timer); resolve(lastGood ?? DEFAULT_SETTINGS) })
     })
   }
 }

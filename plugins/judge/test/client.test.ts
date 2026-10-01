@@ -474,7 +474,7 @@ test('the settings a call used are what the next lookup\'s cap is: the cap follo
   assert.ok(performance.now() - started < 120 + 250)
 })
 
-test('status() is bounded like a call: a key lookup that never answers is no key, within the time limit', async () => {
+test('status() is bounded like a call: a key lookup that never answers is unavailable, within the time limit', async () => {
   let hang = false
   const r = await rig({ timeoutMs: 150, key: () => hang ? never() : Promise.resolve(KEY) })
   r.jev.always(ok())
@@ -484,7 +484,8 @@ test('status() is bounded like a call: a key lookup that never answers is no key
   const status = await r.judge.status()
   const elapsed = performance.now() - started
   assert.equal(status.keySet, false)
-  assert.equal(status.state, 'no-key')
+  assert.equal(status.state, 'unavailable', 'a store that does not answer is not a store with no key in it')
+  assert.match(status.lastError!, /^reading the TypeSafe key timed out after 150 ms$/)
   assert.ok(elapsed >= 140 && elapsed < 150 + 250, `took ${elapsed} ms`)
   assert.equal(r.jev.requests.length, 1)
 })
@@ -1418,4 +1419,195 @@ test('the plugin\'s settings reach the call: the shipped model and time limit', 
   await provideStub(ctx, 'credentials', { resolve: async () => ({ value: KEY, source: 'env' }) })
   answersOf(await ctx.judge.ask(asks))
   assert.equal(jev.requests[0]!.json.model, DEFAULT_SETTINGS.model)
+})
+
+// --- after the re-review ------------------------------------------------------------------------------
+
+test('a key that can not be read is unavailable in the status, with a reason, and no-key is only for a store that has none', async () => {
+  const threw = await rig({ key: async () => { throw new Error('credential file says: hunter2') } })
+  let status = await threw.judge.status()
+  assert.equal(status.keySet, false)
+  assert.equal(status.state, 'unavailable')
+  assert.equal(status.lastError, 'could not read the TypeSafe key from the credential store')
+  assert.equal(typeof status.lastErrorAt, 'number')
+  assert.doesNotMatch(JSON.stringify(status), /hunter2/, 'what the store said is not repeated')
+
+  // The limit is the one the settings last had, which a call has read.
+  let hang = false
+  const hung = await rig({ timeoutMs: 150, key: () => hang ? never() : Promise.resolve(KEY) })
+  hung.jev.always(ok())
+  answersOf(await hung.ask())
+  hang = true
+  status = await hung.judge.status()
+  assert.deepEqual([status.keySet, status.state, status.lastError], [false, 'unavailable', 'reading the TypeSafe key timed out after 150 ms'])
+
+  for (const nothing of [undefined, '', '   ']) {
+    const none = await rig({ key: async () => nothing })
+    status = await none.judge.status()
+    assert.deepEqual(status, { keySet: false, state: 'no-key', p50: null, p95: null, calls: 0, failures: 0 })
+  }
+})
+
+test('a key lookup that fails when the status is asked does not rewrite what the status remembers of the calls', async () => {
+  let t = 1_000
+  let broken = false
+  const r = await rig({ clock: () => t, key: async () => { if (broken) throw new Error('locked'); return KEY } })
+  r.jev.queue({ kind: 'status', status: 503, body: 'down' })
+  failureOf(await r.ask())
+  t = 2_000
+  broken = true
+  const during = await r.judge.status()
+  assert.deepEqual([during.state, during.lastError, during.lastErrorAt], ['unavailable', 'could not read the TypeSafe key from the credential store', 2_000])
+  broken = false
+  const after = await r.judge.status()
+  assert.equal(after.state, 'unavailable', 'the last call still failed')
+  assert.match(after.lastError!, /503/, 'the last error is the call\'s again')
+  assert.equal(after.lastErrorAt, 1_000)
+})
+
+test('a call that was cancelled is not held for a key lookup that never answers, though it has text to mask', async () => {
+  const r = await rig({ timeoutMs: 2000, key: () => never() })
+  const controller = new AbortController()
+  controller.abort()
+  const started = performance.now()
+  const failure = failureOf(await r.ask({ signal: controller.signal, subject: 'git push', tool: 'bash', callId: 'c1', decide: () => ({ decision: 'ask' }) }))
+  const elapsed = performance.now() - started
+  assert.equal(failure.message, 'the call to the judge was cancelled')
+  assert.ok(elapsed < 300, `took ${elapsed} ms`)
+  assert.equal(r.jev.requests.length, 0)
+  assert.equal(r.lines.length, 1, 'and the call has its line')
+  assert.deepEqual([r.lines[0]!.subject, r.lines[0]!.tool, r.lines[0]!.decision], ['git push', 'bash', 'ask'])
+})
+
+test('a call that is cancelled while it waits for the key for its mask ends at once, as one skipped in a back-off does when the store hangs', async () => {
+  let hang = false
+  const r = await rig({ timeoutMs: 2000, key: () => hang ? never() : Promise.resolve(KEY) })
+  r.jev.queue({ kind: 'status', status: 429, headers: { 'retry-after': '30' } })
+  failureOf(await r.ask())
+  hang = true
+  const controller = new AbortController()
+  setTimeout(() => controller.abort(), 60)
+  const started = performance.now()
+  const failure = failureOf(await r.ask({ signal: controller.signal, subject: 'git push' }))
+  const elapsed = performance.now() - started
+  assert.match(failure.message, /^TypeSafe asked for a pause: skipping the judge for another \d+ s$/)
+  assert.ok(elapsed >= 50 && elapsed < 400, `took ${elapsed} ms`)
+  assert.equal(r.lines.length, 2)
+  assert.equal(r.lines[1]!.subject, 'git push')
+  assert.equal(r.jev.requests.length, 1)
+})
+
+test('without a signal, the same skip is still held to the time limit by a store that hangs', async () => {
+  let hang = false
+  const r = await rig({ timeoutMs: 150, key: () => hang ? never() : Promise.resolve(KEY) })
+  r.jev.queue({ kind: 'status', status: 429, headers: { 'retry-after': '30' } })
+  failureOf(await r.ask())
+  hang = true
+  const started = performance.now()
+  failureOf(await r.ask({ subject: 'git push' }))
+  const elapsed = performance.now() - started
+  assert.ok(elapsed >= 100 && elapsed < 150 + 250, `took ${elapsed} ms`)
+})
+
+test('a call whose settling fails still has a line, a minimal one, and comes back as a failure', async () => {
+  const r = await rig()
+  r.jev.queue(ok())
+  const agent = { id: 'a1', get session(): never { throw new Error('the agent is gone') } }
+  const failure = failureOf(await r.ask({ agent, tool: 'bash', subject: 'ls', purpose: 'approval' }))
+  assert.equal(failure.message, 'the judge failed unexpectedly: the agent is gone')
+  assert.equal(r.lines.length, 1)
+  const { at, ...rest } = r.lines[0]!
+  assert.equal(typeof at, 'number')
+  assert.deepEqual(rest, { purpose: 'approval', subject: '', answers: {}, decision: null, latencyMs: null, error: 'the judge failed unexpectedly: the agent is gone' })
+  assert.equal(Object.hasOwn(r.lines[0]!, 'agent'), false)
+  // And it is one line, not two, and a later call is as it was.
+  r.jev.queue(ok())
+  answersOf(await r.ask())
+  assert.equal(r.lines.length, 2)
+})
+
+test('the minimal line has the key masked, and nothing in it can throw: not a log that throws, not a request whose purpose does', async () => {
+  const r = await rig({ key: async () => KEY })
+  r.jev.queue(ok())
+  const agent = { id: 'a1', get session(): never { throw new Error(`failed with ${KEY}`) } }
+  const failure = failureOf(await r.ask({ agent }))
+  assert.doesNotMatch(JSON.stringify([failure, r.lines]), new RegExp(KEY))
+  assert.match(r.lines[0]!.error!, /failed with ‹key›/)
+
+  for (const log of [() => { throw new Error('log is broken') }, () => Promise.reject(new Error('log is broken'))]) {
+    const bad = await rig({ log })
+    bad.jev.queue(ok())
+    failureOf(await bad.ask({ agent: { get session(): never { throw new Error('x') } } }))
+  }
+  const odd = await rig()
+  odd.jev.queue(ok())
+  const request = { state: 's', questions: QUESTIONS, get purpose(): never { throw new Error('no purpose') } }
+  assert.equal((await odd.judge.ask(request as never)).ok, false)
+  assert.equal(odd.lines.length, 0, 'a line that can not be made is not made, and the call still came back')
+})
+
+// --- where an invalid request was refused ---------------------------------------------------------------
+
+test('invalid says where it was refused: from the request when the client refused it before sending, from the server when TypeSafe did', async () => {
+  const r = await rig()
+  const request = async (overrides: Record<string, unknown> = {}) => failureOf(await r.ask(overrides), 'invalid')
+  assert.equal((await request({ questions: {} })).from, 'request')
+  assert.equal((await request({ questions: { 'Bad Id': QUESTIONS.serves_task } })).from, 'request')
+  assert.equal((await request({ questions: { q: { type: 'choice', instructions: 'x', criteria: { only: null } } } })).from, 'request')
+  assert.equal((await request({ questions: { q: { type: 'choice', instructions: 'x', criteria: { 'a b ': null, b: null } } } })).from, 'request')
+  assert.equal((await request({ state: 7 })).from, 'request')
+  assert.equal((await request({ state: undefined })).from, 'request')
+
+  r.jev.queue({ kind: 'status', status: 422, body: 'bad questions' }, { kind: 'status', status: 400, body: '{"detail":"Unknown model"}' })
+  const refused = await request()
+  assert.equal(refused.from, 'server')
+  assert.match(refused.message, /HTTP 422/)
+  assert.equal(refused.tooBig, undefined)
+  const unknown = await request()
+  assert.equal(unknown.from, 'server')
+  assert.match(unknown.message, /Unknown model/)
+  assert.equal(r.jev.requests.length, 2, 'the client\'s own refusals sent nothing')
+})
+
+test('tooBig comes with either: the client\'s own size checks are from the request, and TypeSafe\'s max_tokens_exceeded from the server', async () => {
+  const r = await rig()
+  const state = await (async () => failureOf(await r.ask({ state: 'x'.repeat(200 * 1024) }), 'invalid'))()
+  assert.deepEqual([state.from, state.tooBig], ['request', true])
+  const big = (): Question => ({ type: 'noul', instructions: 'y'.repeat(60 * 1024) })
+  const body = failureOf(await r.ask({ state: 'small', questions: { a: big(), b: big(), c: big(), d: big(), e: big() } }), 'invalid')
+  assert.deepEqual([body.from, body.tooBig], ['request', true])
+  assert.match(body.message, /256 KB/)
+
+  r.jev.queue({ kind: 'status', status: 400, body: JSON.stringify({ detail: { error_type: 'max_tokens_exceeded', message: 'too many tokens' } }) })
+  const server = failureOf(await r.ask(), 'invalid')
+  assert.deepEqual([server.from, server.tooBig], ['server', true])
+})
+
+test('an unavailable result has neither from nor tooBig, and an invalid one that is not too big has no tooBig', async () => {
+  const r = await rig({ key: async () => undefined })
+  const none = failureOf(await r.ask())
+  assert.equal(Object.hasOwn(none, 'from'), false)
+  assert.equal(Object.hasOwn(none, 'tooBig'), false)
+  for (const status of [401, 429, 500, 503]) {
+    const down = await rig()
+    down.jev.queue({ kind: 'status', status })
+    const failure = failureOf(await down.ask())
+    assert.equal(Object.hasOwn(failure, 'from'), false, `HTTP ${status}`)
+  }
+  const refused = await rig()
+  const failure = failureOf(await refused.ask({ questions: {} }), 'invalid')
+  assert.equal(Object.hasOwn(failure, 'tooBig'), false)
+  assert.equal(failure.from, 'request')
+})
+
+test('decide is given the invalid result with its from, and the result that comes back has it too', async () => {
+  const r = await rig()
+  let given: JudgeResult | undefined
+  const asked = await r.ask({ questions: {}, decide: (result: JudgeResult) => { given = result; return { decision: 'ask' } } })
+  assert.equal(asked.ok === false && asked.reason === 'invalid' && asked.from, 'request')
+  assert.ok(given !== undefined && !given.ok && given.reason === 'invalid')
+  assert.equal(given.from, 'request')
+  r.jev.queue({ kind: 'status', status: 422, body: 'no' })
+  const server = await r.ask({ decide: () => ({ decision: 'ask' }) })
+  assert.equal(server.ok === false && server.reason === 'invalid' && server.from, 'server')
 })

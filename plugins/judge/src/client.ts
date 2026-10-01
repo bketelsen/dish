@@ -6,7 +6,8 @@
  *
  * - **It never throws for a Jev failure.** A missing key, a refused key, a time out, a bad status, a dropped connection, a
  *   malformed answer: each is `{ ok: false, reason: 'unavailable' }` (or `'invalid'`, for a request that was refused as
- *   written). The caller decides what that means; the gates fail closed.
+ *   written, with `from: 'request'` when this client refused it before sending and `from: 'server'` when TypeSafe did).
+ *   The caller decides what that means; the gates fail closed.
  * - **It is bounded, whatever its dependencies do.** One request, no retries, and `timeoutMs` covers the whole call: the
  *   settings lookup, the key lookup, the exchange, reading the body and the caller's `decide` hook. The caller's signal
  *   cuts it short too. A lookup that never answers is cut off (the settings at the `timeoutMs` last seen, the shipped one
@@ -18,7 +19,8 @@
  * - **The key stays in the call.** It is resolved at the start of each call, goes into one header, and is dropped. It is not
  *   in any string the client produces: every message, log line and status passes through a mask that hides the key (as it
  *   is, JSON-escaped and URL-encoded) and an error body is cut to 200 characters first. A call that ended before the key
- *   was looked up, and has text of the caller's to log, looks it up for the mask.
+ *   was looked up, and has text of the caller's to log, looks it up for the mask (and the caller's signal ends that lookup
+ *   too: a call that was cancelled is not held for a credential store that hangs).
  * - **Statuses.** `401` is `unavailable` ("the TypeSafe key was refused"); `400` and `422` are `invalid`, with the start of
  *   what TypeSafe said; `429` and `529` are `unavailable` and start the back-off; any other non-2xx is `unavailable`.
  *   A request that is too big (the state over 100 KB, the whole body over 256 KB, or TypeSafe's `max_tokens_exceeded`) is
@@ -27,9 +29,9 @@
  *   exactly the declared options and sum to 1 within 0.025, a choice that is one of its options, a score within its range.
  *
  * The client doesn't know where its log goes: `log` is a function it is given, called once for every call, whatever its
- * outcome, and never waited for. The caller can have its decision written on that line: `decide` is called with the
- * settled result and returns what was decided, which goes on the line and comes back as `decided`. This file imports no
- * dsh, so it can be tested against a fake server alone.
+ * outcome, and never waited for (a call whose settling fails has a minimal line, so every call has one). The caller can
+ * have its decision written on that line: `decide` is called with the settled result and returns what was decided, which
+ * goes on the line and comes back as `decided`. This file imports no dsh, so it can be tested against a fake server alone.
  *
  * @module dish-judge/client
  */
@@ -109,11 +111,17 @@ export interface JudgeRequest<D extends Decision = Decision> {
 
 export type JudgeResult =
   | { ok: true, answers: Record<string, Answer>, latencyMs: number }
+  /** Jev could not be asked, or did not answer as it should: `from` and `tooBig` are only on an `invalid` result. */
+  | { ok: false, reason: 'unavailable', message: string, from?: undefined, tooBig?: undefined }
   /**
-   * `invalid` is a request TypeSafe, or this client, refused as written; `tooBig` says it was too big (the state over
-   * 100 KB, the whole request over 256 KB, or TypeSafe's `max_tokens_exceeded`), which says nothing about Jev.
+   * `invalid` is a request refused as written, and `from` says by whom: `'request'` is this client, before anything was
+   * sent (a question id, type, option or count that isn't allowed, a state that can't be written as JSON or is too big),
+   * so what to change is in the request the caller made, and `message` says what; `'server'` is TypeSafe, with a 400 or
+   * 422 (an unknown model, a request its schema or its own rules refuse), which is more often the judge's configuration
+   * than the caller's request. `tooBig` says it was too big (the state over 100 KB, the whole request over 256 KB, or
+   * TypeSafe's `max_tokens_exceeded`), which says nothing about Jev, and can come from either.
    */
-  | { ok: false, reason: 'unavailable' | 'invalid', message: string, tooBig?: true }
+  | { ok: false, reason: 'invalid', from: 'request' | 'server', message: string, tooBig?: true }
 
 /** A result, and what the request's `decide` made of it, if it made anything. */
 export type Asked<D extends Decision = Decision> = JudgeResult & { decided?: D }
@@ -130,14 +138,19 @@ export type Asked<D extends Decision = Decision> = JudgeResult & { decided?: D }
  * or as too big, one without a key, one that was cancelled, one skipped in a back-off.
  */
 export interface JudgeStatus {
-  /** Whether there is a usable key now. A lookup that fails, or takes longer than the call's time limit, is no key. */
+  /** Whether there is a usable key now. A lookup that returns nothing, fails, or takes longer than the call's time limit is no usable key. */
   keySet: boolean
   /**
-   * `no-key` without a key. Otherwise `unavailable` while Jev is being skipped (a `429` or `529`) or when the last call that
-   * tried Jev got no answers (a `400` or `422` that isn't about size is that too), and `ok` if not, including before any call.
+   * `no-key` when the credential store has no key. `unavailable` when it can't be asked (the lookup fails or takes longer than
+   * the call's time limit: the key may well be set, and `lastError` says it could not be read), while Jev is being skipped (a
+   * `429` or `529`), and when the last call that tried Jev got no answers (a `400` or `422` that isn't about size is that
+   * too). `ok` if not, including before any call.
    */
   state: 'ok' | 'unavailable' | 'no-key'
-  /** The message of the last call that tried Jev and got no answers; kept after a success, with `lastErrorAt`. */
+  /**
+   * The message of the last call that tried Jev and got no answers; kept after a success, with `lastErrorAt`. When this status
+   * could not read the key, that is the message, and `lastErrorAt` is now.
+   */
   lastError?: string
   lastErrorAt?: number
   lastOkAt?: number
@@ -393,15 +406,16 @@ function maskerFor(key: string): (text: string) => string {
 /**
  * A function that hides the key as it is now, in the forms `maskerFor` does, for a caller that has text of its own to keep
  * (the log's withheld content, which the client doesn't write). The key is looked up, not kept, and the lookup is given
- * `ms`: no key, a lookup that fails, and one that takes longer all give a function that changes nothing, so that the caller
- * can go on with the masking that needs no key. Never rejects.
+ * `ms`, and is given up when `signal` aborts: no key, a lookup that fails, one that takes longer and one that is cancelled all
+ * give a function that changes nothing, so that the caller can go on with the masking that needs no key. Never rejects.
  */
-export async function currentKeyMask(lookup: () => Promise<string | undefined>, ms: number): Promise<(text: string) => string> {
+export async function currentKeyMask(lookup: () => Promise<string | undefined>, ms: number, signal?: AbortSignal): Promise<(text: string) => string> {
   try {
-    const key = cleanKey(await within(Promise.resolve().then(lookup), ms, 'the key lookup took too long'))
+    const looked = within(Promise.resolve().then(lookup), ms, 'the key lookup took too long')
+    const key = cleanKey(await (signal === undefined ? looked : untilAborted(looked, signal)))
     if (key !== undefined) return maskerFor(key)
   } catch {
-    // No key to hide, or none that could be found in time.
+    // No key to hide, or none that could be found in time, or the caller gave up.
   }
   return text => text
 }
@@ -497,16 +511,17 @@ function describeNetworkError(error: unknown): string {
 /** `promise`, or its rejection when `signal` aborts first. */
 function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    if (signal.aborted) {
-      reject(signal.reason)
-      return
-    }
     const onAbort = () => reject(signal.reason)
-    signal.addEventListener('abort', onAbort, { once: true })
+    // Listened to first, even for a signal that has aborted already: a promise that rejects later is then not an unhandled rejection.
     promise.then(
       (value) => { signal.removeEventListener('abort', onAbort); resolve(value) },
       (error: unknown) => { signal.removeEventListener('abort', onAbort); reject(error) },
     )
+    if (signal.aborted) {
+      reject(signal.reason)
+      return
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
   })
 }
 
@@ -554,10 +569,16 @@ function clip(text: string): string {
  */
 type Outcome =
   | { kind: 'answers', answers: Record<string, Answer>, latencyMs: number }
-  | { kind: 'failure', reason: 'unavailable' | 'invalid', message: string, effect: 'failed' | 'none', latencyMs: number | null, tooBig?: true }
+  | { kind: 'failure', reason: 'unavailable', message: string, effect: 'failed' | 'none', latencyMs: number | null }
+  | { kind: 'failure', reason: 'invalid', from: 'request' | 'server', message: string, effect: 'failed' | 'none', latencyMs: number | null, tooBig?: true }
 
-function failure(reason: 'unavailable' | 'invalid', message: string, effect: 'failed' | 'none', latencyMs: number | null = null, tooBig = false): Outcome {
-  return { kind: 'failure', reason, message, effect, latencyMs, ...tooBig ? { tooBig: true as const } : {} }
+function failure(reason: 'unavailable', message: string, effect: 'failed' | 'none', latencyMs: number | null = null): Outcome {
+  return { kind: 'failure', reason, message, effect, latencyMs }
+}
+
+/** A request refused as written, by this client (`request`) or by TypeSafe (`server`). */
+function invalid(from: 'request' | 'server', message: string, effect: 'failed' | 'none', latencyMs: number | null = null, tooBig = false): Outcome {
+  return { kind: 'failure', reason: 'invalid', from, message, effect, latencyMs, ...tooBig ? { tooBig: true as const } : {} }
 }
 
 /** What goes with one call while it runs. */
@@ -569,6 +590,8 @@ interface Scope {
   /** When the call's time limit ends, on the monotonic clock, and how long that limit is. */
   deadline: number
   limit: number
+  /** Whether the call's line was handed to the log. */
+  logged: boolean
 }
 
 export function createJudge(deps: JudgeDeps): Judge {
@@ -592,9 +615,9 @@ export function createJudge(deps: JudgeDeps): Judge {
   /** The call itself, up to what it came to. It may throw only for a mistake in this file. */
   async function run(request: JudgeRequest<Decision>, scope: Scope, begun: number): Promise<Outcome> {
     const questions = checkQuestions(request.questions)
-    if (!questions.ok) return failure('invalid', questions.message, 'none')
+    if (!questions.ok) return invalid('request', questions.message, 'none')
     const state = checkState(request.state)
-    if (!state.ok) return failure('invalid', state.message, 'none', null, state.tooBig === true)
+    if (!state.ok) return invalid('request', state.message, 'none', null, state.tooBig === true)
     const cancelled = () => failure('unavailable', CANCELLED, 'none')
     if (request.signal?.aborted) return cancelled()
 
@@ -634,7 +657,7 @@ export function createJudge(deps: JudgeDeps): Judge {
     const body = `{"model":${JSON.stringify(settings.model)},"state":${state.value},"questions":${JSON.stringify(questions.value)}}`
     const bodyBytes = Buffer.byteLength(body)
     if (bodyBytes > MAX_BODY_BYTES) {
-      return failure('invalid', `the request is ${kb(bodyBytes)} KB and the most is 256 KB: send less`, 'none', null, true)
+      return invalid('request', `the request is ${kb(bodyBytes)} KB and the most is 256 KB: send less`, 'none', null, true)
     }
 
     const timeout = limitSignal(scope.deadline - tick())
@@ -707,7 +730,7 @@ export function createJudge(deps: JudgeDeps): Judge {
     // is no sign that Jev is down, so the status doesn't take it as one; any other is, so a typo'd model shows on the page.
     if (status === 400 || status === 422) {
       const big = status === 400 && isTooManyTokens(text)
-      return failure('invalid', `TypeSafe refused the request (HTTP ${status})${detail()}`, big ? 'none' : 'failed', latencyMs, big)
+      return invalid('server', `TypeSafe refused the request (HTTP ${status})${detail()}`, big ? 'none' : 'failed', latencyMs, big)
     }
     if (status < 200 || status > 299) return failure('unavailable', `TypeSafe answered HTTP ${status}${detail()}`, 'failed', latencyMs)
 
@@ -755,14 +778,18 @@ export function createJudge(deps: JudgeDeps): Judge {
     const hasText = given(request.subject) || given(request.tool) || given(request.callId) || typeof agentId === 'string' || typeof agentId === 'number'
     if (!scope.keyLooked && (hasText || typeof request.decide === 'function')) {
       scope.keyLooked = true
-      scope.mask = await currentKeyMask(deps.key, Math.max(DECIDE_FLOOR_MS, scope.deadline - tick()))
+      // The caller's signal ends it too: a call that was cancelled is not held for a credential store that hangs.
+      scope.mask = await currentKeyMask(deps.key, Math.max(DECIDE_FLOOR_MS, scope.deadline - tick()), request.signal)
     }
 
     let result: JudgeResult
     if (outcome.kind === 'answers') {
       result = { ok: true, answers: outcome.answers, latencyMs: outcome.latencyMs }
     } else {
-      result = { ok: false, reason: outcome.reason, message: scope.mask(outcome.message), ...outcome.tooBig === true ? { tooBig: true as const } : {} }
+      const message = scope.mask(outcome.message)
+      result = outcome.reason === 'invalid'
+        ? { ok: false, reason: 'invalid', from: outcome.from, message, ...outcome.tooBig === true ? { tooBig: true as const } : {} }
+        : { ok: false, reason: 'unavailable', message }
     }
 
     const line: LogLine = {
@@ -803,6 +830,7 @@ export function createJudge(deps: JudgeDeps): Judge {
       }
     }
 
+    scope.logged = true
     try {
       Promise.resolve(deps.log(line)).catch(() => {})
     } catch {
@@ -815,7 +843,7 @@ export function createJudge(deps: JudgeDeps): Judge {
     async ask<D extends Decision = Decision>(request: JudgeRequest<D>): Promise<Asked<D>> {
       const at = now()
       const begun = tick()
-      const scope: Scope = { mask: text => text, keyLooked: false, deadline: begun + lastLimit, limit: lastLimit }
+      const scope: Scope = { mask: text => text, keyLooked: false, deadline: begun + lastLimit, limit: lastLimit, logged: false }
       let outcome: Outcome
       try {
         outcome = await run(request as JudgeRequest<Decision>, scope, begun)
@@ -825,24 +853,39 @@ export function createJudge(deps: JudgeDeps): Judge {
       try {
         return await settle(request, at, outcome, scope)
       } catch (error) {
-        // A mistake in settling: the call has still to come back, and as a failure.
-        return { ok: false, reason: 'unavailable', message: clip(scope.mask(`the judge failed unexpectedly: ${describe(error)}`)) }
+        // A mistake in settling: the call has still to come back, and as a failure, and every call has a line.
+        const message = clip(scope.mask(`the judge failed unexpectedly: ${describe(error)}`))
+        if (!scope.logged) {
+          // What can be said without touching the request again, since that may be what failed: nothing in this can throw.
+          try {
+            scope.logged = true
+            Promise.resolve(deps.log({ at, purpose: request.purpose, subject: '', answers: {}, decision: null, latencyMs: null, error: message })).catch(() => {})
+          } catch {
+            // No line, as before: the call is what matters.
+          }
+        }
+        return { ok: false, reason: 'unavailable', message }
       }
     },
 
     async status() {
       let keySet = false
+      // Why the key could not be read, when the lookup failed or hung: not the same as there being none, which is what the
+      // page asks the user to fix. What the credential store said is not repeated, as in a call.
+      let unreadable: string | undefined
+      const limit = limitSignal(lastLimit)
       try {
-        keySet = cleanKey(await untilAborted(Promise.resolve().then(deps.key), limitSignal(lastLimit))) !== undefined
+        keySet = cleanKey(await untilAborted(Promise.resolve().then(deps.key), limit)) !== undefined
       } catch {
-        // Not a key we can use, or not one in time.
+        unreadable = limit.aborted ? `reading the TypeSafe key timed out after ${lastLimit} ms` : 'could not read the TypeSafe key from the credential store'
       }
       const sorted = [...latencies].sort((a, b) => a - b)
+      const shownError = unreadable ?? lastError
       return {
         keySet,
-        state: !keySet ? 'no-key' : lastFailed || skipUntil > tick() ? 'unavailable' : 'ok',
-        ...lastError === undefined ? {} : { lastError },
-        ...lastErrorAt === undefined ? {} : { lastErrorAt },
+        state: unreadable !== undefined ? 'unavailable' : !keySet ? 'no-key' : lastFailed || skipUntil > tick() ? 'unavailable' : 'ok',
+        ...shownError === undefined ? {} : { lastError: shownError },
+        ...unreadable !== undefined ? { lastErrorAt: now() } : lastErrorAt === undefined ? {} : { lastErrorAt },
         ...lastOkAt === undefined ? {} : { lastOkAt },
         p50: sorted.length === 0 ? null : percentile(sorted, 50),
         p95: sorted.length === 0 ? null : percentile(sorted, 95),

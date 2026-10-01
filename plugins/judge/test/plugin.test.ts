@@ -615,6 +615,112 @@ test('a read that ends late with a file that is not valid, or an error, does not
   assert.equal((await settings()).timeoutMs, 3000)      // read 4, which never answers
 })
 
+test('while a read is stuck, the calls after the first are answered at once: they do not wait the budget each, and they join nothing', async () => {
+  const log = collector()
+  const { store, reads } = countingStore(() => wait())
+  const settings = plugin.createSettingsReader(store, log, 100)
+  const started = performance.now()
+  assert.equal(await settings(), DEFAULT_SETTINGS)
+  const first = performance.now() - started
+  assert.ok(first >= 90 && first < 100 + 150, `the first took ${first} ms`)
+  const next = performance.now()
+  for (let call = 0; call < 50; call++) assert.equal(await settings(), DEFAULT_SETTINGS)
+  const rest = performance.now() - next
+  assert.ok(rest < 50, `fifty more took ${rest} ms`)
+  assert.equal(reads(), 1)
+  assert.equal(log.lines.length, 1, log.lines.join('\n'))
+})
+
+test('while a read is stuck, what is attached to it stays bounded, however many calls come', async () => {
+  const { store } = countingStore(() => wait())
+  const settings = plugin.createSettingsReader(store, collector(), 30)
+  await settings()
+  // Every `then` there is while the calls are made, on any promise: after the budget, a call makes none.
+  const original = Promise.prototype.then
+  let thens = 0
+  Promise.prototype.then = function counted(this: Promise<unknown>, ...args: Parameters<typeof original>) {
+    thens++
+    return original.apply(this, args) as never
+  } as typeof original
+  try {
+    for (let call = 0; call < 2000; call++) await settings()
+  } finally {
+    Promise.prototype.then = original
+  }
+  assert.ok(thens < 10, `${thens} promises were chained to in 2000 calls`)
+})
+
+test('a read that is stuck for ten budgets is tried again, and the old one is let go: its late answer is still kept', async () => {
+  assert.equal(plugin.SETTINGS_RETRY_AFTER_BUDGETS, 10)
+  const log = collector()
+  const { store, reads } = countingStore(async (call) => {
+    if (call === 1) { await pause(450); return shippedWith((d) => { d.timeoutMs = 3000 }) }
+    return wait()
+  })
+  const settings = plugin.createSettingsReader(store, log, 30)     // a retry after 300 ms
+  assert.equal(await settings(), DEFAULT_SETTINGS)
+  assert.equal(reads(), 1)
+  await pause(200)
+  assert.equal(await settings(), DEFAULT_SETTINGS, 'at 230 ms, which is not ten budgets, it is not tried again')
+  assert.equal(reads(), 1)
+  await pause(100)
+  // At 330 ms, more than ten budgets since the first read began, a new one is made.
+  assert.equal(await settings(), DEFAULT_SETTINGS)
+  assert.equal(reads(), 2)
+  // The first answers, at 450 ms, with a file: its settings are what is used while the second is stuck.
+  await pause(150)
+  assert.equal((await settings()).timeoutMs, 3000)
+  assert.equal(reads(), 2, 'the second, which is not ten budgets old, is not asked again')
+})
+
+test('a read that is tried again does not let an old read that ends later put older settings over the newer', async () => {
+  const log = collector()
+  const { store } = countingStore(async (call) => {
+    if (call === 1) { await pause(500); return shippedWith((d) => { d.timeoutMs = 3000 }) }   // stuck, and then stale
+    if (call === 2) { await pause(80); return shippedWith((d) => { d.timeoutMs = 4000 }) }    // the retry: slow, but it ends first
+    return wait()
+  })
+  const settings = plugin.createSettingsReader(store, log, 30)
+  assert.equal(await settings(), DEFAULT_SETTINGS)
+  await pause(320)
+  assert.equal(await settings(), DEFAULT_SETTINGS)    // read 2 starts, at 350 ms, and ends at 430
+  await pause(200)                                      // read 1 ends at 500, after it
+  assert.equal((await settings()).timeoutMs, 4000)     // read 3, which never answers: the last good is read 2's
+  await pause(100)
+  assert.equal((await settings()).timeoutMs, 4000, 'what read 1 found, late, is older than what read 2 found, and is not kept over it')
+})
+
+test('a store that never answers is not asked more than three times at once, however long it goes on', async () => {
+  const log = collector()
+  const { store, reads } = countingStore(() => wait())
+  const settings = plugin.createSettingsReader(store, log, 5)
+  const until = performance.now() + 400
+  while (performance.now() < until) {
+    await settings()
+    await pause(5)
+  }
+  // 400 ms is eight times the 50 ms a retry waits: the first, and the two it was let go of, and no more.
+  assert.equal(reads(), 3)
+  assert.equal((await settings()), DEFAULT_SETTINGS)
+})
+
+test('a stuck read that ends frees its place, so a later one is tried again', async () => {
+  const log = collector()
+  const answers: Array<() => void> = []
+  const { store, reads } = countingStore(() => new Promise<string | undefined>((resolve) => { answers.push(() => resolve(shippedWith((d) => { d.timeoutMs = 3500 }))) }))
+  const settings = plugin.createSettingsReader(store, log, 5)
+  const until = performance.now() + 250
+  while (performance.now() < until) {
+    await settings()
+    await pause(5)
+  }
+  assert.equal(reads(), 3)
+  for (const answer of answers) answer()
+  await new Promise<void>(resolve => setImmediate(resolve))   // for what they found to be read
+  assert.equal((await settings()).timeoutMs, 3500)
+  assert.equal(reads(), 4, 'they have all ended, so there is a read to make')
+})
+
 test('the store going away is the default, not a cache', async () => {
   const log = collector()
   let present = true
