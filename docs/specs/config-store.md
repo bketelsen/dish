@@ -205,7 +205,8 @@ Provided by `dish-config` for the **main agent only**. They are registered when 
 - **Prompting** is in the tool descriptions: use `config_write` only for a change the user asked for in this conversation, and `config_propose` for anything the agent initiates; pass `base` from `config_read`; on `CONFLICT`, read again and redo the change; on a proposal that went `STALE`, read again and open a fresh one.
 - **Structural backstop.** Sessions started by `triggers` (unattended) don't get `config_write` at all. This is enforced when `triggers` exists; until then, every session is interactive.
 - **Per-namespace defaults** (each set by its owner):
-  - `prompts/` and `crew.yaml`: `write`
+  - `prompts/`: crew prompts `write`, `main` and `common` `propose` (see the [prompts spec](prompts.md))
+  - `crew.yaml`: `write`
   - family `direction.md`: `propose`, so even on request the agent proposes and you accept in one click. That's tighter than decision (b), so revisit if it gets in the way.
 
 ## Web UI: History page

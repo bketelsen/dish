@@ -122,12 +122,13 @@ Each is its own bundle. "Provides" names its Cordis service; plugins depend only
 |---|---|---|---|
 | `dish-kit` (library) | — | — | XDG paths, terminal logs, client build script, remote helpers, git-backed versioned store |
 | `config-store` | `dishConfig` | — | the config git repo: namespaced documents, history, diff, revert, change events |
-| `prompts` | `prompts` | `dishConfig` | role prompts plus the editor page (edit, history, diff, revert) |
+| `prompts` | `dishPrompts` | `dishConfig` | role prompts plus the editor page (edit, history, diff, revert) |
+| `skills` (placeholder) | to decide | `dishConfig` | dish's own skills (the pipeline's brainstorm, plan, test-first and review procedures, and others), stored and versioned in the config store, edited in the web UI, and offered to agents through dsh's skill mechanism. Shape not discussed yet. |
 | `crew` | `crew` | `prompts`, `dishConfig` | roles, model tiers, the model-family rule, giving each delegated child its role's identity and tools, the `delegate` tool |
 | `projects` | `projects` | `dishConfig` | the repo registry: family, role, clone path, gate command |
 | `workspaces` | `workspaces` | `projects` | clones on the VM, one worktree per task, cleanup |
 | `gates` | — | `projects` | gate execution at turn-stop, retry rounds |
-| `orchestrator` | — | `crew`, `workspaces`, `families` | the main-agent preset and the pipeline as prompts, skills and ledger tools |
+| `orchestrator` | — | `crew`, `skills`, `workspaces`, `families` | the main-agent preset and the pipeline as prompts, skills and ledger tools |
 | `families` | `families` | `dishConfig`, `projects` | direction, initiatives, ledger, the Families page |
 | `inbox` | `inbox` | — | items (proposal, approval, result) and the mobile-friendly page |
 | `triggers` | — | `families`, `inbox` | schedules and GitHub events → main-agent wake-ups |
@@ -194,7 +195,7 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
 
 ## Open questions
 
-1. **Config backup.** Push the config repo to a private remote like the vault, or keep it local?
+1. ~~**Config backup.**~~ Settled 2026-10-01: the store pushes `main` to the private `bketelsen/dish-config` after every commit, from one machine at a time.
 2. **dsh's own home.** `~/.dsh` mixes dsh's config and data. Leave it, or point `DSH_HOME` somewhere XDG-shaped?
 3. **The VM.** OS, provisioning, and the service unit. Deferred from the brainstorm.
 4. **Gate environment.** Sandbox, timeouts, and whether gates need network or secrets.
