@@ -624,7 +624,7 @@ function fakeJudge(script: (request: JudgeRequest<any>) => JudgeResult) {
       requests.push(request)
       const result = script(request)
       if (request.decide === undefined) return result
-      const decided = await request.decide(result)
+      const decided = await request.decide(result, { signal: new AbortController().signal })
       return { ...result, decided } as JudgeResult & { decided?: Decision }
     },
     status: () => Promise.reject(new Error('not used')),
