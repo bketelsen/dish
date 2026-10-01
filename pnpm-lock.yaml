@@ -160,6 +160,12 @@ importers:
         specifier: 0.2.0-rc.2
         version: 0.2.0-rc.2(52b5a8ab481be2b3d891c22a71641755)
 
+  plugins/prompts:
+    dependencies:
+      dish-config:
+        specifier: workspace:*
+        version: link:../config
+
 packages:
 
   '@agentclientprotocol/sdk@1.4.0':

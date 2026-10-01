@@ -1,0 +1,18 @@
+{
+  "name": "dish-prompts",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Role prompts for dish agents, kept in the config store",
+  "type": "module",
+  "files": [
+    "src",
+    "defaults"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin"
+  ],
+  "dependencies": {
+    "dish-config": "workspace:*"
+  }
+}
