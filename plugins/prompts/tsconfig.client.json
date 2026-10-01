@@ -12,5 +12,5 @@
     "verbatimModuleSyntax": true,
     "types": []
   },
-  "include": ["src/protocol.ts"]
+  "include": ["src/client", "src/protocol.ts"]
 }
