@@ -13,6 +13,7 @@ import {
 import type { CommandGateDeps, GateAgent } from '../src/gate.ts'
 import { DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from '../src/settings.ts'
 import type { JudgeSettings } from '../src/settings.ts'
+import * as plugin from '../src/index.ts'
 import { createSettingsReader } from '../src/index.ts'
 import { choiceAnswer, dirs, jevBody, mountConfig, mountJudge, noulAnswer, provideStub, seeded, shippedWith, startFakeJev } from './helpers.ts'
 
@@ -1084,8 +1085,8 @@ function jevSays(probabilities: Record<string, number>, serves: number) {
 const USER = { kind: 'user' } as const
 
 interface PluggedOptions {
-  /** Wait for the plugin to load. Without, the call is made while it is still loading. */
-  waitForLoad?: boolean
+  /** What `start` takes besides the configuration: a log whose prune hangs, say. */
+  internals?: plugin.Internals
   /** Mount dish-config on a real repository, and wait for judge.yaml to be seeded. */
   store?: boolean
   /** A stand-in for `dishConfig`, from a sibling plugin. */
@@ -1108,15 +1109,15 @@ async function plugged(t: { after(fn: () => unknown): void }, options: PluggedOp
   if (options.dishConfig !== undefined) await provideStub(ctx, 'dishConfig', options.dishConfig)
   const config = options.store === true ? mountConfig(ctx, where.repository) : undefined
   await config
-  const handle = mountJudge(ctx, where.state, { baseUrl: jev.url })
+  const handle = options.internals === undefined
+    ? mountJudge(ctx, where.state, { baseUrl: jev.url })
+    : ctx.plugin({ name: plugin.name, apply: (own: Context, given: plugin.Config) => { void plugin.start(own, given, options.internals!) } } as never, { terminal: false, stateDirectory: where.state, baseUrl: jev.url } as never)
   t.after(async () => {
     await handle.dispose()
     await config?.dispose()
   })
-  if (options.waitForLoad !== false) {
-    await handle
-    if (options.store === true) await seeded(ctx.dishConfig)
-  }
+  await handle
+  if (options.store === true) await seeded(ctx.dishConfig)
   const ran: Array<Record<string, unknown>> = []
   ctx.tools.register(defineTool({
     name: 'bash',
@@ -1227,16 +1228,30 @@ test('a cancelled call is logged as cancel by the plugin, and the effect questio
   assert.equal(p.jev.requests[1]!.json.questions.effect.instructions, 'What would running `command` from `cwd` do to files, systems and data?')
 })
 
-test('the gate is active while the plugin is still loading: a call made then is not run ungated', async (t) => {
-  const p = await plugged(t, { waitForLoad: false })
-  // The log's prune is a read of the disk, so the plugin has not finished loading when this call reaches the gate. Either the
-  // judge is not there yet (every gated call is then unavailable) or it is and says irreversible: a child is refused both ways.
-  p.jev.queue(jevSays(IRREVERSIBLE, 0.9))
+/** A log that is only what the plugin needs of one: nothing is written, and `prune` is `prune`. */
+function fakeLog(prune: () => Promise<{ days: number, withheld: number }>): plugin.Internals['log'] {
+  return {
+    write: async () => {},
+    withhold: async () => '0123456789abcdef',
+    read: async () => ({ lines: [], skipped: 0 }),
+    withheld: async () => undefined,
+    flush: async () => {},
+    prune,
+  } as plugin.Internals['log']
+}
+
+test('the gate is active while the log\'s prune is still going: the gate and the judge are there before it, and it waits for nothing', async (t) => {
+  let pruning = 0
+  const p = await plugged(t, { internals: { log: fakeLog(() => { pruning++; return new Promise(() => {}) }) } })
+  assert.equal(pruning, 1, 'the prune has started, and never ends')
+  p.jev.queue(jevSays(IRREVERSIBLE, 0.9), jevSays(READ_ONLY, 0.95))
   const refused = await p.call('bash', BASH('git push'), agentOf({ child: true, cwd: '/work/app', events: [userEvent(1, 'add a test')] }))
   assert.equal(refused.isError, true)
-  assert.match(textOf(refused), /^Error: (The judge didn't let this run|The command was refused because the judge is unavailable)/)
-  assert.deepEqual(p.ran, [])
-  await p.handle
+  assert.match(textOf(refused), /^Error: The judge didn't let this run: it reads as irreversible \(p 0\.87\)/)
+  assert.deepEqual(p.ran, [], 'not run ungated')
+  assert.equal(textOf(await p.call('bash', BASH('git status'))), 'it ran')
+  assert.equal(p.jev.requests.length, 2, 'the judge was asked, as it is once loaded')
+  assert.equal(pruning, 1)
 })
 
 // --- F4: the settings are read once and kept until judge.yaml changes ---------------------------------------------
