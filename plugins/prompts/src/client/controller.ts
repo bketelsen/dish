@@ -587,8 +587,12 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
       patch({ notice: { tone: 'error', text: `Couldn't ${verb} ${roleLabel(role)}`, detail: failure.message ?? failure.notice.text } })
     }
     if (failure.code === 'CONFLICT' && chosen === selection) {
+      // Like any read of the document, this one is dropped if a newer one (an event's, say) has been started since.
+      const generation = ++documentGeneration
       const theirs = await settle(() => api.read(role))
-      if (theirs.ok && chosen === selection) patch({ conflict: { theirs: theirs.value.text, commit: theirs.value.commit } })
+      if (theirs.ok && generation === documentGeneration && chosen === selection) {
+        patch({ conflict: { theirs: theirs.value.text, commit: theirs.value.commit } })
+      }
     }
     await settleEvents()
   }
@@ -644,7 +648,8 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
   const reset = async (): Promise<void> => {
     const state = get()
     const { selected: role, saved } = state
-    if (state.busy !== undefined || role === undefined || saved === undefined || state.defaultText === null) return
+    const { defaultText } = state
+    if (state.busy !== undefined || role === undefined || saved === undefined || defaultText === null) return
     const chosen = selection
     const label = roleLabel(role)
     patch({ busy: 'reset', notice: undefined })
@@ -655,20 +660,32 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
       return
     }
     const commit = result.value
-    patch({
-      notice: commit === null
-        ? { tone: 'info', text: `${label}: ${ALREADY_DEFAULT}` }
-        : { tone: 'success', text: `Reset ${label} to the default as ${shortId(commit.id)}` },
-    })
-    if (chosen === selection) {
-      // The editor shows the default, an unsaved edit included: that is what the person asked for. A read that began before the
-      // reset is older than it, so this one takes the place of any that is out.
-      const generation = ++documentGeneration
-      const read = await settle(() => api.read(role))
-      if (read.ok && generation === documentGeneration && chosen === selection) {
-        adopt(read.value)
-        // What a held live event would have shown is in what was just read.
-        eventWhileWriting = false
+    if (commit === null) {
+      patch({ notice: { tone: 'info', text: `${label}: ${ALREADY_DEFAULT}` } })
+      if (chosen === selection) {
+        // The document already is the default; its commit is not in the answer, so it is read. The editor shows the default, an
+        // unsaved edit included: that is what the person asked for. No echo follows a write that changed nothing, and a read
+        // that began before this one is older than it, so this one takes the place of any that is out.
+        const generation = ++documentGeneration
+        const read = await settle(() => api.read(role))
+        if (read.ok && generation === documentGeneration) adopt(read.value)
+      }
+    } else {
+      patch({ notice: { tone: 'success', text: `Reset ${label} to the default as ${shortId(commit.id)}` } })
+      if (chosen === selection) {
+        // The store wrote exactly the default the page holds, as the commit in the answer: nothing needs reading, and so nothing
+        // can take the place of a read. (A read would let the echo of this very commit take it over, and find the edit it
+        // replaces still in the editor.) Anything that came meanwhile is read after, below.
+        documentGeneration++
+        patch({
+          saved: { text: defaultText, commit: commit.id },
+          draft: defaultText,
+          note: '',
+          dirty: false,
+          conflict: undefined,
+          missing: false,
+          unknownVariables: unknownIn(defaultText, get().variables),
+        })
       }
     }
     await Promise.all([refreshAfterWrite(), settleEvents()])

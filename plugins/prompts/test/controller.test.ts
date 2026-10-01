@@ -477,6 +477,24 @@ test('Reload after a conflict adopts theirs and drops the draft', async () => {
   assert.equal(state().dirty, false)
 })
 
+test('a conflict read that an event\'s newer read has overtaken does not overwrite it', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('mine\n')
+  fake.external('main', 'theirs, first\n')
+  // The read that fetches "theirs" after the refusal is held.
+  const held = gate()
+  fake.gates.set('read main', held)
+  const saving = page.face.save()
+  await until('the conflict read to be made', () => fake.calls.filter(call => call === 'read main').length === 2)
+  // Meanwhile the document changes again, and the event for that is read without waiting.
+  const commit = fake.external('main', 'theirs, second\n')
+  await page.onConfigEvent({ kind: 'changed', commit, paths: ['prompts/main.md'] })
+  assert.deepEqual(state().conflict, { theirs: 'theirs, second\n', commit })
+  held.release()
+  await saving
+  assert.deepEqual(state().conflict, { theirs: 'theirs, second\n', commit }, 'the older answer was dropped')
+})
+
 test('Keep mine after a conflict makes theirs the base, keeps the draft, and the next save goes through', async () => {
   const { fake, page, state } = await opened()
   page.face.edit('mine\n')
@@ -983,7 +1001,7 @@ test('a reset whose answer comes after the page moved to another role leaves tha
   assert.deepEqual(state().saved, { text: 'written by an agent\n', commit: id(fake.head) })
 })
 
-test('a reset whose own read failed still reads the event that was held, and shows the default', async () => {
+test('a reset shows the default from its own answer, so a read that fails after it changes nothing', async () => {
   const { fake, page, state } = await opened()
   page.face.edit('main, edited\n')
   await page.face.save()
@@ -999,6 +1017,63 @@ test('a reset whose own read failed still reads the event that was held, and sho
   await resetting
   assert.equal(state().draft, DEFAULTS.main, 'the page was not left showing what was reset')
   assert.deepEqual(state().saved, { text: DEFAULTS.main, commit: id(2) })
+  assert.equal(state().conflict, undefined)
+})
+
+test('the echo of a reset, arriving as soon as its answer has, is no conflict with the edit the reset replaced', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('custom\n')
+  await page.face.save()
+  page.face.edit('custom\nunsaved\n')
+  // A read of the document that is held: whoever makes the next one waits.
+  const held = gate()
+  fake.gates.set('read main', held)
+  const resetting = page.face.reset()
+  await until('the reset to have its answer', () => fake.calls.some(call => call.startsWith('reset main')) && state().busy === undefined)
+  // Its echo comes now, before anything else the reset might still be waiting for.
+  const echo = page.onConfigEvent({ kind: 'changed', commit: id(2), paths: ['prompts/main.md'] })
+  held.release()
+  await Promise.all([resetting, echo])
+  assert.equal(state().conflict, undefined, 'the person\'s own reset is not "changed while you were editing"')
+  assert.equal(state().draft, DEFAULTS.main)
+  assert.equal(state().dirty, false)
+  assert.deepEqual(state().saved, { text: DEFAULTS.main, commit: id(2) })
+})
+
+test('a reset takes the default and the commit from its own answer: it reads no document', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('custom\n')
+  await page.face.save()
+  page.face.edit('custom\nunsaved\n')
+  page.face.setNote('a note')
+  const reads = fake.calls.filter(call => call === 'read main').length
+  await page.face.reset()
+  assert.equal(fake.calls.filter(call => call === 'read main').length, reads)
+  assert.deepEqual(state().saved, { text: DEFAULTS.main, commit: id(2) })
+  assert.equal(state().draft, DEFAULTS.main)
+  assert.equal(state().note, '')
+  assert.equal(state().dirty, false)
+  assert.equal(state().missing, false)
+  assert.deepEqual(state().unknownVariables, [])
+})
+
+test('a reset leaves no unknown-variable warning from the edit it replaced', async () => {
+  const { page, state } = await opened()
+  page.face.edit('custom {{nope}}\n')
+  await page.face.save()
+  assert.deepEqual(state().unknownVariables, ['nope'])
+  await page.face.reset()
+  assert.deepEqual(state().unknownVariables, [])
+})
+
+test('a reset that found the document already the default shows the default over an unsaved edit', async () => {
+  const { page, state } = await opened()
+  page.face.edit('unsaved\n')
+  await page.face.reset()
+  assert.match(state().notice?.text ?? '', /Already the default/)
+  assert.equal(state().draft, DEFAULTS.main)
+  assert.equal(state().dirty, false)
+  assert.equal(state().conflict, undefined)
 })
 
 test('Reload is not undone by a live event that arrives while it reads', async () => {
@@ -1097,7 +1172,8 @@ test('open selects a role even when the roles were asked for again while it wait
   fake.gates.set('roles', second)
   const event = page.onConfigEvent({ kind: 'remote', status: { pending: 0 } }, true)
   first.release()
-  await new Promise(resolve => setTimeout(resolve, 5))
+  // The second read of the roles is made once the first has landed, and waits on its own gate.
+  await until('the roles to be read again', () => fake.calls.filter(call => call === 'roles').length === 2)
   second.release()
   await Promise.all([opening, event])
   assert.equal(state().selected, 'main')
@@ -1112,9 +1188,10 @@ test('the roles are never read twice at once: a call while one is under way wait
   const opening = page.face.open()
   await until('the roles to be asked for', () => fake.calls.includes('roles'))
   const again = page.onConfigEvent({ kind: 'proposal', id: 'abcd1234', status: 'open' })
-  await new Promise(resolve => setTimeout(resolve, 5))
+  // A second read would have been asked for by now: the fake logs a call the moment it is made.
   assert.equal(fake.calls.filter(call => call === 'roles').length, 1, 'no second read while the first is out')
   first.release()
+  await until('the roles to be read again', () => fake.calls.filter(call => call === 'roles').length === 2)
   await Promise.all([opening, again])
   assert.equal(fake.calls.filter(call => call === 'roles').length, 2, 'one more after it, for what changed meanwhile')
 })

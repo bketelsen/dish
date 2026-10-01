@@ -208,16 +208,15 @@ const css = `
 /*
  * The tabs are dsh's SegmentedTabs: equal columns that can't be narrower than their label, since a grid item's minimum is its
  * content. At a narrow width the labels ran into each other. The tab gives up its minimum and the label shortens with an
- * ellipsis instead, so neighbours never overlap, and the padding and size come down as the page narrows.
+ * ellipsis instead, so neighbours never overlap, at any width. Its own padding and size are left as dsh has them until the page
+ * is narrow (below), where they come down.
  */
 .dish-prompts-tabs {
   min-width: 0;
 }
 .dish-prompts-tabs [role="tab"] {
   min-width: 0;
-  padding: 0 8px;
   overflow: hidden;
-  font-size: 13px;
 }
 .dish-prompts-tab-label {
   display: block;
@@ -400,6 +399,10 @@ const css = `
 }
 
 @container dish-prompts (width < 560px) {
+  .dish-prompts-tabs [role="tab"] {
+    padding: 0 8px;
+    font-size: 13px;
+  }
   .dish-prompts-layout {
     grid-template-columns: minmax(0, 1fr);
     gap: 12px;
