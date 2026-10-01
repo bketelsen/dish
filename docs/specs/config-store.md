@@ -70,7 +70,7 @@ Each write is atomic, and a commit lands only if `main` is still where the write
   - a message, generated as `<paths>: <summary>` plus an optional note; the subject names the first 3 paths, then "and N more"
   - trailers: `Dish-Author-Kind`, `Dish-Session` and `Dish-Role` (agent only), `Dish-Note` (when there's a note), and `Dish-Revert` (a revert: the full id of the commit it undoes; its subject is `Revert <short id>: <paths>`)
   - `history` reads the author and note back from git's own trailer block only; a commit with anything else there (or no `Dish-Author-Kind`) is the `system`'s
-- **Proposal**: a branch `proposal/<id>` whose commits sit on top of the `main` commit it was based on. Metadata (title, rationale, author session, created, status) is stored in the tip commit's message trailers, so the branch alone carries everything.
+- **Proposal**: a branch `refs/heads/proposal/<id>` (8 hex characters) holding one commit, whose parent is the `main` commit it was based on and whose tree is that commit's plus the changes. The commit message carries everything: the title, the rationale, and the trailers `Dish-Proposal` (the id), `Dish-Base` and the author's. Status (open, stale) is computed, never stored.
 
 ## Service: `dishConfig`
 
@@ -98,10 +98,10 @@ interface DishConfig {
   /** One commit with its diff against its parent (the empty tree for the first commit). */
   commit(id: string): Promise<{ info: CommitInfo, diffs: FileDiff[] }>
 
-  propose(changes: Change[], meta: ProposalMeta): Promise<ProposalInfo>
-  proposals(status?: ProposalStatus): Promise<ProposalInfo[]>
-  accept(id: string, meta: WriteMeta): Promise<CommitInfo>   // merge into main
-  reject(id: string, reason: string): Promise<void>
+  propose(changes: Change[], meta: { author: Author, title: string, rationale: string }): Promise<ProposalInfo>
+  proposals(status?: ProposalStatus): Promise<ProposalInfo[]>      // newest first; all statuses when omitted
+  accept(id: string, meta: { author: Author }): Promise<CommitInfo | undefined>   // apply to main; `undefined` when main already holds the content
+  reject(id: string, reason: string, meta: { author: Author }): Promise<void>
 
   remoteStatus(): RemoteStatus                          // last pushed commit, pending, last error
 }
@@ -135,11 +135,18 @@ Consumers re-read on these events rather than caching.
 ### Proposals and staleness
 
 - A proposal records its **base** (the `main` commit it started from) and the paths it changes.
+- **`propose`** runs the checks of `write`, in the same order, with one difference: an agent needs the namespace's `agent` policy to be `write` or `propose` (a user may propose to any namespace). Then:
+  - the **title** is one line (whitespace collapsed, cut to 120 characters) and not empty;
+  - the **rationale** may run to many lines, at most 8 KiB, with no control characters but tab and newline, and **no line that starts like a `Dish-` trailer** (it would let a rationale forge the trailers);
+  - neither may look like a secret, and a proposal that leaves the tree as it is is `INVALID`.
+  Nothing reaches git before all of that passes.
 - **`accept`**:
-  - If each changed path is still identical on `main` to its version at base, the proposal's changes are applied to current `main` as one commit. Its message references the proposal, and the branch is then deleted.
-  - Otherwise the proposal is marked **stale** (`dish-config/proposal` fires) and nothing is merged.
+  - **Only a user may accept.** An agent gets `FORBIDDEN`: the proposal is how an agent asks.
+  - If each changed path is still identical on `main` to its version at base, the proposal's tip versions of those paths are applied to current `main` as one commit (`Accept proposal <id>: <title>`, with `Dish-Proposal` and, for an agent's proposal, `Dish-Proposer-Session` and `Dish-Proposer-Role` trailers), and the branch is then deleted. Ownership, the content guard and the namespace's validator run again, as they are now.
+  - If `main` already holds the content (no commit would result), the branch is still deleted and accept returns `undefined`.
+  - Otherwise the proposal is marked **stale** (`dish-config/proposal` fires), `accept` fails with `STALE`, nothing is merged, and the branch is kept.
 - **Rebuilding.** The agent that owns a stale proposal is told why. It rebuilds the proposal from current `main`, as a fresh proposal superseding the old one. You never resolve conflicts.
-- **`reject`** records the reason in the branch's metadata and deletes the branch. The record stays in the store's proposal log, so the History page and the agent can see why.
+- **`reject`** takes a reason (one line, at most 200 characters, not empty, no secret). The proposal moves to `refs/dish/rejected/<id>`, on a commit `Rejected: <reason>` that carries the reason as `Dish-Rejected`; the branch is deleted. The record stays in the repository, so the History page and the agent can see why, and `proposals('rejected')` lists it. A user may reject any proposal, stale ones included. **An agent may only withdraw its own session's proposals** (`FORBIDDEN` otherwise).
 
 ### Remote
 
@@ -208,7 +215,7 @@ The store's stable error codes:
 - `CONFLICT`: the path changed since `base`
 - `INVALID`: the namespace rejected the document; carries the owner's message
 - `UNOWNED`: no namespace claims the path
-- `FORBIDDEN`: an agent writing to a namespace whose `agent` policy doesn't allow it
+- `FORBIDDEN`: an agent writing to a namespace whose `agent` policy doesn't allow it (or proposing to one whose policy is `none`); an agent accepting a proposal, or rejecting one from another session
 - `SECRET`: a likely credential was found
 - `TOO_LARGE`
 - `LOCKED`: another process holds the store

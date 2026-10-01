@@ -6,8 +6,11 @@ import type { Change, GitIdentity } from './git.ts'
 import { checkContent, secretKind } from './guard.ts'
 import { SerialQueue, acquireLock } from './lock.ts'
 import type { NamespaceRegistry, NamespaceSpec } from './namespaces.ts'
+import { acceptProposal, listProposals, proposeChanges, rejectProposal } from './proposals.ts'
+import type { AcceptMeta, ProposalEvent, ProposalHost, ProposalInfo, ProposalStatus, ProposeMeta, RejectMeta } from './proposals.ts'
 
 export type { Change, GitIdentity }
+export type { AcceptMeta, ProposalEvent, ProposalInfo, ProposalStatus, ProposeMeta, RejectMeta }
 
 /**
  * Who made a commit. `system` is the store's own (the root commit and `seed`);
@@ -78,6 +81,11 @@ export interface StoreOptions {
   maxBytes?: number
   /** Called after each commit to `main` made by `write` or `seed` (not for the root commit). A throw is reported as a process warning and never fails the write. */
   onCommit?: (info: CommitInfo) => void
+  /**
+   * Called when a proposal opens (`propose`), turns out stale (an `accept` it refused), or is
+   * accepted or rejected. A throw is reported as a process warning and never fails the call.
+   */
+  onProposal?: (id: string, status: ProposalEvent) => void
 }
 
 const MAIN = 'refs/heads/main'
@@ -105,8 +113,8 @@ const GIT_INIT_ENTRIES: readonly string[] = ['HEAD', 'branches', 'config', 'desc
 /** The files `git init` writes through a lock, which a crash can leave behind and which would make the next `git init` fail. */
 const GIT_INIT_LOCKS: readonly string[] = ['config.lock', 'HEAD.lock']
 
-/** What `write`, `seed` and `revert` hand to `commitPrepared` once every check has passed. */
-interface Prepared {
+/** What `write`, `seed`, `revert` and the proposals hand to `commitPrepared` once every check has passed. Package-internal. */
+export interface Prepared {
   changes: Change[]
   author: Author
   note?: string
@@ -117,6 +125,27 @@ interface Prepared {
   subject?: (changed: string[]) => string
   /** `Key: value` lines added to the trailers, after the author's and the note. */
   trailers?: string[]
+}
+
+/** What an agent may do through a call: the namespace policies that allow it, and how an error says it. */
+interface AgentRule {
+  allowed: ReadonlyArray<NamespaceSpec['agent']>
+  verb: string
+}
+
+const AGENT_WRITE: AgentRule = { allowed: ['write'], verb: 'write' }
+const AGENT_PROPOSE: AgentRule = { allowed: ['write', 'propose'], verb: 'propose changes to' }
+
+/** A commit as `git log` printed it, with the trailers the proposals read. Package-internal. */
+export interface LogRecord {
+  info: CommitInfo
+  /** The commit's parents, as git prints them. */
+  parents: string[]
+  /** The `Dish-Proposal` and `Dish-Base` values as git read them (the values of a repeated trailer are joined by U+001F, so none matches a valid id). */
+  proposal: string
+  base: string
+  /** The `Dish-Rejected` value, read as a note is; `undefined` for none, or one that isn't a line. */
+  rejected: string | undefined
 }
 
 function invalid(message: string): ConfigStoreError {
@@ -177,19 +206,43 @@ function checkIdentifier(field: string, value: unknown): string {
   return value
 }
 
+/** A one-line text as it will be committed, before any length cap: whitespace collapsed, trimmed, no control characters. `''` for none. */
+function normalizeLine(field: string, value: unknown): string {
+  if (typeof value !== 'string') throw invalid(`${field} must be a string`)
+  const text = value.replace(/\s+/g, ' ').trim()
+  if (NOTE_CONTROL.test(text)) throw invalid(`${field} contains control characters`)
+  return text
+}
+
 /** The note as it will be committed, before the length cap; `undefined` for none (or only whitespace). */
 function normalizeNote(note: unknown): string | undefined {
   if (note === undefined) return undefined
-  if (typeof note !== 'string') throw invalid('note must be a string')
-  const text = note.replace(/\s+/g, ' ').trim()
-  if (NOTE_CONTROL.test(text)) throw invalid('note contains control characters')
+  const text = normalizeLine('note', note)
   return text === '' ? undefined : text
 }
 
-function capNote(note: string): string {
+function capLine(text: string, max: number): string {
   // By code point, so the cut never splits a surrogate pair.
-  const capped = Array.from(note).slice(0, NOTE_MAX_CHARS).join('')
+  const capped = Array.from(text).slice(0, max).join('')
   return capped.trimEnd()
+}
+
+function capNote(note: string): string {
+  return capLine(note, NOTE_MAX_CHARS)
+}
+
+/**
+ * A required one-line text (a proposal's title, a reason) as it will be committed:
+ * normalized, cut to `max` characters, and refused if it looks like a secret either whole or
+ * as cut (dropping a tail can leave a match). `undefined` if there is no text.
+ */
+function checkLine(field: string, raw: unknown, max: number): string | undefined {
+  const text = normalizeLine(field, raw)
+  if (text === '') return undefined
+  refuseSecret(field, text)
+  const capped = capLine(text, max)
+  refuseSecret(field, capped)
+  return capped
 }
 
 /** Step 6: the author's fields and the note. Returns the author as it will be recorded, and the note as committed. */
@@ -253,7 +306,11 @@ function trailerValues(key: string): string {
  * trailers are git's own reading of the message's last paragraph; nothing in
  * the body above it counts.
  */
-const LOG_FIELDS = ['%H', '%at', '%P', ...['Dish-Author-Kind', 'Dish-Session', 'Dish-Role', 'Dish-Note'].map(trailerValues), '%B']
+const LOG_FIELDS = [
+  '%H', '%at', '%P',
+  ...['Dish-Author-Kind', 'Dish-Session', 'Dish-Role', 'Dish-Note', 'Dish-Proposal', 'Dish-Base', 'Dish-Rejected'].map(trailerValues),
+  '%B',
+]
 const LOG_FORMAT = LOG_FIELDS.join('%x00')
 
 /**
@@ -267,12 +324,17 @@ function authorOf(kind: string, session: string, role: string): Author {
   return SYSTEM
 }
 
-/** A commit's `Dish-Note` as `write` would have recorded it: one line, at most 200 characters. Never more than one note, never control characters. */
-function noteOf(value: string): string | undefined {
+/** A one-line trailer value as `write` would have recorded it: at most `max` characters, never more than one value, never control characters. */
+function lineOf(value: string, max: number): string | undefined {
   if (value.includes(VALUE_SEPARATOR)) return undefined
   const text = value.replace(/\s+/g, ' ').trim()
   if (text === '' || NOTE_CONTROL.test(text)) return undefined
-  return capNote(text)
+  return capLine(text, max)
+}
+
+/** A commit's `Dish-Note` as `write` would have recorded it. */
+function noteOf(value: string): string | undefined {
+  return lineOf(value, NOTE_MAX_CHARS)
 }
 
 /** `history`'s query, checked, with its defaults filled in. `before` is passed on unchecked. */
@@ -309,8 +371,20 @@ function processIsGone(pid: number): boolean {
   }
 }
 
-function warn(message: string): void {
-  process.emitWarning(message, { code: 'DISH_CONFIG_ON_COMMIT' })
+function warn(message: string, code: string): void {
+  process.emitWarning(message, { code })
+}
+
+/** Run a listener the caller gave. What it was told about has happened, so a throw (or a rejection) is a process warning, not a failure. */
+function notify(name: 'onCommit' | 'onProposal', call: () => unknown): void {
+  const failed = (error: unknown): void => warn(
+    `dish-config ${name} callback threw: ${error instanceof Error ? error.message : String(error)}`,
+    name === 'onCommit' ? 'DISH_CONFIG_ON_COMMIT' : 'DISH_CONFIG_ON_PROPOSAL')
+  try {
+    Promise.resolve(call()).catch(failed)
+  } catch (error) {
+    failed(error)
+  }
 }
 
 /**
@@ -328,6 +402,7 @@ export class ConfigStore {
   private readonly options: StoreOptions
   private readonly maxBytes: number
   private readonly release: () => Promise<void>
+  private readonly proposalHost: ProposalHost
   private closed = false
   private closing: Promise<void> | undefined
 
@@ -337,6 +412,7 @@ export class ConfigStore {
     this.git = new Git(repository)
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
     this.release = release
+    this.proposalHost = this.makeProposalHost()
   }
 
   /**
@@ -556,6 +632,60 @@ export class ConfigStore {
     })
   }
 
+  /**
+   * Open a proposal: a branch `refs/heads/proposal/<id>` (8 hex characters) holding one commit
+   * whose parent is the `main` commit it was made on and whose tree is that commit's plus
+   * `changes`, deletions before writes. Nothing on `main` changes. The checks are those of
+   * `write`, in its order, except that an agent needs the namespace's `agent` policy to be
+   * `write` or `propose` (`FORBIDDEN`), and users may propose to any namespace; then the
+   * title (one line, whitespace collapsed, cut to 120 characters, not empty) and the
+   * rationale (any lines, at most 8 KiB, no control characters but tab and newline, no line
+   * that starts like a `Dish-` trailer), each refused if it looks like a secret
+   * (`INVALID`, `SECRET`). Nothing reaches git before they all pass. A proposal that would
+   * leave the tree as it is is `INVALID`.
+   * @returns the proposal, as `proposals` lists it.
+   */
+  propose(changes: Change[], meta: ProposeMeta): Promise<ProposalInfo> {
+    return this.run(() => proposeChanges(this.proposalHost, changes, meta))
+  }
+
+  /**
+   * The proposals, newest first; `status` picks `open`, `stale` or `rejected` (all three if
+   * omitted; `INVALID` for anything else). Stale means a path the proposal changes has changed
+   * on `main` since its base. Computed on every call. A ref under `proposal/` or
+   * `refs/dish/rejected/` that holds no well-formed proposal is left out, not an error.
+   */
+  proposals(status?: ProposalStatus): Promise<ProposalInfo[]> {
+    return this.run(() => listProposals(this.proposalHost, status))
+  }
+
+  /**
+   * Put a proposal on `main` and delete its branch. Only a user may (`FORBIDDEN`). If a path it
+   * changes has changed on `main` since its base: `STALE`, `onProposal(id, 'stale')`, nothing
+   * merged, the branch kept. Otherwise the tip's version of each path (a deletion where the tip
+   * has none) goes through the pipeline of `write`, so ownership, the guard and the
+   * validators apply as they are now, as one commit `Accept proposal <id>: <title>` with
+   * the proposal's base, and `Dish-Proposal` and (for an agent's proposal)
+   * `Dish-Proposer-Session` and `Dish-Proposer-Role` trailers.
+   * @returns the commit, or `undefined` when `main` already holds the content: the branch is deleted all the same.
+   * @throws `NOT_FOUND` if there is no such proposal.
+   */
+  accept(id: string, meta: AcceptMeta): Promise<CommitInfo | undefined> {
+    return this.run(() => acceptProposal(this.proposalHost, id, meta))
+  }
+
+  /**
+   * Reject a proposal, with a reason (a line: whitespace collapsed, cut to 200 characters, not
+   * empty, no secret). A user may reject any, stale ones included; an agent only withdraws one
+   * from its own session (`FORBIDDEN`). The proposal moves to `refs/dish/rejected/<id>`, on a
+   * commit `Rejected: <reason>` with the same tree and the trailers `Dish-Rejected` and
+   * `Dish-Proposal`, and `proposals('rejected')` lists it with its `reason`.
+   * @throws `NOT_FOUND` if there is no such open or stale proposal.
+   */
+  reject(id: string, reason: string, meta: RejectMeta): Promise<void> {
+    return this.run(() => rejectProposal(this.proposalHost, id, reason, meta))
+  }
+
   // --- the queue ---------------------------------------------------------------------------------
 
   /** Run `task` on the queue; once `close()` has been called, nothing new starts. */
@@ -711,6 +841,11 @@ export class ConfigStore {
    * `paths` come from the diff against the first parent, or the empty tree for a first commit.
    */
   private async readCommits(revisions: string[], pathspec: string[]): Promise<CommitInfo[]> {
+    return (await this.readRecords(revisions, pathspec)).map(record => record.info)
+  }
+
+  /** `readCommits`, with each commit's parents and the trailers the proposals read. */
+  private async readRecords(revisions: string[], pathspec: string[]): Promise<LogRecord[]> {
     // Options and config so that nothing in a user's git config changes the records: `log.showSignature`, `i18n.logOutputEncoding`,
     // `log.follow` (a single path would follow renames) and `core.commentChar`/`commentString` (a `Dish-` or `D` comment string
     // would make git skip every trailer line, and so turn every author into the system).
@@ -721,20 +856,20 @@ export class ConfigStore {
     const fields = (await this.git.run([...args, ...revisions, '--', ...pathspec])).stdout.split('\0')
     fields.pop() // what follows the last record's NUL
     if (fields.length % LOG_FIELDS.length !== 0) throw new Error('git log printed something other than whole records')
-    const infos: CommitInfo[] = []
+    const records: LogRecord[] = []
     let empty: string | undefined
     for (let at = 0; at < fields.length; at += LOG_FIELDS.length) {
-      const [id, time, parents, kind, session, role, noteValue, message] = fields.slice(at, at + LOG_FIELDS.length) as
-        [string, string, string, string, string, string, string, string]
-      const parent = parents.split(' ')[0]!
-      const before = parent === '' ? (empty ??= await this.git.emptyTree()) : parent
+      const [id, time, parentIds, kind, session, role, noteValue, proposal, base, rejected, message] = fields.slice(at, at + LOG_FIELDS.length) as
+        [string, string, string, string, string, string, string, string, string, string, string]
+      const parents = parentIds === '' ? [] : parentIds.split(' ')
+      const before = parents[0] ?? (empty ??= await this.git.emptyTree())
       const paths = (await this.git.changedPaths(before, id)).sort()
       const info: CommitInfo = { id, time: (Number(time) || 0) * 1000, author: authorOf(kind, session, role), message, paths }
       const note = noteOf(noteValue)
       if (note !== undefined) info.note = note
-      infos.push(info)
+      records.push({ info, parents, proposal, base, rejected: noteOf(rejected) })
     }
-    return infos
+    return records
   }
 
   /** The files that differ between `from` and `to` (commits or trees), with their patches. Runs no external program: see `diff`. */
@@ -764,13 +899,16 @@ export class ConfigStore {
 
   // --- checks before git -------------------------------------------------------------------------
 
-  /** Steps 1 to 6 of `write`. Synchronous: nothing here waits on git, so nothing here can be raced. */
-  private prepareWrite(changes: Change[], meta: WriteMeta): Prepared {
+  /**
+   * Steps 1 to 6 of `write` (the same for a proposal, with the agent policy `rule` it asks).
+   * Synchronous: nothing here waits on git, so nothing here can be raced.
+   */
+  private prepareWrite(changes: Change[], meta: WriteMeta, rule: AgentRule = AGENT_WRITE): Prepared {
     const asked = checkAuthorKind(meta)
     const checked = checkChanges(changes)
     checkPaths(checked)
     const owners = this.ownersOf(checked)
-    if (asked.kind === 'agent') this.requireAgentMayWrite(owners)
+    if (asked.kind === 'agent') this.requireAgentMay(owners, rule)
     this.checkGuard(checked)
     this.checkValid(checked, owners)
     const { author, note } = checkMeta(asked, meta.note)
@@ -791,10 +929,10 @@ export class ConfigStore {
     return owners
   }
 
-  private requireAgentMayWrite(owners: Map<string, NamespaceSpec>): void {
+  private requireAgentMay(owners: Map<string, NamespaceSpec>, rule: AgentRule): void {
     for (const [path, spec] of owners) {
-      if (spec.agent !== 'write') {
-        throw new ConfigStoreError('FORBIDDEN', `agents may not write ${label(path)}: the ${spec.owner} namespace allows agents to "${spec.agent}" only`)
+      if (!rule.allowed.includes(spec.agent)) {
+        throw new ConfigStoreError('FORBIDDEN', `agents may not ${rule.verb} ${label(path)}: the ${spec.owner} namespace allows agents to "${spec.agent}" only`)
       }
     }
   }
@@ -831,15 +969,7 @@ export class ConfigStore {
     for (let attempt = 0; attempt < 2; attempt++) {
       const head = await this.mainCommit()
       if (prepared.base !== undefined) await this.checkBase(prepared.base, head, paths)
-      for (const change of prepared.changes) {
-        if (!('delete' in change)) continue
-        if (!(await this.hasFile(head, change.path))) {
-          throw new ConfigStoreError('NOT_FOUND', `cannot delete ${label(change.path)}: it does not exist`)
-        }
-      }
-      // Removals first, so a file can give way to a directory of the same name (or the reverse) in one commit.
-      const ordered = [...prepared.changes.filter(change => 'delete' in change), ...prepared.changes.filter(change => !('delete' in change))]
-      const tree = await this.git.buildTree(head, ordered)
+      const tree = await this.applyChanges(head, prepared.changes)
       const changed = (await this.git.changedPaths(head, tree)).sort()
       if (changed.length === 0) return undefined
       const subject = prepared.subject?.(changed) ?? `${pathList(changed)}: ${prepared.summary}`
@@ -857,6 +987,22 @@ export class ConfigStore {
     throw new ConfigStoreError('CONFLICT', 'main kept moving while the change was being committed; nothing was written')
   }
 
+  /**
+   * The tree of `base` with `changes` applied. Removals go first, so a file can give way to a
+   * directory of the same name (or the reverse) in one commit.
+   * @throws `NOT_FOUND` for a removal of a document `base` doesn't have.
+   */
+  private async applyChanges(base: string, changes: Change[]): Promise<string> {
+    for (const change of changes) {
+      if (!('delete' in change)) continue
+      if (!(await this.hasFile(base, change.path))) {
+        throw new ConfigStoreError('NOT_FOUND', `cannot delete ${label(change.path)}: it does not exist`)
+      }
+    }
+    const ordered = [...changes.filter(change => 'delete' in change), ...changes.filter(change => !('delete' in change))]
+    return this.git.buildTree(base, ordered)
+  }
+
   /** `base` must be a commit, and none of `paths` may have changed between it and `head`. */
   private async checkBase(base: string, head: string, paths: string[]): Promise<void> {
     if (base === head) return
@@ -872,12 +1018,32 @@ export class ConfigStore {
   /** Tell `onCommit`. The commit has landed, so a failing listener is a warning, not a failed write. */
   private announce(info: CommitInfo): void {
     const { onCommit } = this.options
-    if (onCommit === undefined) return
-    const failed = (error: unknown): void => warn(`dish-config onCommit callback threw: ${error instanceof Error ? error.message : String(error)}`)
-    try {
-      Promise.resolve(onCommit(info)).catch(failed)
-    } catch (error) {
-      failed(error)
+    if (onCommit !== undefined) notify('onCommit', () => onCommit(info))
+  }
+
+  // --- proposals ---------------------------------------------------------------------------------
+
+  /** What `proposals.ts` may use of this store: see `ProposalHost`. */
+  private makeProposalHost(): ProposalHost {
+    return {
+      git: this.git,
+      mainCommit: () => this.mainCommit(),
+      identity: author => this.identity(author),
+      prepare: (changes, meta, mode) => this.prepareWrite(changes, meta, mode === 'propose' ? AGENT_PROPOSE : AGENT_WRITE),
+      tree: (base, changes) => this.applyChanges(base, changes),
+      commit: prepared => this.commitPrepared(prepared),
+      author: meta => checkMeta(checkAuthorKind(meta), undefined).author,
+      line: checkLine,
+      scan: refuseSecret,
+      tidy: lineOf,
+      message: (subject, author, extra) => messageFor(subject, author, undefined, extra),
+      read: revisions => this.readRecords(revisions, []),
+      notify: (id, status) => {
+        const { onProposal } = this.options
+        if (onProposal !== undefined) notify('onProposal', () => onProposal(id, status))
+      },
+      warn: message => warn(message, 'DISH_CONFIG_PROPOSAL'),
+      pathList,
     }
   }
 }
