@@ -18,7 +18,18 @@ importers:
         specifier: ^6.0.0
         version: 6.0.3
 
-  packages/dish-kit: {}
+  packages/dish-kit:
+    dependencies:
+      esbuild:
+        specifier: ^0.25.0
+        version: 0.25.12
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: ~4.0.4
+        version: 4.0.4(@deepseek-ai/cordis-plugin-include@1.0.9)(@deepseek-ai/cordis-plugin-loader@1.0.5)
+      '@deepseek-ai/dsh-typert-protocol':
+        specifier: 0.2.0-rc.2
+        version: 0.2.0-rc.2(@deepseek-ai/cordis@4.0.4)
 
   plugins/copilot:
     dependencies:

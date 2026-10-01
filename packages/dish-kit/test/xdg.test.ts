@@ -15,3 +15,7 @@ test('absolute XDG variables win; relative ones are ignored per spec', () => {
     config: '/cfg/dish', data: '/home/u/.local/share/dish', state: '/st/dish', cache: '/c/dish',
   })
 })
+
+test('an empty XDG variable counts as unset', () => {
+  assert.equal(xdgPaths('dish', { XDG_CACHE_HOME: '' }, '/home/u').cache, '/home/u/.cache/dish')
+})
