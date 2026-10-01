@@ -36,7 +36,7 @@
  * caller is told through `onCorrupt`, and the session starts a new record, so its count starts again. Nothing here logs;
  * an I/O error other than a missing file is thrown.
  *
- * `endRun` and the lookups take what events give them, so they never throw because of what they were given: a child
+ * `startRun`, `endRun` and the lookups take what events give them, so they never throw because of what they were given: a child
  * nobody recorded is `undefined`, and a stop reason or a closing message of the wrong type is made into text.
  *
  * `prune` removes sessions nothing has written to for a while, with their pointers; see there for the rules.
@@ -82,7 +82,7 @@ export interface ChildRecord {
   /** How many follow-ups it has been sent. */
   followUps: number
   runs: RunRecord[]
-  /** The status after the latest run: `running` from the start, or from a follow-up, until the run ends. */
+  /** The status after the latest run: `running` from the start, from a follow-up or from a wake, until the run ends. */
   last: ChildStatus
 }
 
@@ -131,10 +131,11 @@ export const STOP_REASON_STATUS = {
 
 /**
  * The status a stop reason gives. A reason that isn't one of dsh's (the type is merge-extensible, so a backend can add
- * one) is finished; the run keeps the raw reason, so the notice can still say what it was.
+ * one, and an event can be malformed) is stopped: the child isn't running, and nothing says it succeeded. The run keeps the
+ * raw reason, so the notice can still say what it was.
  */
 export function statusFor(stopReason: string): Exclude<ChildStatus, 'running'> {
-  return Object.hasOwn(STOP_REASON_STATUS, stopReason) ? STOP_REASON_STATUS[stopReason as SubagentStopReason] : 'finished'
+  return Object.hasOwn(STOP_REASON_STATUS, stopReason) ? STOP_REASON_STATUS[stopReason as SubagentStopReason] : 'stopped'
 }
 
 /**
@@ -448,6 +449,19 @@ export class CrewRecords {
   async addFollowUp(childId: string): Promise<void> {
     await this.#update(childId, async (child) => {
       child.followUps += 1
+      child.last = 'running'
+      return true
+    })
+  }
+
+  /**
+   * Note that a run of `childId` started: it is `running` until the run ends. dsh starts a run each time it brings a child
+   * up, for a first start and for a wake or a resume of one that had ended (a message to it, say), and only the first is
+   * one `addChild` knows of. A child that is running already isn't written again, and one that isn't recorded is ignored.
+   */
+  async startRun(childId: string): Promise<void> {
+    await this.#update(childId, async (child) => {
+      if (child.last === 'running') return undefined
       child.last = 'running'
       return true
     })

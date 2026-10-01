@@ -4,15 +4,16 @@ import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/p
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
+import type { SubagentRunEndInfo, SubagentRunInfo } from '@deepseek-ai/dsh-subagent'
 import type { DishConfigService } from 'dish-config'
 import * as plugin from '../src/index.ts'
 import type { DishCrew } from '../src/index.ts'
 import { CrewRecords } from '../src/record.ts'
-import type { NewChild } from '../src/record.ts'
+import type { NewChild, RunEnd } from '../src/record.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from '../src/settings.ts'
 import {
   captureStderr, dirs, mountConfig, mountCrew, seeded, shippedWith, tempDir, waitFor, watchLogs, withEnv,
@@ -422,6 +423,11 @@ function ended(ctx: Context, id: string, stopReason: string, lastAssistantMessag
   } as unknown as SubagentRunEndInfo)
 }
 
+/** A run of a child that starts: dsh publishes one for a first start, a wake and a resume alike. */
+function started(ctx: Context, id: string): void {
+  ctx.emit('subagent/start', { runId: 'run-2', provider: 'spawn', id, local: true } as unknown as SubagentRunInfo)
+}
+
 async function exists(path: string): Promise<boolean> {
   return stat(path).then(() => true, () => false)
 }
@@ -439,9 +445,24 @@ async function mounted(where: Dirs): Promise<{ ctx: Context, handle: ReturnType<
   return { ctx, handle, logs }
 }
 
-/** A short wait, for the case a test needs something to have been given the time to do nothing. */
-function pause(ms = 100): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+/**
+ * One turn of the event loop. The listeners chain what they do through promises, so by the next turn every step that is
+ * not waiting on a file or a gate has run. For a test to show that something did *not* happen: after it, what would
+ * have been called by now has been.
+ */
+function turn(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve))
+}
+
+/** What `t.mock.method` gives: enough of it to wait for calls and for what they returned. */
+interface Calls {
+  mock: { callCount(): number, calls: ReadonlyArray<{ result: unknown }> }
+}
+
+/** Wait until `spy` has been called `count` times, then until everything it returned is done. */
+async function done(spy: Calls, count: number): Promise<void> {
+  await waitFor(`${count} call(s)`, () => spy.mock.callCount() >= count || undefined)
+  await Promise.all(spy.mock.calls.map(call => call.result))
 }
 
 test('dishCrew.records is the record on the data directory, and nothing is written until a child is added', async () => {
@@ -565,17 +586,19 @@ test('whenRecorded is the run being recorded: there as soon as the event is, the
   }
 })
 
-test('the errors and ends of agents crew did not start are ignored: nothing is written, and an error is not kept for later', async () => {
+test('the errors and ends of agents crew did not start are ignored: nothing is written, and an error is not kept for later', async (t) => {
   const where = await dirs()
   const { ctx, handle, logs } = await mounted(where)
   try {
+    const lookups = t.mock.method(ctx.dishCrew.records, 'lookup')
     errored(ctx, 'stranger', new Error('not ours'))
     ended(ctx, 'stranger', 'error', [{ type: 'text', text: 'not ours' }])
     assert.equal(await ctx.dishCrew.whenRecorded('stranger'), undefined)
     assert.equal(await exists(where.data), false)
-    // An error for an id that is not a crew child is not remembered, so if it becomes one it doesn't have it.
+    // An error for an id that is not a crew child is not remembered, so if it becomes one it doesn't have it. The
+    // lookup the listener made has to have answered (that it is not one) before the child is added: it is awaited.
     errored(ctx, 'late', new Error('before it was ours'))
-    await pause()
+    await done(lookups, 2)
     await ctx.dishCrew.records.addChild('s1', crewChild('late'))
     ended(ctx, 'late', 'completed', [{ type: 'text', text: 'fine' }])
     await ctx.dishCrew.whenRecorded('late')
@@ -622,8 +645,8 @@ test('what is remembered for errors is bounded: the oldest are forgotten first',
     const total = plugin.ERROR_MEMORY + 3
     const ids = Array.from({ length: total }, (_, index) => `c${index}`)
     for (const id of ids) await ctx.dishCrew.records.addChild('s1', crewChild(id))
+    // Eviction is as the errors come in, so no waiting is needed: the first three are out by the time this returns.
     for (const id of ids) errored(ctx, id, new Error(`error of ${id}`))
-    await pause(300)
     for (const id of [ids[0]!, ids[1]!, ids[total - 1]!]) ended(ctx, id, 'error')
     for (const id of [ids[0]!, ids[1]!, ids[total - 1]!]) await ctx.dishCrew.whenRecorded(id)
     const errors = Object.fromEntries((await ctx.dishCrew.records.children('s1')).map(child => [child.id, child.runs[0]?.error]))
@@ -665,28 +688,164 @@ test('events with nothing in them are no trouble: the listeners take what they a
     const odd: unknown[] = [undefined, null, 5, 'text', {}, { agent: null }, { agent: {} }, { agent: { id: 5 } }, { id: '' }, { id: 7 }, { id: 'x', stopReason: 5, lastAssistantMessage: 'text' }, { id: 'x', lastAssistantMessage: [null, 5, { type: 'text' }, { type: 'text', text: 5 }] }]
     for (const payload of odd) {
       assert.doesNotThrow(() => { ctx.emit('agent/error', payload as never) }, JSON.stringify(payload))
+      assert.doesNotThrow(() => { ctx.emit('subagent/start', payload as never) }, JSON.stringify(payload))
       assert.doesNotThrow(() => { ctx.emit('subagent/end', payload as never) }, JSON.stringify(payload))
     }
-    await pause()
+    // The payloads with an id of 'x' are the only ones the listeners do anything with, and the last of them is an end,
+    // which comes after the starts of 'x': when it is recorded, they all are.
+    assert.equal(await ctx.dishCrew.whenRecorded('x'), undefined)
     assert.equal(await exists(where.data), false)
   } finally {
     await handle.dispose()
   }
 })
 
-test('the listeners go with the plugin, and the unmount waits for a record that is being written', async () => {
+test('the listeners go with the plugin, and the unmount waits for a record that is being written', async (t) => {
   const where = await dirs()
   const { ctx, handle } = await mounted(where)
-  await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
-  await ctx.dishCrew.records.addChild('s1', crewChild('c2'))
+  const { records } = ctx.dishCrew
+  await records.addChild('s1', crewChild('c1'))
+  await records.addChild('s1', crewChild('c2'))
   ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'written before the unmount finished' }])
   await handle.dispose()
   assert.equal(await readFile(sessionPath(where, 's1', '1-coder-1.md'), 'utf8'), 'written before the unmount finished\n')
-  const records = new CrewRecords(where.data)
+  const calls = [t.mock.method(records, 'endRun'), t.mock.method(records, 'startRun')]
   ended(ctx, 'c2', 'completed', [{ type: 'text', text: 'after' }])
-  await pause()
+  started(ctx, 'c2')
+  // Something that is not heard does not happen: after a turn, a listener that was still there would have called the record.
+  await turn()
+  assert.deepEqual(calls.map(call => call.mock.callCount()), [0, 0])
   assert.deepEqual((await records.children('s1'))[1]!.runs, [])
   assert.equal(ctx.get('dishCrew'), undefined)
+})
+
+test('an end that comes while the plugin unmounts is not heard, and the unmount waits for the one being written', async (t) => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  const { records } = ctx.dishCrew
+  await records.addChild('s1', crewChild('c1'))
+  await records.addChild('s1', crewChild('c2'))
+  // The record of c1's end is held until the test lets it go.
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const original = CrewRecords.prototype.endRun
+  const filed: string[] = []
+  t.mock.method(records, 'endRun', async function (this: CrewRecords, id: string, end: RunEnd) {
+    filed.push(id)
+    await gate
+    return original.call(this, id, end)
+  })
+  ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'c1 was being recorded' }])
+  const unmounting = handle.dispose()
+  // The unmount is waiting for c1. An end that comes now is one it would not wait for, if it were heard: it would be filed
+  // after the unmount's wait, with the plugin gone. cordis stops delivering a plugin's events once its disposal starts,
+  // whatever the order its effects were registered in, so this holds the two together: c2 is not heard, and c1 is waited for.
+  await turn()
+  ended(ctx, 'c2', 'completed', [{ type: 'text', text: 'c2 came while unmounting' }])
+  await turn()
+  release()
+  await unmounting
+  assert.deepEqual(filed, ['c1'])
+  assert.equal(await readFile(sessionPath(where, 's1', '1-coder-1.md'), 'utf8'), 'c1 was being recorded\n')
+  assert.deepEqual((await records.children('s1')).map(child => child.runs.length), [1, 0])
+})
+
+// --- starts ---------------------------------------------------------------------------------------
+
+test('a child that dsh brings back up (a message to one that had finished) is running again, so the limits count it', async (t) => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    const { records } = ctx.dishCrew
+    await records.addChild('s1', crewChild('c1'))
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'first run' }])
+    await ctx.dishCrew.whenRecorded('c1')
+    assert.equal((await records.children('s1'))[0]!.last, 'finished')
+    const starts = t.mock.method(records, 'startRun')
+    started(ctx, 'c1')
+    await done(starts, 1)
+    const [child] = await records.children('s1')
+    assert.equal(child!.last, 'running')
+    assert.equal(child!.runs.length, 1)
+    assert.equal(child!.followUps, 0)
+    // And its next end settles it again.
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'second run' }])
+    await ctx.dishCrew.whenRecorded('c1')
+    assert.equal((await records.children('s1'))[0]!.last, 'finished')
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('a start, an end and a start in one tick leave the child running: the second start waits for the end', async (t) => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    const { records } = ctx.dishCrew
+    await records.addChild('s1', crewChild('c1'))
+    // The end is held, so that a start that did not wait for it would be filed first, and the end would then undo it.
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const order: string[] = []
+    const endRun = CrewRecords.prototype.endRun
+    const startRun = CrewRecords.prototype.startRun
+    t.mock.method(records, 'endRun', async function (this: CrewRecords, id: string, end: RunEnd) {
+      await gate
+      const result = await endRun.call(this, id, end)
+      order.push('end')
+      return result
+    })
+    const starts = t.mock.method(records, 'startRun', async function (this: CrewRecords, id: string) {
+      order.push('start')
+      await startRun.call(this, id)
+    })
+    started(ctx, 'c1')
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'done' }])
+    started(ctx, 'c1')
+    await turn()
+    release()
+    await ctx.dishCrew.whenRecorded('c1')
+    await done(starts, 2)
+    assert.deepEqual(order, ['start', 'end', 'start'])
+    const [child] = await records.children('s1')
+    assert.equal(child!.last, 'running')
+    assert.equal(child!.runs.length, 1)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('the start of an agent crew did not start is ignored, and writes nothing', async (t) => {
+  const where = await dirs()
+  const { ctx, handle, logs } = await mounted(where)
+  try {
+    const starts = t.mock.method(ctx.dishCrew.records, 'startRun')
+    started(ctx, 'stranger')
+    await done(starts, 1)
+    assert.equal(await exists(where.data), false)
+    assert.deepEqual(logs, [])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('a start that can not be recorded is logged, never thrown, and the next end is still recorded', async () => {
+  const where = await dirs()
+  const { ctx, handle, logs } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    const file = sessionPath(where, 's1', 'children.json')
+    await rm(file)
+    await mkdir(file)
+    assert.doesNotThrow(() => { started(ctx, 'c1') })
+    await waitFor('the failure to be logged', () => logs.some(line => /could not record the start of child c1: /.test(line)) || undefined)
+    await rm(file, { recursive: true })
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'y' }])
+    assert.ok(await ctx.dishCrew.whenRecorded('c1'))
+  } finally {
+    await handle.dispose()
+  }
 })
 
 // --- pruning at start, and what the record logs ---------------------------------------------------

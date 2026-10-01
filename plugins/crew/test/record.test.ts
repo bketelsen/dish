@@ -162,6 +162,64 @@ test('a follow-up to a child that is not recorded does nothing, and does not thr
   assert.equal(await exists(join(directory, 'sessions')), false)
 })
 
+// --- starts ---------------------------------------------------------------------------------------
+
+test('a run that starts again puts a child that had ended back to running, whatever it ended as', async () => {
+  const { records } = await fixture()
+  for (const reason of ['completed', 'error', 'aborted']) {
+    await records.addChild('s1', newChild(`c-${reason}`))
+    await records.endRun(`c-${reason}`, { stopReason: reason, closing: 'x' })
+  }
+  assert.deepEqual((await records.children('s1')).map(child => child.last), ['finished', 'failed', 'stopped'])
+  for (const reason of ['completed', 'error', 'aborted']) await records.startRun(`c-${reason}`)
+  const listed = await records.children('s1')
+  assert.deepEqual(listed.map(child => child.last), ['running', 'running', 'running'])
+  // A start is not a follow-up and not a run: it changes nothing else.
+  assert.ok(listed.every(child => child.followUps === 0 && child.runs.length === 1))
+})
+
+test('a start for a child that is running already writes nothing', { skip: process.platform === 'win32' }, async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  const file = join(sessionDir(directory, 's1'), 'children.json')
+  // Every write is a new file renamed into place, so a new inode is a write.
+  const before = await stat(file)
+  await records.startRun('c1')
+  await records.startRun('c1')
+  const after = await stat(file)
+  assert.equal(after.ino, before.ino)
+  assert.equal(after.mtimeMs, before.mtimeMs)
+  // And one that is not running is written, once.
+  await records.endRun('c1', { stopReason: 'completed', closing: 'x' })
+  const ended = await stat(file)
+  await records.startRun('c1')
+  const started = await stat(file)
+  assert.notEqual(started.ino, ended.ino)
+  await records.startRun('c1')
+  assert.equal((await stat(file)).ino, started.ino)
+})
+
+test('a start for a child nobody recorded does nothing, writes nothing, and never throws, whatever it is given', async () => {
+  const { records, directory } = await fixture()
+  await records.startRun('ghost')
+  const odd: unknown[] = ['', undefined, null, 5, {}, '../../../etc/passwd', 'a/b', '\0']
+  for (const id of odd) await records.startRun(id as string)
+  assert.equal(await exists(join(directory, 'sessions')), false)
+  assert.equal(await exists(join(directory, 'by-child')), false)
+})
+
+test('the runs of a child that was started again are numbered on, and a start between them changes no report', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  await records.endRun('c1', { stopReason: 'completed', closing: 'first' })
+  await records.startRun('c1')
+  await records.endRun('c1', { stopReason: 'completed', closing: 'second' })
+  const dir = sessionDir(directory, 's1')
+  assert.equal(await readFile(join(dir, '1-coder-1.md'), 'utf8'), 'first\n')
+  assert.equal(await readFile(join(dir, '1-coder-2.md'), 'utf8'), 'second\n')
+  assert.equal((await records.children('s1'))[0]!.last, 'finished')
+})
+
 // --- runs and reports -----------------------------------------------------------------------------
 
 test('endRun writes the closing message as a report named for the child\'s order, role and run, and records the run', async () => {
@@ -277,7 +335,8 @@ test('endRun for a child it knows takes a reason, an error and a closing message
   assert.equal(child!.runs.length, 3)
   assert.deepEqual(child!.runs.map(run => run.stopReason), ['unknown', 'completed', 'unknown'])
   assert.ok(child!.runs.every(run => !('error' in run)))
-  assert.equal(child!.last, 'finished')
+  // The last run had no reason: a malformed event is not a success.
+  assert.equal(child!.last, 'stopped')
 })
 
 test('a pointer that is not a session hash finds nothing, and a pointer to a session that is gone finds nothing', async () => {
@@ -607,9 +666,9 @@ test('every stop reason dsh has maps to a status: completed finishes, error fail
   for (const [reason, status] of Object.entries(STOP_REASON_STATUS)) assert.equal(statusFor(reason), status, reason)
 })
 
-test('a stop reason nobody mapped is finished, and the names on the object\'s prototype are not reasons', () => {
+test('a stop reason nobody mapped is stopped, never finished, and the names on the object\'s prototype are not reasons', () => {
   for (const reason of ['', 'timeout', 'COMPLETED', 'cancelled', 'toString', 'constructor', '__proto__', 'hasOwnProperty']) {
-    assert.equal(statusFor(reason), 'finished', reason)
+    assert.equal(statusFor(reason), 'stopped', reason)
   }
 })
 
@@ -620,7 +679,7 @@ test('each stop reason, as a run ends with it, sets last and keeps the raw reaso
   for (const reason of reasons) await records.endRun(`c-${reason}`, { stopReason: reason, closing: reason })
   const listed = await records.children('s1')
   assert.deepEqual(listed.map(child => [child.runs[0]!.stopReason, child.last]), [
-    ['completed', 'finished'], ['aborted', 'stopped'], ['error', 'failed'], ['max-tokens', 'stopped'], ['refusal', 'failed'], ['something-new', 'finished'],
+    ['completed', 'finished'], ['aborted', 'stopped'], ['error', 'failed'], ['max-tokens', 'stopped'], ['refusal', 'failed'], ['something-new', 'stopped'],
   ])
 })
 

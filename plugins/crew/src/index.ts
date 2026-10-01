@@ -7,9 +7,11 @@
  * - provides the `dishCrew` service: `settings()` is the `crew.yaml` in the config store as it is now (see
  *   `settings.ts`), `records` is the crew's own record of its children and their reports (see `record.ts`), and
  *   `whenRecorded(child)` is the run of that child that is being recorded now, if there is one;
- * - captures every crew child's runs: the error an `agent/error` reports is held for the child, and `subagent/end`
- *   files the run, with that error and the closing message, in the record. Both listeners are the host's, so they hear
- *   every agent, and they act only on children the record knows. They never throw;
+ * - captures every crew child's runs: the error an `agent/error` reports is held for the child, `subagent/end` files the
+ *   run, with that error and the closing message, in the record, and `subagent/start` marks the child running again (dsh
+ *   starts a run each time it brings a child up, not only the first). A child's starts and ends are recorded in the order
+ *   they were published. The listeners are the host's, so they hear every agent, and they act only on children the
+ *   record knows. They never throw;
  * - at start, before it provides the service, removes the sessions' records not written to for 180 days;
  * - claims `crew.yaml` in the store and seeds it when `dishConfig` is there. `dishConfig` is optional, so there is no
  *   order to keep: with no store, every answer is the shipped default;
@@ -227,8 +229,38 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // crew child (the record has to be asked), and an agent that isn't takes its entry out, so what is kept is the
   // children's and no more. Oldest first, and bounded: a child whose end never comes can't grow this.
   const remembered = new Map<string, Promise<string | undefined>>()
-  // The run of each child that is being recorded now, until it is. Never rejects.
+  // What is being recorded for each child, a start or an end, until it is: the one the next waits for, so that a child's
+  // runs reach the record in the order dsh published them, an end before the next start and a start before its end.
+  // Never rejects.
+  const chain = new Map<string, Promise<void>>()
+  // The end of each child that is being recorded now, until it is. For `whenRecorded`: starts are not in it. Never rejects.
   const pending = new Map<string, Promise<EndedRun | undefined>>()
+
+  /** Do `job` for child `id` after whatever is being recorded for it. A failure is logged as `failed` says and gives `undefined`. */
+  const inOrder = <T>(id: string, failed: string, job: () => Promise<T>): Promise<T | undefined> => {
+    const previous = chain.get(id)
+    const run = (async () => {
+      await previous
+      return job()
+    })().catch((cause: unknown) => {
+      warn(failed, id, describe(cause))
+      return undefined
+    })
+    const link = run.then(() => {})
+    chain.set(id, link)
+    void link.then(() => {
+      if (chain.get(id) === link) chain.delete(id)
+    })
+    return run
+  }
+
+  // A shutdown waits for what is being recorded: a run that ended just before it is not lost. Registered before the
+  // listeners, so that it is disposed after them (a plugin's effects are disposed last first); cordis stops delivering a
+  // plugin's events as soon as its disposal starts, so nothing is heard that this does not wait for.
+  ctx.effect(() => async () => {
+    await Promise.all([...chain.values()])
+    await records.flush()
+  })
 
   ctx.on('agent/error', (payload) => {
     try {
@@ -254,6 +286,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   })
 
+  // dsh publishes a start for every run of a child: its first, and each time it is brought up again after it had ended (a
+  // message to it, a resume after a restart). The record says running from the first and from a follow-up that `delegate`
+  // sends; this is how it learns of the others, so that a child that is running again counts against the limits.
+  ctx.on('subagent/start', (info) => {
+    try {
+      const id = idOf(info)
+      if (id === undefined) return
+      void inOrder(id, 'could not record the start of child %s: %s', () => records.startRun(id))
+    } catch (cause) {
+      warn('could not record the start of a child: %s', describe(cause))
+    }
+  })
+
   ctx.on('subagent/end', (info) => {
     try {
       const event: unknown = info
@@ -263,15 +308,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const error = remembered.get(id)
       remembered.delete(id)
       const closing = closingText(lastAssistantMessage)
-      // After the run of this child that is still being recorded, so that runs are numbered as they ended.
-      const previous = pending.get(id)
-      const run: Promise<EndedRun | undefined> = (async () => {
-        await previous
-        return records.endRun(id, { stopReason: stopReason as string, error: await error, closing })
-      })().catch((cause: unknown) => {
-        warn('could not record the end of child %s: %s', id, describe(cause))
-        return undefined
-      })
+      const run = inOrder(id, 'could not record the end of child %s: %s',
+        async () => records.endRun(id, { stopReason: stopReason as string, error: await error, closing }))
       pending.set(id, run)
       void run.then(() => {
         if (pending.get(id) === run) pending.delete(id)
@@ -279,12 +317,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     } catch (cause) {
       warn('could not record the end of a child: %s', describe(cause))
     }
-  })
-
-  // A shutdown waits for the runs being recorded: one that ended just before it is not lost.
-  ctx.effect(() => async () => {
-    await Promise.all([...pending.values()])
-    await records.flush()
   })
 
   // `ctx.get` is read on every call: the store is optional, and may come, go and come back.
