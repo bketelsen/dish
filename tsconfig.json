@@ -14,7 +14,10 @@
     ]
   },
   "include": [
-    "plugins/*/src"
+    "plugins/*/src",
+    "packages/*/src",
+    "packages/*/test",
+    "plugins/*/test"
   ],
   "exclude": [
     "plugins/*/src/client"

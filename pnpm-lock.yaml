@@ -18,6 +18,8 @@ importers:
         specifier: ^6.0.0
         version: 6.0.3
 
+  packages/dish-kit: {}
+
   plugins/copilot:
     dependencies:
       '@deepseek-ai/dsh-llm-pi-ai':
