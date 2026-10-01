@@ -350,13 +350,14 @@ export function createDishPrompts(options: ServiceOptions): DishPrompts {
       }
       const pending = agents.get(id)
       agents.delete(id)
-      reported.delete(id)
       const before = dropping.get(id)
       // Wait for a snapshot that is still being taken (its write must not land after the removal), and for an
       // earlier drop. Nothing here rejects: a snapshot's failure is its caller's.
       const done = (async () => {
         await before
         await pending?.then(() => {}, () => {})
+        // Only now: a snapshot in flight could still record a warning, which would hide the next one after the drop.
+        reported.delete(id)
         try {
           await files.drop(id)
         } catch (error) {
