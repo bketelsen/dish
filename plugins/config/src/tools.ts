@@ -15,6 +15,7 @@
 import type {} from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { isTopLevelAgent } from 'dish-kit'
 import { ConfigStoreError } from './store/errors.ts'
 import { pathProblem } from './store/git.ts'
 import type { NamespaceRegistry } from './store/namespaces.ts'
@@ -28,22 +29,12 @@ const MAIN_ONLY = 'config tools are for the main agent only; ask the main agent 
 const SHOWN_PATH_CHARS = 80
 
 /**
- * The author of this call: the main agent of its session.
- *
- * The main agent is the one that nothing marks as a child. dsh marks a child twice, and dsh's own depth rule takes the
- * larger of the two: the session header's `delegationDepth`, and the runtime `options.subagentDepth` (which a resumed
- * child can have where its header says otherwise). A session also records `origin: 'subagent'`. Any of them, or a value
- * that is none of the shapes dsh writes, makes the caller not the main agent.
+ * The author of this call: the main agent of its session. See `isTopLevelAgent` for what makes a caller the main agent.
  * @throws a plain `Error` unless the caller is a top-level agent.
  */
 function mainAuthor(exec: ToolRunContext): EditAuthor {
   const header = exec.agent?.session?.header
-  if (header === undefined) throw new Error(MAIN_ONLY)
-  const options: { subagentDepth?: unknown } | undefined = exec.agent?.options
-  const topLevel = (depth: unknown): boolean => depth === undefined || depth === 0
-  if (!topLevel(header.delegationDepth) || !topLevel(options?.subagentDepth) || header.origin === 'subagent') {
-    throw new Error(MAIN_ONLY)
-  }
+  if (header === undefined || !isTopLevelAgent(exec.agent)) throw new Error(MAIN_ONLY)
   return { kind: 'agent', sessionId: header.id, role: 'main' }
 }
 
