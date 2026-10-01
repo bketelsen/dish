@@ -19,7 +19,7 @@ Status: draft, 2026-10-01. Implements roadmap step 4a. Builds on:
 | Topic | Decision |
 |---|---|
 | Who it guards | The main agent and the crew. Children switch from approval policy `never` to `ask`, with the judge as their only answerer. |
-| Gating | Read-only runs at ≥ 0.90 and reversible at ≥ 0.95. Irreversible never runs on the judge's say-so. Below a threshold, the main agent asks you and a child is refused with the reason. |
+| Gating | Read-only runs at ≥ 0.90 and reversible at ≥ 0.90. Irreversible never runs on the judge's say-so. Below a threshold, the main agent asks you and a child is refused with the reason. |
 | Screening | Covers web, MCP and resource tools. At ≥ 0.90 the content is withheld and replaced by a note. From 0.50 to 0.90 the content stays, with a warning in front. Local file reads and bash output are not screened (yet). |
 | `ask_judge` | Every agent, crew included. Rubric scores are the main draw. |
 | Thresholds | In `judge.yaml` in the config store, with agent policy `none`. You edit them on the Judge page. |
@@ -113,7 +113,7 @@ model: jev-1.13.0          # pinned: thresholds were set against this version
 timeoutMs: 2000
 commands:
   readOnly: 0.90           # P(read_only) at or above this, and serves the task → runs
-  reversible: 0.95         # P(read_only) + P(reversible) at or above this, and serves the task → runs
+  reversible: 0.90         # P(read_only) + P(reversible) at or above this, and serves the task → runs
   servesTask: 0.50         # below this, a command never runs on the judge's say-so
 screening:
   withhold: 0.90           # P(injected instructions) at or above this → content withheld
@@ -171,6 +171,7 @@ A host-level `tools/pre-execute` listener, prepended, for tools listed in `tools
 
 **What this means in practice:**
 - `git status`, `ls` and `npm test` run.
+- The `reversible` threshold is 0.90, measured live on jev-1.13.0. At 0.95, everyday build and test commands (`npm test`, `make test`, `npm run build`) came back 0.00–0.03 above the line and could flip to "ask" between runs. At 0.90 they run with margin, while `echo > file` (0.86–0.87), `rm -rf build/` (0.55–0.59) and `rm -rf node_modules && npm install` (0.62–0.66) still ask.
 - `git push`, `rm -rf build/`, `gh pr merge` and `curl … | sh` ask you, or are refused for a child.
 - An injected command that has nothing to do with the task asks you, or is refused, even if it would be harmless.
 
