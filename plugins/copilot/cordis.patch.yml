@@ -4,7 +4,9 @@
     - id: dish-copilot-catalog
       name: dish-copilot/catalog
       config:
-        cacheFile: !!js dshHomePath('dish-copilot-models.json')
+        # The cache lives in the XDG cache directory (cacheFile defaults there).
+        # The old location is read once, if the new file does not exist yet.
+        legacyCacheFile: !!js dshHomePath('dish-copilot-models.json')
     - id: dish-copilot
       name: dish-copilot
 

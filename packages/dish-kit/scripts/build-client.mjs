@@ -1,16 +1,26 @@
-// Bundle src/client into lib/client.js in the shape dsh's client module loader
-// expects: one CommonJS factory registered with window.__ModuleLoader__, with
-// the shell's platform modules left as require() calls it satisfies.
+// Bundle a plugin's src/client into lib/client.js in the shape dsh's client
+// module loader expects: one CommonJS factory registered with
+// window.__ModuleLoader__, with the shell's platform modules left as require()
+// calls it satisfies. Run from the plugin directory:
+//   node <dish-kit>/scripts/build-client.mjs [--watch]
+// The package name comes from <cwd>/package.json; the entry is
+// <cwd>/src/client/index.tsx and the output <cwd>/lib/client.js.
+// Modules the plugin asks the shell for beyond its own platform table, in
+// `dsh.client.external` of its package.json, stay require() calls too: the
+// package's own file for such a module has no runtime exports to bundle.
 // `--watch` rebuilds on change; the running dsh hot-swaps the bundle.
 import { context } from 'esbuild'
 import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
-const { name } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+const cwd = process.cwd()
+const { name, dsh } = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'))
+const requested = dsh?.client?.external ?? []
 const watch = process.argv.includes('--watch')
 
 const ctx = await context({
-  entryPoints: [new URL('../src/client/index.tsx', import.meta.url).pathname],
-  outfile: new URL('../lib/client.js', import.meta.url).pathname,
+  entryPoints: [join(cwd, 'src/client/index.tsx')],
+  outfile: join(cwd, 'lib/client.js'),
   bundle: true,
   format: 'cjs',
   platform: 'browser',
@@ -24,6 +34,7 @@ const ctx = await context({
     '@deepseek-ai/cordis',
     '@deepseek-ai/dsh-client-store', '@deepseek-ai/dsh-client-ui-slots',
     '@deepseek-ai/dsh-client-ui-primitives', '@deepseek-ai/dsh-client-ui-dockkit',
+    ...requested,
   ],
   define: { 'process.env.NODE_ENV': '"production"' },
   banner: { js: `window.__ModuleLoader__.load({ id: ${JSON.stringify(name)}, factory: (require) => { var module = { exports: {} }; var exports = module.exports;` },

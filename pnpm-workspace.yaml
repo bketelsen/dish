@@ -1,4 +1,5 @@
 packages:
+  - packages/*
   - plugins/*
 
 # Native prebuilds the harness needs at runtime (pty terminal, FFI, spawn helper).

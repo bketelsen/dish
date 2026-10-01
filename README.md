@@ -10,6 +10,7 @@ A personal plugin workspace for [DeepSeek Harness](https://github.com/deepseek-a
 pnpm install
 pnpm build          # bundles each plugin's browser half (plugins/*/lib/client.js)
 pnpm dsh plugin --profile web add ./plugins/copilot
+pnpm dsh plugin --profile web add ./plugins/config
 pnpm web            # = dsh web; prints the UI URL (with its access token)
 ```
 
@@ -27,9 +28,13 @@ pnpm dsh --profile web --dump-config | grep -A3 dish-
 
 ## Plugins
 
+Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, terminal logging, remote helpers and the client build script.
+
+
 | Plugin | What it does |
 |---|---|
 | [`copilot`](plugins/copilot) | GitHub Copilot as a model provider: a sign-in card on Settings → Models, plus a model list kept in step with your account (including models newer than dsh's bundled catalog). |
+| [`config`](plugins/config) | The versioned config store other plugins keep what you author in: a bare git repo pushed to GitHub, namespaces per plugin, main-agent tools with proposal branches, and a Settings → History page. |
 
 ## Writing another plugin
 
@@ -42,7 +47,7 @@ Plugins run as plain `.ts` through Node's type stripping, so stick to erasable s
 
 ### Things that aren't obvious
 
-- **Browser code must be pre-bundled.** A plugin's `./client` export is loaded by dsh's own module loader, not by Node, so it can't be raw `.ts`. `plugins/copilot/scripts/build-client.mjs` is a reusable esbuild script for that; the plugin's README explains the wiring.
-- **`dsh web` prints no plugin logs.** The web profile mounts no console log exporter. A plugin that needs to reach the terminal has to register its own `ctx.logger.exporter(...)` (see `plugins/copilot/src/terminal.ts`).
+- **Browser code must be pre-bundled.** A plugin's `./client` export is loaded by dsh's own module loader, not by Node, so it can't be raw `.ts`. `packages/dish-kit/scripts/build-client.mjs` is a reusable esbuild script for that, run from the plugin's directory; `plugins/copilot/README.md` explains the wiring.
+- **`dsh web` prints no plugin logs.** The web profile mounts no console log exporter. A plugin that needs to reach the terminal has to register its own `ctx.logger.exporter(...)` (`printOwnLogs()` in `packages/dish-kit/src/terminal.ts` does this).
 - **Upstream reference.** The dsh docs worth reading are `docs/user/develop/` (tutorials), `docs/cookbook/` (tools, remote APIs, settings cards), and each package's `README.md`. `.agents/notes/` records the reasoning behind upstream design decisions.
 - **State lives in `~/.dsh`**: `profiles/<name>/` holds profile manifests and user patches, and `.credentials.yaml` holds stored keys and sign-ins.

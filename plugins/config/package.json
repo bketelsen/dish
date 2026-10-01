@@ -1,12 +1,12 @@
 {
-  "name": "dish-copilot",
-  "version": "0.1.0",
-  "description": "Sign DeepSeek Harness into a GitHub Copilot subscription",
+  "name": "dish-config",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Git-backed versioned config store for dish plugins",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./catalog": "./src/catalog.ts",
     "./client": "./lib/client.js"
   },
   "files": [
@@ -14,10 +14,10 @@
     "lib/client.js",
     "cordis.patch.yml"
   ],
+  "license": "MIT",
   "keywords": [
     "dsh-plugin"
   ],
-  "license": "MIT",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -26,7 +26,10 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-api-remotes",
-        "@deepseek-ai/dsh-client-ui-settings-models"
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "external": [
+        "@deepseek-ai/dsh-api-gateway/client"
       ]
     }
   },
@@ -36,26 +39,23 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
-    "@deepseek-ai/dsh-authorization": "^0.2.0-rc.2",
-    "@deepseek-ai/dsh-credentials": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-agent": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-settings": "^0.2.0-rc.2",
-    "@deepseek-ai/dsh-llm-pi-ai": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-typert-protocol": "^0.2.0-rc.2"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
     "@deepseek-ai/dsh-api-gateway": "0.2.0-rc.2",
     "@deepseek-ai/dsh-api-remotes": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-authorization": "0.2.0-rc.2",
     "@deepseek-ai/dsh-client-store": "0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-primitives": "0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-renderer": "0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-settings": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-settings-models": "0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-slots": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-credentials": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
     "@deepseek-ai/dsh-settings": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
     "@types/react": "~18.3.1"
   },

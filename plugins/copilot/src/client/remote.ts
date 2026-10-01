@@ -10,6 +10,7 @@
 import type {
   InvocationDescriptor, RemoteResult, RemoteStreamHandle, TypertRemoteContribution,
 } from '@deepseek-ai/dsh-typert-protocol'
+import { remoteContribution, remoteDescriptor } from 'dish-kit/client'
 import { NAMESPACE, type CopilotStatus, type SignInEvent } from '../protocol.ts'
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
@@ -24,26 +25,13 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
   }
 }
 
-function descriptor(method: string, extra: Partial<InvocationDescriptor> = {}): InvocationDescriptor {
-  return {
-    id: `dish-copilot#${NAMESPACE}/${method}`,
-    service: NAMESPACE,
-    namespace: NAMESPACE,
-    method,
-    invocation: { kind: 'direct' },
-    parameters: [],
-    result: { mode: 'src-json' },
-    ...extra,
-  }
-}
+const descriptor = (method: string, extra?: Partial<InvocationDescriptor>) =>
+  remoteDescriptor('dish-copilot', NAMESPACE, method, extra)
 
-export const copilotRemote: TypertRemoteContribution = {
-  package: 'dish-copilot',
-  descriptors: [
-    descriptor('status'),
-    descriptor('signIn', { mode: 'stream', cancellation: { parameter: 'signal' } }),
-    descriptor('cancel'),
-    descriptor('signOut'),
-    descriptor('refreshModels'),
-  ],
-}
+export const copilotRemote: TypertRemoteContribution = remoteContribution('dish-copilot', [
+  descriptor('status'),
+  descriptor('signIn', { mode: 'stream', cancellation: { parameter: 'signal' } }),
+  descriptor('cancel'),
+  descriptor('signOut'),
+  descriptor('refreshModels'),
+])

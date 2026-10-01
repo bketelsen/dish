@@ -96,6 +96,24 @@ Everything here is edited and watched on a **Families** page in the web UI.
 - Results, proposals and anything waiting for you go to the **inbox** page. There are no push notifications.
 - No budget cap for now.
 
+## The judge (Jev)
+
+[TypeSafe's Jev](https://typesafe.ai) is a judge built into the harness, not a crew member. It doesn't write. It answers typed questions in about 300 ms, with probabilities the code thresholds:
+- **noul**: yes/no, as the probability of yes
+- **choice**: one of your options, with a probability per option and a confidence
+- **score**: a position on a rubric you define
+
+At $0.042 per million input tokens it's cheap enough to sit on every tool call, every finished task, and every incoming event. The [ten levels of Jev](https://github.com/disler/ten-levels-of-jev) are the reference for patterns.
+
+| Decision (2026-09-30) | |
+|---|---|
+| Shape | A `judge` service (`ctx.judge`) that plugins call. The main agent also gets an ad hoc `ask_judge` tool. |
+| First uses | **Guardrails.** (1) A machine answerer on dsh's approval seam: each command is read-only, reversible or irreversible, with confidence gating (confident and safe runs; irreversible is blocked; in between asks you). This makes `infra`'s tiered autonomy real. (2) Screening tool results for injected instructions before they reach an agent (GitHub issues, CI logs, web pages). |
+| Later uses | Checking crew claims against evidence, diff risk scores, issue triage into initiatives, model routing, and when to compact. |
+| Questions vs thresholds | Questions live in each plugin's code, reviewed like code. Thresholds live in the config store, tunable in the UI with history. |
+| When Jev is down | Gates fail closed and ask you. Advisory uses skip. |
+| Access | Direct TypeSafe API (`api.typesafe.ai/v1/systemone`, `jev-latest`). The key goes in dsh's credential store through a small settings card, never in the config repo. |
+
 ## Plugins and contracts
 
 Each is its own bundle. "Provides" names its Cordis service; plugins depend only on the services listed.
@@ -114,6 +132,7 @@ Each is its own bundle. "Provides" names its Cordis service; plugins depend only
 | `inbox` | `inbox` | — | items (proposal, approval, result) and the mobile-friendly page |
 | `triggers` | — | `families`, `inbox` | schedules and GitHub events → main-agent wake-ups |
 | `memory` | `memory` | — | the vault: notes, search and agent tools |
+| `judge` | `judge` | `dishConfig` (thresholds) | the TypeSafe Jev client, the key settings card, guardrails (approval answerer and result screen), `ask_judge` |
 | `copilot` (done) | `copilotCatalog` | — | Copilot sign-in and the live model catalog |
 | later: `copilot-usage`, `infra` (with a tiered approval answerer), `web-research` | | | |
 
@@ -180,3 +199,13 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
 3. **The VM.** OS, provisioning, and the service unit. Deferred from the brainstorm.
 4. **Gate environment.** Sandbox, timeouts, and whether gates need network or secrets.
 5. **Main-agent preset vs global `delegate`.** See the spike lessons above.
+6. **Public access with GitHub sign-in, instead of Tailscale only** (raised 2026-09-30, to settle at deployment). You may make dish publicly reachable, signing in with GitHub and allowing only your account and members of the `frostyard` org, so others can use it. This would reopen several decisions:
+   - **Access** (currently Tailscale only, Funnel only for webhooks): dsh's own token-in-URL auth would sit behind an OAuth front, either a proxy or a dsh plugin.
+   - **Multi-user:**
+     - Each user needs an identity across sessions.
+     - Copilot sign-in is per user, or shared.
+     - Commits in the config store need the real author, not just "user".
+     - Approvals and the inbox need routing per user.
+     - Who may edit prompts, crew and family direction, vs who may only use them?
+   - **Cost:** whose Copilot quota pays for whose work?
+   - **Where it would go:** the Caddy VM that already fronts your self-hosted services, with its route and the dish Incus instance defined in your GitOps repo `~/projects/fleet`.

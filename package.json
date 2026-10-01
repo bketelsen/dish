@@ -6,6 +6,7 @@
   "scripts": {
     "dsh": "dsh",
     "web": "dsh web",
+    "test": "node --test 'packages/*/test/*.test.ts' 'plugins/*/test/*.test.ts'",
     "typecheck": "tsc -p tsconfig.json --noEmit && pnpm -r --if-present typecheck",
     "build": "pnpm -r --if-present build"
   },

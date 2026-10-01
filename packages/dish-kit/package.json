@@ -1,0 +1,23 @@
+{
+  "name": "dish-kit",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Shared helpers for dish plugins",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client.ts",
+    "./build-client": "./scripts/build-client.mjs"
+  },
+  "dependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.0-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2"
+  }
+}
