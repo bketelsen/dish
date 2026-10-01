@@ -68,7 +68,8 @@ Each write is atomic, and a commit lands only if `main` is still where the write
 - **Commit**: one atomic change to one or more documents, carrying:
   - an author: `{ kind: 'user' }`, `{ kind: 'agent', sessionId, role }`, or `{ kind: 'system' }` for the store's own commits (the root commit and `seed`); git records `user` as the user identity, and `agent` and `system` as the agent identity
   - a message, generated as `<paths>: <summary>` plus an optional note; the subject names the first 3 paths, then "and N more"
-  - trailers: `Dish-Author-Kind`, `Dish-Session` and `Dish-Role` (agent only), `Dish-Note` (when there's a note)
+  - trailers: `Dish-Author-Kind`, `Dish-Session` and `Dish-Role` (agent only), `Dish-Note` (when there's a note), and `Dish-Revert` (a revert: the full id of the commit it undoes; its subject is `Revert <short id>: <paths>`)
+  - `history` reads the author and note back from git's own trailer block only; a commit with anything else there (or no `Dish-Author-Kind`) is the `system`'s
 - **Proposal**: a branch `proposal/<id>` whose commits sit on top of the `main` commit it was based on. Metadata (title, rationale, author session, created, status) is stored in the tip commit's message trailers, so the branch alone carries everything.
 
 ## Service: `dishConfig`
@@ -87,10 +88,15 @@ interface DishConfig {
   write(changes: Change[], meta: WriteMeta): Promise<CommitInfo | undefined>
   /** One-time defaults: writes only documents that don't exist yet. */
   seed(defaults: Record<string, string>, owner: string): Promise<CommitInfo | undefined>
-  revert(commit: string, meta: WriteMeta): Promise<CommitInfo>   // new commit restoring what `commit` changed
+  /** New commit restoring what `commit` (a full id on main) changed, via `write` with `base: commit`. `undefined`, with no commit, when nothing is left to restore. The first commit is INVALID. */
+  revert(commit: string, meta: Omit<WriteMeta, 'base'>): Promise<CommitInfo | undefined>
 
+  /** Newest first. `limit` is 1 to 500 (default 50). `before`: a full id on main; the list starts just below it. `path` and `prefix` are exclusive. */
   history(options?: { path?: string, prefix?: string, limit?: number, before?: string }): Promise<CommitInfo[]>
+  /** `from` and `to`: "main", a full commit id, or the empty tree. Runs no external diff program. */
   diff(from: string, to: string, path?: string): Promise<FileDiff[]>
+  /** One commit with its diff against its parent (the empty tree for the first commit). */
+  commit(id: string): Promise<{ info: CommitInfo, diffs: FileDiff[] }>
 
   propose(changes: Change[], meta: ProposalMeta): Promise<ProposalInfo>
   proposals(status?: ProposalStatus): Promise<ProposalInfo[]>
@@ -230,5 +236,4 @@ The UI is checked by hand in the browser, as with the copilot card.
 ## Open items for the implementation plan
 
 - Proposal ids: short random ids, or slugs from the title.
-- Whether `history` pages by commit count or time.
 - The remote's protocol for the VM: SSH deploy key (write access to this repo only) vs a `gh` credential helper. Leaning toward a deploy key.

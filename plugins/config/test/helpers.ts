@@ -1,7 +1,10 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import assert from 'node:assert/strict'
 import { after } from 'node:test'
+import { ConfigStoreError } from '../src/store/errors.ts'
+import { Git } from '../src/store/git.ts'
 import type { GitIdentity } from '../src/store/git.ts'
 import { NamespaceRegistry } from '../src/store/namespaces.ts'
 import type { NamespaceSpec } from '../src/store/namespaces.ts'
@@ -64,6 +67,33 @@ export async function openStore(options: OpenStoreOptions = {}): Promise<ConfigS
   })
   opened.push(store)
   return store
+}
+
+/** `openStore` on a fresh repository, with a `Git` on the same directory. */
+export async function openAt(options: OpenStoreOptions = {}): Promise<{ store: ConfigStore, repository: string, git: Git }> {
+  const repository = await repoPath()
+  const store = await openStore({ ...options, repository })
+  return { store, repository, git: new Git(repository) }
+}
+
+/** For `assert.rejects`: a `ConfigStoreError` with this `code`, whose message mentions each of `mentions`. */
+export function isStoreError(code: string, ...mentions: string[]): (error: unknown) => boolean {
+  return error => {
+    assert.ok(error instanceof ConfigStoreError, `expected a ConfigStoreError, got ${String(error)}`)
+    assert.equal(error.code, code, error.message)
+    for (const text of mentions) assert.ok(error.message.includes(text), `message mentions ${text}: ${error.message}`)
+    return true
+  }
+}
+
+/** For `assert.rejects`: a plain `Error` (a programmer or environment problem), not one of the store's coded refusals. */
+export function isPlainError(pattern: RegExp): (error: unknown) => boolean {
+  return error => {
+    assert.ok(error instanceof Error)
+    assert.ok(!(error instanceof ConfigStoreError), `expected a plain Error, got ${String(error)}`)
+    assert.match(error.message, pattern)
+    return true
+  }
 }
 
 /** Collect what `onCommit` is told, in order. */

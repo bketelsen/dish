@@ -10,18 +10,12 @@ import type { Change } from '../src/store/git.ts'
 import { secretKind } from '../src/store/guard.ts'
 import { ConfigStore } from '../src/store/store.ts'
 import type { WriteMeta } from '../src/store/store.ts'
-import { AGENT, AGENTA, USER, USERA, ns, openStore, recorder, repoPath } from './helpers.ts'
+import { AGENT, AGENTA, USER, USERA, isPlainError, isStoreError, ns, openAt, openStore, recorder, repoPath } from './helpers.ts'
 
 const MAIN = 'refs/heads/main'
 const TOKEN = `ghp_${'a'.repeat(36)}`
 const SK_KEY = `sk-${'a'.repeat(40)}`
 const AWS_KEY = `AKIA${'A'.repeat(16)}`
-
-async function openAt(options: Parameters<typeof openStore>[0] = {}): Promise<{ store: ConfigStore, repository: string, git: Git }> {
-  const repository = await repoPath()
-  const store = await openStore({ ...options, repository })
-  return { store, repository, git: new Git(repository) }
-}
 
 /** The loose-object summary: it changes when anything at all is written to the object database. */
 async function objects(git: Git): Promise<string> {
@@ -41,25 +35,6 @@ async function identities(git: Git, id: string): Promise<string> {
 
 async function mainOf(git: Git): Promise<string | undefined> {
   return git.resolve(MAIN)
-}
-
-function isStoreError(code: string, ...mentions: string[]): (error: unknown) => boolean {
-  return error => {
-    assert.ok(error instanceof ConfigStoreError, `expected a ConfigStoreError, got ${String(error)}`)
-    assert.equal(error.code, code, error.message)
-    for (const text of mentions) assert.ok(error.message.includes(text), `message mentions ${text}: ${error.message}`)
-    return true
-  }
-}
-
-/** A plain `Error` (a programmer or environment problem), not one of the store's coded refusals. */
-function isPlainError(pattern: RegExp): (error: unknown) => boolean {
-  return error => {
-    assert.ok(error instanceof Error)
-    assert.ok(!(error instanceof ConfigStoreError), `expected a plain Error, got ${String(error)}`)
-    assert.match(error.message, pattern)
-    return true
-  }
 }
 
 /** Commit `text` to `path` on `main` behind the store's back, as an outside writer would. */
@@ -420,6 +395,52 @@ test('a directory that is not a repository, even with a HEAD file, is left exact
   await assert.rejects(openStore({ repository }), isPlainError(/not a dish config repository, refusing to initialize over existing files/))
   for (const name of files) assert.equal(await readFile(join(repository, name), 'utf8'), 'not git', `${name} is untouched`)
   assert.deepEqual((await readdir(repository)).sort(), ['HEAD', 'dish-index-keepme', 'packed-refs.lock', 'refs'], 'no lock left behind')
+})
+
+test('the refusal to initialize over existing files carries git\'s own reason, so a corrupt real repository is not misreported', async () => {
+  // A repository that is really one (packed refs and all), with a HEAD git cannot read.
+  const repository = await repoPath()
+  await new Git(repository).initBare('main')
+  await writeFile(join(repository, 'packed-refs'), '# pack-refs with: peeled fully-peeled sorted\n')
+  await writeFile(join(repository, 'HEAD'), 'garbage\n')
+  await assert.rejects(openStore({ repository }), isPlainError(
+    /not a dish config repository, refusing to initialize over existing files \(git: fatal: not a git repository: .+\)$/))
+  assert.equal(await readFile(join(repository, 'HEAD'), 'utf8'), 'garbage\n', 'left as it was')
+})
+
+test('a first start that crashed inside git init, leaving config.lock or HEAD.lock, is completed: the locks are removed first', async () => {
+  for (const leftovers of [['config.lock'], ['HEAD.lock'], ['config.lock', 'HEAD.lock']]) {
+    const repository = await repoPath()
+    await mkdir(repository)
+    for (const name of leftovers) await writeFile(join(repository, name), 'left by a crash')
+    const store = await openStore({ repository })
+    assert.equal(await storedMessage(new Git(repository), await store.head()), 'Initialize dish config\n\nDish-Author-Kind: system\n', leftovers.join())
+    const names = await readdir(repository)
+    for (const name of leftovers) assert.ok(!names.includes(name), `${name} is removed`)
+  }
+})
+
+test('a half-made repository with a config.lock is completed too, and the lock is removed', async () => {
+  const repository = await crashedInit(['HEAD', 'refs', 'objects', 'info', 'branches'])
+  await writeFile(join(repository, 'config.lock'), 'left by a crash')
+  await writeFile(join(repository, 'HEAD.lock'), 'left by a crash')
+  const store = await openStore({ repository })
+  assert.match(await store.head(), /^[0-9a-f]{40}$/)
+  assert.deepEqual((await readdir(repository)).filter(name => name.endsWith('.lock')), ['dish.lock'], 'only our own lock remains')
+})
+
+test('config.lock and HEAD.lock are only taken for leftovers when nothing else is in the way', async () => {
+  const repository = await repoPath()
+  await mkdir(repository)
+  for (const name of ['config.lock', 'HEAD.lock', 'notes.txt']) await writeFile(join(repository, name), 'mine')
+  await assert.rejects(openStore({ repository }), isPlainError(/not a dish config repository, refusing to initialize over existing files/))
+  assert.deepEqual((await readdir(repository)).sort(), ['HEAD.lock', 'config.lock', 'notes.txt'], 'nothing touched, no lock left behind')
+
+  // A directory by that name is not a lock file.
+  const odd = await repoPath()
+  await mkdir(join(odd, 'config.lock'), { recursive: true })
+  await assert.rejects(openStore({ repository: odd }), isPlainError(/refusing to initialize over existing files/))
+  await stat(join(odd, 'config.lock'))
 })
 
 test('open validates maxBytes before it takes any lock', async () => {

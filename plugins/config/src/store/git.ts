@@ -108,7 +108,7 @@ function checkPath(path: string): void {
 }
 
 /** A path as git pathspec, with wildcards and `:(magic)` switched off. */
-function literal(path: string): string {
+export function literal(path: string): string {
   return `:(literal)${path}`
 }
 
