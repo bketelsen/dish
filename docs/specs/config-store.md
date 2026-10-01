@@ -1,6 +1,6 @@
 # Spec: config store (`dish-config`) and `dish-kit`
 
-Status: draft, 2026-09-30. Implements roadmap step 2. Builds on the [design](../design.md) (configuration and runtime data kept apart; XDG locations; everything you author is versioned).
+Status: implemented 2026-10-01 (branch `config-store`); drafted 2026-09-30. Implements roadmap step 2. Builds on the [design](../design.md) (configuration and runtime data kept apart; XDG locations; everything you author is versioned).
 
 ## Summary
 

@@ -10,6 +10,7 @@ A personal plugin workspace for [DeepSeek Harness](https://github.com/deepseek-a
 pnpm install
 pnpm build          # bundles each plugin's browser half (plugins/*/lib/client.js)
 pnpm dsh plugin --profile web add ./plugins/copilot
+pnpm dsh plugin --profile web add ./plugins/config
 pnpm web            # = dsh web; prints the UI URL (with its access token)
 ```
 
@@ -27,9 +28,13 @@ pnpm dsh --profile web --dump-config | grep -A3 dish-
 
 ## Plugins
 
+Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, terminal logging, remote helpers and the client build script.
+
+
 | Plugin | What it does |
 |---|---|
 | [`copilot`](plugins/copilot) | GitHub Copilot as a model provider: a sign-in card on Settings → Models, plus a model list kept in step with your account (including models newer than dsh's bundled catalog). |
+| [`config`](plugins/config) | The versioned config store other plugins keep what you author in: a bare git repo pushed to GitHub, namespaces per plugin, main-agent tools with proposal branches, and a Settings → History page. |
 
 ## Writing another plugin
 
