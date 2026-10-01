@@ -227,6 +227,67 @@ test('a model belongs to one family, since the family of a model is how the revi
     /^families\.openai\.mid: "claude-sonnet-5\.5" is also in family anthropic; a model belongs to one family/)
 })
 
+test('a model id may not be another listed model\'s provider/model name, which is what a listing offers it as', () => {
+  // A family on its own provider offers claude-opus-5.5 as anthropic/claude-opus-5.5, and another family has that for an id.
+  const problem = problemWith((d) => {
+    d.families.anthropic.provider = 'anthropic'
+    d.families.openai.strong = 'anthropic/claude-opus-5.5'
+  })
+  assert.match(problem, /^families\.openai\.strong: "anthropic\/claude-opus-5\.5" names two models: /)
+  assert.ok(problem.includes('"claude-opus-5.5" (family anthropic, as provider/model)') && problem.includes('"anthropic/claude-opus-5.5" (family openai)'), problem)
+  assert.match(problem, /Change one of the model ids, or the provider of a family, so that no two models are offered under one name\.$/)
+  // The other way round, the family with the provider comes second in the file: the later one is the one named.
+  const reversed = problemWith((d) => {
+    d.families = {
+      openai: { strong: 'anthropic/claude-opus-5.5', mid: 'gpt-5.6-sol' },
+      anthropic: { provider: 'anthropic', strong: 'claude-opus-5.5', mid: 'claude-sonnet-5.5' },
+    }
+  })
+  assert.match(reversed, /^families\.anthropic\.strong: "anthropic\/claude-opus-5\.5" names two models: /)
+  assert.ok(reversed.includes('(family openai)') && reversed.includes('(family anthropic, as provider/model)'), reversed)
+  // It is the mid tier that is named when that is the one that collides.
+  assert.match(problemWith((d) => {
+    d.families.anthropic.provider = 'anthropic'
+    d.families.openai.mid = 'anthropic/claude-sonnet-5.5'
+  }), /^families\.openai\.mid: "anthropic\/claude-sonnet-5\.5" names two models/)
+})
+
+test('a model id may not be the provider/model name of another model in its own family either', () => {
+  const problem = problemWith((d) => { d.families.anthropic = { provider: 'proxy', strong: 'proxy/claude-x', mid: 'claude-x' } })
+  assert.match(problem, /^families\.anthropic\.mid: "proxy\/claude-x" names two models: "claude-x" \(family anthropic, as provider\/model\) and "proxy\/claude-x" \(family anthropic\)\. /)
+  assert.match(problemWith((d) => { d.families.anthropic = { provider: 'proxy', strong: 'claude-x', mid: 'proxy/claude-x' } }), /^families\.anthropic\.mid: "proxy\/claude-x" names two models/)
+})
+
+test('two models of different families may not be offered under one name', () => {
+  // a/b + c and a + b/c are both a/b/c.
+  const problem = problemWith((d) => {
+    d.families.anthropic = { provider: 'a', strong: 'b/c', mid: 'claude-sonnet-5.5' }
+    d.families.openai = { provider: 'a/b', strong: 'c', mid: 'gpt-5.6-sol' }
+  })
+  assert.match(problem, /^families\.openai\.strong: "a\/b\/c" names two models: "c" \(family openai, as provider\/model\) and "b\/c" \(family anthropic, as provider\/model\)\. /)
+})
+
+test('names that only look alike are no collision, and one model in both tiers of a family is one model', () => {
+  const settings = settingsOf(shippedWith((d) => {
+    d.families.anthropic = { provider: 'proxy', strong: 'claude-x', mid: 'claude-x' }
+    d.families.openai = { provider: 'proxy', strong: 'proxy-claude-x', mid: 'claude-x-proxy' }
+    d.families.google = { strong: 'proxy/claude-y', mid: 'proxy/gemini' }
+    d.reviewerFamilies = ['openai', 'anthropic']
+  }))
+  assert.equal(settings.families.anthropic!.mid, 'claude-x')
+  // The same provider and an id that merely starts with it, in another family.
+  assert.ok(parseSettings(shippedWith((d) => { d.families.openai.provider = 'anthropic'; d.families.anthropic.provider = 'anthropic' })).ok)
+  // A model id with a slash, in a family with no provider, owes nothing to any other name.
+  assert.ok(parseSettings(shippedWith((d) => { d.families.openai = { strong: 'openrouter/gpt-6.1-sol', mid: 'openrouter/gpt-5.6-sol' } })).ok)
+})
+
+test('the shipped default, and the spec\'s direct-API example over it, have no colliding names', () => {
+  assert.ok(parseSettings(DEFAULT_TEXT).ok)
+  const direct = specBlocks()[1]!
+  const parsed = parseSettings(render({ ...shippedDocument(), ...load(direct) as object }))
+  assert.ok(parsed.ok, parsed.ok ? '' : parsed.problem)
+})
+
 test('reviewerFamilies must be a list naming only known families', () => {
   assert.equal(problemWith((d) => { d.reviewerFamilies = ['openai', 'gogle'] }), 'reviewerFamilies[1]: "gogle" is not a family (families: anthropic, openai)')
   assert.match(problemWith((d) => { d.reviewerFamilies = 'openai' }), /^reviewerFamilies: /)
@@ -357,6 +418,7 @@ test('a refusal never echoes much of the file, however large the offending value
     problemWith((d) => { d.families.openai.mid = huge; d.families.anthropic.mid = huge }),
     problemWith((d) => { d.families.openai.provider = [huge] }),
     problemWith((d) => { d.families.openai.provider = ` ${huge}` }),
+    problemWith((d) => { d.families.anthropic.provider = huge; d.families.openai.strong = `${huge}/claude-opus-5.5` }),
     problemOf(`provider: ${huge}\n  bad: [`),
   ]
   for (const problem of problems) assert.ok(problem.length < 500, `${problem.length}: ${problem.slice(0, 120)}`)

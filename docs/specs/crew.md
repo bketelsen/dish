@@ -79,7 +79,7 @@ reviewerFamilies: [openai, anthropic]
 ```
 
 **Validation** (the namespace's `validate`, so neither an agent nor the store can save a broken file):
-- **Well-formed:** valid YAML with exactly this shape. Families must name both tiers, and may name a `provider`, which is checked like the top-level one: a non-empty string with no whitespace around it. Tiers are `strong` or `mid`. Limits are positive integers, with `writers ≤ running`.
+- **Well-formed:** valid YAML with exactly this shape. Families must name both tiers, and may name a `provider`, which is checked like the top-level one: a non-empty string with no whitespace around it. A model id may not be another model's `provider/model` name, since a listing and a `model` override would then mean different models. Tiers are `strong` or `mid`. Limits are positive integers, with `writers ≤ running`.
 - **Role names** follow the prompts grammar. Each role needs a prompt: a shipped default or a document under `prompts/crew/`. That's checked when delegating, not at save, because the prompts plugin owns those documents.
 - **`reviews: true`** marks the reviewer: it has no fixed `family`, and its family comes from `reviewerFamilies`. Exactly one role may set it.
 - **Tools** are names only. A name the child can't see when it starts is left out at that moment (see [Tools](#tools)), so the file never makes a delegation fail.

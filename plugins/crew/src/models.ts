@@ -155,7 +155,8 @@ function listedFamily(settings: CrewSettings, model: string): string | undefined
  * The model and family `text` names, if it names a listed one: the bare model id, which is how a model has always been
  * given, or what an offer shows for it, `provider/model`, when its family has a provider of its own. A bare id comes
  * first, so an id with a slash in it is itself. The provider is no part of the model: it is its family's, and a model is
- * in one family only.
+ * in one family only. The settings refuse two models that would have one name (an id that is another model's
+ * `provider/model`), so neither spelling can mean a model the listing didn't say.
  */
 function offeredModel(settings: CrewSettings, text: string): { model: string, family: string } | undefined {
   const bare = listedFamily(settings, text)

@@ -717,6 +717,19 @@ test('offeredModels shows provider/model for a family with a provider of its own
   assert.deepEqual(offeredModels(same), ['anthropic/claude-opus-5.5', 'gpt-6.1-sol', 'gpt-5.6-sol'])
 })
 
+test('what a listing offers is one name per model, since the settings refuse names that collide', () => {
+  for (const settings of [SETTINGS, DIRECT, MIXED]) {
+    const names = offeredModels(settings)
+    assert.equal(new Set(names).size, names.length, names.join(', '))
+  }
+  // Two models that would be offered as one name are not settings at all.
+  const parsed = parseSettings(shippedWith((d) => {
+    d.families.anthropic.provider = 'anthropic'
+    d.families.openai.strong = 'anthropic/claude-opus-5.5'
+  }))
+  assert.equal(parsed.ok, false)
+})
+
 test('the refusals that list models show where each runs, and what they list is accepted back', () => {
   const unknown = problemOf(chooseRoute({ settings: DIRECT, role: 'coder', override: 'gpt-9' }))
   assert.match(unknown, /Models offered, by family: anthropic: anthropic\/claude-opus-5\.5, anthropic\/claude-sonnet-5\.5; openai: openai\/gpt-6\.1-sol, openai\/gpt-5\.6-sol\./)
