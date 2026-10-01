@@ -5,12 +5,15 @@
  */
 
 /**
- * The parts of a dsh agent that say whether it is a child. Every field is `unknown`, so any agent dsh builds fits
- * (dsh's own `Agent` types, a tool's `exec.agent`), and so does a plain object in a test.
+ * The parts of a dsh agent that say whether it is a child. Every field is `unknown` or an `object`, so any agent dsh
+ * builds fits (dsh's own `Agent` types, a tool's `exec.agent`), and so does a plain object in a test.
+ *
+ * `options` is only an `object`, because `subagentDepth` is not in dsh's `AgentOptions` until the subagent package
+ * adds it, and a program that doesn't load that package would not accept an agent whose options lack the property.
  */
 export interface AgentLike {
   session?: { header?: { delegationDepth?: unknown, origin?: unknown } }
-  options?: { subagentDepth?: unknown }
+  options?: object
 }
 
 /**
@@ -28,5 +31,6 @@ export function isTopLevelAgent(agent: AgentLike | undefined): boolean {
   const header = agent?.session?.header
   if (header === undefined) return false
   const topLevel = (depth: unknown): boolean => depth === undefined || depth === 0
-  return topLevel(header.delegationDepth) && topLevel(agent?.options?.subagentDepth) && header.origin !== 'subagent'
+  const options = agent?.options as { subagentDepth?: unknown } | undefined
+  return topLevel(header.delegationDepth) && topLevel(options?.subagentDepth) && header.origin !== 'subagent'
 }

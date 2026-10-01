@@ -22,18 +22,11 @@ import { printOwnLogs, xdgPaths } from 'dish-kit'
 import { DEFAULTS } from './defaults.ts'
 import { namespaceSpecs, pathFor } from './roles.ts'
 import { createDishPrompts } from './service.ts'
-import type { DishPrompts } from './service.ts'
 import { SnapshotFiles } from './snapshots.ts'
 
 export type { DishPrompts, Persona } from './service.ts'
 
 export const name = 'dish-prompts'
-
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    dishPrompts: DishPrompts
-  }
-}
 
 export interface Config {
   stateDirectory: string

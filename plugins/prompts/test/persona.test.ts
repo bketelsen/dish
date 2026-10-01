@@ -7,14 +7,16 @@ import { format, promisify } from 'node:util'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import Schema from '@deepseek-ai/schemastery'
 import SystemPrompt, { PERSONA_PREFIX_SECTION, PERSONA_SUFFIX_SECTION, renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import type { AssembleContext, PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { DEFAULTS } from '../src/defaults.ts'
 import { interpolate } from '../src/interpolate.ts'
 import * as row from '../src/persona.ts'
 import { applyPersona, personaListener } from '../src/persona.ts'
+import { pathFor } from '../src/roles.ts'
 import type { DishPrompts, Persona } from '../src/service.ts'
-import { dirs, mountPrompts, watchLogs } from './helpers.ts'
+import { captureStderr, dirs, mountPrompts, watchLogs } from './helpers.ts'
 
 const run = promisify(execFile)
 
@@ -338,6 +340,117 @@ test('a section the listener can\'t patch is logged once per agent, and the step
   assert.match(logger.lines[0]!, /a1/)
 })
 
+test('with no service, a child\'s own prefix is still rendered leniently, so its typo can\'t fail its step; a top-level agent is left alone', async () => {
+  const logger = recorder()
+  const listener = personaListener({ role: 'main', service: () => undefined, logger })
+  const child = build()
+  const prefix = section(child, PERSONA_PREFIX_SECTION)
+  prefix.text = 'You are the coder, on {{model}}. {{typo}} {{ bad }}'
+  const suffix = { ...section(child, PERSONA_SUFFIX_SECTION) }
+  assert.throws(() => renderPrompt(child), /typo/, 'as it is, dsh would fail the child\'s step')
+  assert.equal(await listener(child, assembling(agent('kid', true)), async () => child), child)
+  assert.equal(section(child, PERSONA_PREFIX_SECTION), prefix)
+  assert.equal(prefix.text, 'You are the coder, on deepseek-x. {{typo}} {{ bad }}')
+  assert.equal(prefix.interpolate, false)
+  assert.deepEqual(section(child, PERSONA_SUFFIX_SECTION), suffix, 'the suffix is not the child\'s to set without a service')
+  assert.doesNotThrow(() => renderPrompt(child))
+  assert.equal(logger.lines.length, 2, logger.lines.join('\n'))
+  assert.match(logger.lines[0]!, /dishPrompts/)
+  assert.match(logger.lines[1]!, /kid/)
+  assert.match(logger.lines[1]!, /\{\{typo\}\}/)
+
+  const top = build()
+  section(top, PERSONA_PREFIX_SECTION).text = 'global prefix {{typo}}'
+  const before = structuredClone(top)
+  await listener(top, assembling(agent('top')), async () => top)
+  assert.deepEqual(top, before)
+})
+
+test('when its snapshot fails, a child\'s own prefix is still rendered leniently; a top-level agent is left alone', async () => {
+  const logger = recorder()
+  const listener = personaListener({
+    role: 'reviewer',
+    service: () => service({ snapshot: async () => { throw new Error('the store is gone') } }),
+    logger,
+  })
+  const child = build()
+  const prefix = section(child, PERSONA_PREFIX_SECTION)
+  prefix.text = 'You are the coder, on {{model}}. {{typo}}'
+  await listener(child, assembling(agent('kid', true)), async () => child)
+  assert.equal(prefix.text, 'You are the coder, on deepseek-x. {{typo}}')
+  assert.equal(prefix.interpolate, false)
+  assert.equal(section(child, PERSONA_SUFFIX_SECTION).text, 'global suffix')
+  assert.doesNotThrow(() => renderPrompt(child))
+  assert.equal(logger.lines.length, 2, logger.lines.join('\n'))
+  assert.match(logger.lines[0]!, /the store is gone/)
+  assert.match(logger.lines[1]!, /\{\{typo\}\}/)
+
+  const top = build()
+  section(top, PERSONA_PREFIX_SECTION).text = 'global prefix {{typo}}'
+  const before = structuredClone(top)
+  await listener(top, assembling(agent('top')), async () => top)
+  assert.deepEqual(top, before)
+
+  // A child prefix that dsh would render literally stays literal on this path too.
+  const literal = build()
+  Object.assign(section(literal, PERSONA_PREFIX_SECTION), { text: 'Say {{typo}} as is.', interpolate: false })
+  const kept = structuredClone(literal)
+  await listener(literal, assembling(agent('kid2', true)), async () => literal)
+  assert.deepEqual(literal, kept)
+})
+
+test('a child whose sections can\'t be patched on a failure path is still not a failure', async () => {
+  const logger = recorder()
+  const listener = personaListener({ role: 'main', service: () => service(), logger })
+  const child = build()
+  Object.freeze(section(child, PERSONA_PREFIX_SECTION))
+  Object.freeze(section(child, PERSONA_SUFFIX_SECTION))
+  assert.equal(await listener(child, assembling(agent('kid', true)), async () => child), child)
+  assert.equal(logger.lines.length, 1, logger.lines.join('\n'))
+})
+
+test('forget lets an agent be told about again, and leaves the row-wide warning and other agents as they were', async () => {
+  const logger = recorder()
+  let current: DishPrompts | undefined
+  const listener = personaListener({ role: 'main', service: () => current, logger })
+  const step = async (id: string) => {
+    const assembly = build()
+    await listener(assembly, assembling(agent(id)), async () => assembly)
+  }
+  // No service: once, for the row.
+  await step('a1')
+  await step('a2')
+  assert.equal(logger.lines.length, 1)
+  listener.forget('a1')
+  await step('a1')
+  assert.equal(logger.lines.length, 1, 'the row-wide warning is not an agent\'s')
+
+  // A snapshot that fails, and a prompt with a variable with no value: an agent's own.
+  current = service({ snapshot: async () => { throw new Error('the store is gone') } })
+  await step('a1')
+  await step('a2')
+  assert.equal(logger.lines.length, 3)
+  await step('a1')
+  await step('a2')
+  assert.equal(logger.lines.length, 3)
+  listener.forget('a1')
+  await step('a1')
+  await step('a2')
+  assert.equal(logger.lines.length, 4)
+  assert.match(logger.lines[3]!, /a1/)
+
+  current = service({ snapshot: async () => ({ prefix: '{{nobody}}', suffix: '', commit: null }) })
+  await step('a1')
+  await step('a1')
+  assert.equal(logger.lines.length, 5)
+  listener.forget('a1')
+  await step('a1')
+  assert.equal(logger.lines.length, 6)
+  assert.match(logger.lines[5]!, /\{\{nobody\}\}/)
+  // Forgetting an agent never told about is nothing.
+  listener.forget('never-seen')
+})
+
 // --- the row --------------------------------------------------------------------------------------
 
 /** A context with a `systemPrompt` that does nothing, which is all the row asks of it: its events are `ctx`'s. */
@@ -370,6 +483,91 @@ test('the row is configured with a role, and a role that isn\'t one fails the lo
   }
 })
 
+test('the role pattern says what roles.ts says a role is, and says it again after the schema is serialized and revived', () => {
+  const alphabet = ['a', 'Z', '1', '-', '_', '/', '.', ' ', '\n']
+  const candidates = ['', 'main', 'common', 'commons', 'xcommon', 'uncommon', 'coder', 'my-role2', 'common\n', 'main\n']
+  let level = ['']
+  for (let length = 1; length <= 3; length++) {
+    level = level.flatMap(prefix => alphabet.map(character => prefix + character))
+    candidates.push(...level)
+  }
+  const revived = new Schema(JSON.parse(JSON.stringify(row.Config)))
+  const accepts = (schema: Schema, role: string): boolean => {
+    try {
+      schema({ role })
+      return true
+    } catch {
+      return false
+    }
+  }
+  let valid = 0
+  for (const role of candidates) {
+    let expected = role !== 'common'
+    if (expected) {
+      try {
+        pathFor(role)
+      } catch {
+        expected = false
+      }
+    }
+    if (expected) valid++
+    assert.equal(accepts(row.Config, role), expected, `Config: ${JSON.stringify(role)}`)
+    assert.equal(accepts(revived, role), expected, `revived Config: ${JSON.stringify(role)}`)
+  }
+  assert.equal(valid, 19)  // main, commons, xcommon, uncommon, coder, my-role2, and 13 made of a, 1 and - after an a
+  // And a role that is missing, or not a string, is no role either way.
+  for (const schema of [row.Config, revived] as Schema[]) {
+    assert.throws(() => schema({}), /role/)
+    assert.throws(() => schema({ role: 7 }), /role/)
+  }
+})
+
+test('the row logs as dish-prompts, so the host prints its lines once, and only when its terminal setting is on', async () => {
+  const where = await dirs()
+  const printed = async (terminal: boolean): Promise<string[]> => {
+    const out = captureStderr()
+    const ctx = contextWithStubs()
+    const host = mountPrompts(ctx, where.state, { terminal })
+    try {
+      await host
+      // A role with the grammar of one, and no default and no store: the host's service can't answer for it.
+      await ctx.plugin(row, { role: 'nosuchrole' })
+      for (let step = 0; step < 2; step++) {
+        const assembly = build()
+        await ctx.waterfall('system-prompt/assemble', assembly, assembling(agent('a1')), () => Promise.resolve(assembly))
+      }
+    } finally {
+      await host.dispose()
+      out.restore()
+    }
+    return out.lines()
+  }
+  const on = await printed(true)
+  assert.equal(on.length, 1, on.join('\n'))
+  assert.match(on[0]!, /^\[dish-prompts\] warn: could not set the prompt of agent a1 \(role nosuchrole\)/)
+  assert.deepEqual(await printed(false), [])
+})
+
+test('agent/disposed lets the row tell about an agent\'s trouble again, if the same id comes back', async () => {
+  const ctx = contextWithStubs()
+  const logs = watchLogs(ctx)
+  ctx.provide('dishPrompts', service({ snapshot: async () => { throw new Error('the store is gone') } }))
+  await ctx.plugin(row, { role: 'main' })
+  const step = async (id: string) => {
+    const assembly = build()
+    await ctx.waterfall('system-prompt/assemble', assembly, assembling(agent(id)), () => Promise.resolve(assembly))
+  }
+  await step('a1')
+  await step('a2')
+  await step('a1')
+  assert.equal(logs.length, 2, logs.join('\n'))
+  ctx.emit('agent/disposed', { agent: agent('a1') })
+  await step('a1')
+  await step('a2')
+  assert.equal(logs.length, 3, logs.join('\n'))
+  assert.match(logs[2]!, /agent a1 /)
+})
+
 test('the row patches an assembly dispatched through ctx.waterfall, and the original object is what comes out', async () => {
   const ctx = contextWithStubs()
   const spy = service()
@@ -398,7 +596,7 @@ test('the row without dishPrompts leaves the assembly alone, and the service arr
     assert.deepEqual(assembly, before)
   }
   assert.equal(logs.length, 1, logs.join('\n'))
-  assert.match(logs[0]!, /^\[dish-prompts-persona\] warn: /)
+  assert.match(logs[0]!, /^\[dish-prompts\] warn: /)
   ctx.provide('dishPrompts', service())
   const assembly = build()
   await ctx.waterfall('system-prompt/assemble', assembly, assembling(agent('a1')), () => Promise.resolve(assembly))
@@ -454,6 +652,25 @@ test('with dsh\'s own SystemPrompt and the dishPrompts service on the shipped de
   assert.deepEqual(logs, [])
 })
 
+test('a preset with a complete section gets exactly that section, and nothing throws', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  await ctx.plugin(SystemPrompt, { personaPrefix: 'global prefix', personaSuffix: 'global suffix' })
+  ctx.systemPrompt.variable('model', () => 'deepseek-x')
+  ctx.systemPrompt.variable('cwd', () => '/work')
+  ctx.systemPrompt.section({ name: 'preset:everything', order: 50, text: 'All of it, on {{model}}.', complete: true })
+  ctx.systemPrompt.section({ name: 'tool:bash', order: 1000, text: 'Use bash in {{cwd}}.' })
+  await mountPrompts(ctx, where.state)
+  await ctx.plugin(row, { role: 'main' })
+
+  const assembly = await ctx.systemPrompt.assemble({ agent: agent('a1') } as AssembleContext)
+  // dsh restores the complete section after the waterfall, so it is the whole prompt, however the row patched.
+  assert.deepEqual(assembly.sections.map(item => item.name), ['preset:everything'])
+  assert.equal(renderPrompt(assembly), 'All of it, on deepseek-x.')
+  assert.deepEqual(logs, [])
+})
+
 // --- what the row loads ---------------------------------------------------------------------------------
 
 test('loading the row loads neither defaults.ts nor the service, so the row can\'t be broken by them', async () => {
@@ -468,7 +685,7 @@ test('loading the row loads neither defaults.ts nor the service, so the row can\
   const { stdout } = await run(process.execPath, ['--input-type=module', '-e', script])
   const loaded = (JSON.parse(stdout) as string[]).filter(url => url.startsWith('file:'))
   const ours = loaded.filter(url => url.includes('/plugins/prompts/src/')).map(url => url.slice(url.lastIndexOf('/') + 1)).sort()
-  assert.deepEqual(ours, ['interpolate.ts', 'persona.ts', 'roles.ts'])
+  assert.deepEqual(ours, ['interpolate.ts', 'persona.ts'])
   assert.ok(loaded.some(url => url.includes('/dsh-system-prompt/')), 'it did load dsh-system-prompt: the hook sees the packages too')
   // One cordis, whichever of the packages loaded it.
   const cordis = new Set(loaded.filter(url => /\/@deepseek-ai\/cordis\//.test(url)).map(url => url.slice(0, url.indexOf('/@deepseek-ai/cordis/'))))

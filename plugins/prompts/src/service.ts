@@ -67,6 +67,14 @@ export interface DishPrompts {
   defaultText(role: string): string | undefined
 }
 
+// Here, not in the plugin's own file, so that whoever imports these types (the persona row does, and only that) also
+// gets `ctx.get('dishPrompts')` typed.
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    dishPrompts: DishPrompts
+  }
+}
+
 /** What the service needs of the store: dish-config's reads. */
 export type StoreReader = Pick<DishConfigService, 'head' | 'read' | 'list'>
 
