@@ -239,21 +239,45 @@ function deriveAdditions(
   return additions
 }
 
-/** Most shared leading plus trailing characters: `gpt-6.1-sol` pairs with `gpt-6-sol`. */
-function nearest(id: string, candidates: CatalogModel[]): CatalogModel | undefined {
+/** The version an id carries: `5.5` in `claude-sonnet-5.5`, `6.1` in `gpt-6.1-sol`. */
+function versionOf(id: string): number | undefined {
+  const match = /-(\d+(?:\.\d+)?)(?=-|$)/.exec(id)
+  return match === null ? undefined : Number(match[1])
+}
+
+/**
+ * The catalog model a new one is served like. Its own vendor first (`claude`, `gpt`, ...), then the closest version,
+ * then the most shared leading plus trailing characters: `gpt-6.1-sol` pairs with `gpt-6-sol`.
+ *
+ * Version before name, because a generation changes the request rules: `claude-sonnet-5.5` copied from
+ * `claude-sonnet-5` turned thinking off with `{type: "disabled"}`, which the 5.5 models reject; `claude-opus-5.5`
+ * leaves it out instead.
+ */
+export function nearest(id: string, candidates: readonly Pick<CatalogModel, 'id'>[]): CatalogModel | undefined {
   const shared = (a: string, b: string) => {
     let n = 0
     while (n < a.length && n < b.length && a[n] === b[n]) n++
     return n
   }
   const reverse = (text: string) => [...text].reverse().join('')
-  let best: CatalogModel | undefined
-  let bestScore = 0
-  for (const candidate of candidates) {
-    const score = shared(id, candidate.id) + shared(reverse(id), reverse(candidate.id))
-    if (score > bestScore) [best, bestScore] = [candidate, score]
+  const vendor = (text: string) => text.split('-')[0]
+  const own = candidates.filter(candidate => vendor(candidate.id) === vendor(id))
+  const pool = own.length > 0 ? own : candidates
+  const version = versionOf(id)
+  const distance = (candidate: string) => {
+    const other = versionOf(candidate)
+    return version === undefined || other === undefined ? 0 : Math.abs(version - other)
   }
-  return best
+  let best: Pick<CatalogModel, 'id'> | undefined
+  let bestDistance = Infinity
+  let bestScore = 0
+  for (const candidate of pool) {
+    const gap = distance(candidate.id)
+    const score = shared(id, candidate.id) + shared(reverse(id), reverse(candidate.id))
+    if (score === 0) continue
+    if (gap < bestDistance || (gap === bestDistance && score > bestScore)) [best, bestDistance, bestScore] = [candidate, gap, score]
+  }
+  return best as CatalogModel | undefined
 }
 
 /**

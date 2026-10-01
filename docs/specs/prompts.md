@@ -7,7 +7,7 @@ Status: implemented 2026-10-01 (branch `prompts`). Implements roadmap step 3. Bu
 `dish-prompts` keeps the persona text of each dish agent in the config store and gives it to agents when they start.
 - One document per role: `main`, plus the crew roles `architect`, `coder`, `researcher`, `ops`, `writer` and `reviewer`. `common.md` holds rules for every role.
 - You edit them on **Settings → Prompts**: save with conflict checks, see what the model sees, compare with the shipped default, and reset.
-- A **persona row**, mountable in any agent preset, gives that preset's agents a role's prompt as it stands when the agent starts. A **"dish" preset** shipped with the plugin uses it for the main agent. `crew` (step 4) gives delegated children their roles through the `dishPrompts` service.
+- A **persona row**, mountable in any agent preset, gives that preset's agents a role's prompt as it stands when the agent starts. A **"dish" preset** uses it for the main agent. The preset ships with `crew` (step 4), which also gives delegated children their roles through the `dishPrompts` service.
 
 ## Decisions (from the 2026-10-01 discussion)
 
@@ -15,7 +15,7 @@ Status: implemented 2026-10-01 (branch `prompts`). Implements roadmap step 3. Bu
 |---|---|
 | What you edit | The **persona** part of the prompt only. dsh keeps writing its identity line, tool and skill guidance, and runtime context, so they stay correct as tools change. |
 | Shared rules | `prompts/common.md` goes into every role. You have no `~/.dsh/AGENTS.md`, and none is needed: global rules live here. A repo's own `AGENTS.md`/`CLAUDE.md` stay as dsh loads them. |
-| Main agent before `orchestrator` | A **"dish" preset** shipped now, which you set as your default. dsh's stock presets stay available. |
+| Main agent before `orchestrator` | A **"dish" preset**, which you set as your default. It was shipped here first and moved to `dish-crew` with the crew step (see the [crew spec](crew.md#the-dish-preset)). dsh's stock presets stay available. |
 | Agent edits | Crew prompts: `config_write` when you ask. `main.md` and `common.md`: **proposal only**, so the agent never rewrites its own instructions without your click. |
 | Editor extras | A "what the model sees" preview, a diff against the shipped default with reset, and the list of prompt variables. |
 | Defaults | Drafted by Claude in the superpowers style, seeded once, then yours to revise. |
@@ -101,11 +101,12 @@ The row needs the `dishPrompts` service. If the `dish-prompts` plugin isn't load
 
 ### The dish preset
 
-The bundle inserts a `@deepseek-ai/dsh-agent-preset` row, `id: preset-dish`, with `config.id: dish` and a display name, so the Agent presets page lists it as a custom preset.
-- Its plugin list is a copy of the web app's `standard` preset, with the stock `persona` row replaced by `dish-prompts/persona` (`role: main`).
+**It moved to `dish-crew`** when the crew step landed (the [crew spec](crew.md#the-dish-preset) has the rest). This plugin's bundle inserts only its host row, so `dish-prompts` alone ships no preset and the persona row is mounted by whatever preset lists it.
+- The preset was built here first: a `@deepseek-ai/dsh-agent-preset` row, `id: preset-dish`, whose plugin list is a copy of the web app's `standard` preset with the stock `persona` row replaced by `dish-prompts/persona` (`role: main`). In `dish-crew` it also has the `delegate` row and has dsh's own delegation switched off.
 - You make it the default once on **Settings → Agent presets**, which dsh stores in your profile. The bundle doesn't touch `agent-preset-registry`.
-- **Drift check:** a test reads the installed `dsh-web-app` `presets/standard.patch.yml` and fails when its list, minus `persona`, differs from the copy. A dsh upgrade then says what to update, instead of silently giving the dish preset an old tool set.
-- `orchestrator` (step 7) takes this preset over later. Until then it lives here.
+- **Drift check:** `dish-crew`'s test reads the installed `dsh-web-app` `presets/standard.patch.yml` and fails when the copy no longer matches what the generator makes from it. A dsh upgrade then says what to update, instead of silently giving the dish preset an old tool set.
+- The Prompts page's preview assembles the system prompt in the dish preset's scope, so it needs `dish-crew` installed; without it the preview falls back, with a banner.
+- `orchestrator` (step 7) takes this preset over from `crew` later.
 
 ### Delegated children (for `crew`, step 4)
 
@@ -192,7 +193,7 @@ The page talks to a Typert remote, Cordis service `dishPromptsRemote`, wire name
 - prefix and suffix composition, lenient interpolation (known, unknown, valueless)
 - snapshots: an edit after the first step doesn't change that agent's prompt; the next agent gets it; a restart gives the same text; `/clear` takes a new one; store missing gives defaults
 - the row's listener on a top-level agent, a delegated child, and an assembly with a `complete` section
-- the drift check against the installed `standard` preset
+- the drift check against the installed `standard` preset (now in `dish-crew`'s tests, with the preset)
 
 By hand in the browser: the preview path first (see the open items), then the editor, conflict, reset, variables and the History tab. Live: start a chat on the dish preset and check the trajectory's "Initial System Prompt" shows `main.md` after the identity line and `common.md` at the end.
 
@@ -209,4 +210,4 @@ By hand in the browser: the preview path first (see the open items), then the ed
 - **A bad `role` on the persona row** fails the preset's row audit, so the whole dish preset won't mount (dsh reports it broken).
 - **`variables()`** returns `{ variables, fallback }`, and the page doesn't warn about unknown names when `fallback` is true.
 - **The Prompts page shows a role's history itself.** A settings section can only `close`, so it can't link to the History page. The diff view moved to `dish-kit/ui`, so both pages share it.
-- **The dish preset is generated** from the installed dsh's `standard` preset (`pnpm --filter dish-prompts sync-preset`). The drift test reads the standard preset through `@deepseek-ai/dsh` itself, not a pinned copy.
+- **The dish preset is generated** from the installed dsh's `standard` preset (`pnpm --filter dish-crew sync-preset`, since the crew step moved it). The drift test reads the standard preset through `@deepseek-ai/dsh` itself, not a pinned copy.

@@ -24,7 +24,7 @@ import { applyPersona } from './persona.ts'
 import type { PreviewResult, VariableInfo, VariablesResult } from './protocol.ts'
 import type { DishPrompts, Persona } from './service.ts'
 
-/** The preset whose scope the preview assembles in: the one the plugin ships. */
+/** The preset whose scope the preview assembles in: the dish preset, which dish-crew ships. Without it the preview falls back. */
 const PRESET = 'dish'
 
 /** Told why the preview fell back. Never allowed to fail the preview. */

@@ -1,235 +1,353 @@
 /**
- * dish-crew (spike) — delegate to a fixed crew of specialists.
+ * dish-crew: a fixed crew of specialists the main agent delegates to.
  *
- * One `delegate` tool, taking a `role`. Each role gives its child:
- * - a persona, which replaces the deployment persona for that child alone;
- * - a tool filter, always including `delegate` itself, so only the main agent delegates;
- * - a default model by tier, which the caller may override.
+ * This is the host plugin. The `delegate` tool and the finish notices are a preset row, `dish-crew/delegate`, which
+ * reads what is provided here. The plugin:
  *
- * Children are continuable and run in the background. dsh delivers a notice
- * to the parent when each one settles, so the main agent's chat stays open.
- *
- * The reviewer's model is structural, not the caller's choice: it always
- * comes from a different model family than the coder it reviews.
- *
- * This is the spike for docs/design.md open question 1. Prompts and roles
- * will move to the versioned config store; here they are plain config.
+ * - provides the `dishCrew` service: `settings()` is the `crew.yaml` in the config store as it is now (see
+ *   `settings.ts`), `records` is the crew's own record of its children and their reports (see `record.ts`), and
+ *   `whenRecorded(child)` is the run of that child that is being recorded now, if there is one;
+ * - captures every crew child's runs: the error an `agent/error` reports is held for the child, `subagent/end` files the
+ *   run, with that error and the closing message, in the record, and `subagent/start` marks the child running again (dsh
+ *   starts a run each time it brings a child up, not only the first). A child's starts and ends are recorded in the order
+ *   they were published. The listeners are the host's, so they hear every agent, and they act only on children the
+ *   record knows. They never throw;
+ * - at start, before it provides the service, removes the sessions' records not written to for 180 days;
+ * - claims `crew.yaml` in the store and seeds it when `dishConfig` is there. `dishConfig` is optional, so there is no
+ *   order to keep: with no store, every answer is the shipped default;
+ * - logs as `dish-crew`.
  *
  * @module dish-crew
  */
 
+import { homedir } from 'node:os'
+import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import type { AgentOptions } from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-llm'
-import type {} from '@deepseek-ai/dsh-subagent'
-import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
+import { printOwnLogs, xdgPaths } from 'dish-kit'
+import { CrewRecords, closingOf } from './record.ts'
+import type { EndedRun } from './record.ts'
+import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from './settings.ts'
+import type { CrewSettings } from './settings.ts'
+
+export type { CrewSettings, FamilySettings, Limits, ParseResult, RoleSettings, Tier } from './settings.ts'
+export type { ChildRecord, ChildStatus, EndedRun, NewChild, RunEnd, RunRecord } from './record.ts'
+export { CrewRecords, statusFor } from './record.ts'
 
 export const name = 'dish-crew'
-export const inject = ['tools', 'subagents', 'llm']
 
-const TOOL = 'delegate'
-
-interface Route {
-  provider: string
-  model: string
-  reasoningEffort?: string
+/** The `dishCrew` service. */
+export interface DishCrew {
+  /**
+   * The crew's settings: `crew.yaml` on `main` of the config store as it is now, so an edit shows at once. A missing
+   * file, a file that doesn't pass `parseSettings`, a store that can't be read and no store at all each give the
+   * shipped default, with one logged warning for each distinct problem. Never rejects.
+   */
+  settings(): Promise<CrewSettings>
+  /** The crew's record: its children by session, and each run's report. */
+  readonly records: CrewRecords
+  /**
+   * The latest `subagent/end` of `childId` that is still being recorded, or `undefined` if none is. It resolves, never
+   * rejects, with where the report went, or `undefined` if the child isn't a crew child or recording failed (which is
+   * logged). Once it has resolved it is gone from here: the run is in `records`.
+   */
+  whenRecorded(childId: string): Promise<EndedRun | undefined> | undefined
+  /** The `ctx.subagents` provider the crew's children are created on: the `subagentProvider` setting. The preset row can't see the host's config. */
+  readonly subagentProvider: string
 }
 
-interface Role {
-  persona: string
-  tier: 'strong' | 'mid'
-  /** Tools this role may not use, beyond `delegate` which no child gets. */
-  deny: string[]
+// Here, with the type, so that whoever imports it also gets `ctx.get('dishCrew')` typed.
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    dishCrew: DishCrew
+  }
 }
 
 export interface Config {
+  dataDirectory: string
   subagentProvider: string
-  maxDelegationsPerParent: number
-  tiers: Record<'strong' | 'mid', Route>
-  /** Mid-tier route per model family, for picking a reviewer outside the coder's family. */
-  reviewers: Record<string, Route>
-  roles: Record<string, Role>
+  terminal: boolean
 }
-
-const route: Schema<Route> = Schema.object({
-  provider: Schema.string().required(),
-  model: Schema.string().required(),
-  reasoningEffort: Schema.string(),
-})
-
-const role: Schema<Role> = Schema.object({
-  persona: Schema.string().required(),
-  tier: Schema.union(['strong', 'mid'] as const).default('mid'),
-  deny: Schema.array(Schema.string()).default([]),
-})
 
 export const Config: Schema<Config> = Schema.object({
+  dataDirectory: Schema.string().default('')
+    .description('Where the crew\'s records and saved reports go: an absolute path, where a leading ~/ is your home directory. Leave blank for crew in the XDG data directory for dish.'),
   subagentProvider: Schema.string().default('spawn')
-    .description('The ctx.subagents provider that creates in-process children.'),
-  maxDelegationsPerParent: Schema.natural().default(20)
-    .description('Safety cap on children one agent may start in this process, against a runaway delegation loop.'),
-  tiers: Schema.object({
-    strong: route.default({ provider: 'github-copilot', model: 'claude-opus-5.5' }),
-    mid: route.default({ provider: 'github-copilot', model: 'gpt-5-mini' }),
-  }),
-  reviewers: Schema.dict(route).default({
-    openai: { provider: 'github-copilot', model: 'gpt-5-mini' },
-    anthropic: { provider: 'github-copilot', model: 'claude-haiku-4.5' },
-  }),
-  roles: Schema.dict(role).default({
-    architect: {
-      tier: 'strong',
-      deny: [],
-      persona: 'You are the crew\'s architect, running on {{model}}. You turn a goal into a spec and then a plan of small tasks, each naming exact files, interfaces and tests, sized for a mid-tier model to implement alone.',
-    },
-    coder: {
-      tier: 'mid',
-      deny: [],
-      persona: 'You are the crew\'s coder, running on {{model}}. You implement exactly one task, test it, and commit. You do not widen scope.',
-    },
-    reviewer: {
-      tier: 'mid',
-      deny: ['write', 'edit'],
-      persona: 'You are the crew\'s reviewer, running on {{model}}. You review one change for spec compliance and code quality and report findings; you never edit code.',
-    },
-    researcher: {
-      tier: 'mid',
-      deny: ['write', 'edit', 'bash'],
-      persona: 'You are the crew\'s researcher, running on {{model}}. You investigate and report cited findings; you never change files.',
-    },
-  }),
+    .description('The ctx.subagents provider that creates the crew\'s children in-process.'),
+  terminal: Schema.boolean().default(true)
+    .description('Print this plugin\'s messages to the terminal.'),
 })
 
-/** The model family a model id belongs to, for the reviewer rule. */
-export function familyOf(model: string): string {
-  if (/^claude/i.test(model)) return 'anthropic'
-  if (/^(gpt|o\d|codex)/i.test(model)) return 'openai'
-  if (/^gemini/i.test(model)) return 'google'
-  if (/^grok/i.test(model)) return 'xai'
-  return 'other'
+/** A string setting as it will be used: trimmed, and `undefined` when nothing is left (use the default). */
+function text(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed === undefined || trimmed === '' ? undefined : trimmed
 }
 
-export function apply(ctx: Context, config: Config) {
-  // The model each child this plugin started runs on, by child id, so a
-  // reviewer can be pinned outside its coder's family.
-  const childModels = new Map<string, string>()
-  const startedBy = new Map<string, number>()
-  const roles = Object.keys(config.roles)
+/**
+ * Where the crew's data lives: the setting with a leading `~/` (or a bare `~`) taken as the home directory, else the XDG default.
+ * @throws a plain `Error` for any other relative path: what it would be relative to is not something to guess.
+ */
+export function dataDirectoryPath(setting: string | undefined): string {
+  if (setting === undefined) return join(xdgPaths('dish').data, 'crew')
+  if (setting === '~') return homedir()
+  if (setting.startsWith('~/')) return join(homedir(), setting.slice(2))
+  if (!isAbsolute(setting)) throw new Error(`dataDirectory must be an absolute path (or start with ~/), got ${JSON.stringify(setting)}`)
+  return setting
+}
 
-  const pickReviewer = (coderModel: string): Route => {
-    const coderFamily = familyOf(coderModel)
-    const candidate = Object.entries(config.reviewers).find(([family]) => family !== coderFamily)
-    if (candidate === undefined) throw new Error(`no reviewer route outside the ${coderFamily} family`)
-    return candidate[1]
-  }
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
-  /**
-   * Fail in the tool call, where the model can read why, rather than in the
-   * child: a child that cannot reach its model settles with no message, and
-   * the delegating agent learns nothing it can act on.
-   */
-  const preflight = async (target: Route, signal: AbortSignal): Promise<void> => {
+/** What the settings need of the store: its reads. */
+type Reader = { read(path: string): Promise<string | undefined> }
+
+interface Logger {
+  warn(format: string, ...args: unknown[]): void
+}
+
+/**
+ * `settings()` over a store that may or may not be there, looked up on every call. Each distinct problem is logged
+ * once, and none of it is thrown: a delegation reads this on every call, and the shipped default always works.
+ */
+function createSettingsReader(store: () => Reader | undefined, logger: Logger): () => Promise<CrewSettings> {
+  const told = new Set<string>()
+  /** Say `message` once. A logger that throws is not worth a failed call. */
+  const tell = (message: string): void => {
+    if (told.has(message)) return
+    told.add(message)
     try {
-      await ctx.llm.resolveCallConfig({ provider: target.provider, model: target.model }, signal)
+      logger.warn('%s', message)
+    } catch {
+      // Nothing to do about it.
+    }
+  }
+  return async () => {
+    try {
+      const reader = store()
+      if (reader === undefined) {
+        tell('dish-config is not running; using the shipped crew.yaml')
+        return DEFAULT_SETTINGS
+      }
+      let stored: string | undefined
+      try {
+        stored = await reader.read('crew.yaml')
+      } catch (error) {
+        tell(`could not read crew.yaml from the config store (${describe(error)}); using the shipped default`)
+        return DEFAULT_SETTINGS
+      }
+      if (stored === undefined) {
+        tell('crew.yaml is not in the config store; using the shipped default')
+        return DEFAULT_SETTINGS
+      }
+      const parsed = parseSettings(stored)
+      if (!parsed.ok) {
+        tell(`crew.yaml in the config store is not valid, so the shipped default is used: ${parsed.problem}`)
+        return DEFAULT_SETTINGS
+      }
+      return parsed.settings
     } catch (error) {
-      const providers = ctx.llm.listProviders().map(info => info.id)
-      const models = providers.includes(target.provider)
-        ? (await ctx.llm.listModels(target.provider)).map(info => info.id)
-        : []
-      throw new Error(`model ${target.provider}/${target.model} is not available (${error instanceof Error ? error.message : String(error)}). `
-        + (models.length > 0
-          ? `Models on ${target.provider}: ${models.join(', ')}. `
-          : `Providers: ${providers.join(', ')}. `)
-        + 'Omit provider and model to use the role\'s default.', { cause: error })
+      tell(`could not get the crew settings (${describe(error)}); using the shipped default`)
+      return DEFAULT_SETTINGS
+    }
+  }
+}
+
+/** How long a session's record is kept without being written to. */
+const KEEP_RECORDS_MS = 180 * 24 * 60 * 60 * 1000
+/** How many children's errors are held for the `subagent/end` that follows. A child ends within moments of its error. */
+export const ERROR_MEMORY = 64
+/** The longest an error is kept, in characters: a record of it, not a copy of a stack. */
+const MAX_ERROR_LENGTH = 1000
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/** An agent's or a child's id from `value`, if it has one: a non-empty string `id`. */
+function idOf(value: unknown): string | undefined {
+  const id = isObject(value) ? value.id : undefined
+  return typeof id === 'string' && id !== '' ? id : undefined
+}
+
+/** `error` as a short line: an error's message, a string, a message in an object, or a short form of anything else. */
+function errorText(error: unknown): string {
+  let text = ''
+  try {
+    if (error instanceof Error) text = error.message.trim() || error.name
+    else if (typeof error === 'string') text = error.trim()
+    else if (isObject(error) && typeof error.message === 'string' && error.message.trim() !== '') text = error.message.trim()
+    else if (error !== undefined && error !== null) text = JSON.stringify(error) ?? String(error)
+  } catch {
+    try {
+      text = String(error)
+    } catch {
+      text = ''
+    }
+  }
+  if (text === '') return 'unknown error'
+  return text.length > MAX_ERROR_LENGTH ? `${text.slice(0, MAX_ERROR_LENGTH - 1)}…` : text
+}
+
+/** Whether `error` is cordis refusing an effect because the plugin has been unloaded: a plugin that is going away didn't fail. */
+function unloaded(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === 'INACTIVE_EFFECT'
+}
+
+/**
+ * Provide `dishCrew`, and claim and seed `crew.yaml` whenever the store is there.
+ * @throws a plain `Error` for a `dataDirectory` that is a relative path.
+ */
+export async function apply(ctx: Context, config: Config): Promise<void> {
+  const logger = ctx.logger(name)
+  if (config.terminal) printOwnLogs(ctx, name)
+  /** A logger that throws is not worth a failed event, a failed lookup or a failed start. */
+  const warn = (format: string, ...args: unknown[]): void => {
+    try {
+      logger.warn(format, ...args)
+    } catch {
+      // Nothing to do about it.
     }
   }
 
-  ctx.tools.register(defineTool({
-    name: TOOL,
-    description: `Delegate a task to one crew specialist (${roles.join(', ')}). `
-      + 'The specialist starts fresh with only your prompt, so make it self-contained. '
-      + 'It runs in the background and returns a subagent id; you are notified when it settles, '
-      + 'and can follow up with `send_message`. Start independent delegations together and keep '
-      + 'working (and talking with the user) while they run.',
-    parameters: {
-      role: { type: 'string', required: true, description: `One of: ${roles.join(', ')}.` },
-      description: { type: 'string', required: true, description: 'A short (3-5 word) label for the task.' },
-      prompt: { type: 'string', required: true, description: 'The complete, self-contained task.' },
-      reviews: {
-        type: 'string',
-        description: 'Reviewer only, required: the subagent id of the coder whose work is under review. '
-          + 'The reviewer\'s model is then chosen from a different model family.',
-      },
-      provider: { type: 'string', description: 'Optional LLM provider override; supply with `model`. Ignored for reviewer.' },
-      model: { type: 'string', description: 'Optional model override; supply with `provider`. Ignored for reviewer.' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          subagentId: { type: 'string', required: true },
-          role: { type: 'string', required: true },
-          model: { type: 'string', required: true },
-        },
-      },
-      render: (_args, value) => [{
-        type: 'text',
-        text: `started ${value.role} subagent ${value.subagentId} on ${value.model}`,
-      }],
-    },
-    async execute(args, exec) {
-      const parent = exec.agent
-      if (parent === undefined) throw new Error(`${TOOL} requires a calling agent`)
-      // Models tend to fill every optional field; an empty string means "not given".
-      const given = (value: string | undefined) => value === undefined || value.trim() === '' ? undefined : value.trim()
-      const reviews = given(args.reviews)
-      const provider = given(args.provider)
-      const model = given(args.model)
-      const started = startedBy.get(parent.id) ?? 0
-      if (started >= config.maxDelegationsPerParent) {
-        throw new Error(`delegation cap reached: this agent has started ${started} subagents. `
-          + 'Stop delegating, and report what has and has not completed.')
-      }
-      const spec = config.roles[args.role]
-      if (spec === undefined) throw new Error(`unknown role "${args.role}"; roles are ${roles.join(', ')}`)
+  // Checked now, so a bad setting fails the plugin to load rather than the first delegation.
+  const directory = resolve(dataDirectoryPath(text(config.dataDirectory)))
+  const records = new CrewRecords(directory, (session, path) => {
+    warn('the record of session %s is not valid; it was moved to %s and the session starts a new one, so its delegation count starts again from 0', session, path)
+  })
 
-      let target: Route
-      if (args.role === 'reviewer') {
-        if (reviews === undefined) throw new Error('a reviewer delegation needs `reviews`: the coder subagent id')
-        const coderModel = childModels.get(reviews)
-        if (coderModel === undefined) throw new Error(`no model recorded for subagent ${reviews}`)
-        target = pickReviewer(coderModel)
-      } else if (provider !== undefined && model !== undefined) {
-        target = { provider, model }
-      } else {
-        target = config.tiers[spec.tier]
-      }
+  // The error each crew child's agent last reported, until its `subagent/end`. The promise answers whether the agent is a
+  // crew child (the record has to be asked), and an agent that isn't takes its entry out, so what is kept is the
+  // children's and no more. Oldest first, and bounded: a child whose end never comes can't grow this.
+  const remembered = new Map<string, Promise<string | undefined>>()
+  // What is being recorded for each child, a start or an end, until it is: the one the next waits for, so that a child's
+  // runs reach the record in the order dsh published them, an end before the next start and a start before its end.
+  // Never rejects.
+  const chain = new Map<string, Promise<void>>()
+  // The end of each child that is being recorded now, until it is. For `whenRecorded`: starts are not in it. Never rejects.
+  const pending = new Map<string, Promise<EndedRun | undefined>>()
 
-      await preflight(target, exec.signal)
+  /** Do `job` for child `id` after whatever is being recorded for it. A failure is logged as `failed` says and gives `undefined`. */
+  const inOrder = <T>(id: string, failed: string, job: () => Promise<T>): Promise<T | undefined> => {
+    const previous = chain.get(id)
+    const run = (async () => {
+      await previous
+      return job()
+    })().catch((cause: unknown) => {
+      warn(failed, id, describe(cause))
+      return undefined
+    })
+    const link = run.then(() => {})
+    chain.set(id, link)
+    void link.then(() => {
+      if (chain.get(id) === link) chain.delete(id)
+    })
+    return run
+  }
 
-      const agentOptions = {
-        provider: target.provider,
-        model: target.model,
-        ...target.reasoningEffort === undefined ? {} : { reasoningEffort: target.reasoningEffort },
-      } as AgentOptions
-      startedBy.set(parent.id, started + 1)
-      const child = await ctx.subagents.startContinuable({
-        provider: config.subagentProvider,
-        label: `${args.role}: ${args.description}`,
-        request: {
-          prompt: [{ type: 'text', text: args.prompt }],
-          parent,
-          agentOptions,
-          persona: spec.persona,
-          toolFilter: { deny: [TOOL, ...spec.deny] },
-          maxDepth: 1,
-        },
-        signal: exec.signal,
+  // A shutdown waits for what is being recorded: a run that ended just before it is not lost. cordis disposes a plugin's
+  // effects together, one microtask after dispose(), so removing the listeners and taking this snapshot of `chain` happen
+  // in the same batch: everything heard is in the snapshot, and nothing after it is heard, whatever the registration order.
+  ctx.effect(() => async () => {
+    await Promise.all([...chain.values()])
+    await records.flush()
+  })
+
+  ctx.on('agent/error', (payload) => {
+    try {
+      const event: unknown = payload
+      const id = idOf(isObject(event) ? event.agent : undefined)
+      if (id === undefined) return
+      const message = errorText((event as { error?: unknown }).error)
+      const found = records.lookup(id).then(
+        hit => hit === undefined ? undefined : message,
+        (cause: unknown) => {
+          warn('could not tell whether agent %s is a crew child: %s', id, describe(cause))
+          return undefined
+        })
+      // Last, so that the oldest entry is the first out.
+      remembered.delete(id)
+      remembered.set(id, found)
+      while (remembered.size > ERROR_MEMORY) remembered.delete(remembered.keys().next().value!)
+      void found.then((kept) => {
+        if (kept === undefined && remembered.get(id) === found) remembered.delete(id)
       })
-      childModels.set(child.childId, target.model)
-      return { subagentId: child.childId, role: args.role, model: target.model }
-    },
-  }))
+    } catch (cause) {
+      warn('could not note the error of an agent: %s', describe(cause))
+    }
+  })
+
+  // dsh publishes a start for every run of a child: its first, and each time it is brought up again after it had ended (a
+  // message to it, a resume after a restart). The record says running from the first and from a follow-up that `delegate`
+  // sends; this is how it learns of the others, so that a child that is running again counts against the limits.
+  ctx.on('subagent/start', (info) => {
+    try {
+      const id = idOf(info)
+      if (id === undefined) return
+      void inOrder(id, 'could not record the start of child %s: %s', () => records.startRun(id))
+    } catch (cause) {
+      warn('could not record the start of a child: %s', describe(cause))
+    }
+  })
+
+  ctx.on('subagent/end', (info) => {
+    try {
+      const event: unknown = info
+      const id = idOf(event)
+      if (id === undefined) return
+      const { stopReason, lastAssistantMessage } = event as { stopReason?: unknown, lastAssistantMessage?: unknown }
+      const error = remembered.get(id)
+      remembered.delete(id)
+      const closing = closingOf(lastAssistantMessage)
+      const run = inOrder(id, 'could not record the end of child %s: %s',
+        async () => records.endRun(id, { stopReason: stopReason as string, error: await error, closing }))
+      pending.set(id, run)
+      void run.then(() => {
+        if (pending.get(id) === run) pending.delete(id)
+      })
+    } catch (cause) {
+      warn('could not record the end of a child: %s', describe(cause))
+    }
+  })
+
+  // `ctx.get` is read on every call: the store is optional, and may come, go and come back.
+  const settings = createSettingsReader(() => ctx.get('dishConfig'), logger)
+
+  // With the store there: claim crew.yaml, as an effect so it goes when the store, or this plugin, does, and seed it.
+  // A claim that is refused (someone else owns the path) or a seed that fails leaves the store as it is.
+  ctx.inject(['dishConfig'], async (child) => {
+    const store = child.dishConfig
+    let present = true
+    child.effect(() => () => { present = false })
+    try {
+      child.effect(() => child.dishConfig.claim(CREW_SPEC))
+    } catch (error) {
+      warn('could not claim crew.yaml: %s', describe(error))
+      return
+    }
+    try {
+      await store.seed({ 'crew.yaml': DEFAULT_TEXT }, name)
+    } catch (error) {
+      // Unless the store is going away, which closed it under the seed.
+      if (present) warn('could not seed crew.yaml: %s', describe(error))
+    }
+  })
+
+  // Before the service is there, so that nothing asks the record while it is pruned. A failure is logged, and the crew
+  // works all the same: old records that stay are only disk.
+  try {
+    const removed = await records.prune(KEEP_RECORDS_MS)
+    if (removed > 0) logger.info('removed the records of %d crew session(s) not written to for 180 days', removed)
+  } catch (error) {
+    warn('could not prune the crew\'s old records in %s: %s', directory, describe(error))
+  }
+
+  try {
+    ctx.provide('dishCrew', { settings, records, whenRecorded: (childId: string) => pending.get(childId), subagentProvider: text(config.subagentProvider) ?? 'spawn' })
+  } catch (error) {
+    // Unloaded while it was pruning: the plugin is going away, and didn't fail.
+    if (unloaded(error)) return
+    throw error
+  }
 }

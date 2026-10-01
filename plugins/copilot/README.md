@@ -58,7 +58,7 @@ At startup, after each sign-in, and on **Refresh models**, the catalog plugin:
 2. For each model the picker would offer that pi-ai doesn't know, adds an entry to pi-ai's in-memory catalog.
    - The protocol comes from the model's `supported_endpoints`.
    - Name, context window, output limit and vision come from the live listing.
-   - Headers, compat switches and reasoning levels are cloned from the nearest catalog sibling, e.g. `gpt-6.1-sol` from `gpt-6-sol`.
+   - Headers, compat switches and reasoning levels are cloned from the nearest catalog sibling: the same vendor, then the closest version, then the closest name. So `gpt-6.1-sol` comes from `gpt-6-sol`, and `claude-sonnet-5.5` from `claude-opus-5.5` rather than the older `claude-sonnet-5`, whose way of turning thinking off the 5.5 models reject.
 3. Sets the `github-copilot` route's `models` to exactly what your account can use. Per-model fields you've configured are kept.
 4. Caches the result in `$XDG_CACHE_HOME/dish/copilot-models.json` (`~/.cache/dish/` by default). A cache at the old location, `~/.dsh/dish-copilot-models.json`, is read while the new file doesn't exist yet, i.e. until the first successful refresh writes it.
 

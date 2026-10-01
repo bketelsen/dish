@@ -12,6 +12,7 @@ pnpm build          # bundles each plugin's browser half (plugins/*/lib/client.j
 pnpm dsh plugin --profile web add ./plugins/copilot
 pnpm dsh plugin --profile web add ./plugins/config
 pnpm dsh plugin --profile web add ./plugins/prompts
+pnpm dsh plugin --profile web add ./plugins/crew
 pnpm web            # = dsh web; prints the UI URL (with its access token)
 ```
 
@@ -36,7 +37,8 @@ Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, termin
 |---|---|
 | [`copilot`](plugins/copilot) | GitHub Copilot as a model provider: a sign-in card on Settings → Models, plus a model list kept in step with your account (including models newer than dsh's bundled catalog). |
 | [`config`](plugins/config) | The versioned config store other plugins keep what you author in: a bare git repo pushed to GitHub, namespaces per plugin, main-agent tools with proposal branches, and a Settings → History page. |
-| [`prompts`](plugins/prompts) | Every agent's persona text in the config store: role prompts plus shared house rules, edited on Settings → Prompts with preview, default diff and history. A **dish** preset gives them to the main agent, and each agent keeps the prompt it started with. |
+| [`prompts`](plugins/prompts) | Every agent's persona text in the config store: role prompts plus shared house rules, edited on Settings → Prompts with preview, default diff and history. Each agent keeps the prompt it started with. |
+| [`crew`](plugins/crew) | The crew the main agent delegates to: a `delegate` tool with roles, model tiers and a reviewer that never shares the reviewed work's model family, `crew.yaml` in the config store, saved reports and role-named finish notices. Ships the **dish** preset for the main agent. |
 
 ## Writing another plugin
 

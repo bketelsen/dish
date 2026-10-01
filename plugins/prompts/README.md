@@ -5,7 +5,7 @@ The persona text of each dish agent, kept in the config store and editable on **
   - `prompts/main.md` for the main agent;
   - `prompts/crew/<role>.md` for architect, coder, researcher, ops, writer and reviewer;
   - `prompts/common.md`, house rules for every role.
-- **Agents get them through a persona row** in their preset. The plugin ships a **dish** preset for the main agent. `crew` (roadmap step 4) gives delegated children their role text.
+- **Agents get them through a persona row** in their preset. The **dish** preset for the main agent, which mounts that row, ships with `dish-crew`. `dish-crew` also gives delegated children their role text.
 - **Edits apply to agents that start afterwards.** An agent keeps the prompt it started with for its whole life, a dsh restart included.
 
 The design and its reasoning are in the [spec](../../docs/specs/prompts.md).
@@ -19,7 +19,7 @@ pnpm dsh plugin --profile web add ./plugins/prompts
 
 It needs `dish-config` in the same profile, installed first. On its first start with the store, it seeds the eight default prompts as one commit, and the store pushes it like any other.
 
-**Choose the preset:** on **Settings → Agent presets**, use **Set as new task default** on **dish** (under Custom). dsh's own presets stay available, and the mode picker on a new chat switches per chat.
+**Choose the preset:** the **dish** preset comes with `dish-crew`, not with this plugin, so install that too (see [dish-crew](../crew)). Then, on **Settings → Agent presets**, use **Set as new task default** on **dish** (under Custom). dsh's own presets stay available, and the mode picker on a new chat switches per chat. On its own, this plugin gives you the persona row for a preset of your own.
 
 ## What an agent sees
 
@@ -68,17 +68,11 @@ So the agent never rewrites its own instructions or the house rules without your
 
 ## The dish preset
 
-`presets/dish.patch.yml` is **generated** from the `standard` preset of the dsh you have installed: the same rows, with the stock persona row swapped for `dish-prompts/persona` (`role: main`). dsh presets can't inherit, so it's a copy.
-
-After a dsh upgrade, a test fails if `standard` changed. Run:
+The preset now lives in `dish-crew` (`plugins/crew/presets/dish.patch.yml`), which also generates it from your installed dsh and tests it for drift. It mounts this plugin's persona row (`role: main`), so without `dish-crew` there is no dish preset, and the Prompts page's preview shows its fallback text with a banner. After a dsh upgrade, regenerate it there:
 
 ```sh
-pnpm --filter dish-prompts sync-preset
+pnpm --filter dish-crew sync-preset
 ```
-
-Then commit the regenerated file. The test also fails if dsh adds a preset-level setting the generator would drop.
-
-`orchestrator` (roadmap step 7) takes this preset over later.
 
 ## Configuration
 
