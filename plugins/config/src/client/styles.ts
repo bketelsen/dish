@@ -67,22 +67,11 @@ const css = `
   display: flex;
   align-items: center;
   gap: 8px;
-}
-.dish-history-select {
-  flex: 0 1 auto;
   min-width: 0;
-  max-width: 100%;
-  height: 32px;
-  padding: 0 8px;
-  border: 0.5px solid var(--dsw-alias-border-l4);
-  border-radius: var(--dsw-radius-md);
-  background: var(--dsw-alias-bg-layer-1);
-  color: var(--dsw-alias-label-primary);
-  font: inherit;
 }
-.dish-history-select:focus-visible {
-  outline: none;
-  border-color: var(--dsw-alias-state-business-primary);
+.dish-history-filter-input {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .dish-history-list {
   display: flex;

@@ -46,6 +46,20 @@ export function subjectOf(message: string): string {
   return end === -1 ? message : message.slice(0, end)
 }
 
+/**
+ * What was typed in the log's filter, as the remote takes it: without the spaces around it, so that nothing typed is
+ * `''`, which is all. A trailing `/` makes it a prefix (`prompts/`); anything else is one path (`crew.yaml`).
+ */
+export function normalizeFilter(typed: string): string {
+  return typed.trim()
+}
+
+/** What an empty log says it is empty of, for the filter in force (already `normalizeFilter`ed). */
+export function noCommitsText(filter: string): string {
+  if (filter === '') return 'No commits yet.'
+  return filter.endsWith('/') ? `No commits under ${filter}.` : `No commits changed ${filter}.`
+}
+
 /** What a commit says it is for: the note its author gave, or else its subject. */
 export function commitText(commit: Pick<CommitInfo, 'note' | 'message'>): string {
   return commit.note !== undefined && commit.note !== '' ? commit.note : subjectOf(commit.message)

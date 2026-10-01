@@ -6,7 +6,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { classifyPatch, patchTotals } from '../src/client/diff.ts'
-import { authorLabel, commitText, orderProposals, relativeTime, remoteLine, shortId, subjectOf } from '../src/client/format.ts'
+import {
+  authorLabel, commitText, noCommitsText, normalizeFilter, orderProposals, relativeTime, remoteLine, shortId, subjectOf,
+} from '../src/client/format.ts'
 import {
   NOTHING_TO_ACCEPT, NOTHING_TO_REVERT, STALE_TEXT, failureNotice, unexpectedNotice,
 } from '../src/client/outcome.ts'
@@ -133,6 +135,19 @@ test('commitText is the note when there is one, else the subject', () => {
   assert.equal(commitText({ message, note: '' }), 'prompts/a.md: update')
 })
 
+test('normalizeFilter trims what was typed, so empty means all', () => {
+  assert.equal(normalizeFilter(''), '')
+  assert.equal(normalizeFilter('   '), '')
+  assert.equal(normalizeFilter('  prompts/ '), 'prompts/')
+  assert.equal(normalizeFilter('crew.yaml'), 'crew.yaml')
+})
+
+test('noCommitsText says what an empty log is empty of: a prefix (trailing slash) or a path', () => {
+  assert.equal(noCommitsText(''), 'No commits yet.')
+  assert.equal(noCommitsText('prompts/'), 'No commits under prompts/.')
+  assert.equal(noCommitsText('crew.yaml'), 'No commits changed crew.yaml.')
+})
+
 test('remoteLine: pushed, pending and the last error', () => {
   const status = (value: Partial<RemoteStatus>): RemoteStatus => ({ pending: 0, ...value })
   assert.equal(remoteLine(status({})), 'No remote configured')
@@ -179,6 +194,21 @@ test('failureNotice puts each store code in plain language and keeps the store m
   for (const code of ['INVALID', 'UNOWNED', 'FORBIDDEN', 'SECRET', 'TOO_LARGE', 'LOCKED'] as const) {
     assert.deepEqual(failureNotice(code, 'the reason'), { text: `${code}: the reason` }, code)
   }
+})
+
+test('failureNotice: a CONFLICT on a revert says what to do about it; on any other action, to reload', () => {
+  const revert = {
+    text: 'A later change touched the same files — revert that change first, or edit the files directly.',
+    detail: 'prompts/a.md changed since abc',
+  }
+  const reload = { text: 'This changed since you loaded it — reload and try again', detail: 'prompts/a.md changed since abc' }
+  assert.deepEqual(failureNotice('CONFLICT', 'prompts/a.md changed since abc', 'revert'), revert)
+  assert.deepEqual(failureNotice('CONFLICT', 'prompts/a.md changed since abc', 'accept'), reload)
+  assert.deepEqual(failureNotice('CONFLICT', 'prompts/a.md changed since abc', 'reject'), reload)
+  assert.deepEqual(failureNotice('CONFLICT', 'prompts/a.md changed since abc'), reload, 'no action: the general wording')
+  // The action changes nothing for the other codes.
+  assert.deepEqual(failureNotice('STALE', 'm', 'revert'), { text: STALE_TEXT, detail: 'm' })
+  assert.deepEqual(failureNotice('FORBIDDEN', 'no', 'revert'), { text: 'FORBIDDEN: no' })
 })
 
 test('the "nothing to do" results of a revert and an accept', () => {

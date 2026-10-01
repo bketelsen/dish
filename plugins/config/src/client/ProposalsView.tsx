@@ -105,12 +105,17 @@ function Decision({ proposal, busy, actions }: { proposal: ProposalInfo, busy: s
   const [rejecting, setRejecting] = useState(false)
   const [reason, setReason] = useState('')
   const stale = status === 'stale'
+  const working = busy === `reject:${id}`
+  // The form stays while the store is asked: it goes only once the proposal is rejected, and a refusal leaves the reason in it.
   const submit = (event: FormEvent): void => {
     event.preventDefault()
-    if (reason.trim() === '') return
-    actions.reject(id, reason.trim())
-    setRejecting(false)
-    setReason('')
+    const why = reason.trim()
+    if (why === '' || busy !== undefined) return
+    void actions.reject(id, why).then((rejected) => {
+      if (!rejected) return
+      setRejecting(false)
+      setReason('')
+    })
   }
   return (
     <div className="dish-history-stack">
@@ -124,14 +129,15 @@ function Decision({ proposal, busy, actions }: { proposal: ProposalInfo, busy: s
               maxLength={200}
               placeholder="Why are you rejecting it?"
               aria-label="Reason for rejecting"
+              readOnly={working}
               autoFocus
               onChange={(event) => { setReason(event.target.value) }}
             />
             <div className="dish-history-actions">
               <Button type="submit" variant="primary" size="sm" disabled={busy !== undefined || reason.trim() === ''}>
-                {busy === `reject:${id}` ? 'Rejecting…' : 'Reject'}
+                {working ? 'Rejecting…' : 'Reject'}
               </Button>
-              <Button type="button" variant="ghost" size="sm" onClick={() => { setRejecting(false) }}>Cancel</Button>
+              <Button type="button" variant="ghost" size="sm" disabled={working} onClick={() => { setRejecting(false) }}>Cancel</Button>
             </div>
           </form>
         )

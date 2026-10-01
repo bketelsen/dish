@@ -67,6 +67,7 @@ async function follow(ctx: Context, history: HistoryController, closing: AbortSi
     const stop = (): void => { void stream.dispose() }
     closing.addEventListener('abort', stop, { once: true })
     let lastGeneration: number | undefined
+    let failure: unknown
     try {
       for await (const item of stream) {
         history.receive(item.value, item.generation !== lastGeneration)
@@ -74,14 +75,16 @@ async function follow(ctx: Context, history: HistoryController, closing: AbortSi
         item.accept()
         wait = RETRY_FIRST_MS
       }
-    } catch {
+    } catch (error) {
       // Not a carrier loss (those are retried inside the stream): the page says updates stopped and tries again below.
+      failure = error
     } finally {
       closing.removeEventListener('abort', stop)
       await stream.dispose()
     }
     if (closing.aborted) return
     history.streamDown()
+    console.warn(`dish-config History: live updates failed, retrying in ${Math.round(wait / 1000)}s`, failure)
     await sleep(wait, closing)
     wait = Math.min(wait * 2, RETRY_LONGEST_MS)
   }

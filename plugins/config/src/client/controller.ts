@@ -8,7 +8,7 @@ import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { CommitInfo, ConfigEvent, FileDiff, NamespaceInfo, Outcome, ProposalInfo, RemoteStatus } from '../protocol.ts'
 import { orderProposals, shortId } from './format.ts'
-import { NOTHING_TO_ACCEPT, NOTHING_TO_REVERT, failureNotice, unexpectedNotice, type Notice } from './outcome.ts'
+import { NOTHING_TO_ACCEPT, NOTHING_TO_REVERT, failureNotice, unexpectedNotice, type Action, type Notice } from './outcome.ts'
 import type { ConfigApi } from './remote.ts'
 
 /** How many commits the log asks for at a time (the server's own default, said out loud). */
@@ -86,7 +86,8 @@ export interface HistoryActions {
   reload(): void
   revert(id: string): void
   accept(id: string): void
-  reject(id: string, reason: string): void
+  /** Resolves `true` once the store has rejected it; `false` when it refused (the page has said why) or another action was running. */
+  reject(id: string, reason: string): Promise<boolean>
   loadProposal(id: string): void
   dismiss(): void
 }
@@ -94,8 +95,8 @@ export interface HistoryActions {
 export interface HistoryController {
   face: HistoryActions
   /**
-   * One item of `watch`. `opening` is whether it is the first of a stream the page has (re)opened: any but the very
-   * first means the carrier was lost and found again, so events may have been missed and every loaded view is read again.
+   * One item of `watch`. `opening` is whether it is the first of a stream the page has (re)opened (or of a new
+   * generation of one, after the carrier was lost and found again): events may have been missed, so every loaded view is read again.
    */
   receive(event: ConfigEvent, opening: boolean): void
   /** `watch` lost its carrier; the page keeps what it has and says so. */
@@ -104,13 +105,16 @@ export interface HistoryController {
 
 type Settled<T> = { ok: true, value: T } | { ok: false, notice: Notice }
 
-/** Wait for a call and fold both kinds of failure (the carrier's and the store's) into a `Notice`. Never throws. */
-async function settle<T>(task: () => Promise<RemoteResult<Outcome<T>>>): Promise<Settled<T>> {
+/**
+ * Wait for a call and fold both kinds of failure (the carrier's and the store's) into a `Notice`. Never throws.
+ * @param action - what the person was doing, for the refusals whose wording depends on it.
+ */
+async function settle<T>(task: () => Promise<RemoteResult<Outcome<T>>>, action?: Action): Promise<Settled<T>> {
   try {
     const result = await task()
     if (!result.ok) return { ok: false, notice: unexpectedNotice(result.error) }
     const outcome = result.value
-    if (!outcome.ok) return { ok: false, notice: failureNotice(outcome.code, outcome.message) }
+    if (!outcome.ok) return { ok: false, notice: failureNotice(outcome.code, outcome.message, action) }
     return { ok: true, value: outcome.value }
   } catch (error) {
     return { ok: false, notice: unexpectedNotice(error) }
@@ -170,7 +174,6 @@ export function createHistory(api: ConfigApi): HistoryController {
 
   /** Bumped when the log's filter changes, so an answer for the old filter is dropped. */
   let logGeneration = 0
-  let connectedBefore = false
 
   const loadNamespaces = async (): Promise<void> => {
     const result = await settlePlain(() => api.namespaces())
@@ -262,23 +265,29 @@ export function createHistory(api: ConfigApi): HistoryController {
     })
   }
 
-  /** Run one of the person's actions: one at a time, and its outcome becomes the page's notice. */
-  const act = async <T>(key: string, task: () => Promise<Settled<T>>, done: (value: T) => void, refreshOnFailure = false): Promise<void> => {
-    if (get().busy !== undefined) return
+  /**
+   * Run one of the person's actions: one at a time, and its outcome becomes the page's notice.
+   * @returns whether it succeeded; `false` too when another action was running, which this one did not start.
+   */
+  const act = async <T>(key: string, task: () => Promise<Settled<T>>, done: (value: T) => void, refreshOnFailure = false): Promise<boolean> => {
+    if (get().busy !== undefined) return false
     patch({ busy: key, notice: undefined })
     const result = await task()
     patch({ busy: undefined })
     if (result.ok) {
       done(result.value)
-      return
+      return true
     }
     patch({ notice: { tone: 'error', ...result.notice } })
     if (refreshOnFailure) void refreshProposals()
+    return false
   }
 
+  /** Read again what the page has, or is still reading (that read may have started before what changed). Nothing if it has opened nothing. */
   const refreshLoaded = (): void => {
-    if (get().log.loaded) void refreshLog()
-    if (get().proposals.loaded) void refreshProposals()
+    const { log, proposals } = get()
+    if (log.loaded || log.loading) void refreshLog()
+    if (proposals.loaded || proposals.loading) void refreshProposals()
   }
 
   const face: HistoryActions = {
@@ -307,7 +316,7 @@ export function createHistory(api: ConfigApi): HistoryController {
       else void refreshLog()
     },
     revert(id) {
-      void act(`revert:${id}`, () => settle(() => api.revert(id)), (commit) => {
+      void act(`revert:${id}`, () => settle(() => api.revert(id), 'revert'), (commit) => {
         if (commit === null) {
           patch({ notice: { tone: 'info', text: NOTHING_TO_REVERT } })
           return
@@ -321,7 +330,7 @@ export function createHistory(api: ConfigApi): HistoryController {
       })
     },
     accept(id) {
-      void act(`accept:${id}`, () => settle(() => api.accept(id)), (commit) => {
+      void act(`accept:${id}`, () => settle(() => api.accept(id), 'accept'), (commit) => {
         void refreshProposals()
         void refreshLog()
         patch({
@@ -332,7 +341,7 @@ export function createHistory(api: ConfigApi): HistoryController {
       }, true)
     },
     reject(id, reason) {
-      void act(`reject:${id}`, () => settle(() => api.reject(id, reason)), () => {
+      return act(`reject:${id}`, () => settle(() => api.reject(id, reason), 'reject'), () => {
         void refreshProposals()
         patch({ notice: { tone: 'success', text: 'Rejected' } })
       }, true)
@@ -345,10 +354,10 @@ export function createHistory(api: ConfigApi): HistoryController {
     face,
     receive(event, opening) {
       if (opening) {
-        const reconnected = connectedBefore
-        connectedBefore = true
+        // The first item of every stream, the very first included: a commit made between the page's own read and the
+        // stream's subscription would otherwise be missed. Nothing loaded (or loading) makes this nothing.
         patch({ stream: 'live' })
-        if (reconnected) refreshLoaded()
+        refreshLoaded()
       }
       switch (event.kind) {
         case 'remote':
@@ -360,7 +369,7 @@ export function createHistory(api: ConfigApi): HistoryController {
         case 'proposal':
           // A proposal that was rebuilt or moved on has a different diff.
           patch({ proposalDiffs: {} })
-          if (get().proposals.loaded) void refreshProposals()
+          if (get().proposals.loaded || get().proposals.loading) void refreshProposals()
           break
       }
     },
