@@ -1,5 +1,6 @@
-import { mkdir, readdir, rm, stat } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { randomBytes } from 'node:crypto'
+import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
+import { basename, dirname, join, resolve } from 'node:path'
 import { ConfigStoreError } from './errors.ts'
 import { Git, literal, pathProblem } from './git.ts'
 import type { Change, GitIdentity } from './git.ts'
@@ -8,9 +9,11 @@ import { SerialQueue, acquireLock } from './lock.ts'
 import type { NamespaceRegistry, NamespaceSpec } from './namespaces.ts'
 import { acceptProposal, listProposals, proposeChanges, rejectProposal } from './proposals.ts'
 import type { AcceptMeta, ProposalEvent, ProposalHost, ProposalInfo, ProposalStatus, ProposeMeta, RejectMeta } from './proposals.ts'
+import { DEFAULT_PUSH_TIMEOUT_MS, PushQueue, checkPushOptions, checkRemote, fetchRemoteMain } from './push.ts'
+import type { RemoteStatus } from './push.ts'
 
 export type { Change, GitIdentity }
-export type { AcceptMeta, ProposalEvent, ProposalInfo, ProposalStatus, ProposeMeta, RejectMeta }
+export type { AcceptMeta, ProposalEvent, ProposalInfo, ProposalStatus, ProposeMeta, RejectMeta, RemoteStatus }
 
 /**
  * Who made a commit. `system` is the store's own (the root commit and `seed`);
@@ -79,8 +82,23 @@ export interface StoreOptions {
   agent: GitIdentity
   /** Per-document size cap in bytes. Default 262144. */
   maxBytes?: number
-  /** Called after each commit to `main` made by `write` or `seed` (not for the root commit). A throw is reported as a process warning and never fails the write. */
+  /** Called after each commit to `main` (`write`, `seed`, `revert`, `accept`; not for the root commit). A throw is reported as a process warning and never fails the write. */
   onCommit?: (info: CommitInfo) => void
+  /**
+   * Where `main` is pushed after every commit, and at start-up (so the root commit and anything an earlier
+   * run left unpushed goes out): a URL or path git can push to. Never forced; a failed push never fails
+   * a write (see `remoteStatus`). When the repository doesn't exist yet and the remote has a `main`, the
+   * store restores it from there instead of starting a new history; a remote that can't be reached then
+   * is an error. An existing repository never contacts the remote while opening.
+   * @throws a plain `Error` from `open` for a remote that is empty, holds control characters, starts with `-` or uses `ext::`.
+   */
+  remote?: string
+  /** A push, or a start-up `ls-remote` or `fetch`, still running after this many milliseconds is killed. Default 60 000. */
+  pushTimeoutMs?: number
+  /** The wait before each retry of a failed push, in milliseconds, the last repeating. Default 1s, 5s, 30s, 120s, 600s. */
+  pushDelays?: number[]
+  /** Called, in order, after every change to what `remoteStatus` says. A throw is reported as a process warning. */
+  onRemoteStatus?: (status: RemoteStatus) => void
   /**
    * Called when a proposal opens (`propose`), turns out stale (an `accept` it refused), or is
    * accepted or rejected. A throw is reported as a process warning and never fails the call.
@@ -112,6 +130,8 @@ const STALE_TEMP_MS = 60_000
 const GIT_INIT_ENTRIES: readonly string[] = ['HEAD', 'branches', 'config', 'description', 'hooks', 'info', 'objects', 'refs']
 /** The files `git init` writes through a lock, which a crash can leave behind and which would make the next `git init` fail. */
 const GIT_INIT_LOCKS: readonly string[] = ['config.lock', 'HEAD.lock']
+/** What a restore from the remote is fetched into, next to the repository: `<name>.clone-<16 hex>`. */
+const CLONE_SUFFIX = /^\.clone-[0-9a-f]{16}$/
 
 /** What `write`, `seed`, `revert` and the proposals hand to `commitPrepared` once every check has passed. Package-internal. */
 export interface Prepared {
@@ -357,6 +377,21 @@ function checkHistoryQuery(query: unknown): { pathspec: string[], limit: number,
   return { pathspec, limit: Math.min(MAX_HISTORY_LIMIT, Math.max(1, wanted)), before }
 }
 
+/** Whether anything but directories is at or below `path`: a file, a link, or `path` itself not being a directory. A missing path holds nothing. */
+async function holdsFiles(path: string): Promise<boolean> {
+  let entries
+  try {
+    entries = await readdir(path, { recursive: true, withFileTypes: true })
+  } catch (error) {
+    const code = (error as { code?: string }).code
+    if (code === 'ENOENT') return false
+    // A file (or anything that isn't a directory): not a skeleton directory.
+    if (code === 'ENOTDIR') return true
+    throw error
+  }
+  return entries.some(entry => !entry.isDirectory())
+}
+
 function isOwnLockFile(name: string): boolean {
   return name === 'dish.lock' || LOCK_TEMP.test(name)
 }
@@ -403,6 +438,7 @@ export class ConfigStore {
   private readonly maxBytes: number
   private readonly release: () => Promise<void>
   private readonly proposalHost: ProposalHost
+  private readonly pushQueue: PushQueue | undefined
   private closed = false
   private closing: Promise<void> | undefined
 
@@ -413,24 +449,36 @@ export class ConfigStore {
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
     this.release = release
     this.proposalHost = this.makeProposalHost()
+    if (options.remote !== undefined) {
+      this.pushQueue = new PushQueue(this.git, options.remote, {
+        delays: options.pushDelays, timeoutMs: options.pushTimeoutMs, onStatus: options.onRemoteStatus,
+      })
+    }
   }
 
   /**
    * Open the store at `options.repository`: create the directory, take the
-   * process lock, then make sure the repository is there (initializing it with
-   * one root commit if the directory is empty) and clear what a crashed run left.
+   * process lock, then make sure the repository is there (restoring it from the
+   * `remote` if the directory is empty and the remote has a `main`, else initializing
+   * it with one root commit) and clear what a crashed run left. With a `remote`, a
+   * first push is then started, in the background.
    * @throws `LOCKED` if another process holds the store; a plain `Error` if the
-   *   directory holds something that isn't a dish config repository.
+   *   directory holds something that isn't a dish config repository, the `remote`
+   *   or the push options are unusable, or a first start can't reach the remote.
    */
   static async open(options: StoreOptions): Promise<ConfigStore> {
     const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
     if (!(maxBytes >= 0)) throw new Error(`maxBytes must be zero or more, got ${String(maxBytes)}`)
+    if (options.remote !== undefined) checkRemote(options.remote)
+    checkPushOptions({ delays: options.pushDelays, timeoutMs: options.pushTimeoutMs })
     const repository = resolve(options.repository)
     await mkdir(repository, { recursive: true })
     const release = await acquireLock(repository)
     try {
       const store = new ConfigStore(options, repository, release)
       await store.ensureRepository()
+      // Not from `onCommit`: the root commit doesn't fire it, and an earlier run may have left commits unpushed.
+      store.pushQueue?.schedule()
       return store
     } catch (error) {
       await release()
@@ -444,12 +492,27 @@ export class ConfigStore {
    */
   close(): Promise<void> {
     this.closed = true
-    this.closing ??= this.queue.run(() => this.release()).catch(error => {
+    // First, so that no push outlives the lock: one in flight is killed, none is started.
+    this.closing ??= this.closePushes().then(() => this.queue.run(() => this.release())).catch(error => {
       // A failed release can be tried again.
       this.closing = undefined
       throw error
     })
     return this.closing
+  }
+
+  private closePushes(): Promise<void> {
+    return this.pushQueue?.close() ?? Promise.resolve()
+  }
+
+  /**
+   * Where the remote copy stands: the commit last pushed (by this process), how many commits on
+   * `main` may be missing there, the last error and when the last attempt began. Without a
+   * `remote` that is `{ pending: 0 }`. Never waits for the network, and a slow push doesn't slow it.
+   */
+  remoteStatus(): Promise<RemoteStatus> {
+    if (this.closed) return Promise.reject(new Error('config store is closed'))
+    return this.pushQueue?.status() ?? Promise.resolve({ pending: 0 })
   }
 
   /** The commit `main` points at. */
@@ -707,8 +770,14 @@ export class ConfigStore {
    * `git init --bare` makes (and the `config.lock` and `HEAD.lock` it works through,
    * which are removed first): that also finishes a first start that crashed inside
    * `git init`, which writes `config` before `HEAD` and `HEAD` before `objects/`.
+   *
+   * With a `remote` and no repository yet, the remote's `main` is fetched first, and the
+   * directory becomes a copy of it (see `restoreFromRemote`); only a remote with no `main`
+   * leaves the directory to be initialized. A directory that already is a repository never
+   * contacts the remote here.
    */
   private async ensureRepository(): Promise<void> {
+    await this.removeStaleClones()
     // A stray `HEAD` file doesn't make a repository: it is whatever git itself accepts.
     const check = await this.git.run(['rev-parse', '--git-dir'], { allowFail: true })
     if (check.code === 0) {
@@ -730,9 +799,64 @@ export class ConfigStore {
     }
     // This process holds `dish.lock`, so no git of ours is running: whatever lock `git init` left is a crash's.
     await Promise.all(entries.filter(isInitLock).map(entry => rm(join(this.repository, entry.name), { force: true })))
+    if (this.options.remote !== undefined && await this.restoreFromRemote(entries.map(entry => entry.name))) return
     // Safe on what a crashed `git init` left: it fills in whatever is missing and changes nothing else.
     await this.git.initBare('main')
     await this.completeInitialization()
+  }
+
+  /**
+   * Make `<repository>` a copy of the remote's `main`. It is fetched into a new bare repository next
+   * to this one (`<repository>.clone-<hex>`, SHA-1 and loose refs whatever the user's git config says,
+   * `main` only, no remote configured in it) and checked there; then each of its entries is moved
+   * into this directory, `refs` and `HEAD` last, and the temporary directory is removed. It is
+   * removed when anything fails too, and nothing has been touched by then.
+   *
+   * This directory may hold what a crashed `git init` or an earlier restore's first renames left
+   * (`entries`), which is replaced, unless `objects` or `refs` hold a file: that could be commits.
+   * @returns `true` once restored; `false` if the remote is reachable but has no `main`.
+   * @throws a plain `Error` if the remote can't be reached or what it has isn't usable, or the directory holds more than leftovers.
+   */
+  private async restoreFromRemote(entries: string[]): Promise<boolean> {
+    const remote = this.options.remote!
+    const leftovers = entries.filter(name => GIT_INIT_ENTRIES.includes(name))
+    for (const name of ['objects', 'refs']) {
+      if (leftovers.includes(name) && await holdsFiles(join(this.repository, name))) {
+        throw new Error(`${this.repository} is not a repository but holds parts of one (${name}), refusing to replace them from the remote; remove ${name} (or the whole directory) to restore`)
+      }
+    }
+    const temp = `${this.repository}.clone-${randomBytes(8).toString('hex')}`
+    try {
+      const fetched = new Git(temp)
+      await fetched.initBare('main')
+      if (!(await fetchRemoteMain(remote, fetched, this.options.pushTimeoutMs ?? DEFAULT_PUSH_TIMEOUT_MS))) return false
+      // Only now is anything in the directory touched; what is removed holds no files.
+      await Promise.all(leftovers.map(name => rm(join(this.repository, name), { recursive: true, force: true })))
+      const names = (await readdir(temp)).filter(name => name !== 'refs' && name !== 'HEAD')
+      // `refs` carries `main` and `HEAD` makes it a repository. Until the last rename it is none, and a crash after the
+      // first `objects` leaves files that the next start refuses to guess about (see above).
+      for (const name of [...names, 'refs', 'HEAD']) await rename(join(temp, name), join(this.repository, name))
+      return true
+    } finally {
+      await rm(temp, { recursive: true, force: true })
+    }
+  }
+
+  /**
+   * Delete the temporary directories a crashed restore left next to the repository
+   * (`<repository>.clone-<16 hex>`). Safe: this process holds the lock, and only a restore makes them.
+   */
+  private async removeStaleClones(): Promise<void> {
+    const name = basename(this.repository)
+    let siblings: string[]
+    try {
+      siblings = await readdir(dirname(this.repository))
+    } catch (error) {
+      if (['ENOENT', 'EACCES', 'EPERM'].includes((error as { code?: string }).code ?? '')) return
+      throw error
+    }
+    const stale = siblings.filter(entry => entry.startsWith(name) && CLONE_SUFFIX.test(entry.slice(name.length)))
+    await Promise.all(stale.map(entry => rm(join(dirname(this.repository), entry), { recursive: true, force: true })))
   }
 
   /**
@@ -1018,8 +1142,9 @@ export class ConfigStore {
     }
   }
 
-  /** Tell `onCommit`. The commit has landed, so a failing listener is a warning, not a failed write. */
+  /** Push the new `main` (in the background), and tell `onCommit`. The commit has landed, so a failing listener is a warning, not a failed write. */
   private announce(info: CommitInfo): void {
+    this.pushQueue?.schedule()
     const { onCommit } = this.options
     if (onCommit !== undefined) notify('onCommit', () => onCommit(info))
   }

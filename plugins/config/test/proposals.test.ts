@@ -996,7 +996,12 @@ test('a branch the tree refuses at accept time is STALE, not a raw INVALID, and 
   await forge(git, { id: 'aaaaaaaa', tree })
   assert.deepEqual((await store.proposals()).map(item => [item.id, item.status, item.paths]), [['aaaaaaaa', 'open', ['prompts/git~1/x']]])
   const head = await mainOf(git)
-  await assert.rejects(store.accept('aaaaaaaa', { author: USERA }), isStoreError('STALE', 'aaaaaaaa'))
+  await assert.rejects(store.accept('aaaaaaaa', { author: USERA }), (error: unknown) => {
+    isStoreError('STALE', 'aaaaaaaa')(error)
+    // What git said about the path is cut to its first line: the whole of its stderr would be several.
+    assert.ok(!(error as Error).message.includes('\n'), `one line: ${JSON.stringify((error as Error).message)}`)
+    return true
+  })
   assert.equal(await mainOf(git), head)
   assert.ok(await git.resolve(`${HEADS}aaaaaaaa`))
   assert.deepEqual(seen, [['aaaaaaaa', 'stale']])

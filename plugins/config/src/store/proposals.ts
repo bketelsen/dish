@@ -465,7 +465,8 @@ export async function acceptProposal(host: ProposalHost, id: string, meta: Accep
       commit = await host.commit(prepared)
     } catch (error) {
       // The only `INVALID` left here is the tree refusing a path (a file in a directory's way that `standing` could not see).
-      if (error instanceof ConfigStoreError && error.code === 'INVALID') throw stale(host, proposal, `its paths no longer fit main's tree (${error.message})`)
+      // The message carries git's stderr, which is several lines; the first says it.
+      if (error instanceof ConfigStoreError && error.code === 'INVALID') throw stale(host, proposal, `its paths no longer fit main's tree (${error.message.split('\n', 1)[0]})`)
       throw error
     }
   }

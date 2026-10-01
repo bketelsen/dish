@@ -47,8 +47,10 @@ Status: draft, 2026-09-30. Implements roadmap step 2. Builds on the [design](../
 Each write is atomic, and a commit lands only if `main` is still where the writer saw it. To browse files, view the GitHub repo or clone it.
 
 **First start.**
-- If the repository is missing and a remote is configured with history, the store does a bare clone of it. That's how a rebuilt VM gets its config back.
-- Otherwise it runs `git init --bare -b main` and makes an empty root commit.
+- If the repository is missing and a remote is configured, the store asks the remote for its `main` (`ls-remote`). If there is one, it is fetched into a temporary bare repository next to the real one, SHA-1 with loose refs whatever the user's git config says, `main` only, no remote recorded in it. It is checked, and its entries are then moved into place. That's how a rebuilt VM gets its config back.
+- A remote that can't be reached is an error (plain, with git's first line), and nothing is created: starting a new history would diverge from the real one later.
+- If the remote is reachable but has no `main`, or none is configured, the store runs `git init --bare -b main` and makes an empty root commit. With a remote, the root commit is pushed as soon as the store opens.
+- A repository that already exists never contacts the remote while opening. A directory that holds objects or refs but isn't a repository is refused, never replaced.
 
 ## Model
 
@@ -103,7 +105,7 @@ interface DishConfig {
   accept(id: string, meta: { author: Author }): Promise<CommitInfo | undefined>   // apply to main; `undefined` when main already holds the content
   reject(id: string, reason: string, meta: { author: Author }): Promise<void>
 
-  remoteStatus(): RemoteStatus                          // last pushed commit, pending, last error
+  remoteStatus(): Promise<RemoteStatus>                 // last pushed commit, pending, last error; `{ pending: 0 }` with no remote
 }
 
 type Change = { path: string, text: string } | { path: string, delete: true }
@@ -156,8 +158,13 @@ Consumers re-read on these events rather than caching.
 
 ### Remote
 
-- After each commit to `main`, a push (`main` only) is queued.
-- Failures retry with backoff and show up in `remoteStatus()` and on the History page. **A failed push never fails the save**, because the local commit is the source of truth.
+- After each commit to `main`, a push (`main` only) is queued, and one more when the store opens, so the root commit and anything an earlier run left unpushed go out.
+- **A push never waits for a person.** It runs with no terminal (a new session, so ssh can't prompt on `/dev/tty`; a host-key or passphrase question fails instead of hanging), no stdin and `GIT_TERMINAL_PROMPT=0`, under a hard time limit (`pushTimeoutMs`, 60 s) that kills git and everything it started. The user's `GIT_SSH*`, `GIT_ASKPASS` and git config are left as they are, so their auth works as it does in a shell.
+- **It never delays a write.** The queue takes no store lock and runs on none of the store's queues. Pushes go one at a time; commits that land while one runs are covered by one more push, not one each.
+- **The push is `git push --porcelain <remote> refs/heads/main:refs/heads/main`**, to the URL itself: never forced, no remote or tracking refs in the repository, no local ref locked. The `remote` is checked when the store opens: not empty, no control characters, not starting with `-`, not using `ext::`; and `ext` is switched off for every call.
+- Failures retry with backoff (1s, 5s, 30s, 120s, 600s, then every 600s; a success starts over) and show up in `remoteStatus()` and on the History page. A new commit doesn't cut a wait short: the retry carries it. **A failed push never fails the save**, because the local commit is the source of truth.
+- **A rejected push** means the remote has commits this store doesn't (another machine pushed). It is never forced: `lastError` says "remote main has commits this store doesn't have; resolve manually", and retries go on.
+- `remoteStatus()` is `{ remote, pushed, pending, lastError, lastAttempt }`. `pushed` is the commit last pushed by this process; `pending` is the number of commits after it (all of them until the first success after a start, so after a restart it is an upper bound). `lastError` is git's first line with credentials masked: a password in a URL, or anything that looks like a secret (see Safety), is hidden. A listener (`onRemoteStatus`) hears every change.
 - Authentication is the host's git setup (SSH key or credential helper); the store holds none.
 - Proposal branches stay local, since they're transient and visible in the UI.
 - **Setup is a one-time manual step:**
