@@ -86,7 +86,7 @@ function exec(args: string[], options: RunOptions): Promise<RunResult> {
 }
 
 /** Why `path` can't be a config document path, or `undefined` if it can. */
-function pathProblem(path: string): string | undefined {
+export function pathProblem(path: string): string | undefined {
   if (path === '') return 'empty'
   // Control characters (newline, tab, NUL, DEL, ...) would let a path forge lines in commit messages and logs.
   if (/[\x00-\x1f\x7f]/.test(path)) return 'contains a control character'
