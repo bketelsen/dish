@@ -106,7 +106,7 @@ Empty strings are treated as absent. The checks run in this order, before anythi
    Each refusal says who's running and what to do: "a coder is running (child X, 'add login'); wait for its notice, or delegate a read-only role."
 5. **Model.**
    - **Non-reviewers:** the role's `family` and `tier`, unless `model` names another model in `crew.yaml`'s families.
-   - **The reviewer:** `reviews` is required. Its family is the first in `reviewerFamilies` that isn't the reviewed work's family. That's the family of the reviewed child's recorded model, or of the main agent's own model for `"main"`. A `model` override is accepted only if its family is also different.
+   - **The reviewer:** `reviews` is required. Its family is the first in `reviewerFamilies` that isn't the reviewed work's family, and that lists no model from the reviewed work's vendor. The exclusion is by vendor as well as by family name, so a model missing from the file or renamed families can't put Claude on Claude. That's the family of the reviewed child's recorded model, or of the main agent's own model for `"main"`. A `model` override is accepted only if its family is also different.
 6. **Route check.** `ctx.llm.resolveCallConfig({ provider, model, reasoningEffort })` must resolve. On failure, the error lists the models `crew.yaml` offers.
 7. **Start or send.**
    - **Start:** `startContinuable` with:
@@ -126,7 +126,8 @@ Empty strings are treated as absent. The checks run in this order, before anythi
 A child's allow list is its role's `tools` from `crew.yaml`, intersected with the tools the parent can see when the child starts.
 - A tool that's missing then, such as `bash` on Windows (where it's `pwsh`) or `read_image` without attachments, is dropped, not an error.
 - `pwsh` is added wherever `bash` is listed.
-- Whatever the file says, a child never gets these, even if a role lists them: `delegate`, `subagent`, `subagent_fork`, `workflow`, `interrupt_agent`, `list_agents`, `ask_user_question`, `create_goal`, `update_goal`, `exit_plan_mode` or `present`. Children can't ask you anything: dsh runs them with approval policy `never`.
+- Whatever the file says, a child never gets these, even if a role lists them: `delegate`, `subagent`, `subagent_fork`, `subagent_codex`, `subagent_claude_code`, `list_subagent_models`, `workflow`, `ralph`, `interrupt_agent`, `list_agents`, `ask_user_question`, `create_goal`, `update_goal`, `exit_plan_mode`, `present`, or dsh's reserved `run_code`.
+- "Tools the parent can see" means tools the child can inherit: those in the parent's preset and global layers, not tools installed on the parent agent's own scope (such as dsh-schedule's), which dsh won't let a child's filter name. Children can't ask you anything: dsh runs them with approval policy `never`.
 
 The list is stored in the child's descriptor. So if a tool is later removed from the dish preset, older children that were allowed it may no longer reload. That's dsh's behavior, noted in the README.
 
