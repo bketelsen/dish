@@ -42,7 +42,14 @@ test('a corrupt or wrong-version cache reads as absent and is left alone', () =>
   await writeFile(legacy, JSON.stringify(sample('from-legacy')))
 
   const file = join(dir, 'new.json')
-  for (const text of ['{ not json', 'null', '{"version":2,"report":{},"additions":[]}', '{"version":1}']) {
+  for (const text of [
+    '{ not json', 'null',
+    '{"version":2,"report":{"available":[]},"additions":[]}',
+    '{"version":1}',
+    '{"version":1,"report":null,"additions":[]}',
+    '{"version":1,"report":{},"additions":[]}',
+    '{"version":1,"report":{"available":[]}}',
+  ]) {
     await writeFile(file, text)
     assert.equal(await readCache(file, legacy), undefined, text)
     assert.equal(await readFile(file, 'utf8'), text)

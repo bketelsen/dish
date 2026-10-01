@@ -88,9 +88,6 @@ importers:
       '@types/react':
         specifier: ~18.3.1
         version: 18.3.31
-      esbuild:
-        specifier: ^0.25.0
-        version: 0.25.12
 
   plugins/crew:
     dependencies:

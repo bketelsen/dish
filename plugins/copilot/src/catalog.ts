@@ -107,7 +107,7 @@ export const Config: Schema<Config> = Schema.object({
   cacheFile: Schema.string()
     .description('Where the last refresh is cached, so additions survive restarts. Defaults to copilot-models.json in the XDG cache directory for dish.'),
   legacyCacheFile: Schema.string()
-    .description('An older cache location, read once when cacheFile does not exist yet. Never written or deleted.'),
+    .description('An older cache location, read when cacheFile does not exist yet (until a refresh writes it). Never written or deleted.'),
   refreshOnStart: Schema.boolean().default(true)
     .description('Refresh from Copilot at startup when signed in.'),
   updateRoute: Schema.boolean().default(true)
@@ -318,8 +318,9 @@ interface RouteProfile {
 
 /**
  * Read the cache `file`. Only when it does not exist, read `legacy` instead,
- * so a cache from an older location is found once; the first refresh then
- * writes `file`, and `legacy` is never consulted again. Never writes or
+ * so a cache from an older location is still found; once a refresh succeeds it
+ * writes `file`, and `legacy` is no longer consulted. Until then (e.g. while
+ * not signed in) `legacy` is read on every start. Never writes or
  * deletes either file.
  * @returns the cache, or `undefined` if there is none, or it is corrupt or of another version.
  */
@@ -333,7 +334,7 @@ export async function readCache(file: string, legacy?: string): Promise<Cache | 
   }
   try {
     const cache = JSON.parse(text) as Partial<Cache> | null
-    if (cache?.version !== 1 || typeof cache.report !== 'object' || !Array.isArray(cache.additions)) return undefined
+    if (cache?.version !== 1 || !Array.isArray(cache.report?.available) || !Array.isArray(cache.additions)) return undefined
     return cache as Cache
   } catch {
     return undefined

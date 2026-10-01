@@ -60,7 +60,7 @@ At startup, after each sign-in, and on **Refresh models**, the catalog plugin:
    - Name, context window, output limit and vision come from the live listing.
    - Headers, compat switches and reasoning levels are cloned from the nearest catalog sibling, e.g. `gpt-6.1-sol` from `gpt-6-sol`.
 3. Sets the `github-copilot` route's `models` to exactly what your account can use. Per-model fields you've configured are kept.
-4. Caches the result in `$XDG_CACHE_HOME/dish/copilot-models.json` (`~/.cache/dish/` by default). A cache at the old location, `~/.dsh/dish-copilot-models.json`, is read once if the new file doesn't exist yet.
+4. Caches the result in `$XDG_CACHE_HOME/dish/copilot-models.json` (`~/.cache/dish/` by default). A cache at the old location, `~/.dsh/dish-copilot-models.json`, is read while the new file doesn't exist yet, i.e. until the first successful refresh writes it.
 
 `llm-pi-ai` reads the catalog when its config changes, not per request. So this bundle patches the `llm-pi-ai` row with `inject: [copilotCatalog]`. The adapter mounts only after the cached additions are back in place, and they resolve from the first request after a restart.
 
@@ -87,7 +87,7 @@ Set in `~/.dsh/profiles/web/cordis.patch.yml`.
 | Field | Default | |
 |---|---|---|
 | `cacheFile` | `$XDG_CACHE_HOME/dish/copilot-models.json` | Where the last refresh is cached. |
-| `legacyCacheFile` | `~/.dsh/dish-copilot-models.json` (set by the bundle) | Read once when `cacheFile` doesn't exist yet; never written or deleted. |
+| `legacyCacheFile` | `~/.dsh/dish-copilot-models.json` (set by the bundle) | Read while `cacheFile` doesn't exist yet; never written or deleted. |
 | `refreshOnStart` | `true` | Refresh at startup when signed in. |
 | `updateRoute` | `true` | Rewrite the route's model list to match the account. |
 | `terminal` | `true` | Print this plugin's messages to the terminal. |
