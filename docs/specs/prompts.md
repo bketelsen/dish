@@ -86,7 +86,7 @@ The `dishPrompts` service takes a **snapshot** the first time it's asked for an 
 
 ### The persona row: `dish-prompts/persona`
 
-A plugin row for preset compositions, the counterpart of `@deepseek-ai/dsh-persona`, configured with `{ role }` (`main` in the dish preset). It registers no sections. It registers one `system-prompt/assemble` listener. If anything has added a `complete` section, the listener changes nothing, as dsh intends. Otherwise, for each agent under the preset, it:
+A plugin row for preset compositions, the counterpart of `@deepseek-ai/dsh-persona`, configured with `{ role }` (`main` in the dish preset). It registers no sections. It registers one `system-prompt/assemble` listener that, for each agent under the preset:
 
 1. awaits the agent's snapshot (instant after the first step). For a delegated child, only `common` is used from it;
 2. finds the assembled `deployment:persona-prefix` and `deployment:persona-suffix` sections by name, and sets their text, interpolated leniently, with `interpolate: false`:
@@ -94,6 +94,8 @@ A plugin row for preset compositions, the counterpart of `@deepseek-ai/dsh-perso
    - **a delegated child** (`delegationDepth` above zero): the prefix is left as the child's own persona (crew's role text) and only interpolated leniently; the suffix is `common.md`.
 
    The global persona sections always exist (`dsh-system-prompt` registers them unconditionally), so there's always something to set.
+
+A `complete` section isn't marked in the assembly, and dsh restores it after the waterfall anyway, so a preset that uses one gets exactly that section, as dsh intends.
 
 The row needs the `dishPrompts` service. If the `dish-prompts` plugin isn't loaded, the row logs once and leaves the assembly unchanged, so the agent still works, on dsh's empty global persona.
 
@@ -119,6 +121,8 @@ interface DishPrompts {
   persona(role: string): Promise<{ prefix: string, suffix: string, commit: string | null }>
   /** The agent's snapshot: taken on the first call for that agent, the same for its whole life. */
   snapshot(agent: { id: string }, role: string): Promise<{ prefix: string, suffix: string, commit: string | null }>
+  /** Forget the agent's snapshot (on `/clear`); its next call takes a new one. */
+  drop(agent: { id: string }): Promise<void>
   /** The shipped default for a role, or undefined for a role with none. */
   defaultText(role: string): string | undefined
 }
@@ -136,7 +140,7 @@ interface DishPrompts {
 
 ## Defaults
 
-Shipped as files in `plugins/prompts/defaults/`, seeded with `dishConfig.seed` (only what doesn't exist, so your edits survive an upgrade). Short and direct; each role says what it is for, what it hands back, and what it never does.
+Shipped as files in `plugins/prompts/defaults/` (laid out like the store: `common.md`, `main.md`, `crew/<role>.md`), seeded with `dishConfig.seed` (only what doesn't exist, so your edits survive an upgrade). Short and direct; each role says what it is for, what it hands back, and what it never does.
 
 | Role | Covers |
 |---|---|
@@ -153,7 +157,7 @@ Shipped as files in `plugins/prompts/defaults/`, seeded with `dishConfig.seed` (
 
 A `settings.section` page, like History.
 
-- **List:** Common, Main, then the crew roles found under `prompts/crew/`. Each shows a dot when it differs from its default, and a count of open proposals for it.
+- **List:** Common, Main, then the crew roles found under `prompts/crew/`. Each shows a dot when it differs from its default, and a count of pending (open or stale) proposals for it.
 - **Editor:** a monospace text area with an optional note (it becomes the commit's `Dish-Note`).
   - **Save** writes as you with `base` set to the commit the page loaded. On `CONFLICT`, your text stays in the editor, and a notice shows what changed underneath and offers **Reload**.
   - **Discard** goes back to what's saved.
@@ -164,18 +168,18 @@ A `settings.section` page, like History.
   - Labeled as an approximation. Runtime context (sandbox and approval policy, `AGENTS.md`) reaches the model as separate messages and isn't shown. For a crew role, the child's own persona is shown in place of `main`'s.
   - Nothing shipped in dsh assembles without an agent, so this path is the first thing the plan checks. If it fails, the preview shows the persona sections in place between labeled markers for dsh's sections.
 - **Variables:** the prompt variables available now, with their current values where they have one (`model`, `cwd`, ...).
-- **History:** a link to Settings → History, filtered to the document. The History page learns to open with a filter (a small change in `dish-config`'s client).
-- Proposals for `main` and `common` are accepted or rejected on the History page, as now.
+- **History** tab: this document's commits, each with its diff and **Revert**, through `dish-config`'s remote (`history`, `commit`, `revert`). A settings section can't open another one (dsh gives a section only `close`), so the page shows the document's history itself rather than linking to Settings → History. The diff view moves from `dish-config`'s client into `dish-kit` so both pages use it.
+- Proposals for `main` and `common` are accepted or rejected on the History page, as now. The editor shows how many are open.
 
 The page talks to a Typert remote, Cordis service `dishPromptsRemote`, wire namespace `dishPrompts`, built like `dish-config`'s (hand-written client descriptors, `Outcome<T>` results carrying the store's error codes, `''` meaning absent). It follows `dishConfig.watch` from `dish-config`'s remote for live updates, instead of a stream of its own.
 
 | Method | Returns |
 |---|---|
-| `roles()` | `Outcome<RoleInfo[]>`: `{ role, path, agent, differsFromDefault, openProposals }` |
+| `roles()` | `Outcome<RoleInfo[]>`: `{ role, path, agent, differsFromDefault, missing, pendingProposals }`; `pendingProposals` counts open and stale proposals that change the role's document |
 | `read(role)` | `Outcome<{ text, commit, defaultText, missing }>`: `missing` when the document is absent and `text` is the default |
 | `save(role, text, base, note)` | `Outcome<CommitInfo \| null>`: `null` when nothing changed |
 | `reset(role, base, note)` | `Outcome<CommitInfo \| null>`: writes the shipped default |
-| `preview(role)` | `Outcome<{ text, approximate, unknownVariables }>` |
+| `preview(role)` | `Outcome<{ text, approximate, fallback, unknownVariables }>`: `fallback` when dsh's assembly couldn't be used and the text has markers in place of dsh's sections |
 | `variables()` | `Outcome<{ name, value }[]>`: the variables visible to the dish preset, `value` empty for per-agent ones |
 
 ## Testing
@@ -190,10 +194,10 @@ The page talks to a Typert remote, Cordis service `dishPromptsRemote`, wire name
 - the row's listener on a top-level agent, a delegated child, and an assembly with a `complete` section
 - the drift check against the installed `standard` preset
 
-By hand in the browser: the preview path first (see the open items), then the editor, conflict, reset, variables and the History link. Live: start a chat on the dish preset and check the trajectory's "Initial System Prompt" shows `main.md` after the identity line and `common.md` at the end.
+By hand in the browser: the preview path first (see the open items), then the editor, conflict, reset, variables and the History tab. Live: start a chat on the dish preset and check the trajectory's "Initial System Prompt" shows `main.md` after the identity line and `common.md` at the end.
 
 ## Open items for the plan
 
-- Whether a plugin row can be named by a package subpath (`dish-prompts/persona`) in a preset's list, or needs its own package.
-- Whether the assembly handed to the waterfall can carry `interpolate: false` per section, as `renderPrompt` reads it. If not, the row escapes its own text's braces, or registers the sections itself.
-- The preview path (above).
+- ~~Package subpath as a row name.~~ Works: `dish-copilot/catalog` already loads that way. A preset's rows go through the same loader; the live check confirms it.
+- ~~`interpolate: false` on an assembled section.~~ Works: `AssembledSection` carries `interpolate`, `renderPrompt` honors it, and the waterfall's `assembly.variables` holds the resolved values the lenient interpolation needs.
+- The preview path (above): checked live first.
