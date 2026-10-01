@@ -65,6 +65,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { isTopLevelAgent } from 'dish-kit'
 import type { Decision, Judge, JudgeAgent, JudgeResult, JsonValue, Question } from './client.ts'
+import { ASK_JUDGE_TOOL } from './ask.ts'
 import { DEFAULT_SETTINGS } from './settings.ts'
 import type { JudgeSettings } from './settings.ts'
 
@@ -106,9 +107,9 @@ const MAX_JUSTIFICATION_CHARS = 1000
 /**
  * Tools that are never gated, whatever `tools.gated` says: the judge's own tool (a question to the judge is not a command, and
  * `*` or `a*` in the list would otherwise put it behind itself), and PTC's `run_code`, whose inner calls are gated one by
- * one. The names are dsh's (`RUN_CODE_NAME` in `dsh-tools`) and Task 7's (`ask_judge`).
+ * one. The names are dsh's (`RUN_CODE_NAME` in `dsh-tools`) and `ask.ts`'s.
  */
-const NEVER_GATED: ReadonlySet<string> = new Set(['ask_judge', 'run_code'])
+const NEVER_GATED: ReadonlySet<string> = new Set([ASK_JUDGE_TOOL, 'run_code'])
 
 /** Probabilities are compared with this much give, so 0.5 + 0.45 reaches 0.95 as a person reads it. */
 const EPSILON = 1e-9

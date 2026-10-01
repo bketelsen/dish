@@ -582,28 +582,24 @@ test('the tool registers when a tools service appears, and goes when it does; wi
   await again.dispose()
 })
 
-test('the tool is registered before the startup prune of the log, which can\'t hold it back; until the judge is provided it says the judge is not running', async () => {
+test('the tool and the judge are there while the startup prune of the log is still going: nothing waits on it', async () => {
   const ctx = new Context()
   const where = await dirs()
   disposables.push(await provideStub(ctx, 'systemPrompt', { tools() {}, section() {}, getSectionOrder: () => 1 }))
   disposables.push(await ctx.plugin(ToolRuntime, {}))
-  // A prune that doesn't finish until the test lets it: the plugin waits on it before it provides the judge.
+  // A prune that doesn't finish until the test lets it. The plugin runs it in the background.
   const original = JudgeLog.prototype.prune
   let release!: () => void
   const gate = new Promise<void>((resolve) => { release = resolve })
-  JudgeLog.prototype.prune = async () => { await gate; return { days: 0, withheld: 0 } }
+  let pruneEnded = false
+  JudgeLog.prototype.prune = async () => { await gate; pruneEnded = true; return { days: 0, withheld: 0 } }
   try {
     const handle = mountJudge(ctx, where.state)
     disposables.push(handle)
-    await waitFor('ask_judge to be registered', () => ctx.tools.get('ask_judge'))
-    assert.equal(ctx.get('judge'), undefined, 'the prune is still going, so the judge is still to come')
-    const early = await ctx.tools.execute({ callId: 'early' as never, name: 'ask_judge', arguments: { state: 'x', questions: NOUL }, agent: MAIN as never, signal: new AbortController().signal }) as unknown as Result
-    assert.equal(early.isError, true)
-    assert.match(textOf(early), /the judge is unavailable: it is not running; continue without it/)
-    release()
     await handle
-    assert.ok(ctx.get('judge'))
-    assert.ok(ctx.tools.get('ask_judge'))
+    await waitFor('ask_judge to be registered', () => ctx.tools.get('ask_judge'))
+    assert.ok(ctx.get('judge'), 'the judge is provided before the prune ends')
+    assert.equal(pruneEnded, false, 'the prune is still going')
   } finally {
     JudgeLog.prototype.prune = original
     release()
