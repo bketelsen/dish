@@ -6,7 +6,8 @@
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./persona": "./src/persona.ts"
   },
   "files": [
     "src",
@@ -28,9 +29,13 @@
     "dish-kit": "workspace:*"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.4"
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-agent": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "^0.2.0-rc.2"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "~4.0.4"
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2"
   }
 }
