@@ -1,0 +1,8 @@
+# The judge's host plugin (the dishJudge service). It works without dish-config,
+# on the shipped judge.yaml, and claims and seeds judge.yaml when the store is
+# there, so there is no order to keep. Config: `baseUrl` (the TypeSafe API),
+# `keyName` (the credential's env-var name), `stateDirectory` (where the log
+# goes; the XDG state directory for dish by default) and `terminal`.
+- insert:
+    - id: dish-judge
+      name: dish-judge

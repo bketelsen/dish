@@ -1,0 +1,37 @@
+{
+  "name": "dish-judge",
+  "version": "0.0.1",
+  "private": true,
+  "description": "A fast typed judge in front of the risky edges of every agent: a command gate, an approval answerer, a result screen and ask_judge",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "defaults",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "dish-config": "workspace:*",
+    "dish-kit": "workspace:*",
+    "js-yaml": "^4.1.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@types/js-yaml": "^4.0.9"
+  }
+}
