@@ -18,8 +18,10 @@ import { LISTED, SHOWN, listed as listNames, truncate } from './text.ts'
 /** The two sizes of model a family has. */
 export type Tier = 'strong' | 'mid'
 
-/** The model a family uses at each tier. */
+/** The model a family uses at each tier, and the provider it runs on if that isn't the file's own. */
 export interface FamilySettings {
+  /** The provider the family's models run on, where that isn't the top-level `provider`: direct API keys, say, with Claude on `anthropic` and GPT on `openai`. Absent for a family on the file's own. */
+  readonly provider?: string
   readonly strong: string
   readonly mid: string
 }
@@ -46,6 +48,7 @@ export interface RoleSettings {
 
 /** Everything in it is frozen, and the types say so: copy before changing anything. */
 export interface CrewSettings {
+  /** The provider every family runs on, unless the family has its own. */
   readonly provider: string
   /** Model ids per family and tier; a family's models identify it. */
   readonly families: Readonly<Record<string, FamilySettings>>
@@ -58,6 +61,7 @@ export type ParseResult = { ok: true, settings: CrewSettings } | { ok: false, pr
 
 const TIERS: readonly Tier[] = ['strong', 'mid']
 const TOP_KEYS = ['provider', 'families', 'reviewerFamilies', 'limits', 'roles'] as const
+const FAMILY_KEYS = ['provider', ...TIERS] as const
 const LIMIT_KEYS = ['running', 'writers', 'perSession'] as const
 const ROLE_KEYS = ['tier', 'family', 'writes', 'reviews', 'tools'] as const
 
@@ -133,17 +137,33 @@ function plainString(value: unknown, path: string, what: string): string {
   return unpadded(value, path)
 }
 
+/** A model as an offer names it: the family it is in, and whether the name is its provider and id together (`provider/model`) or the id itself. */
+interface Offer {
+  readonly model: string
+  readonly family: string
+  readonly joined: boolean
+}
+
+/** How `offer` is told in a message about two models that have one name. */
+function told(offer: Offer): string {
+  return `${shown(offer.model)} (family ${truncate(offer.family)}${offer.joined ? ', as provider/model' : ''})`
+}
+
 function parseFamilies(value: unknown): Record<string, FamilySettings> {
   if (!isMapping(value)) refuse('families', `must be a mapping of family name to its strong and mid models (got ${shown(value)})`)
   const families = dictionary<FamilySettings>()
   // The family each model is listed under: a model is how a family is told, so it can't be in two.
   const owner = new Map<string, string>()
+  // What each model can be called when it's given back as `model`: its id, and `provider/model` when its family has a provider.
+  // Two models called the same thing would have the listing say one and the route be the other.
+  const offered = new Map<string, Offer>()
   for (const [name, models] of Object.entries(value)) {
     const path = at('families', name)
     unpadded(name, path)
     if (!FAMILY_NAME.test(name)) refuse(path, `${shown(name)} is not a valid family name (lowercase letters, digits and hyphens, starting with a letter)`)
     if (!isMapping(models)) refuse(path, `must be a mapping with strong and mid models (got ${shown(models)})`)
-    noOtherKeys(models, path, TIERS)
+    noOtherKeys(models, path, FAMILY_KEYS)
+    const provider = models.provider === undefined ? undefined : plainString(models.provider, at(path, 'provider'), 'a provider id')
     const chosen = {} as Record<Tier, string>
     for (const tier of TIERS) {
       const model = plainString(required(models, tier, path, 'a model id'), at(path, tier), 'a model id')
@@ -152,9 +172,19 @@ function parseFamilies(value: unknown): Record<string, FamilySettings> {
         refuse(at(path, tier), `${shown(model)} is also in family ${truncate(other)}; a model belongs to one family`)
       }
       owner.set(model, name)
+      const calls: Array<[string, Offer]> = [[model, { model, family: name, joined: false }]]
+      if (provider !== undefined) calls.push([`${provider}/${model}`, { model, family: name, joined: true }])
+      for (const [call, offer] of calls) {
+        const taken = offered.get(call)
+        // The same model again (both tiers of a family) is no second model.
+        if (taken !== undefined && taken.model !== model) {
+          refuse(at(path, tier), `${shown(call)} names two models: ${told(offer)} and ${told(taken)}. Change one of the model ids, or the provider of a family, so that no two models are offered under one name.`)
+        }
+        offered.set(call, offer)
+      }
       chosen[tier] = model
     }
-    families[name] = { strong: chosen.strong, mid: chosen.mid }
+    families[name] = { ...provider === undefined ? {} : { provider }, strong: chosen.strong, mid: chosen.mid }
   }
   return families
 }

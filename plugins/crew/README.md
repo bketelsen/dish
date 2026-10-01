@@ -51,14 +51,26 @@ roles:
   writer:     { tier: mid,    family: anthropic, writes: true,  tools: [...] }
 ```
 
+For direct API keys, with Claude through an `anthropic` provider and GPT through an `openai` one, give each family its provider and keep the rest of the file (`limits` and `roles` as above). Use the model ids the provider's API names:
+
+```yaml
+provider: anthropic       # required: the provider of any family that doesn't have its own
+families:
+  anthropic: { provider: anthropic, strong: claude-opus-5.5, mid: claude-sonnet-5.5 }
+  openai:    { provider: openai,    strong: gpt-6.1-sol,     mid: gpt-5.6-sol }
+reviewerFamilies: [openai, anthropic]
+```
+
 - **A broken file can't be saved.** It is checked when written: unknown keys, model ids padded with spaces, a model listed in two families, a role with no tools, and more are refused, each with the path at fault.
 - **Families and tiers.** Each role uses its family's model at its tier. The main agent may pass `model` to pick another model listed in `families`.
-- **The reviewer** has no `family`. It takes the first `reviewerFamilies` entry that isn't the reviewed work's family, and that lists no model of the same vendor.
+- **A provider per family.** `provider` at the top is where every family runs, and it is required. A family may add its own `provider` next to its tiers, for direct API keys, where Claude and GPT come through different providers (the example above). A model override runs on the provider of the family its model is in. When a refusal lists the models, a family with its own provider shows them as `provider/model`, and either form is accepted back as `model`. A model id that equals another model's `provider/model` name is refused when the file is saved.
+- **The reviewer** has no `family`. It takes the first `reviewerFamilies` entry that isn't the reviewed work's family, and that lists no model of the same vendor. That is told by model ids, never by provider names, and it runs on the provider of the family it lands in.
 - **Limits.**
   - At most `running` children run at once, and at most `writers` of the roles marked `writes: true`. Until per-task worktrees exist (roadmap step 6), children share one directory, so one writer at a time.
   - A session can start `perSession` children in all. Follow-ups don't count toward it.
 - **Tools.**
   - A role's `tools` are an allow list. Tools the main agent can't pass on are dropped when the child starts; those are the ones on its own scope, not the preset's.
+  - Every shipped role lists `ask_judge`, which comes from [`dish-judge`](../judge/). Without that plugin there is no such tool, and the name is dropped like any other missing one: children start with the rest of their tools.
   - Whatever the file says, a child never gets `delegate`, dsh's delegation and workflow tools, the goal or plan tools, `ask_user_question` or `present`.
 
 A role also needs a prompt: `prompts/crew/<role>.md`, or a shipped default.
@@ -101,5 +113,6 @@ pnpm --filter dish-crew sync-preset
 - **`send_message` isn't checked against the limits.** It can still wake a finished child, and the woken child counts as running from then on. Fix rounds should go through `delegate` with `to`.
 - **Children share the main agent's working directory.** dsh 0.2.0-rc.2 has no per-child `cwd`.
 - **Children can't ask you anything.** dsh runs them with approval policy `never`.
+- **A crew child's approval requests are refused when `dish-judge` isn't loaded.** With `dish-judge`, a child is switched to approval policy `ask` and the judge answers it. If the judge is then disabled, uninstalled or unloaded, a child that had settled still has `ask` in its log, and a follow-up would resume it at `ask`. Without a guard, dsh would show its prompt in the child's own session, where nobody sees it, and nothing times it out. So crew refuses a crew child's request whenever `dish-judge` is absent. Other children, and the main agent, are untouched.
 - **Without `dish-prompts`,** the persona row logs once and `delegate` refuses every call, naming the missing plugin. Nothing refuses at load.
 - **Claude Sonnet 5.5 comes from `dish-copilot`'s catalog,** which copies settings from the nearest catalog model of the same generation. An older copy rejected every request from crew children (Task 9's live check found it).

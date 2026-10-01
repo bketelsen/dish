@@ -16,7 +16,8 @@
  * 4. **The limits:** children running, writers running, and delegations in the session.
  * 5. **The model:** the role's own, or an override `crew.yaml` lists; the reviewer's by the reviewer rule (`chooseRoute`),
  *    whose reviewed work is a crew child of this session or `"main"`.
- * 6. **The route** resolves, and 7. **the tools** the child may have (`allowList`) are not none.
+ * 6. **The route** resolves (the model on its family's provider, else the file's, which is what the child starts on), and
+ *    7. **the tools** the child may have (`allowList`) are not none.
  * 8. **The start or the send.**
  *
  * From 4 to the end, a call holds its session's lock, so two calls in one step can't both pass the same check. A start
@@ -327,7 +328,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     return { route: chosen.route, reviews: call.roleSettings.reviews ? call.reviews : undefined }
   }
 
-  /** Step 6. @throws a refusal that lists the models crew.yaml offers. */
+  /** Step 6. @throws a refusal that names the route's provider and model and lists the models crew.yaml offers, as `provider/model` where a family has its own provider. */
   async function checkRoute(call: Call, route: Route): Promise<void> {
     try {
       await ctx.llm.resolveCallConfig({ provider: route.provider, model: route.model }, call.signal)

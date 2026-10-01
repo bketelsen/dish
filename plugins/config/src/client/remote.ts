@@ -18,7 +18,9 @@ import {
 
 // `DiffView` is dish-kit's, and dish-kit does not depend on dish-config, so it declares a `FileDiff` of its own. The page hands
 // it the store's: this fails to compile if the two shapes ever differ.
-type Same<A, B> = [A] extends [B] ? [B] extends [A] ? true : false : false
+type Same<A, B> = [A] extends [B] ? [B] extends [A] ? SameKeys<A, B> : false : false
+/** Mutual assignability lets a field that is optional on one side only through: the keys of two objects must be the same too. */
+type SameKeys<A, B> = [A] extends [object] ? [B] extends [object] ? ([keyof A] extends [keyof B] ? [keyof B] extends [keyof A] ? true : false : false) : true : true
 type Check<T extends true> = T
 export type DiffViewTakesStoreDiffs = Check<Same<FileDiff, KitFileDiff>>
 

@@ -46,7 +46,9 @@ declare module '@deepseek-ai/cordis' {
 }
 
 // What the page is told must be what the store says: these fail to compile if either side drifts.
-type Same<A, B> = [A] extends [B] ? [B] extends [A] ? true : false : false
+type Same<A, B> = [A] extends [B] ? [B] extends [A] ? SameKeys<A, B> : false : false
+/** Mutual assignability lets a field that is optional on one side only through: the keys of two objects must be the same too. */
+type SameKeys<A, B> = [A] extends [object] ? [B] extends [object] ? ([keyof A] extends [keyof B] ? [keyof B] extends [keyof A] ? true : false : false) : true : true
 type Check<T extends true> = T
 export type WireMatchesStore = [
   Check<Same<StoreErrorCode, ErrorCode>>,

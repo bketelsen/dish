@@ -60,16 +60,26 @@ limits:
   writers: 1              # of those, roles with writes: true
   perSession: 30          # delegations a session may start, ever
 roles:
-  architect:  { tier: strong, family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message] }
-  coder:      { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message] }
-  reviewer:   { tier: mid,    reviews: true,                    tools: [read, glob, grep, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message] }
-  researcher: { tier: mid,    family: anthropic,                tools: [read, glob, grep, web_search, web_fetch, skill, todo_write, send_message] }
-  ops:        { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_search, web_fetch, skill, todo_write, send_message] }
-  writer:     { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message] }
+  architect:  { tier: strong, family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
+  coder:      { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
+  reviewer:   { tier: mid,    reviews: true,                    tools: [read, glob, grep, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
+  researcher: { tier: mid,    family: anthropic,                tools: [read, glob, grep, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
+  ops:        { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
+  writer:     { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
+```
+
+**With direct API keys, a family can have a provider of its own.** The shipped file sends both families through the top-level `provider`, because Copilot serves Claude and GPT alike. With direct keys, Claude comes through an `anthropic` provider and GPT through an `openai` one, so each family says so, next to its tiers. A family without a `provider` runs on the top-level one, which stays required. This is an alternative example, not the shipped file; the `limits` and `roles` are as above.
+
+```yaml
+provider: anthropic       # required: the provider of any family that doesn't have its own
+families:
+  anthropic: { provider: anthropic, strong: claude-opus-5.5, mid: claude-sonnet-5.5 }
+  openai:    { provider: openai,    strong: gpt-6.1-sol,     mid: gpt-5.6-sol }   # ids as that provider's API names them
+reviewerFamilies: [openai, anthropic]
 ```
 
 **Validation** (the namespace's `validate`, so neither an agent nor the store can save a broken file):
-- **Well-formed:** valid YAML with exactly this shape. Families must name both tiers. Tiers are `strong` or `mid`. Limits are positive integers, with `writers ≤ running`.
+- **Well-formed:** valid YAML with exactly this shape. Families must name both tiers, and may name a `provider`, which is checked like the top-level one: a non-empty string with no whitespace around it. A model id may not be another model's `provider/model` name, since a listing and a `model` override would then mean different models. Tiers are `strong` or `mid`. Limits are positive integers, with `writers ≤ running`.
 - **Role names** follow the prompts grammar. Each role needs a prompt: a shipped default or a document under `prompts/crew/`. That's checked when delegating, not at save, because the prompts plugin owns those documents.
 - **`reviews: true`** marks the reviewer: it has no fixed `family`, and its family comes from `reviewerFamilies`. Exactly one role may set it.
 - **Tools** are names only. A name the child can't see when it starts is left out at that moment (see [Tools](#tools)), so the file never makes a delegation fail.
@@ -106,8 +116,9 @@ Empty strings are treated as absent. The checks run in this order, before anythi
    Each refusal says who's running and what to do: "a coder is running (child X, 'add login'); wait for its notice, or delegate a read-only role."
 5. **Model.**
    - **Non-reviewers:** the role's `family` and `tier`, unless `model` names another model in `crew.yaml`'s families.
+   - **The provider** of a route is its family's `provider`, or else the top-level one. An override takes the provider of the family its model is in, since a model is in one family only. `model` is the bare id; for a family with a provider of its own it may also be `provider/model`, which is how the refusals list the models.
    - **The reviewer:** `reviews` is required. Its family is the first in `reviewerFamilies` that isn't the reviewed work's family, and that lists no model from the reviewed work's vendor. The exclusion is by vendor as well as by family name, so a model missing from the file or renamed families can't put Claude on Claude. That's the family of the reviewed child's recorded model, or of the main agent's own model for `"main"`. A `model` override is accepted only if its family is also different.
-6. **Route check.** `ctx.llm.resolveCallConfig({ provider, model, reasoningEffort })` must resolve. On failure, the error lists the models `crew.yaml` offers.
+6. **Route check.** `ctx.llm.resolveCallConfig({ provider, model, reasoningEffort })` must resolve. On failure, the error lists the models `crew.yaml` offers, as `provider/model` for each family that has a provider of its own, so the model can see where each runs.
 7. **Start or send.**
    - **Start:** `startContinuable` with:
      - `label`: `<role> · <model> · <title>`;
@@ -125,9 +136,11 @@ Empty strings are treated as absent. The checks run in this order, before anythi
 
 A child's allow list is its role's `tools` from `crew.yaml`, intersected with the tools the parent can see when the child starts.
 - A tool that's missing then, such as `bash` on Windows (where it's `pwsh`) or `read_image` without attachments, is dropped, not an error.
+- **`ask_judge`** is in every shipped role. It belongs to `dish-judge`, which registers it as a global tool, so children inherit it. Without `dish-judge` installed no such tool exists, so the name is dropped like any other missing one: the child starts with the rest of its role. A role whose only tool is `ask_judge` is the "no tools" refusal below.
 - `pwsh` is added wherever `bash` is listed.
 - Whatever the file says, a child never gets these, even if a role lists them: `delegate`, `subagent`, `subagent_fork`, `subagent_codex`, `subagent_claude_code`, `list_subagent_models`, `workflow`, `ralph`, `interrupt_agent`, `list_agents`, `ask_user_question`, `create_goal`, `update_goal`, `exit_plan_mode`, `present`, or dsh's reserved `run_code`.
 - "Tools the parent can see" means tools the child can inherit: those in the parent's preset and global layers, not tools installed on the parent agent's own scope (such as dsh-schedule's), which dsh won't let a child's filter name. Children can't ask you anything: dsh runs them with approval policy `never`.
+- **A crew child's approvals are refused when `dish-judge` isn't loaded.** [`dish-judge`](judge.md) switches crew's children to approval policy `ask` and answers their requests itself; it puts `never` back on the live ones when it unloads. A child that settled keeps `ask` in its log and is resumed at `ask` by a follow-up. If `dish-judge` is absent then (disabled, uninstalled, failed to load, or a restart without it), dsh would put the child's request to the browser, which shows it in the child's own session and has no time limit. So crew registers an `approval/request` listener, prepended, that does nothing when `dishJudge` is there, and otherwise returns `rejected` for a request from a child that isn't top-level and that crew's record knows (also `rejected` if the record can't be read within 2 s). Anything else goes on to `next()`.
 
 The list is stored in the child's descriptor. So if a tool is later removed from the dish preset, older children that were allowed it may no longer reload. That's dsh's behavior, noted in the README.
 
@@ -219,6 +232,7 @@ Roles, models and limits live in `crew.yaml`, not here.
 
 - **The running rule.** A child counts as running when dsh says it's running, or when the record says `running` and the agent still exists. The record is marked running on every `subagent/start`, so a child woken by `send_message` counts too.
 - **The reviewer rule excludes by vendor as well as family name.** A model missing from `crew.yaml`, renamed families, or provider-qualified ids (`github-copilot/claude-…`, `us.anthropic.claude-…`) can't put a reviewer on the reviewed work's vendor. `reviews` can't name a reviewer child, and a follow-up to a reviewer is re-checked against the reviewed work as it is now.
+- **The reviewer rule reads models, never providers.** A family's `provider` decides where its route runs and nothing else: `vendorsOf` and the family checks look at model ids only, so a provider called `anthropic-proxy` on the `openai` family doesn't make GPT count as Anthropic's. Labels, notices and the record show the model alone, which is one family's, so they are unchanged.
 - **Visible tools are the ones a child can inherit:** the parent's preset and global layers, never tools on the parent agent's own scope. dsh's `restrict` refuses those, and a refusal that slips through is turned into "remove X from `roles.<r>.tools`".
 - **Services.** The preset row reads everything it doesn't inject through `ctx.get`. A property read of an un-injected service throws in dsh, because the providers are siblings of the row, not ancestors. The tests provide every stub from a sibling plugin, so they'd catch it.
 - **Notices.** Each notice is matched to its own run by the report's content and the stop reason dsh's line implies, not by "the latest run". The notice's collapsed summary is role-named too.

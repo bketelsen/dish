@@ -580,6 +580,176 @@ test('offeredModels lists every model the families list, once, family by family'
   assert.deepEqual(offeredModels(settings), ['claude-opus-5.5', 'gpt-6.1-sol', 'gpt-5.6-sol'])
 })
 
+// --- a provider per family ------------------------------------------------------------------------
+
+/** Direct API keys: the top-level provider is Copilot's, and each family has the provider that serves it. */
+const DIRECT = settingsOf((document) => {
+  document.families.anthropic.provider = 'anthropic'
+  document.families.openai.provider = 'openai'
+  document.roles.writer.family = 'openai'
+})
+
+/** Only the openai family has a provider of its own: the anthropic family stays on the file's. */
+const MIXED = settingsOf((document) => {
+  document.families.openai.provider = 'openai'
+  document.roles.writer.family = 'openai'
+})
+
+test('the shipped default routes every role to github-copilot, whichever family it is in', () => {
+  for (const role of Object.keys(SETTINGS.roles)) {
+    const route = routeOf(chooseRoute({ settings: SETTINGS, role, reviewed: { family: 'anthropic' } }))
+    assert.equal(route.provider, 'github-copilot', role)
+  }
+  for (const override of ['claude-opus-5.5', 'gpt-6.1-sol']) assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'coder', override })).provider, 'github-copilot', override)
+  assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'openai' } })).provider, 'github-copilot')
+})
+
+test('a role routes to its family\'s provider', () => {
+  const expected: Record<string, { provider: string, model: string, family: string }> = {
+    architect: { provider: 'anthropic', model: 'claude-opus-5.5', family: 'anthropic' },
+    coder: { provider: 'anthropic', model: 'claude-sonnet-5.5', family: 'anthropic' },
+    researcher: { provider: 'anthropic', model: 'claude-sonnet-5.5', family: 'anthropic' },
+    ops: { provider: 'anthropic', model: 'claude-sonnet-5.5', family: 'anthropic' },
+    writer: { provider: 'openai', model: 'gpt-5.6-sol', family: 'openai' },
+  }
+  for (const [role, route] of Object.entries(expected)) assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role })), route, role)
+})
+
+test('a family with no provider of its own runs on the file\'s, next to one that has its own', () => {
+  assert.deepEqual(routeOf(chooseRoute({ settings: MIXED, role: 'coder' })), { provider: 'github-copilot', model: 'claude-sonnet-5.5', family: 'anthropic' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: MIXED, role: 'writer' })), { provider: 'openai', model: 'gpt-5.6-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: MIXED, role: 'coder', override: 'gpt-6.1-sol' })), { provider: 'openai', model: 'gpt-6.1-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: MIXED, role: 'writer', override: 'claude-opus-5.5' })), { provider: 'github-copilot', model: 'claude-opus-5.5', family: 'anthropic' })
+})
+
+test('the tier does not change the provider, and the top-level one is not needed when every family has its own', () => {
+  const settings = settingsOf((document) => {
+    document.provider = 'unused'
+    document.families.anthropic.provider = 'anthropic'
+    document.families.openai.provider = 'openai'
+    document.roles.coder.tier = 'strong'
+  })
+  assert.deepEqual(routeOf(chooseRoute({ settings, role: 'coder' })), { provider: 'anthropic', model: 'claude-opus-5.5', family: 'anthropic' })
+  assert.deepEqual(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'anthropic' } })), { provider: 'openai', model: 'gpt-5.6-sol', family: 'openai' })
+})
+
+test('an override in another family takes that family\'s provider, bare or as provider/model', () => {
+  assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role: 'coder', override: 'gpt-5.6-sol' })), { provider: 'openai', model: 'gpt-5.6-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role: 'writer', override: 'claude-opus-5.5' })), { provider: 'anthropic', model: 'claude-opus-5.5', family: 'anthropic' })
+  // The models are listed as provider/model, so that is a model a caller may copy back.
+  assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role: 'coder', override: 'openai/gpt-6.1-sol' })), { provider: 'openai', model: 'gpt-6.1-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role: 'coder', override: ' anthropic/claude-opus-5.5 ' })), { provider: 'anthropic', model: 'claude-opus-5.5', family: 'anthropic' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: MIXED, role: 'coder', override: 'openai/gpt-5.6-sol' })), { provider: 'openai', model: 'gpt-5.6-sol', family: 'openai' })
+})
+
+test('provider/model is only the name a model has under the provider of its own family', () => {
+  for (const override of ['anthropic/gpt-5.6-sol', 'openai/claude-opus-5.5', 'github-copilot/gpt-5.6-sol', 'openai/', '/gpt-5.6-sol', 'openai/openai/gpt-5.6-sol', 'OPENAI/gpt-5.6-sol']) {
+    const problem = problemOf(chooseRoute({ settings: DIRECT, role: 'coder', override }))
+    assert.ok(problem.includes(JSON.stringify(override)), problem)
+    assert.match(problem, /not one crew\.yaml offers/, override)
+  }
+  // A family on the file's provider is listed bare, so that is its name: no provider/ form is added for it.
+  assert.match(problemOf(chooseRoute({ settings: MIXED, role: 'coder', override: 'github-copilot/claude-opus-5.5' })), /not one crew\.yaml offers/)
+  assert.match(problemOf(chooseRoute({ settings: SETTINGS, role: 'coder', override: 'github-copilot/claude-opus-5.5' })), /not one crew\.yaml offers/)
+  // A bare id that holds a slash is itself, first.
+  const slashed = settingsOf((document) => {
+    document.families.anthropic = { provider: 'proxy', strong: 'proxy/claude-x', mid: 'claude-y' }
+  })
+  assert.deepEqual(routeOf(chooseRoute({ settings: slashed, role: 'coder', override: 'proxy/claude-x' })), { provider: 'proxy', model: 'proxy/claude-x', family: 'anthropic' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: slashed, role: 'coder', override: 'proxy/claude-y' })), { provider: 'proxy', model: 'claude-y', family: 'anthropic' })
+})
+
+test('the reviewer\'s route uses its own family\'s provider, for the default and for an override', () => {
+  assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role: 'reviewer', reviewed: { family: 'anthropic' } })), { provider: 'openai', model: 'gpt-5.6-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role: 'reviewer', reviewed: { family: 'openai' } })), { provider: 'anthropic', model: 'claude-sonnet-5.5', family: 'anthropic' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role: 'reviewer', reviewed: { model: 'claude-opus-4.7' } })), { provider: 'openai', model: 'gpt-5.6-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'gpt-6.1-sol' })), { provider: 'openai', model: 'gpt-6.1-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: DIRECT, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'openai/gpt-6.1-sol' })), { provider: 'openai', model: 'gpt-6.1-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: MIXED, role: 'reviewer', reviewed: { family: 'openai' } })), { provider: 'github-copilot', model: 'claude-sonnet-5.5', family: 'anthropic' })
+  // The reviewer's route is checked as a route of its family still: a reviewer is never in the reviewed work's.
+  assert.match(problemOf(chooseRoute({ settings: DIRECT, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'anthropic/claude-opus-5.5' })), /different family/)
+  assert.match(problemOf(chooseRoute({ settings: DIRECT, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'claude-opus-5.5' })), /different family/)
+})
+
+test('a provider\'s name says nothing about the vendor: the reviewer rule reads model ids', () => {
+  // Nonsense, but legal: the openai family on a provider with `anthropic` in its name, and the anthropic family on one with `openai`.
+  const crossed = settingsOf((document) => {
+    document.families.openai.provider = 'anthropic-proxy'
+    document.families.anthropic.provider = 'openai-direct'
+  })
+  // The family of GPT work is still openai, and Claude work is still reviewed on GPT, on the provider the file gave.
+  assert.deepEqual(routeOf(chooseRoute({ settings: crossed, role: 'reviewer', reviewed: { family: 'anthropic' } })), { provider: 'anthropic-proxy', model: 'gpt-5.6-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: crossed, role: 'reviewer', reviewed: { model: 'claude-opus-5.5' } })), { provider: 'anthropic-proxy', model: 'gpt-5.6-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: crossed, role: 'reviewer', reviewed: { model: 'claude-opus-4.7' } })), { provider: 'anthropic-proxy', model: 'gpt-5.6-sol', family: 'openai' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: crossed, role: 'reviewer', reviewed: { family: 'openai' } })), { provider: 'openai-direct', model: 'claude-sonnet-5.5', family: 'anthropic' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: crossed, role: 'reviewer', reviewed: { model: 'gpt-5.6-sol' } })), { provider: 'openai-direct', model: 'claude-sonnet-5.5', family: 'anthropic' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: crossed, role: 'reviewer', reviewed: { model: 'gpt-4.1' } })), { provider: 'openai-direct', model: 'claude-sonnet-5.5', family: 'anthropic' })
+  // An override is judged by its model too: the openai family is not Anthropic's for Claude work, nor the anthropic family OpenAI's for GPT work.
+  assert.equal(routeOf(chooseRoute({ settings: crossed, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'gpt-6.1-sol' })).provider, 'anthropic-proxy')
+  assert.match(problemOf(chooseRoute({ settings: crossed, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'claude-opus-5.5' })), /different family/)
+  assert.match(problemOf(chooseRoute({ settings: crossed, role: 'reviewer', reviewed: { family: 'openai' }, override: 'gpt-6.1-sol' })), /different family/)
+  // The vendor of a model id is the same however the file names providers.
+  for (const model of offeredModels(SETTINGS)) assert.deepEqual([...vendorsOf(model)], [model.startsWith('claude') ? 'anthropic' : 'openai'], model)
+  assert.equal(familyOf('claude-opus-5.5', crossed), 'anthropic')
+  assert.equal(familyOf('gpt-5.6-sol', crossed), 'openai')
+  assert.equal(familyOf('claude-haiku-4.5', crossed), 'anthropic')
+  assert.equal(familyOf('gpt-4.1', crossed), 'openai')
+})
+
+test('a provider named for a vendor keeps a reviewer away from that vendor\'s models only, never from a family for its provider', () => {
+  // With every family on an `anthropic`-named provider, nothing is excluded for the provider's sake.
+  const all = settingsOf((document) => {
+    document.families.openai.provider = 'anthropic'
+    document.families.anthropic.provider = 'anthropic'
+  })
+  assert.equal(routeOf(chooseRoute({ settings: all, role: 'reviewer', reviewed: { family: 'anthropic' } })).family, 'openai')
+  assert.equal(routeOf(chooseRoute({ settings: all, role: 'reviewer', reviewed: { family: 'openai' } })).family, 'anthropic')
+  // And a reviewed model with a provider prefix still tells its vendor by the whole id, as it always did.
+  assert.equal(routeOf(chooseRoute({ settings: all, role: 'reviewer', reviewed: { model: 'github-copilot/claude-opus-4.7' } })).family, 'openai')
+})
+
+test('offeredModels shows provider/model for a family with a provider of its own, and the bare id for one without', () => {
+  assert.deepEqual(offeredModels(DIRECT), ['anthropic/claude-opus-5.5', 'anthropic/claude-sonnet-5.5', 'openai/gpt-6.1-sol', 'openai/gpt-5.6-sol'])
+  assert.deepEqual(offeredModels(MIXED), ['claude-opus-5.5', 'claude-sonnet-5.5', 'openai/gpt-6.1-sol', 'openai/gpt-5.6-sol'])
+  const same = settingsOf((document) => {
+    document.families.anthropic = { provider: 'anthropic', strong: 'claude-opus-5.5', mid: 'claude-opus-5.5' }
+  })
+  assert.deepEqual(offeredModels(same), ['anthropic/claude-opus-5.5', 'gpt-6.1-sol', 'gpt-5.6-sol'])
+})
+
+test('what a listing offers is one name per model, since the settings refuse names that collide', () => {
+  for (const settings of [SETTINGS, DIRECT, MIXED]) {
+    const names = offeredModels(settings)
+    assert.equal(new Set(names).size, names.length, names.join(', '))
+  }
+  // Two models that would be offered as one name are not settings at all.
+  const parsed = parseSettings(shippedWith((d) => {
+    d.families.anthropic.provider = 'anthropic'
+    d.families.openai.strong = 'anthropic/claude-opus-5.5'
+  }))
+  assert.equal(parsed.ok, false)
+})
+
+test('the refusals that list models show where each runs, and what they list is accepted back', () => {
+  const unknown = problemOf(chooseRoute({ settings: DIRECT, role: 'coder', override: 'gpt-9' }))
+  assert.match(unknown, /Models offered, by family: anthropic: anthropic\/claude-opus-5\.5, anthropic\/claude-sonnet-5\.5; openai: openai\/gpt-6\.1-sol, openai\/gpt-5\.6-sol\./)
+  const mixed = problemOf(chooseRoute({ settings: MIXED, role: 'coder', override: 'gpt-9' }))
+  assert.match(mixed, /anthropic: claude-opus-5\.5, claude-sonnet-5\.5; openai: openai\/gpt-6\.1-sol, openai\/gpt-5\.6-sol\./)
+  // The reviewer's: models outside the reviewed work's family.
+  const outside = problemOf(chooseRoute({ settings: DIRECT, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'claude-opus-5.5' }))
+  assert.match(outside, /Models offered outside it: openai: openai\/gpt-6\.1-sol, openai\/gpt-5\.6-sol\./)
+  assert.ok(!outside.includes('anthropic/claude'), outside)
+  const notListed = problemOf(chooseRoute({ settings: DIRECT, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'gpt-9' }))
+  assert.match(notListed, /Models offered outside that family: openai: openai\/gpt-6\.1-sol, openai\/gpt-5\.6-sol\./)
+  // A role whose family is missing offers them too.
+  const noFamily = problemOf(chooseRoute({ settings: { ...DIRECT, roles: { ...DIRECT.roles, ghost: { tier: 'mid', family: 'ghost', writes: false, reviews: false, tools: ['read'] } } }, role: 'ghost' }))
+  assert.match(noFamily, /by family: anthropic: anthropic\/claude-opus-5\.5/)
+  // The default, with no family provider, is listed bare, as before.
+  assert.match(problemOf(chooseRoute({ settings: SETTINGS, role: 'coder', override: 'gpt-9' })), /anthropic: claude-opus-5\.5, claude-sonnet-5\.5; openai: gpt-6\.1-sol, gpt-5\.6-sol\./)
+  // Every model that is listed is accepted as listed.
+  for (const listed of offeredModels(DIRECT)) assert.ok(chooseRoute({ settings: DIRECT, role: 'coder', override: listed }).ok, listed)
+})
+
 // --- robustness -----------------------------------------------------------------------------------
 
 test('chooseRoute never throws, and doesn\'t touch the settings', () => {

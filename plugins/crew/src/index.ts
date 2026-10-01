@@ -13,6 +13,9 @@
  *   they were published. The listeners are the host's, so they hear every agent, and they act only on children the
  *   record knows. They never throw;
  * - at start, before it provides the service, removes the sessions' records not written to for 180 days;
+ * - guards its children's approvals (see `guard.ts`): an `approval/request` listener that refuses a crew child's request when
+ *   dish-judge, whose answerer is the only one a child has, is not loaded. It is registered before anything is awaited, so there is
+ *   no start-up window without it;
  * - claims `crew.yaml` in the store and seeds it when `dishConfig` is there. `dishConfig` is optional, so there is no
  *   order to keep: with no store, every answer is the shipped default;
  * - logs as `dish-crew`.
@@ -25,6 +28,7 @@ import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
+import { approvalGuard } from './guard.ts'
 import { CrewRecords, closingOf } from './record.ts'
 import type { EndedRun } from './record.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from './settings.ts'
@@ -216,6 +220,21 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const records = new CrewRecords(directory, (session, path) => {
     warn('the record of session %s is not valid; it was moved to %s and the session starts a new one, so its delegation count starts again from 0', session, path)
   })
+
+  // A crew child asks nobody but dish-judge: when dish-judge is not loaded, its approval requests are refused here, not left to the
+  // browser, where nobody sees them and nothing times them out. The services are looked up on each request, so the order the two
+  // plugins load in, and a reload of either, make no difference. Before the first `await`, like the listeners below.
+  const lookup = ctx as unknown as { get(name: string): unknown }
+  const toldGuard = new Set<string>()
+  ctx.on('approval/request', approvalGuard({
+    judgeIsLoaded: () => lookup.get('dishJudge') !== undefined,
+    isCrewChild: async childId => (await records.lookup(childId)) !== undefined,
+    tell: (message) => {
+      if (toldGuard.has(message) || toldGuard.size >= 100) return
+      toldGuard.add(message)
+      warn('%s', message)
+    },
+  }), { prepend: true })
 
   // The error each crew child's agent last reported, until its `subagent/end`. The promise answers whether the agent is a
   // crew child (the record has to be asked), and an agent that isn't takes its entry out, so what is kept is the

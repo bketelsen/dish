@@ -302,6 +302,69 @@ for (const { name, text, secret, label } of wrapped) {
   })
 }
 
+// In a YAML double-quoted string or a JSON one, a line break is written `\n`: a backslash and a letter. The letter is right in
+// front of whatever follows, and used to hide a token there from the guard, though a parser reads it as a token on its own line.
+const escapedIn: Array<{ name: string, text: string, secret: string, label: string }> = [
+  { name: 'ghp_ token after \\n in a YAML double-quoted string', text: `note: "first line\\n${GH}"`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token after \\t in a YAML double-quoted string', text: `note: "first\\t${GH}"`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token after \\r\\n in a YAML double-quoted string', text: `note: "first line\\r\\n${GH}"`, secret: GH, label: 'a GitHub token' },
+  { name: 'ghp_ token after an escaped backslash and n', text: `note: "first line\\\\n${GH}"`, secret: GH, label: 'a GitHub token' },
+  { name: 'github_pat_ token after \\n', text: `note: "x\\n${PAT}"`, secret: PAT, label: 'a GitHub fine-grained token' },
+  { name: 'sk- key after \\t in a JSON object', text: `{"key": "x\\t${SK}"}`, secret: SK, label: 'an sk- API key' },
+  { name: 'sk- key after \\n in a JSON array', text: `["first\\n${SK}"]`, secret: SK, label: 'an sk- API key' },
+]
+
+for (const { name, text, secret, label } of escapedIn) {
+  test(`checkContent refuses a token that follows an escape sequence: ${name}`, () => {
+    const error = refusal('prompts/coder.md', `before\n${text}\nafter\n`)
+    assert.equal(error.code, 'SECRET')
+    assert.equal(error.message, `prompts/coder.md: looks like ${label}`)
+    assertNoLeak(error.message, secret)
+  })
+}
+
+test('checkContent allows a token-shaped run that follows a plain letter, escape or not', () => {
+  for (const text of [`note: "x${GH}"`, `note: "first line\\nx${GH}"`, `{"key": "x${SK}"}`, `note: "first line\\n1${PAT}"`]) {
+    assert.doesNotThrow(() => checkContent('prompts/coder.md', text, MAX), text)
+  }
+})
+
+// A TypeSafe API key is `apikey_`, 35 hex digits, `_`, and 64 hex digits. This one is random, made for this file: not a key.
+const TS_FIRST = '760816af9c2088fea182638699c0065a826'
+const TS_KEY = `apikey_${TS_FIRST}_${'1d2f9a11c37d3bf93c0a50d186c1cabbb20936b507f96d71b7b75782f1750b1b'}`
+
+test('checkContent refuses a TypeSafe API key, whole or cut, naming the kind and the path but never the key', () => {
+  for (const text of [
+    `typesafe_api_key: ${TS_KEY}`,
+    `note: "first line\\n${TS_KEY}"`,
+    `{"key": "${TS_KEY}"}`,
+    `Authorization: Bearer ${TS_KEY}`,
+    // A key that was cut off in a log or a paste: half of a credential, from 32 digits of its first part.
+    `cut: ${TS_KEY.slice(0, 7 + 35 + 1 + 10)}`,
+    `cut: apikey_${TS_FIRST}`,
+    `cut: apikey_${TS_FIRST.slice(0, 32)}`,
+    `capitals: ${TS_KEY.toUpperCase().replace('APIKEY_', 'apikey_')}`,
+  ]) {
+    const error = refusal('prompts/coder.md', `before\n${text}\nafter\n`)
+    assert.equal(error.code, 'SECRET', text)
+    assert.equal(error.message, 'prompts/coder.md: looks like a TypeSafe API key', text)
+    assertNoLeak(error.message, TS_KEY)
+  }
+  // A name, a placeholder, and a stub that is too short to be one are not.
+  for (const text of ['Set apikey_ to your key.', 'apikey_placeholder', 'apikey_YOUR_KEY_HERE', `apikey_${TS_FIRST.slice(0, 31)}`, `my${TS_KEY}`]) {
+    assert.doesNotThrow(() => checkContent('prompts/coder.md', `before\n${text}\nafter\n`, MAX), text)
+  }
+})
+
+test('checkContent refuses what the secret scan cannot read, and does not throw out of it', () => {
+  // A scan that fails (V8 throws on a text long enough for a regular expression that loops) is not a clean one. Here the
+  // path throws when it is read, which is what the scan sees of one.
+  const unreadable = { toString: () => { throw new Error('the engine ran out of stack') } } as unknown as string
+  const error = refusal(unreadable, 'text')
+  assert.equal(error.code, 'SECRET')
+  assert.equal(error.message, 'the document path looks like an unreadable secret scan')
+})
+
 test('secretKind names the kind of the first secret in a text, or nothing', () => {
   assert.equal(secretKind(`key ${GH}`), 'a GitHub token')
   assert.equal(secretKind(`key ${AKIA}`), 'an AWS access key ID')

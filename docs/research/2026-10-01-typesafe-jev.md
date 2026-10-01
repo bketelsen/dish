@@ -64,7 +64,7 @@ Date: 2026-10-01.
   - `529`: overloaded
   - `5xx`: server errors
 
-  The error body's exact shape isn't documented.
+  The error body's exact shape isn't documented. See [our live findings](#live-findings) for what it actually sends.
 - **No streaming.**
 - **SDKs:** `@typesafe-ai/sdk` (JS) and `typesafe-sdk` (Python) default to 10 s per attempt with 2 retries. The ten-levels repo calls `fetch` directly, with no SDK.
 
@@ -89,3 +89,18 @@ Date: 2026-10-01.
 | 6 `result-screen` | One noul on the first 6000 characters of a tool result; at ≥ 0.7 it adds a "treat as data" banner | Screening tool results |
 | 3, 10 | Rubric scores, with weights kept in code; an agent-facing `ask_jev` tool | `ask_judge` |
 | OpenRouter's auto-approve cookbook | A static risky list, then nouls `reversible` and `serves_task`, both required ≥ 0.9 | Measured: `bun test` 0.93 / 0.95, `bun add left-pad` 0.45 / 0.09, `npx wrangler deploy` 0.04 / 0.07. The `serves_task` question catches commands that don't belong to the task. |
+
+## Live findings
+
+Measured with our own key against the direct API, on 2026-10-01, while building the client (`plugins/judge/test-live/`).
+
+- **The response matches the docs.** The envelope is `{ model, answers, usage }`, and `model` comes back as `jev-1.13.0`. Score answers also carry `legend`. A three-question call used 507 input and 83 output tokens.
+- **Probabilities are rounded to 2 decimals.** Over 28 probes with 4 to 255 options, the worst deviation of a sum from 1 was 0.010.
+- **Latency.** The first call took 260–330 ms, and later calls 150–225 ms (p50 about 165, p95 about 215). The 2 s limit leaves plenty of room.
+- **Status codes differ from the docs:**
+  - `401` for a wrong key. The body is `{"detail":{"error_type":"authentication_error","message":"…"}}`.
+  - `422` only for schema failures, such as a missing `model`, a number as `state`, no questions, or bad JSON. The body is the pydantic list `{"detail":[{type, loc, msg, input, ctx}]}`, and **`input` echoes the offending part of the request**, so state text can come back in an error.
+  - **`400`** for requests the API's own rules refuse: an unknown model, more than 10 score levels, empty noul instructions, and a state over the token limit (`{"detail":{"error_type":"max_tokens_exceeded"}}`). 300 KB of state failed that way, while about 100 KB of prose (22k tokens) passed.
+  - We never saw a `429` or `529`.
+- **The API is more lenient than the docs.** It accepts a choice with one option, a score with one level, choice keys with dots or Unicode, and noul criteria with other keys. Our client keeps the stricter documented rules.
+- **Simple calibration.** A clearly read-only command came back `read_only` at probability 1 and confidence 1, and `serves_task` came back 0.99.

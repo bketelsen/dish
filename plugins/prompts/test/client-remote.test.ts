@@ -18,7 +18,9 @@ import { PromptsRemote } from '../src/remote.ts'
 
 // What the page believes of dish-config's wire is checked here, where Node's types and the store's are both in reach: this
 // fails to compile if either side changes.
-type Same<A, B> = [A] extends [B] ? [B] extends [A] ? true : false : false
+type Same<A, B> = [A] extends [B] ? [B] extends [A] ? SameKeys<A, B> : false : false
+/** Mutual assignability lets a field that is optional on one side only through: the keys of two objects must be the same too. */
+type SameKeys<A, B> = [A] extends [object] ? [B] extends [object] ? ([keyof A] extends [keyof B] ? [keyof B] extends [keyof A] ? true : false : false) : true : true
 type Check<T extends true> = T
 export type PageMatchesStore = [
   Check<Same<ConfigEvent, StoreEvent>>,

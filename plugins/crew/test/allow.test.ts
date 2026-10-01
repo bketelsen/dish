@@ -125,6 +125,26 @@ test('the shipped crew.yaml gives every role tools when the standard ones are vi
   assert.ok(allowed([...DEFAULT_SETTINGS.roles.coder!.tools], windows).includes('pwsh'))
 })
 
+test('ask_judge is allowed where dish-judge provides it, and left out, with nothing else lost, where it isn\'t installed', () => {
+  const standard = ['read', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message', ...NEVER_NAMES]
+  for (const [name, role] of Object.entries(DEFAULT_SETTINGS.roles)) {
+    assert.ok(role.tools.includes('ask_judge'), `${name} lists ask_judge`)
+    const without = allowed([...role.tools], standard)
+    assert.ok(!without.includes('ask_judge'), `${name}: dropped when no tool of that name is visible`)
+    // Dropping it costs the role nothing else: the list is what it was before the shipped roles listed ask_judge.
+    assert.deepEqual(without, allowed(role.tools.filter(tool => tool !== 'ask_judge'), standard), name)
+    const withJudge = allowed([...role.tools], [...standard, 'ask_judge'])
+    assert.deepEqual(withJudge, [...without, 'ask_judge'].sort(), `${name}: allowed once dish-judge registers it`)
+  }
+})
+
+test('a role that lists only ask_judge, with dish-judge not installed, is the readable "no tools" problem, not a throw', () => {
+  const problem = problemOf(['ask_judge'], ['read', 'write'], 'reviewer')
+  assert.match(problem, /^role reviewer would have no tools here \(visible: read, write\)/)
+  assert.ok(problem.includes('crew.yaml lists: ask_judge'), problem)
+  assert.match(problem, /roles\.reviewer\.tools/)
+})
+
 test('allowList doesn\'t change what it is given', () => {
   const tools = ['read', 'bash', 'delegate']
   const visible = new Set(['read', 'pwsh', 'delegate'])
@@ -255,6 +275,30 @@ test('the reserved run_code transport of a parent in a code mode is left out, an
   assert.deepEqual(result.allow, ['glob', 'read'])
   child.ctx.tools.restrict({ allow: result.allow })
   assert.deepEqual(names(ctx, child), ['glob', 'read'])
+})
+
+test('ask_judge as a global tool reaches a child through the preset; where it isn\'t registered the filter is still one restrict accepts', async () => {
+  const roleTools = [...DEFAULT_SETTINGS.roles.reviewer!.tools]
+  // dish-judge registers ask_judge globally, so every agent inherits it, whatever preset the main agent is on.
+  const installed = await world(['glob', 'ask_judge'], ['read', 'grep', 'bash', 'send_message'])
+  const parent = installed.agent('parent')
+  const withJudge = allowList(roleTools, visibleTools(parent), 'reviewer')
+  assert.ok(withJudge.ok)
+  assert.ok(withJudge.allow.includes('ask_judge'))
+  const child = installed.agent('child')
+  child.ctx.tools.restrict({ allow: withJudge.allow })
+  assert.deepEqual(names(installed.ctx, child), withJudge.allow)
+  // Without dish-judge nothing is registered under that name. restrict() throws on an unknown name, so the name has to be
+  // left out of the filter, and it is: the child starts, with the rest of its role.
+  const bare = await world(['glob'], ['read', 'grep', 'bash', 'send_message'])
+  assert.throws(() => bare.agent('probe').ctx.tools.restrict({ allow: ['read', 'ask_judge'] }), /unknown global tool "ask_judge"/)
+  const without = allowList(roleTools, visibleTools(bare.agent('parent')), 'reviewer')
+  assert.ok(without.ok)
+  assert.ok(!without.allow.includes('ask_judge'))
+  assert.deepEqual(without.allow, ['bash', 'glob', 'grep', 'read', 'send_message'])
+  const child2 = bare.agent('child')
+  child2.ctx.tools.restrict({ allow: without.allow })
+  assert.deepEqual(names(bare.ctx, child2), without.allow)
 })
 
 test('visibleTools is a snapshot of now: a tool registered later is in the next one', async () => {

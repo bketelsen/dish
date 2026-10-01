@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { load } from 'js-yaml'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from '../src/settings.ts'
 import type { CrewSettings } from '../src/settings.ts'
 import { render, shippedDocument, shippedWith } from './helpers.ts'
@@ -25,6 +26,8 @@ function settingsOf(text: string): CrewSettings {
 
 const ROLES = ['architect', 'coder', 'reviewer', 'researcher', 'ops', 'writer']
 const STANDARD_TOOLS = ['read', 'glob', 'grep', 'skill', 'todo_write', 'send_message']
+/** The tool dish-judge registers. It's in every shipped role so that crew children can ask the judge. */
+const JUDGE_TOOL = 'ask_judge'
 
 // --- the shipped default --------------------------------------------------------------------------
 
@@ -33,6 +36,35 @@ test('the shipped crew.yaml is the one in the spec, and DEFAULT_TEXT is that fil
   const spec = readFileSync(new URL('../../../docs/specs/crew.md', import.meta.url), 'utf8')
   const block = /^## `crew\.yaml`[\s\S]*?```yaml\n([\s\S]*?)```/m.exec(spec)?.[1]
   assert.equal(DEFAULT_TEXT, block)
+})
+
+/** The yaml blocks of the spec's `crew.yaml` section, in order: the shipped file first, then the examples after it. */
+function specBlocks(): string[] {
+  const spec = readFileSync(new URL('../../../docs/specs/crew.md', import.meta.url), 'utf8')
+  const from = spec.search(/^## `crew\.yaml`/m)
+  assert.notEqual(from, -1, 'the crew.yaml section')
+  const next = spec.slice(from + 1).search(/^## /m)
+  const section = next === -1 ? spec.slice(from) : spec.slice(from, from + 1 + next)
+  return [...section.matchAll(/```yaml\n([\s\S]*?)```/g)].map(match => match[1]!)
+}
+
+test('the spec shows the family provider as a second, separate example, and the shipped file stays its first block', () => {
+  const [shipped, direct, ...rest] = specBlocks()
+  assert.equal(shipped, DEFAULT_TEXT)
+  assert.ok(direct !== undefined, 'a second example')
+  assert.deepEqual(rest, [])
+  // The shipped file has no family provider: Copilot serves both families.
+  assert.doesNotMatch(DEFAULT_TEXT, /families:[\s\S]*\bprovider:[\s\S]*reviewerFamilies/)
+  assert.deepEqual(Object.keys(load(shipped) as object), ['provider', 'families', 'reviewerFamilies', 'limits', 'roles'])
+  // The example is the part of a file that changes, so it is laid over the shipped one to be checked: direct API keys, one provider per family.
+  const example = load(direct) as Record<string, any>
+  assert.deepEqual(example.families.anthropic.provider, 'anthropic')
+  assert.deepEqual(example.families.openai.provider, 'openai')
+  const settings = settingsOf(render({ ...shippedDocument(), ...example }))
+  assert.equal(settings.families.anthropic!.provider, 'anthropic')
+  assert.equal(settings.families.openai!.provider, 'openai')
+  for (const model of [settings.families.anthropic!.strong, settings.families.anthropic!.mid]) assert.match(model, /^claude-/)
+  for (const model of [settings.families.openai!.strong, settings.families.openai!.mid]) assert.match(model, /^gpt-/)
 })
 
 test('parseSettings accepts the shipped default, and DEFAULT_SETTINGS is what it makes of it', () => {
@@ -55,7 +87,7 @@ test('the default has the models, limits and roles of the spec', () => {
   assert.equal(coder.family, 'anthropic')
   assert.equal(coder.writes, true)
   assert.equal(coder.reviews, false)
-  assert.deepEqual([...coder.tools], ['read', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual([...coder.tools], ['read', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message', 'ask_judge'])
   assert.equal(settings.roles.architect!.tier, 'strong')
   // writes and reviews are false unless the file says so.
   const researcher = settings.roles.researcher!
@@ -68,6 +100,10 @@ test('the default has the models, limits and roles of the spec', () => {
   assert.equal(reviewer.family, undefined)
   assert.ok(!('family' in reviewer))
   assert.deepEqual(Object.keys(settings.roles).filter(role => settings.roles[role]!.writes), ['architect', 'coder', 'ops', 'writer'])
+})
+
+test('the default has no family provider, so every family runs on the top-level one', () => {
+  for (const family of Object.values(DEFAULT_SETTINGS.families)) assert.ok(!('provider' in family))
 })
 
 test('settings are frozen, and families and roles have no prototype: a role named like an Object method is no role', () => {
@@ -105,6 +141,37 @@ test('limits, families and the reviewer follow the file', () => {
   assert.deepEqual([...settings.roles.coder!.tools], ['read'])
 })
 
+test('a family may have a provider of its own, next to its tiers, and the others keep the top-level one', () => {
+  const settings = settingsOf(shippedWith((document) => { document.families.openai.provider = 'openai' }))
+  assert.deepEqual({ ...settings.families.openai }, { provider: 'openai', strong: 'gpt-6.1-sol', mid: 'gpt-5.6-sol' })
+  assert.deepEqual({ ...settings.families.anthropic }, { strong: 'claude-opus-5.5', mid: 'claude-sonnet-5.5' })
+  assert.ok(!('provider' in settings.families.anthropic!))
+  assert.equal(settings.provider, 'github-copilot')
+  assert.ok(Object.isFrozen(settings.families.openai))
+  const both = settingsOf(shippedWith((document) => {
+    document.families.anthropic.provider = 'anthropic'
+    document.families.openai.provider = 'openai'
+  }))
+  assert.equal(both.families.anthropic!.provider, 'anthropic')
+  assert.equal(both.families.openai!.provider, 'openai')
+  // A family's provider may be the file's own, and may be a name that means nothing: only the shape is checked.
+  assert.equal(settingsOf(shippedWith((d) => { d.families.openai.provider = 'github-copilot' })).families.openai!.provider, 'github-copilot')
+  assert.equal(settingsOf(shippedWith((d) => { d.families.openai.provider = 'anthropic-proxy' })).families.openai!.provider, 'anthropic-proxy')
+})
+
+test('a family provider is a non-empty string, like the top-level one', () => {
+  for (const value of ['', '   ', '\t', 7, true, null, ['openai'], { name: 'openai' }]) {
+    assert.match(problemWith((d) => { d.families.openai.provider = value }), /^families\.openai\.provider: must be a provider id \(got /, JSON.stringify(value))
+  }
+  // The same words as the top-level one, only the path differs.
+  assert.equal(problemWith((d) => { d.families.openai.provider = '' }), 'families.openai.provider: must be a provider id (got "")')
+  assert.equal(problemWith((d) => { d.provider = '' }), 'provider: must be a provider id (got "")')
+})
+
+test('the top-level provider is still required, whatever the families say', () => {
+  assert.match(problemWith((d) => { delete d.provider; d.families.openai.provider = 'openai'; d.families.anthropic.provider = 'anthropic' }), /^provider: required/)
+})
+
 test('a one-model family, and a model reused by a family\'s two tiers, are fine', () => {
   const settings = settingsOf(shippedWith((document) => {
     document.families.anthropic = { strong: 'claude-opus-5.5', mid: 'claude-opus-5.5' }
@@ -116,9 +183,19 @@ test('a one-model family, and a model reused by a family\'s two tiers, are fine'
 
 test('unknown keys are refused at every level, with the path', () => {
   assert.match(problemWith((d) => { d.extra = 1 }), /^extra: unknown key \(allowed: provider, families, reviewerFamilies, limits, roles\)/)
-  assert.match(problemWith((d) => { d.families.openai.fast = 'gpt-x' }), /^families\.openai\.fast: unknown key \(allowed: strong, mid\)/)
+  assert.match(problemWith((d) => { d.families.openai.fast = 'gpt-x' }), /^families\.openai\.fast: unknown key \(allowed: provider, strong, mid\)/)
   assert.match(problemWith((d) => { d.limits.total = 3 }), /^limits\.total: unknown key \(allowed: running, writers, perSession\)/)
   assert.match(problemWith((d) => { d.roles.coder.model = 'gpt-x' }), /^roles\.coder\.model: unknown key \(allowed: tier, family, writes, reviews, tools\)/)
+})
+
+test('provider is a key of a family and of the top level, and of nothing else', () => {
+  assert.match(problemWith((d) => { d.limits.provider = 'openai' }), /^limits\.provider: unknown key \(allowed: running, writers, perSession\)/)
+  assert.match(problemWith((d) => { d.roles.coder.provider = 'openai' }), /^roles\.coder\.provider: unknown key \(allowed: tier, family, writes, reviews, tools\)/)
+  assert.match(problemWith((d) => { d.roles.reviewer.provider = 'openai' }), /^roles\.reviewer\.provider: unknown key /)
+  // Directly under `families` it is a family's name, and a string is not a family.
+  assert.match(problemWith((d) => { d.families.provider = 'openai' }), /^families\.provider: must be a mapping with strong and mid models/)
+  // And a family's tiers are not keys of the top level or of a role, as before.
+  assert.match(problemWith((d) => { d.strong = 'x' }), /^strong: unknown key/)
 })
 
 test('a missing key is refused, with the path', () => {
@@ -150,6 +227,67 @@ test('a model belongs to one family, since the family of a model is how the revi
   assert.match(
     problemWith((d) => { d.families.openai.mid = 'claude-sonnet-5.5' }),
     /^families\.openai\.mid: "claude-sonnet-5\.5" is also in family anthropic; a model belongs to one family/)
+})
+
+test('a model id may not be another listed model\'s provider/model name, which is what a listing offers it as', () => {
+  // A family on its own provider offers claude-opus-5.5 as anthropic/claude-opus-5.5, and another family has that for an id.
+  const problem = problemWith((d) => {
+    d.families.anthropic.provider = 'anthropic'
+    d.families.openai.strong = 'anthropic/claude-opus-5.5'
+  })
+  assert.match(problem, /^families\.openai\.strong: "anthropic\/claude-opus-5\.5" names two models: /)
+  assert.ok(problem.includes('"claude-opus-5.5" (family anthropic, as provider/model)') && problem.includes('"anthropic/claude-opus-5.5" (family openai)'), problem)
+  assert.match(problem, /Change one of the model ids, or the provider of a family, so that no two models are offered under one name\.$/)
+  // The other way round, the family with the provider comes second in the file: the later one is the one named.
+  const reversed = problemWith((d) => {
+    d.families = {
+      openai: { strong: 'anthropic/claude-opus-5.5', mid: 'gpt-5.6-sol' },
+      anthropic: { provider: 'anthropic', strong: 'claude-opus-5.5', mid: 'claude-sonnet-5.5' },
+    }
+  })
+  assert.match(reversed, /^families\.anthropic\.strong: "anthropic\/claude-opus-5\.5" names two models: /)
+  assert.ok(reversed.includes('(family openai)') && reversed.includes('(family anthropic, as provider/model)'), reversed)
+  // It is the mid tier that is named when that is the one that collides.
+  assert.match(problemWith((d) => {
+    d.families.anthropic.provider = 'anthropic'
+    d.families.openai.mid = 'anthropic/claude-sonnet-5.5'
+  }), /^families\.openai\.mid: "anthropic\/claude-sonnet-5\.5" names two models/)
+})
+
+test('a model id may not be the provider/model name of another model in its own family either', () => {
+  const problem = problemWith((d) => { d.families.anthropic = { provider: 'proxy', strong: 'proxy/claude-x', mid: 'claude-x' } })
+  assert.match(problem, /^families\.anthropic\.mid: "proxy\/claude-x" names two models: "claude-x" \(family anthropic, as provider\/model\) and "proxy\/claude-x" \(family anthropic\)\. /)
+  assert.match(problemWith((d) => { d.families.anthropic = { provider: 'proxy', strong: 'claude-x', mid: 'proxy/claude-x' } }), /^families\.anthropic\.mid: "proxy\/claude-x" names two models/)
+})
+
+test('two models of different families may not be offered under one name', () => {
+  // a/b + c and a + b/c are both a/b/c.
+  const problem = problemWith((d) => {
+    d.families.anthropic = { provider: 'a', strong: 'b/c', mid: 'claude-sonnet-5.5' }
+    d.families.openai = { provider: 'a/b', strong: 'c', mid: 'gpt-5.6-sol' }
+  })
+  assert.match(problem, /^families\.openai\.strong: "a\/b\/c" names two models: "c" \(family openai, as provider\/model\) and "b\/c" \(family anthropic, as provider\/model\)\. /)
+})
+
+test('names that only look alike are no collision, and one model in both tiers of a family is one model', () => {
+  const settings = settingsOf(shippedWith((d) => {
+    d.families.anthropic = { provider: 'proxy', strong: 'claude-x', mid: 'claude-x' }
+    d.families.openai = { provider: 'proxy', strong: 'proxy-claude-x', mid: 'claude-x-proxy' }
+    d.families.google = { strong: 'proxy/claude-y', mid: 'proxy/gemini' }
+    d.reviewerFamilies = ['openai', 'anthropic']
+  }))
+  assert.equal(settings.families.anthropic!.mid, 'claude-x')
+  // The same provider and an id that merely starts with it, in another family.
+  assert.ok(parseSettings(shippedWith((d) => { d.families.openai.provider = 'anthropic'; d.families.anthropic.provider = 'anthropic' })).ok)
+  // A model id with a slash, in a family with no provider, owes nothing to any other name.
+  assert.ok(parseSettings(shippedWith((d) => { d.families.openai = { strong: 'openrouter/gpt-6.1-sol', mid: 'openrouter/gpt-5.6-sol' } })).ok)
+})
+
+test('the shipped default, and the spec\'s direct-API example over it, have no colliding names', () => {
+  assert.ok(parseSettings(DEFAULT_TEXT).ok)
+  const direct = specBlocks()[1]!
+  const parsed = parseSettings(render({ ...shippedDocument(), ...load(direct) as object }))
+  assert.ok(parsed.ok, parsed.ok ? '' : parsed.problem)
 })
 
 test('reviewerFamilies must be a list naming only known families', () => {
@@ -280,6 +418,9 @@ test('a refusal never echoes much of the file, however large the offending value
     problemWith((d) => { d.roles.coder.tools = [huge, 7] }),
     problemWith((d) => { d.families[huge] = { strong: 'a', mid: 'b' }; d.roles.coder.family = 'nope' }),
     problemWith((d) => { d.families.openai.mid = huge; d.families.anthropic.mid = huge }),
+    problemWith((d) => { d.families.openai.provider = [huge] }),
+    problemWith((d) => { d.families.openai.provider = ` ${huge}` }),
+    problemWith((d) => { d.families.anthropic.provider = huge; d.families.openai.strong = `${huge}/claude-opus-5.5` }),
     problemOf(`provider: ${huge}\n  bad: [`),
   ]
   for (const problem of problems) assert.ok(problem.length < 500, `${problem.length}: ${problem.slice(0, 120)}`)
@@ -311,6 +452,12 @@ test('provider, model ids, tool names and reviewer families may not start or end
   for (const family of PADDED('openai')) {
     assert.match(problemWith((d) => { d.reviewerFamilies = ['anthropic', family] }), /^reviewerFamilies\[1\]: must not start or end with whitespace/, JSON.stringify(family))
     assert.match(problemWith((d) => { d.roles.coder.family = family }), /^roles\.coder\.family: must not start or end with whitespace/, JSON.stringify(family))
+  }
+})
+
+test('a family provider may not start or end with whitespace', () => {
+  for (const provider of PADDED('openai')) {
+    assert.match(problemWith((d) => { d.families.openai.provider = provider }), /^families\.openai\.provider: must not start or end with whitespace \(got "/, JSON.stringify(provider))
   }
 })
 
@@ -392,4 +539,30 @@ test('the default has every tool a role lists, once', () => {
     assert.equal(new Set(settings.tools).size, settings.tools.length, role)
     for (const tool of STANDARD_TOOLS) assert.ok(settings.tools.includes(tool), `${role} lacks ${tool}`)
   }
+})
+
+test('every shipped role lists ask_judge, last, and the tools it had before are unchanged', () => {
+  for (const [role, settings] of Object.entries(DEFAULT_SETTINGS.roles)) {
+    assert.equal(settings.tools.at(-1), JUDGE_TOOL, role)
+    assert.equal(settings.tools.filter(tool => tool === JUDGE_TOOL).length, 1, role)
+  }
+  // The tools before it are the spec's roles from before dish-judge: the lists only gained one name.
+  const before = (role: string) => DEFAULT_SETTINGS.roles[role]!.tools.slice(0, -1)
+  assert.deepEqual(before('architect'), ['read', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('reviewer'), ['read', 'glob', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('researcher'), ['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('writer'), ['read', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+})
+
+test('a tool name is only a name: a file that lists ask_judge is valid whether or not dish-judge is installed', () => {
+  // The settings never look at a tool registry, so no listing can make crew.yaml unsaveable. What a name means is decided
+  // when a child starts (see allow.test.ts), and a name nobody provides is left out then.
+  const text = shippedWith((d) => {
+    d.roles.researcher.tools = ['read', 'ask_judge', 'a_tool_no_plugin_provides']
+    d.roles.coder.tools = ['ask_judge']
+  })
+  assert.equal(CREW_SPEC.validate('crew.yaml', text), undefined)
+  const settings = settingsOf(text)
+  assert.deepEqual([...settings.roles.researcher!.tools], ['read', 'ask_judge', 'a_tool_no_plugin_provides'])
+  assert.deepEqual([...settings.roles.coder!.tools], ['ask_judge'])
 })
