@@ -1,9 +1,9 @@
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
-import { readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { readFile, readdir, readlink, rm, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -12,6 +12,14 @@ import { SerialQueue, acquireLock } from '../src/store/lock.ts'
 import { tempDir } from './helpers.ts'
 
 const BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
+
+async function currentPidNamespace(): Promise<string | undefined> {
+  try {
+    return await readlink('/proc/self/ns/pid')
+  } catch {
+    return undefined
+  }
+}
 
 async function currentBootId(): Promise<string | undefined> {
   try {
@@ -54,15 +62,16 @@ async function writeLock(file: string, content: unknown): Promise<void> {
   await writeFile(file, typeof content === 'string' ? content : JSON.stringify(content))
 }
 
-async function readLock(file: string): Promise<{ pid?: unknown, nonce?: unknown, bootId?: unknown, host?: unknown }> {
+async function readLock(file: string): Promise<{ pid?: unknown, nonce?: unknown, bootId?: unknown, pidNs?: unknown, host?: unknown }> {
   return JSON.parse(await readFile(file, 'utf8'))
 }
 
-function isLocked(pid?: number): (error: unknown) => boolean {
+function isLocked(pid?: number, mentions?: string): (error: unknown) => boolean {
   return error => {
     assert.ok(error instanceof ConfigStoreError)
     assert.equal(error.code, 'LOCKED')
     if (pid !== undefined) assert.ok(error.message.includes(String(pid)), `message names pid ${pid}: ${error.message}`)
+    if (mentions !== undefined) assert.ok(error.message.includes(mentions), `message mentions ${mentions}: ${error.message}`)
     return true
   }
 }
@@ -162,7 +171,7 @@ test('a lock from another machine is live even if its pid is dead: the filesyste
   const dead = await deadPid()
   for (const bootId of [undefined, 'another-machine']) {
     await writeLock(file, { pid: dead, bootId, host: `not-${hostname()}` })
-    await assert.rejects(acquireLock(dir), isLocked(dead))
+    await assert.rejects(acquireLock(dir), isLocked(dead, file))
     assert.equal((await readLock(file)).host, `not-${hostname()}`)
   }
 })
@@ -176,6 +185,40 @@ test('the same boot id with a different hostname is this machine: a dead pid is 
   const live = livePid()
   await writeLock(file, { pid: live, bootId, host: `renamed-${hostname()}` })
   await assert.rejects(acquireLock(dir), isLocked(live))
+})
+
+test('a lock from another pid namespace on this machine is unverifiable, and the message says which file to delete', async t => {
+  if (await currentPidNamespace() === undefined) return t.skip('/proc/self/ns/pid is not readable')
+  const { dir, file } = await lockPath()
+  const dead = await deadPid()
+  await writeLock(file, { pid: dead, bootId: await currentBootId(), pidNs: 'pid:[1]', host: hostname() })
+  await assert.rejects(acquireLock(dir), isLocked(dead, `delete ${file}`))
+  assert.equal((await readLock(file)).pid, dead)
+  // Not even a holder whose pid number happens to be ours: it is another namespace's process, not a stale copy of us.
+  await writeLock(file, { pid: process.pid, nonce: '0123456789abcdef', bootId: await currentBootId(), pidNs: 'pid:[1]', host: hostname() })
+  await assert.rejects(acquireLock(dir), isLocked(process.pid, `delete ${file}`))
+})
+
+test('a lock whose pid namespace is unknown, or matches ours, is judged by its pid as usual', async () => {
+  const { dir, file } = await lockPath()
+  const pidNs = await currentPidNamespace()
+  const dead = await deadPid()
+  await writeLock(file, { pid: dead, bootId: await currentBootId(), host: hostname() })
+  await (await acquireLock(dir))()
+  if (pidNs !== undefined) {
+    await writeLock(file, { pid: dead, bootId: await currentBootId(), pidNs, host: hostname() })
+    await (await acquireLock(dir))()
+    const live = livePid()
+    await writeLock(file, { pid: live, bootId: await currentBootId(), pidNs, host: hostname() })
+    await assert.rejects(acquireLock(dir), isLocked(live))
+  }
+})
+
+test('acquireLock records the pid namespace where there is one', async () => {
+  const { dir, file } = await lockPath()
+  const release = await acquireLock(dir)
+  assert.equal((await readLock(file)).pidNs, await currentPidNamespace())
+  await release()
 })
 
 test('a lock from another boot is stale even if its pid is alive (pid reuse after reboot)', async t => {
@@ -258,20 +301,21 @@ test('acquireLock fails with the underlying error when the directory is missing'
   await assert.rejects(acquireLock(dir), { code: 'ENOENT' })
 })
 
-// A child process that takes the lock for real, with its event loop stalled for STALL_MS at one point
-// (GC, a sync module load, a busy start-up). It prints what it did and then stays alive until killed.
+// A child process that takes the lock for real, paused at one point until the parent writes a line to its
+// stdin (the point where a slow start-up, GC or a busy loop would stall a real process). It prints what it
+// did and then stays alive until killed.
 const CHILD_SOURCE = `
 import fsp from 'node:fs/promises'
 import { writeSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
+import { once } from 'node:events'
 const say = line => writeSync(1, line + '\\n')
-const stall = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
-const [name, said] = process.env.STALL_AT === 'after-link' ? ['link', 'linked'] : ['writeFile', 'written']
+const [name, said] = process.env.PAUSE_AT === 'after-link' ? ['link', 'linked'] : ['writeFile', 'written']
 const original = fsp[name]
 fsp[name] = async (...args) => {
   const result = await original(...args)
   say(said)
-  stall(Number(process.env.STALL_MS))
+  await once(process.stdin, 'data')
   return result
 }
 syncBuiltinESMExports()
@@ -280,12 +324,15 @@ try { await acquireLock(process.env.LOCK_DIR); say('acquired') } catch (error) {
 setInterval(() => {}, 1000)
 `
 
-function startLockingChild(dir: string, stallAt: 'after-write' | 'after-link'): { child: ChildProcess, waitFor: (line: string) => Promise<void> } {
+const LOCK_MODULE = pathToFileURL(join(import.meta.dirname, '../src/store/lock.ts')).href
+
+function startLockingChild(dir: string, pauseAt: 'after-write' | 'after-link'): { child: ChildProcess, waitFor: (line: string) => Promise<void>, go: () => void } {
   const child = spawn(process.execPath, ['--input-type=module', '-e', CHILD_SOURCE], {
-    stdio: ['ignore', 'pipe', 'inherit'],
-    env: { ...process.env, LOCK_DIR: dir, STALL_AT: stallAt, STALL_MS: '300', LOCK_MODULE: pathToFileURL(join(import.meta.dirname, '../src/store/lock.ts')).href },
+    stdio: ['pipe', 'pipe', 'inherit'],
+    env: { ...process.env, LOCK_DIR: dir, PAUSE_AT: pauseAt, LOCK_MODULE },
   })
   livePids.push(child)
+  child.stdin!.on('error', () => {})
   let output = ''
   child.stdout!.setEncoding('utf8').on('data', chunk => { output += chunk })
   const waitFor = async (line: string): Promise<void> => {
@@ -294,16 +341,45 @@ function startLockingChild(dir: string, stallAt: 'after-write' | 'after-link'): 
       await new Promise(resolve => setTimeout(resolve, 10))
     }
   }
-  return { child, waitFor }
+  return { child, waitFor, go: () => { child.stdin!.write('go\n') } }
 }
 
-test('a live holder that has just taken the lock is not robbed while its event loop stalls', async () => {
+// A second process on the same machine in its own pid namespace (a container) shares the boot id but not the
+// pids: it can't see the holder, and must not conclude the holder is dead.
+const UNSHARE = ['--user', '--map-root-user', '--pid', '--fork', '--mount-proc', '--uts']
+const IN_NAMESPACE_SOURCE = `
+const { acquireLock } = await import(process.env.LOCK_MODULE)
+try { await acquireLock(process.env.LOCK_DIR); console.log(JSON.stringify({ acquired: true })) }
+catch (error) { console.log(JSON.stringify({ code: error.code, message: error.message })) }
+`
+
+test('a process in another pid namespace on this machine does not take the lock from a live holder', async t => {
+  const probe = spawnSync('unshare', [...UNSHARE, 'true'], { stdio: 'ignore' })
+  if (probe.status !== 0) return t.skip('unshare with user, pid and uts namespaces is not permitted here')
   const { dir, file } = await lockPath()
-  const { child, waitFor } = startLockingChild(dir, 'after-link')
+  const release = await acquireLock(dir)
+  const run = spawnSync('unshare', [...UNSHARE, 'sh', '-c', 'hostname ctr && exec "$0" --input-type=module -e "$1"', process.execPath, IN_NAMESPACE_SOURCE], {
+    encoding: 'utf8',
+    timeout: 30_000,
+    env: { ...process.env, LOCK_DIR: dir, LOCK_MODULE },
+  })
+  assert.equal(run.status, 0, run.stderr)
+  const result = JSON.parse(run.stdout.trim().split('\n').at(-1) ?? '')
+  assert.equal(result.acquired, undefined, 'the process in the other namespace must not have taken the lock')
+  assert.equal(result.code, 'LOCKED')
+  assert.ok(result.message.includes(file), result.message)
+  assert.equal((await readLock(file)).pid, process.pid)
+  await release()
+})
+
+test('a live holder that has just taken the lock is not robbed while it is paused before it returns', async () => {
+  const { dir, file } = await lockPath()
+  const { child, waitFor, go } = startLockingChild(dir, 'after-link')
   await waitFor('linked')
   // The child holds a complete lock but hasn't yet noticed. It must read as live, not as half-written garbage.
   assert.equal((await readLock(file)).pid, child.pid)
   await assert.rejects(acquireLock(dir), isLocked(child.pid))
+  go()
   await waitFor('acquired')
   assert.equal((await readLock(file)).pid, child.pid)
   // Once it dies the lock is stale, and ours.
@@ -316,12 +392,13 @@ test('a live holder that has just taken the lock is not robbed while its event l
 
 test('when another process stalls before its lock is in place, one of the two wins and the other gets LOCKED', async () => {
   const { dir, file } = await lockPath()
-  const { child, waitFor } = startLockingChild(dir, 'after-write')
+  const { child, waitFor, go } = startLockingChild(dir, 'after-write')
   await waitFor('written')
   // The child has written its lock to a temporary file but hasn't linked it. There is no lock yet, and no
   // empty or partial one to mistake for a stale holder: we take it.
   await assert.rejects(readFile(file), { code: 'ENOENT' })
   const release = await acquireLock(dir)
+  go()
   await waitFor('LOCKED')
   assert.equal((await readLock(file)).pid, process.pid)
   await release()

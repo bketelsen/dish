@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { link, readFile, unlink, writeFile } from 'node:fs/promises'
+import { link, readFile, readlink, unlink, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { join, resolve } from 'node:path'
 import { ConfigStoreError } from './errors.ts'
@@ -8,6 +8,7 @@ const LOCK_FILE = 'dish.lock'
 const BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
 // The largest pid `process.kill` accepts; anything above throws ERR_INVALID_ARG_TYPE.
 const MAX_PID = 0x7fffffff
+const PID_NAMESPACE_PATH = '/proc/self/ns/pid'
 
 /** What a lock file says about its holder. */
 interface Holder {
@@ -16,8 +17,22 @@ interface Holder {
   nonce?: string
   /** Linux boot id, when the holder could read one. */
   bootId?: string
+  /** The holder's pid namespace, e.g. `pid:[4026531836]`, when it could read one: a pid means something only inside its namespace. */
+  pidNs?: string
   host: string
 }
+
+/** This process's pid namespace (`/proc/self/ns/pid`), or `undefined` where there is none (not Linux). */
+async function currentPidNamespace(): Promise<string | undefined> {
+  try {
+    return await readlink(PID_NAMESPACE_PATH)
+  } catch {
+    return undefined
+  }
+}
+
+/** What `isStale` makes of a lock. `unverifiable` means the holder can't be probed from here. */
+type Verdict = 'stale' | 'live' | 'unverifiable'
 
 /**
  * The nonces of the locks this process holds, or is in the middle of creating. A lock that names this
@@ -49,16 +64,18 @@ function parseHolder(text: string): Holder | undefined {
     return undefined
   }
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
-  const { pid, nonce, bootId, host } = value as Record<string, unknown>
+  const { pid, nonce, bootId, pidNs, host } = value as Record<string, unknown>
   // pid <= 0 is rejected because kill(0, 0) and kill(-n, 0) probe a whole process group, not one process;
   // pid > MAX_PID because process.kill throws on it, which `isAlive` would read as "alive" and lock the store for good.
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || pid > MAX_PID) return undefined
   if (typeof host !== 'string') return undefined
   if (nonce !== undefined && typeof nonce !== 'string') return undefined
   if (bootId !== undefined && typeof bootId !== 'string') return undefined
+  if (pidNs !== undefined && typeof pidNs !== 'string') return undefined
   const holder: Holder = { pid, host }
   if (nonce !== undefined) holder.nonce = nonce
   if (bootId !== undefined) holder.bootId = bootId
+  if (pidNs !== undefined) holder.pidNs = pidNs
   return holder
 }
 
@@ -88,21 +105,25 @@ function isAlive(pid: number): boolean {
 }
 
 /**
- * Whether the holder is gone, so its lock can be taken over.
+ * Whether the holder is gone, so its lock can be taken over, or can't be judged from here.
  * - Which machine: a boot id equal to this machine's means the holder is here, whatever its hostname says
  *   (DHCP or NetworkManager can rename a host mid-boot). Without one to compare, or with a different one, a
- *   lock from another host is live: the store may sit on a shared filesystem and that pid can't be probed.
+ *   lock from another host is unverifiable: the store may sit on a shared filesystem.
  * - A different boot id on this host means the machine rebooted since, so the pid (which may have been
  *   reused) says nothing: stale.
- * - On this machine, a lock that names our own pid but none of our nonces is another namespace's holder: stale.
+ * - Which pid namespace: containers on one machine share the boot id, but a pid only exists inside its own
+ *   namespace, so a holder in another one can't be probed with `kill`: unverifiable, just like another host.
+ * - On this machine and in this namespace, a lock that names our own pid but none of our nonces was written
+ *   by someone else who had the same pid: stale.
  * - Otherwise the lock is stale exactly when its pid is not alive.
  */
-function isStale(holder: Holder, host: string, bootId: string | undefined): boolean {
+function judge(holder: Holder, host: string, bootId: string | undefined, pidNs: string | undefined): Verdict {
   const comparable = holder.bootId !== undefined && bootId !== undefined
-  if (comparable && holder.bootId !== bootId) return holder.host === host
-  if (!comparable && holder.host !== host) return false
-  if (holder.pid === process.pid && !(holder.nonce !== undefined && ownNonces.has(holder.nonce))) return true
-  return !isAlive(holder.pid)
+  if (comparable && holder.bootId !== bootId) return holder.host === host ? 'stale' : 'unverifiable'
+  if (!comparable && holder.host !== host) return 'unverifiable'
+  if (holder.pidNs !== undefined && pidNs !== undefined && holder.pidNs !== pidNs) return 'unverifiable'
+  if (holder.pid === process.pid && !(holder.nonce !== undefined && ownNonces.has(holder.nonce))) return 'stale'
+  return isAlive(holder.pid) ? 'live' : 'stale'
 }
 
 /**
@@ -131,18 +152,28 @@ async function createLock(path: string, content: string): Promise<boolean> {
   }
 }
 
-function locked(holder: Holder | null | undefined): ConfigStoreError {
+/** The refusal for a lock that is held, or that can't be shown not to be. */
+function locked(path: string, holder: Holder | null | undefined, verdict: Verdict): ConfigStoreError {
   if (holder === null || holder === undefined) {
-    return new ConfigStoreError('LOCKED', `the config store is locked by another process (${LOCK_FILE})`)
+    return new ConfigStoreError('LOCKED', `the config store is locked by another process (${path})`)
   }
-  return new ConfigStoreError('LOCKED', `the config store is locked by process ${holder.pid} on ${holder.host}`)
+  const who = `process ${holder.pid} on ${holder.host}`
+  if (verdict === 'unverifiable') {
+    return new ConfigStoreError(
+      'LOCKED',
+      `the config store is locked by ${who}, which can't be verified from here (another host or pid namespace); if it is known to be dead, delete ${path}`,
+    )
+  }
+  return new ConfigStoreError('LOCKED', `the config store is locked by ${who} (${path})`)
 }
 
 /**
  * Take the store's process lock, `<gitDir>/dish.lock`. It is created whole and exclusively: written to a
- * temporary file, then hard-linked into place (see `createLock`). It holds JSON `{ pid, nonce, bootId?, host }`.
+ * temporary file, then hard-linked into place (see `createLock`). It holds JSON `{ pid, nonce, bootId?, pidNs?, host }`.
  *
- * - A lock whose holder is alive, or lives on another machine, throws `ConfigStoreError('LOCKED')` naming the pid.
+ * - A lock whose holder is alive, or can't be probed from here (another machine or pid namespace), throws
+ *   `ConfigStoreError('LOCKED')` naming the pid. For a holder that can't be probed the message also names the file to
+ *   delete if the holder is known to be dead.
  * - A stale lock (unparseable; its pid dead; from an earlier boot; or naming our pid without our nonce) is taken
  *   over: removed, then created anew. If another process creates it first, the lock is theirs and this throws
  *   `LOCKED`. Two processes taking over the *same* stale lock at the same instant can still both end up believing
@@ -158,8 +189,10 @@ export async function acquireLock(gitDir: string, pid: number = process.pid): Pr
   const path = join(resolve(gitDir), LOCK_FILE)
   const host = hostname()
   const bootId = await currentBootId()
+  const pidNs = await currentPidNamespace()
   const nonce = randomBytes(8).toString('hex')
-  const content = JSON.stringify(bootId === undefined ? { pid, nonce, host } : { pid, nonce, bootId, host })
+  // JSON.stringify leaves out the fields that are undefined.
+  const content = JSON.stringify({ pid, nonce, bootId, pidNs, host })
 
   // Registered before the lock exists, so that no look at the file, however early, takes it for a stranger's.
   ownNonces.add(nonce)
@@ -169,14 +202,15 @@ export async function acquireLock(gitDir: string, pid: number = process.pid): Pr
       const holder = await readHolder(path)
       // Gone already (released between our create and read): try the create again.
       if (holder === undefined) continue
-      if (holder !== null && !isStale(holder, host, bootId)) throw locked(holder)
+      const verdict = holder === null ? 'stale' : judge(holder, host, bootId, pidNs)
+      if (verdict !== 'stale') throw locked(path, holder, verdict)
       // Stale. Second time round we already took over once and still lost the create: someone else owns it now.
-      if (attempt > 0) throw locked(holder)
+      if (attempt > 0) throw locked(path, holder, verdict)
       await unlink(path).catch(error => {
         if (errorCode(error) !== 'ENOENT') throw error
       })
     }
-    throw locked(await readHolder(path))
+    throw locked(path, await readHolder(path), 'live')
   } catch (error) {
     ownNonces.delete(nonce)
     throw error
