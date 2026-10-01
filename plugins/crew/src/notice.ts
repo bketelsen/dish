@@ -28,9 +28,10 @@
  * - **Which round.** A child that is sent a follow-up settles again, and dsh steers a notice into the parent's next step
  *   for each settlement, which that step claims all at once. A step can hold the notices of several rounds, and a notice
  *   can be read after later rounds were recorded, so "the child's latest run" can be another round's. A notice is matched
- *   to a run by what it says: the run's report file must hold the notice's closing text (the text blocks joined by a
- *   blank line, or `(no closing message)`, as `CrewRecords.endRun` writes it), and the run's stop reason must be the one
- *   dsh's opening line says (see `IMPLIED`). Of the runs that match, the newest not claimed by another notice of the
+ *   to a run by what it says: the run's report file must hold the notice's closing text (`closingOf` its blocks, and
+ *   `reportContent` of that, the rules `record.ts` records a run by and this reads one back by), and the run's stop
+ *   reason must be the one dsh's opening line says (see `IMPLIED`). A report that can't be read is not the run, and is
+ *   told of once. Of the runs that match, the newest not claimed by another notice of the
  *   step is the one, taking the step's notices from the last: if two rounds said the same and ended the same way, the
  *   last notice gets the newest run and the one before it the next. A notice that matches no run is rewritten without a
  *   report path (dsh's own account of how the child ended, with the child named), and so is a notice in a shape that
@@ -53,6 +54,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { DishCrew } from './index.ts'
+import { closingOf, reportContent } from './record.ts'
 import type { ChildRecord, RunRecord } from './record.ts'
 
 /** The longest a notice waits for a run that is being recorded, in ms. */
@@ -67,9 +69,6 @@ const SUMMARY_MAX_CHARS = 120
 /** dsh's two ways to introduce what follows the opening line of a settlement notice. */
 const CLOSING_LABEL = 'Its closing message:'
 const NO_CLOSING = 'It left no closing message.'
-
-/** What `CrewRecords` writes in a report for a run with no closing message. */
-const NO_CLOSING_REPORT = '(no closing message)'
 
 /** How each of dsh's stop reasons that isn't `completed` is said. Another reason is `stopped (<reason>)`. */
 const VERBS: Readonly<Record<string, string>> = {
@@ -170,24 +169,13 @@ interface Parts {
   implied: string | undefined
 }
 
-/** What `CrewRecords.endRun` writes for a closing message of `closing`: the text, or `(no closing message)`, and a newline. */
-function reportBytes(closing: string): Buffer {
-  const text = closing.trim() === '' ? NO_CLOSING_REPORT : closing
-  return Buffer.from(text.endsWith('\n') ? text : `${text}\n`)
-}
-
 function partsOf(message: UserMessage, childId: string): Parts | undefined {
   const [lead, next] = message.content
   if (lead?.type !== 'text') return undefined
   const label = next?.type === 'text' && (next.text === CLOSING_LABEL || next.text === NO_CLOSING) ? next.text : undefined
-  let report: Buffer | undefined
-  if (label === NO_CLOSING) {
-    report = reportBytes('')
-  } else if (label !== undefined) {
-    // What the host files as the closing message: the text blocks that aren't blank, joined by a blank line.
-    const texts = message.content.slice(2).flatMap(block => block.type === 'text' && block.text.trim() !== '' ? [block.text] : [])
-    report = reportBytes(texts.join('\n\n'))
-  }
+  // What the host files as the closing message of the run is `closingOf` its output, and `endRun` writes `reportContent` of
+  // that: the notice carries the output's text blocks, and is matched by the same two rules.
+  const report = label === undefined ? undefined : Buffer.from(reportContent(label === NO_CLOSING ? '' : closingOf(message.content.slice(2))))
   const subject = `Background subagent ${childId}`
   let implied: string | undefined
   if (lead.text.startsWith(subject)) {
@@ -218,13 +206,23 @@ async function reportIs(path: string, expected: Buffer): Promise<boolean> {
   }
 }
 
-/** The newest run of `runs` that `parts` is the notice of and that isn't in `claimed`, which it is added to. */
-async function runOf(parts: Parts, runs: readonly RunRecord[], claimed: Set<RunRecord>): Promise<RunRecord | undefined> {
+/**
+ * The newest run of `runs` that `parts` is the notice of and that isn't in `claimed`, which it is added to. A report that
+ * can't be read isn't the run: `unreadable` is told, and the search goes on with the runs before it.
+ */
+async function runOf(parts: Parts, runs: readonly RunRecord[], claimed: Set<RunRecord>, unreadable: (run: RunRecord, error: unknown) => void): Promise<RunRecord | undefined> {
   if (parts.report === undefined) return undefined
   for (let index = runs.length - 1; index >= 0; index--) {
     const run = runs[index]!
     if (claimed.has(run) || (parts.implied !== undefined && run.stopReason !== parts.implied)) continue
-    if (await reportIs(run.report, parts.report)) {
+    let same: boolean
+    try {
+      same = await reportIs(run.report, parts.report)
+    } catch (error) {
+      unreadable(run, error)
+      continue
+    }
+    if (same) {
       claimed.add(run)
       return run
     }
@@ -243,6 +241,8 @@ function rewritten(message: UserMessage, child: ChildRecord, parts: Parts, run: 
 
 /** Wait for `recording`, however it ends, but no longer than `ms`, nor than `signal` is aborted. */
 async function settled(recording: Promise<unknown>, ms: number, signal: AbortSignal | undefined): Promise<void> {
+  // A turn that was cancelled already, in the lookup before this, would never fire the listener below.
+  if (signal?.aborted) return
   let timer: ReturnType<typeof setTimeout> | undefined
   let onAbort: (() => void) | undefined
   try {
@@ -296,13 +296,20 @@ async function rewriteChild(id: string, indexes: readonly number[], messages: re
     }
     const { record } = found
     const claimed = new Set<RunRecord>()
+    // Said once for the child, whichever of its notices find a report they can't read.
+    let told = false
+    const unreadable = (run: RunRecord, error: unknown): void => {
+      if (told) return
+      told = true
+      tell(context, 'could not read the report %s of child %s, so it is not taken for the notice\'s run: %s', run.report, id, describe(error))
+    }
     // The last notice of the step is the newest, and takes the newest run it can.
     for (const index of [...indexes].reverse()) {
       const message = messages[index]!
       try {
         const parts = partsOf(message, id)
         if (parts === undefined) continue
-        out[index] = rewritten(message, record, parts, await runOf(parts, record.runs, claimed))
+        out[index] = rewritten(message, record, parts, await runOf(parts, record.runs, claimed, unreadable))
       } catch (error) {
         tell(context, 'could not rewrite a finish notice of child %s, which is left as dsh wrote it: %s', id, describe(error))
       }

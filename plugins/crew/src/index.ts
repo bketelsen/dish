@@ -25,7 +25,7 @@ import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
-import { CrewRecords } from './record.ts'
+import { CrewRecords, closingOf } from './record.ts'
 import type { EndedRun } from './record.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from './settings.ts'
 import type { CrewSettings } from './settings.ts'
@@ -190,16 +190,6 @@ function errorText(error: unknown): string {
   return text.length > MAX_ERROR_LENGTH ? `${text.slice(0, MAX_ERROR_LENGTH - 1)}…` : text
 }
 
-/** The text of a child's final message: its text blocks, each as it is, joined by blank lines. `''` if it has none. */
-function closingText(blocks: unknown): string {
-  if (!Array.isArray(blocks)) return ''
-  const texts: string[] = []
-  for (const block of blocks) {
-    if (isObject(block) && block.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '') texts.push(block.text)
-  }
-  return texts.join('\n\n')
-}
-
 /** Whether `error` is cordis refusing an effect because the plugin has been unloaded: a plugin that is going away didn't fail. */
 function unloaded(error: unknown): boolean {
   return (error as { code?: unknown } | null)?.code === 'INACTIVE_EFFECT'
@@ -309,7 +299,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const { stopReason, lastAssistantMessage } = event as { stopReason?: unknown, lastAssistantMessage?: unknown }
       const error = remembered.get(id)
       remembered.delete(id)
-      const closing = closingText(lastAssistantMessage)
+      const closing = closingOf(lastAssistantMessage)
       const run = inOrder(id, 'could not record the end of child %s: %s',
         async () => records.endRun(id, { stopReason: stopReason as string, error: await error, closing }))
       pending.set(id, run)

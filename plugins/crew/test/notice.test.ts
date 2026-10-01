@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises'
+import { chmod, readFile, writeFile } from 'node:fs/promises'
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { format } from 'node:util'
@@ -8,13 +8,14 @@ import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import { createScope } from '@deepseek-ai/dsh-scope'
+import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
 import * as row from '../src/delegate.ts'
 import type { DishCrew } from '../src/index.ts'
 import { COMPARE_BYTES, noticeSummary, noticeText, rewriteNotices } from '../src/notice.ts'
 import { CrewRecords } from '../src/record.ts'
 import type { ChildRecord, EndedRun, NewChild } from '../src/record.ts'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
-import { provideStub, tempDir, watchLogs } from './helpers.ts'
+import { dirs, mountCrew, provideStub, tempDir, watchLogs } from './helpers.ts'
 
 const SESSION = 'session-main'
 const WHO = 'coder «add login» (claude-sonnet-5.5)'
@@ -552,6 +553,78 @@ test('a notice for a round that matches no run gets the fallback, and the others
   assert.deepEqual(texts(out[1]), [`${WHO} finished and will do no further work unless you send it more. Its closing message:`, 'Unrecorded.'])
 })
 
+test('a run the host plugin records from subagent/end is the report the notice for the same blocks cites', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const handle = mountCrew(ctx, where.data)
+  await handle
+  try {
+    await ctx.dishCrew.records.addChild(SESSION, { id: 'child-1', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic' })
+    // The blocks dsh publishes on `subagent/end` for a child: reasoning and tool calls too, and a block of blanks. dsh's
+    // notice carries the text blocks of the same output, blanks included, so the two see the same closing message only if
+    // the record and the notice read it by the same rule.
+    const closing = ['I got as far as the router.', '   ', 'Then the API stopped answering.']
+    ctx.emit('subagent/end', {
+      runId: 'run-1', provider: 'spawn', id: 'child-1', local: true, stopReason: 'completed',
+      lastAssistantMessage: [
+        { type: 'reasoning', text: 'thinking about it' },
+        { type: 'text', text: closing[0] },
+        { type: 'tool_use', id: 't1', name: 'read', input: {} },
+        { type: 'text', text: closing[1] },
+        { type: 'text', text: closing[2] },
+      ],
+    } as unknown as SubagentRunEndInfo)
+    const warnings: string[] = []
+    const [out] = await rewriteNotices([settlement('child-1', 'completed', closing)], {
+      crew: ctx.dishCrew, sessionId: SESSION, warn: (text, ...args) => { warnings.push(format(text, ...args)) },
+    })
+    const report = (await ctx.dishCrew.records.lookup('child-1'))!.record.runs[0]!.report
+    assert.equal(await readFile(report, 'utf8'), 'I got as far as the router.\n\nThen the API stopped answering.\n')
+    assert.deepEqual(texts(out).slice(0, 1), [`${WHO} finished. Report: \`${report}\`. Its closing message:`])
+    assert.deepEqual(warnings, [])
+    // And a child that left nothing says the same on both sides.
+    await ctx.dishCrew.records.addChild(SESSION, { id: 'child-2', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic' })
+    ctx.emit('subagent/end', {
+      runId: 'run-2', provider: 'spawn', id: 'child-2', local: true, stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'text', text: '  \n' }],
+    } as unknown as SubagentRunEndInfo)
+    const [none] = await rewriteNotices([settlement('child-2', 'completed', ['  \n'])], { crew: ctx.dishCrew, sessionId: SESSION, warn: () => {} })
+    assert.match(texts(none)[0]!, /finished\. Report: `.*2-coder-1\.md`\. Its closing message:$/)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('a report that can\'t be read is not the run, and the search goes on, with one warning', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, async () => {
+  const world = await setup()
+  await world.child()
+  // Two rounds that said the same: a notice takes the newest, and when that one can't be read, the one before it.
+  const one = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Done.' })
+  const two = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Done.' })
+  await chmod(two!.report, 0o000)
+  try {
+    const [out] = await world.rewrite([settlement('child-1', 'completed', ['Done.'])])
+    assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${one!.report}\`. Its closing message:`, 'Done.'])
+    assert.equal(world.warnings.length, 1)
+    assert.match(world.warnings[0]!, /child-1.*EACCES/)
+    // Two notices that both meet it are told once. The last takes the one report that can be read, and the other has none.
+    world.warnings.length = 0
+    const both = await world.rewrite([settlement('child-1', 'completed', ['Done.']), settlement('child-1', 'completed', ['Done.'])])
+    assert.equal(world.warnings.length, 1)
+    assert.ok(!texts(both[0])[0]!.includes('Report'))
+    assert.equal(texts(both[1])[0], `${WHO} finished. Report: \`${one!.report}\`. Its closing message:`)
+    // With nothing else that matches, it is the form without a report.
+    await chmod(one!.report, 0o000)
+    world.warnings.length = 0
+    const [none] = await world.rewrite([settlement('child-1', 'completed', ['Done.'])])
+    assert.deepEqual(texts(none), [`${WHO} finished and will do no further work unless you send it more. Its closing message:`, 'Done.'])
+    assert.equal(world.warnings.length, 1)
+  } finally {
+    await chmod(two!.report, 0o600)
+    await chmod(one!.report, 0o600)
+  }
+})
+
 // --- the summary --------------------------------------------------------------------------------------
 
 test('the source\'s summary is the role-named first sentence, without the report', async () => {
@@ -607,6 +680,24 @@ test('a turn cancelled already is not looked at', async () => {
   controller.abort()
   const messages = [settlement('child-1', 'completed', ['x'])]
   assert.equal(await world.rewrite(messages, { signal: controller.signal }), messages)
+})
+
+test('a turn cancelled inside the first lookup does not wait for a run that is being recorded', async () => {
+  const world = await setup()
+  await world.child()
+  world.recording.set('child-1', new Promise(() => {}))
+  const controller = new AbortController()
+  const lookup = world.records.lookup.bind(world.records)
+  world.records.lookup = async (id: string) => {
+    const found = await lookup(id)
+    controller.abort()
+    return found
+  }
+  const message = settlement('child-1', 'completed', ['x'])
+  const started = Date.now()
+  const out = await world.rewrite([message], { waitMs: 30_000, signal: controller.signal })
+  assert.ok(Date.now() - started < 1500, 'it did not wait the 30 s')
+  assert.equal(out[0], message)
 })
 
 // --- failures ---------------------------------------------------------------------------------------

@@ -147,6 +147,30 @@ export const TEMP_GRACE_MS = 60 * 60 * 1000
 /** The text of a report for a run that left no closing message. */
 const NO_CLOSING = '(no closing message)'
 
+/**
+ * The closing message of a run as text: the text blocks of the child's final message that have something in them (a block
+ * of blanks is dropped, and the others are kept whole), joined by a blank line. `''` if there are none or `blocks` isn't a
+ * list. What `subagent/end` is recorded from, and what a finish notice is matched to a report by (`notice.ts`): one rule,
+ * here, so that the two can't drift.
+ */
+export function closingOf(blocks: unknown): string {
+  if (!Array.isArray(blocks)) return ''
+  const texts: string[] = []
+  for (const block of blocks) {
+    if (isObject(block) && block.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '') texts.push(block.text)
+  }
+  return texts.join('\n\n')
+}
+
+/**
+ * What a report file holds for a run whose closing message is `closing`: the text, or a line that says there is none if it
+ * is blank, and a newline at the end if it has none. `endRun` writes it, and `notice.ts` compares a report to it.
+ */
+export function reportContent(closing: string): string {
+  const text = closing.trim() === '' ? NO_CLOSING : closing
+  return text.endsWith('\n') ? text : `${text}\n`
+}
+
 /** A session's directory name, and the content of a pointer: 64 hex digits. */
 const HASH = /^[0-9a-f]{64}$/
 /** A temp file the writes here leave: a dot, the target's name, 16 random hex digits, and `.tmp`. */
@@ -478,21 +502,21 @@ export class CrewRecords {
   async endRun(childId: string, end: RunEnd): Promise<EndedRun | undefined> {
     const stopReason = isText(end?.stopReason) && end.stopReason !== '' ? end.stopReason : 'unknown'
     const error = isText(end?.error) && end.error !== '' ? end.error : undefined
-    const closing = isText(end?.closing) && end.closing.trim() !== '' ? end.closing : NO_CLOSING
+    const content = reportContent(isText(end?.closing) ? end.closing : '')
     return this.#update(childId, async (child, hash) => {
-      const report = await this.#writeReport(hash, `${child.n}-${fileSafe(child.role)}-${child.runs.length + 1}`, closing)
+      const report = await this.#writeReport(hash, `${child.n}-${fileSafe(child.role)}-${child.runs.length + 1}`, content)
       child.runs.push({ endedAt: Date.now(), stopReason, ...error === undefined ? {} : { error }, report })
       child.last = statusFor(stopReason)
       return { report }
     })
   }
 
-  /** Write `text` as `<base>.md` in session `hash`'s directory, or `<base>.2.md` and on if that name is taken. */
+  /** Write `text` (a `reportContent`) as `<base>.md` in session `hash`'s directory, or `<base>.2.md` and on if that name is taken. */
   async #writeReport(hash: string, base: string, text: string): Promise<string> {
     const directory = this.#sessionDirectory(hash)
     let file = join(directory, `${base}.md`)
     for (let attempt = 2; await exists(file); attempt++) file = join(directory, `${base}.${attempt}.md`)
-    await writeAtomic(file, text.endsWith('\n') ? text : `${text}\n`)
+    await writeAtomic(file, text)
     return file
   }
 

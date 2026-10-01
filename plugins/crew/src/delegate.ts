@@ -34,8 +34,9 @@
  * where its report is (`notice.ts`): one `agent/pre-step` listener, registered here so that it is the preset's and hears
  * only the agents under it.
  *
- * This module is the row and little else: everything it loads of the plugin is plain code over plain data (`models`,
- * `allow`, `notice`, `text`), and the services come in by `import type`.
+ * This module is the row and little else: everything it loads of the plugin is plain code (`models`, `allow`, `text`, and
+ * `notice`, which reads the crew's report files and nothing else outside the process), and the services come in by
+ * `import type`.
  *
  * @module dish-crew/delegate
  */

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { CrewRecords, STOP_REASON_STATUS, TEMP_GRACE_MS, statusFor } from '../src/record.ts'
+import { CrewRecords, STOP_REASON_STATUS, TEMP_GRACE_MS, closingOf, reportContent, statusFor } from '../src/record.ts'
 import type { ChildRecord, NewChild } from '../src/record.ts'
 import { tempDir } from './helpers.ts'
 
@@ -822,4 +822,38 @@ test('an empty session directory goes when its own mtime is old, and not before'
   await age(empty, 3 * DAY)
   assert.equal(await records.prune(DAY), 1)
   assert.equal(await exists(empty), false)
+})
+
+test('closingOf keeps the text blocks that have something in them, whole, and joins them with a blank line', () => {
+  assert.equal(closingOf([
+    { type: 'reasoning', text: 'thinking' },
+    { type: 'text', text: '  first\n' },
+    { type: 'tool_use', id: 't', name: 'read', input: {} },
+    { type: 'text', text: ' \n ' },
+    { type: 'text', text: '' },
+    { type: 'text', text: 'second' },
+    { type: 'text', text: 7 },
+    null,
+  ]), '  first\n\n\nsecond')
+  assert.equal(closingOf([]), '')
+  assert.equal(closingOf(undefined), '')
+  assert.equal(closingOf('not blocks'), '')
+})
+
+test('reportContent is what a report holds: the closing text with one newline at the end, or a line that says there is none', () => {
+  assert.equal(reportContent('Done.'), 'Done.\n')
+  assert.equal(reportContent('Done.\n'), 'Done.\n')
+  assert.equal(reportContent('Done.\n\n'), 'Done.\n\n')
+  assert.equal(reportContent(''), '(no closing message)\n')
+  assert.equal(reportContent('  \n '), '(no closing message)\n')
+})
+
+test('endRun writes reportContent of the closing message', async () => {
+  const { records } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  await records.addChild('s1', newChild('c2'))
+  const a = await records.endRun('c1', { stopReason: 'completed', closing: 'Text\nmore' })
+  const b = await records.endRun('c2', { stopReason: 'completed', closing: ' \n' })
+  assert.equal(await readFile(a!.report, 'utf8'), reportContent('Text\nmore'))
+  assert.equal(await readFile(b!.report, 'utf8'), reportContent(''))
 })
