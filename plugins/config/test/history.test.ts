@@ -40,6 +40,20 @@ async function orphan(git: Git, message: string, changes: Change[]): Promise<str
 
 const ids = (log: CommitInfo[]): string[] => log.map(info => info.id)
 
+/** Run `body` with `text` as the user's global git config (`GIT_CONFIG_GLOBAL`, which the store's git children inherit). */
+async function withGlobalConfig<T>(text: string, body: () => Promise<T>): Promise<T> {
+  const config = join(await tempDir(), 'gitconfig')
+  await writeFile(config, text)
+  const previous = process.env.GIT_CONFIG_GLOBAL
+  process.env.GIT_CONFIG_GLOBAL = config
+  try {
+    return await body()
+  } finally {
+    if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL
+    else process.env.GIT_CONFIG_GLOBAL = previous
+  }
+}
+
 // --- history ------------------------------------------------------------------------------------
 
 test('history lists commits newest first with authors, notes and paths, and filters by path or prefix', async () => {
@@ -286,6 +300,27 @@ test('history is a store operation: it throws a plain Error once the store is cl
   await assert.rejects(store.revert(ZEROS, { author: USERA }), isPlainError(/closed/))
 })
 
+test('history of a path does not follow renames, even when the user\'s git config says log.follow', async () => {
+  const { store } = await openAt({ claims: [ns('prompts/')] })
+  const text = Array.from({ length: 30 }, (_, n) => `line ${n}\n`).join('')
+  const added = await put(store, [file('prompts/old.md', text)])
+  const moved = await put(store, [{ path: 'prompts/old.md', delete: true }, file('prompts/new.md', `${text}one more\n`)])
+  const follow = '[log]\n\tfollow = true\n'
+  assert.deepEqual(ids(await withGlobalConfig(follow, () => store.history({ path: 'prompts/new.md' }))), [moved.id])
+  assert.deepEqual(ids(await withGlobalConfig(follow, () => store.history({ path: 'prompts/old.md' }))), [moved.id, added.id])
+  assert.deepEqual(ids(await withGlobalConfig(follow, () => store.history({ prefix: 'prompts/new.md' }))), [moved.id])
+})
+
+test('authors and notes are read back whatever comment character the user\'s git config sets', async () => {
+  const { store } = await openAt({ claims: [ns('prompts/')] })
+  const a = await put(store, [file('prompts/a.md', 'A')], AGENTA, 'why')
+  const b = await put(store, [file('prompts/b.md', 'B')])
+  for (const config of ['[core]\n\tcommentChar = D\n', '[core]\n\tcommentString = Dish-\n', '[core]\n\tcommentChar = auto\n']) {
+    const [newest, older] = await withGlobalConfig(config, () => store.history())
+    assert.deepEqual([newest, older], [b, a], config)
+  }
+})
+
 // --- diff ------------------------------------------------------------------------------------------
 
 test('diff reports added, modified and deleted files, and each patch holds the changed lines', async () => {
@@ -394,6 +429,29 @@ test('diff and commit never run an external diff program or a textconv, whatever
   }
 })
 
+test('diff and commit give the same output whatever diff options the user\'s git config sets', async () => {
+  const order = join(await tempDir(), 'order')
+  await writeFile(order, 'prompts/c.md\nprompts/b.md\nprompts/a.md\n')
+  const { store, git } = await openAt({ claims: [ns('prompts/')] })
+  const c1 = await put(store, ['a', 'b', 'c'].map(name => file(`prompts/${name}.md`, `${name}\n`)))
+  const c2 = await put(store, [...['a', 'b', 'c'].map(name => file(`prompts/${name}.md`, `${name}\nmore\n`)), file('prompts/é.md', 'E\n')])
+  const hostile = `[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n\tsrcPrefix = x/\n\tdstPrefix = y/\n\torderFile = ${order}\n[core]\n\tquotePath = true\n`
+
+  const clean = await withGlobalConfig('', () => store.diff(c1.id, c2.id))
+  assert.deepEqual(clean.map(d => d.path), ['prompts/a.md', 'prompts/b.md', 'prompts/c.md', 'prompts/é.md'])
+  assert.match(clean[0]!.patch, /^diff --git a\/prompts\/a\.md b\/prompts\/a\.md\n/)
+  assert.match(clean[3]!.patch, /^diff --git a\/prompts\/é\.md b\/prompts\/é\.md\n/, 'a path with a non-ASCII character is not quoted')
+
+  assert.deepEqual(await withGlobalConfig(hostile, () => store.diff(c1.id, c2.id)), clean)
+  assert.deepEqual(await withGlobalConfig(hostile, () => store.diff(c1.id, c2.id, 'prompts')), clean)
+  assert.deepEqual((await withGlobalConfig(hostile, () => store.commit(c2.id))).diffs, clean)
+  // The control: plain git, under the same config, does print something else.
+  const plain = await withGlobalConfig(hostile, async () => (await git.run(['diff', '--name-only', c1.id, c2.id])).stdout)
+  assert.ok(!plain.startsWith('prompts/a.md\n'), 'the config reorders what plain git lists')
+  const header = await withGlobalConfig(hostile, async () => (await git.run(['diff', '--no-ext-diff', c1.id, c2.id])).stdout)
+  assert.ok(!header.includes('diff --git a/prompts/a.md'), 'and changes its prefixes')
+})
+
 // --- commit ------------------------------------------------------------------------------------------
 
 test('commit(id) gives a commit and its diff against its parent', async () => {
@@ -435,6 +493,28 @@ test('commit(id) needs "main" or a full id of a commit that exists: NOT_FOUND ot
   for (const id of ['', 'HEAD', 'refs/heads/main', head.slice(0, 12), head.toUpperCase(), ZEROS, tree, '--help', `${head}^`]) {
     await assert.rejects(store.commit(id), isStoreError('NOT_FOUND'), `commit ${id}`)
   }
+})
+
+test('a path that was a file and became a directory: each file\'s patch holds only its own change', async () => {
+  const { store } = await openAt({ claims: [ns('prompts/')] })
+  await put(store, [file('prompts/a', 'FILE\n')])
+  const toDir = await put(store, [{ path: 'prompts/a', delete: true }, file('prompts/a/x', 'X\n')])
+  const { diffs } = await store.commit(toDir.id)
+  assert.deepEqual(diffs.map(d => `${d.status} ${d.path}`), ['deleted prompts/a', 'added prompts/a/x'])
+  for (const { patch } of diffs) assert.equal(patch.match(/^diff --git /gm)?.length, 1, 'one file per patch')
+  assert.match(diffs[0]!.patch, /^-FILE$/m)
+  assert.doesNotMatch(diffs[0]!.patch, /prompts\/a\/x|X/)
+  assert.match(diffs[1]!.patch, /^\+X$/m)
+  assert.ok(diffs[0]!.patch.endsWith('\n'), 'a patch ends where its last line does')
+
+  // And back: a directory that became a file.
+  const toFile = await put(store, [{ path: 'prompts/a/x', delete: true }, file('prompts/a', 'AGAIN\n')])
+  const back = await store.commit(toFile.id)
+  assert.deepEqual(back.diffs.map(d => `${d.status} ${d.path}`), ['added prompts/a', 'deleted prompts/a/x'])
+  assert.match(back.diffs[0]!.patch, /^\+AGAIN$/m)
+  assert.doesNotMatch(back.diffs[0]!.patch, /^-X$/m)
+  assert.match(back.diffs[1]!.patch, /^-X$/m)
+  assert.deepEqual(await store.diff(toDir.id, toFile.id), back.diffs)
 })
 
 // --- revert ------------------------------------------------------------------------------------------
@@ -563,6 +643,24 @@ test('a revert that finds some paths already restored reverts the rest, and reve
   const next = await put(store, [file('prompts/a.md', 'a3'), file('prompts/b.md', 'b3')])
   await put(store, [file('prompts/a.md', 'a1'), file('prompts/b.md', 'b4')])
   await assert.rejects(store.revert(next.id, { author: USERA }), isStoreError('CONFLICT', 'prompts/b.md'))
+})
+
+test('a revert can turn a file back into a directory, and a directory back into a file', async () => {
+  const { store } = await openAt({ claims: [ns('prompts/')] })
+  await put(store, [file('prompts/a', 'FILE')])
+  const toDir = await put(store, [{ path: 'prompts/a', delete: true }, file('prompts/a/x', 'X')])
+
+  const undo = await store.revert(toDir.id, { author: USERA })
+  assert.ok(undo, 'a directory goes back to the file it replaced')
+  assert.deepEqual(undo.paths, ['prompts/a', 'prompts/a/x'])
+  assert.equal(await store.read('prompts/a'), 'FILE')
+  assert.equal(await store.read('prompts/a/x'), undefined)
+
+  const redo = await store.revert(undo.id, { author: USERA })
+  assert.ok(redo, 'and a file goes back to the directory it replaced')
+  assert.equal(await store.read('prompts/a'), undefined)
+  assert.equal(await store.read('prompts/a/x'), 'X')
+  assert.deepEqual(await store.list('prompts/'), ['prompts/a/x'])
 })
 
 test('a revert can itself be reverted', async () => {

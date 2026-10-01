@@ -806,6 +806,16 @@ test('a delete removes the file and appears in the commit', async () => {
   assert.deepEqual(await store.list('prompts/'), ['prompts/b.md', 'prompts/c.md'])
 })
 
+test('a file and a directory can swap places in one write, whichever order the changes are listed in', async () => {
+  const store = await openStore({ claims: [ns('x/')] })
+  await store.write([{ path: 'x/a', text: 'file' }, { path: 'x/b/c', text: 'nested' }], { author: USERA })
+  await store.write([{ path: 'x/a', delete: true }, { path: 'x/a/y', text: 'now a directory' }], { author: USERA })
+  assert.deepEqual(await store.list('x/'), ['x/a/y', 'x/b/c'])
+  await store.write([{ path: 'x/a', text: 'a file again' }, { path: 'x/a/y', delete: true }], { author: USERA })
+  await store.write([{ path: 'x/b', text: 'file' }, { path: 'x/b/c', delete: true }], { author: USERA })
+  assert.deepEqual(await store.list('x/'), ['x/a', 'x/b'])
+})
+
 test('deleting a path that does not exist at head is NOT_FOUND, and the rest of the write is not applied', async () => {
   const { store, git } = await openAt({ claims: [ns('prompts/'), ns('x/')] })
   await store.write([{ path: 'prompts/a.md', text: 'A' }, { path: 'x/d/f.md', text: 'F' }], { author: USERA })

@@ -711,8 +711,13 @@ export class ConfigStore {
    * `paths` come from the diff against the first parent, or the empty tree for a first commit.
    */
   private async readCommits(revisions: string[], pathspec: string[]): Promise<CommitInfo[]> {
-    // `--no-show-signature` and `--encoding` so a user's `log.showSignature` or `i18n.logOutputEncoding` can't change the records.
-    const args = ['log', '-z', '--first-parent', '--no-show-signature', '--encoding=UTF-8', `--format=${LOG_FORMAT}`]
+    // Options and config so that nothing in a user's git config changes the records: `log.showSignature`, `i18n.logOutputEncoding`,
+    // `log.follow` (a single path would follow renames) and `core.commentChar`/`commentString` (a `Dish-` or `D` comment string
+    // would make git skip every trailer line, and so turn every author into the system).
+    const args = [
+      '-c', 'core.commentChar=#', 'log', '-z', '--first-parent', '--no-follow', '--no-show-signature', '--encoding=UTF-8',
+      `--format=${LOG_FORMAT}`,
+    ]
     const fields = (await this.git.run([...args, ...revisions, '--', ...pathspec])).stdout.split('\0')
     fields.pop() // what follows the last record's NUL
     if (fields.length % LOG_FIELDS.length !== 0) throw new Error('git log printed something other than whole records')
@@ -735,13 +740,23 @@ export class ConfigStore {
   /** The files that differ between `from` and `to` (commits or trees), with their patches. Runs no external program: see `diff`. */
   private async fileDiffs(from: string, to: string, pathspec: string[]): Promise<FileDiff[]> {
     // A user's global git config can name an external diff command or a textconv filter, and git would run it for every file.
-    const base = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames']
+    // Its other diff settings must not change the output either: the path prefixes (`diff.noprefix`, `diff.mnemonicPrefix`),
+    // the order of the files (`diff.orderFile`, which `-O/dev/null` empties) and whether a path in a header is quoted (`core.quotePath`).
+    const base = [
+      '-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames',
+      '--src-prefix=a/', '--dst-prefix=b/', '-O/dev/null',
+    ]
     const listing = (await this.git.run([...base, '--name-status', '-z', from, to, '--', ...pathspec])).stdout.split('\0')
     const diffs: FileDiff[] = []
     for (let at = 0; at + 1 < listing.length; at += 2) {
       const status = listing[at]!
       const path = listing[at + 1]!
-      const patch = (await this.git.run([...base, from, to, '--', literal(path)])).stdout
+      const full = (await this.git.run([...base, from, to, '--', literal(path)])).stdout
+      // A literal pathspec still names a directory's whole subtree, so the patch for a file that has become a directory goes on
+      // into its children's. Every file's patch starts with `diff --git ` and no line inside one can (hunk lines begin with
+      // a space, `+`, `-` or `\`), so a patch ends where the next one begins.
+      const next = full.indexOf('\ndiff --git ', 1)
+      const patch = next === -1 ? full : full.slice(0, next + 1)
       diffs.push({ path, status: status === 'A' ? 'added' : status === 'D' ? 'deleted' : 'modified', patch })
     }
     return diffs
@@ -822,7 +837,9 @@ export class ConfigStore {
           throw new ConfigStoreError('NOT_FOUND', `cannot delete ${label(change.path)}: it does not exist`)
         }
       }
-      const tree = await this.git.buildTree(head, prepared.changes)
+      // Removals first, so a file can give way to a directory of the same name (or the reverse) in one commit.
+      const ordered = [...prepared.changes.filter(change => 'delete' in change), ...prepared.changes.filter(change => !('delete' in change))]
+      const tree = await this.git.buildTree(head, ordered)
       const changed = (await this.git.changedPaths(head, tree)).sort()
       if (changed.length === 0) return undefined
       const subject = prepared.subject?.(changed) ?? `${pathList(changed)}: ${prepared.summary}`
