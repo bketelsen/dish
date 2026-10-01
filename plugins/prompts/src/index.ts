@@ -9,7 +9,9 @@
  *   propose changes to `common` and `main`, and write crew roles) and seeds the shipped defaults, which never
  *   overwrites an edit. While it isn't, every answer is the shipped default;
  * - each agent's prompt is pinned to the store commit it was first asked for, in a file under `stateDirectory`, so
- *   it doesn't change for the agent's life, across a restart. Files not read for 180 days are pruned at start.
+ *   it doesn't change for the agent's life, across a restart. Files not read for 180 days are pruned at start;
+ * - the Prompts page's server half is the `dishPromptsRemote` Typert remote (see `remote.ts`), served by the
+ *   gateway when there is one and idle otherwise.
  *
  * @module dish-prompts
  */
@@ -21,6 +23,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
 import { DEFAULTS } from './defaults.ts'
 import { namespaceSpecs, pathFor } from './roles.ts'
+import { PromptsRemote } from './remote.ts'
 import { createDishPrompts } from './service.ts'
 import { SnapshotFiles } from './snapshots.ts'
 
@@ -109,6 +112,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   try {
     // `ctx.get` is read on every call: the store is optional, and may come, go and come back.
     ctx.provide('dishPrompts', createDishPrompts({ store: () => ctx.get('dishConfig'), files, logger }))
+    // The Prompts page's remote: a child plugin that needs `dishPrompts`, so it goes when the service does.
+    ctx.plugin(PromptsRemote)
     // With the store there: claim the namespaces, as effects so they go when the store, or this plugin, does, and
     // seed what is missing. A seed that fails (a size cap too small for a prompt, say) leaves the store as it is.
     ctx.inject(['dishConfig'], async (child) => {
