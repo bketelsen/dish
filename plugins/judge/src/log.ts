@@ -4,18 +4,21 @@
  *
  * ```
  * <directory>/<yyyy-mm-dd>.jsonl       the day's lines, oldest first, one JSON object and a newline each
- * <directory>/withheld/<id>.txt        one withheld result, masked and capped; <id> is 16 random hex characters
+ * <directory>/withheld/<id>.txt        one withheld result; <id> is 16 random hex characters. A line holding the tool's
+ *                                      name as a JSON string, then the content, masked and capped
  * ```
  *
  * - **No secrets.** `write` masks the subject and the error (`maskSecrets` from dish-kit, the same patterns dish-config
  *   refuses to store), and `withhold` masks the content. Masking comes before any cut, so a cut can't leave the start of a
  *   secret that no pattern would now match. Only the fields of a `JudgeLogLine` are written, so a caller can't put
  *   anything else in the log by passing more than the type says.
- * - **Bounded.** A line is at most `MAX_LINE_BYTES` (the subject is cut first), withheld content at most
- *   `MAX_WITHHELD_BYTES`, and `read` holds a page of lines and one buffer at a time, however long the files are.
+ * - **Bounded.** A line is at most `MAX_LINE_BYTES` (the subject is cut first, and, as a last resort, the answers: a call
+ *   is logged whatever Jev answered), withheld content at most `MAX_WITHHELD_BYTES`, and `read` holds a page of lines and
+ *   one buffer at a time, however long the files are.
  * - **Private.** Directories are `0o700`, files `0o600`.
  * - **Whole lines.** Appends to a day's file go through that file's queue, one `appendFile` for each line. A line that
- *   can't be read back (torn by a crash, or not ours) is skipped on read and counted in `skipped`.
+ *   can't be read back (torn by a crash, or not ours) is skipped on read and counted in `skipped`. The first append to a
+ *   file in a process starts a new line if the file's last line has no newline, so a torn line doesn't take the next one with it.
  *
  * `write` rejects when the disk does. A caller on the way to a decision must catch that and decide anyway: a log that
  * can't be written is no reason to fail a gate.
@@ -54,11 +57,20 @@ export interface JudgeLogLine {
   callId?: string
   /** The command, or the tool and size of a result, or `ask_judge`. Masked on write, and cut to fit the line. */
   subject: string
-  /** What Jev answered, by question id. `{}` when it didn't. */
+  /** What Jev answered, by question id. `{}` when it didn't. Cut down if the line would be too long: see `answersCut`. */
   answers: { [question: string]: JsonValue }
-  /** What the judge decided: `allow`, `ask`, `deny`, `withhold`, `warn`, `pass`, and so on. */
-  decision: string
-  latencyMs: number
+  /**
+   * Set (by `write`) on a line whose answers were cut down to fit it: to the one value of each question, or, if that was
+   * too long too, to `{}`.
+   */
+  answersCut?: boolean
+  /**
+   * What the judge decided: `allow`, `ask`, `deny`, `withhold`, `warn`, `pass`, and so on. `null` if none was recorded
+   * (the code that decides failed, say). A `decision` filter on `read` never matches it.
+   */
+  decision: string | null
+  /** How long the call took. `null` if Jev wasn't called: no key, a back-off, a question that was refused before sending. */
+  latencyMs: number | null
   /** Why the call failed, or `null`. Masked on write, and cut to fit the line. */
   error: string | null
   withheld?: string
@@ -71,7 +83,7 @@ export interface ReadQuery {
   decision?: string
   /** How many lines at most: a whole number from 1 to 500. Default 200. */
   limit?: number
-  /** The `next` of the page before: read the lines older than the last one of that page. */
+  /** The `next` of the page before: read the lines older than the last one of that page. `''` is as if it were not given. */
   before?: string
 }
 
@@ -103,6 +115,8 @@ const ID = /^[0-9a-f]{16}$/
 const WITHHELD_FILE = /^([0-9a-f]{16})\.txt$/
 const CURSOR = /^(\d{4}-\d{2}-\d{2}):(\d{1,15})$/
 const WITHHELD = 'withheld'
+/** The most of a tool's name a withheld file keeps, in UTF-16 units. */
+const MAX_TOOL_CHARS = 200
 
 /** Where a cut subject or error ends. */
 const CUT_MARK = '…'
@@ -133,13 +147,14 @@ function lineProblem(value: unknown): string | undefined {
   }
   if (typeof value.subject !== 'string') return 'subject must be a string'
   if (!isObject(value.answers)) return 'answers must be an object'
-  if (typeof value.decision !== 'string') return 'decision must be a string'
-  if (!isFiniteNumber(value.latencyMs)) return 'latencyMs must be a finite number'
+  if (value.decision !== null && typeof value.decision !== 'string') return 'decision must be a string or null'
+  if (value.latencyMs !== null && !isFiniteNumber(value.latencyMs)) return 'latencyMs must be a finite number or null'
   if (value.error !== null && typeof value.error !== 'string') return 'error must be a string or null'
   for (const field of ['agent', 'tool', 'callId', 'withheld'] as const) {
     if (value[field] !== undefined && typeof value[field] !== 'string') return `${field} must be a string`
   }
   if (value.child !== undefined && typeof value.child !== 'boolean') return 'child must be a boolean'
+  if (value.answersCut !== undefined && typeof value.answersCut !== 'boolean') return 'answersCut must be a boolean'
   return undefined
 }
 
@@ -156,6 +171,11 @@ function dayStart(day: string): number | undefined {
   const start = Date.parse(`${day}T00:00:00.000Z`)
   // V8 reads `2026-02-30` as March 2nd: a day that does not round-trip is not one.
   return Number.isNaN(start) || new Date(start).toISOString().slice(0, 10) !== day ? undefined : start
+}
+
+/** When the UTC day that `ms` is in ends. */
+function endOfDay(ms: number): number {
+  return Math.floor(ms / DAY_MS) * DAY_MS + DAY_MS
 }
 
 /** How many bytes `line` takes in a file: its JSON and a newline. */
@@ -190,17 +210,50 @@ function shrink(line: JudgeLogLine, field: 'subject' | 'error'): JudgeLogLine | 
   return withText(characters.slice(0, low).join('') + CUT_MARK)
 }
 
-/**
- * `line` as JSON, within `MAX_LINE_BYTES` with its newline. The subject is cut first. If the line is too long even with
- * no subject, the error is what is long, and it is cut instead and the subject kept; if it is long in both, the error
- * goes to its mark and the subject takes what is left.
- * @throws RangeError if no cut of the subject and the error makes it fit: it is the other fields that are long.
- */
-function fitLine(line: JudgeLogLine): string {
-  const fitted = shrink(line, 'subject')
+/** The fields of an answer that say what it is, which `compactAnswers` keeps: the choice and its confidence, the score, the noul. */
+const ANSWER_FIELDS = ['type', 'choice', 'score', 'normalized', 'noul', 'confidence', 'value'] as const
+
+/** One answer as its few plain values: what was chosen or scored or said, and how sure. The probabilities and the legend go. */
+function compactAnswer(answer: JsonValue): JsonValue {
+  if (isObject(answer)) {
+    const kept: { [key: string]: JsonValue } = {}
+    for (const field of ANSWER_FIELDS) {
+      const value = answer[field]
+      if (typeof value === 'number' || typeof value === 'boolean' || (typeof value === 'string' && value.length <= 100)) kept[field] = value
+    }
+    return kept
+  }
+  return typeof answer === 'number' || typeof answer === 'boolean' || (typeof answer === 'string' && answer.length <= 100) ? answer : null
+}
+
+function compactAnswers(answers: JudgeLogLine['answers']): JudgeLogLine['answers'] {
+  return Object.fromEntries(Object.entries(answers).map(([question, answer]) => [question, compactAnswer(answer)]))
+}
+
+/** `line` cut to fit by its subject and its error, or `undefined`: the subject first; if an empty one leaves it too long, the error; if both are long, the error to its mark and the subject what is left. */
+function shrinkText(line: JudgeLogLine): JudgeLogLine | undefined {
+  return shrink(line, 'subject')
     ?? shrink(line, 'error')
     ?? (typeof line.error === 'string' ? shrink({ ...line, error: CUT_MARK }, 'subject') : undefined)
-  if (fitted === undefined) throw new RangeError(`a log line is over ${MAX_LINE_BYTES} bytes even with its subject and error cut`)
+}
+
+/**
+ * `line` as JSON, within `MAX_LINE_BYTES` with its newline.
+ *
+ * 1. The subject is cut first. If the line is too long even with no subject, the error is what is long, and it is cut instead
+ *    and the subject kept; if it is long in both, the error goes to its mark and the subject takes what is left.
+ * 2. If that can't do it, the answers are what is long (twenty questions of 255 options each is 160 KB): they are cut to the
+ *    one value of each question, and the subject and error are cut to what is then left. The line says `answersCut`.
+ * 3. If even those are too long, the answers are `{}`, and the line says `answersCut`.
+ *
+ * Every call is logged: a line is cut, not dropped.
+ * @throws RangeError if nothing of this makes it fit: it is the other fields that are long (a tool name of 16 KB).
+ */
+function fitLine(line: JudgeLogLine): string {
+  const fitted = shrinkText(line)
+    ?? shrinkText({ ...line, answers: compactAnswers(line.answers), answersCut: true })
+    ?? shrinkText({ ...line, answers: {}, answersCut: true })
+  if (fitted === undefined) throw new RangeError(`a log line is over ${MAX_LINE_BYTES} bytes even with its subject, error and answers cut`)
   return JSON.stringify(fitted)
 }
 
@@ -212,6 +265,14 @@ function capWithheld(text: string): string {
   // A continuation byte (10xxxxxx) at the cut means the cut is inside a character: back up to the character's first byte.
   while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--
   return bytes.subarray(0, end).toString('utf8') + WITHHELD_CUT_MARK
+}
+
+/** `tool` as it's kept at the head of a withheld file: masked, and cut to `MAX_TOOL_CHARS`. */
+function toolName(tool: string): string {
+  const masked = maskSecrets(tool)
+  if (masked.length <= MAX_TOOL_CHARS) return masked
+  const head = masked.slice(0, MAX_TOOL_CHARS)
+  return (/[\ud800-\udbff]$/.test(head) ? head.slice(0, -1) : head) + CUT_MARK
 }
 
 /** The line in `text`, or `undefined` if it isn't JSON or isn't shaped like a log line. */
@@ -310,12 +371,31 @@ async function* linesBackward(file: string, end: number | undefined): AsyncGener
   }
 }
 
+/** Whether `file` is there, isn't empty and doesn't end with a newline. Best effort: a file that can't be read is taken to be fine. */
+async function endsMidLine(file: string): Promise<boolean> {
+  let handle: FileHandle | undefined
+  try {
+    handle = await open(file, constants.O_RDONLY | NO_FOLLOW)
+    const { size } = await handle.stat()
+    if (size === 0) return false
+    const last = Buffer.alloc(1)
+    const { bytesRead } = await handle.read(last, 0, 1, size - 1)
+    return bytesRead === 1 && last[0] !== 0x0a
+  } catch {
+    return false
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+}
+
 /** The judge's decision log in one directory. It needn't exist yet: the first write creates it. */
 export class JudgeLog {
   readonly #directory: string
   readonly #now: () => number
   /** The tail of each day file's queue, until it's done. */
   readonly #queues = new Map<string, Promise<void>>()
+  /** The day files that this process has appended to, and so has checked for a torn last line. */
+  readonly #tidy = new Set<string>()
 
   /**
    * @param directory - where the log is kept. Made absolute.
@@ -345,9 +425,10 @@ export class JudgeLog {
 
   /**
    * Append `line` to the file of its UTC day: masked (the subject, and the error if there is one), cut to `MAX_LINE_BYTES`
-   * (the subject first), and with only the fields of a `JudgeLogLine`. Writes to one file are made in the order of the calls.
-   * @throws TypeError if `line` isn't a `JudgeLogLine`; RangeError if `at` has no day or the line can't be made to fit.
-   *   Nothing is written then. Other errors are the disk's.
+   * (the subject first; then the error; then, as a last resort, the answers, which the line then says with `answersCut`),
+   * and with only the fields of a `JudgeLogLine`. Writes to one file are made in the order of the calls.
+   * @throws TypeError if `line` isn't a `JudgeLogLine`; RangeError if `at` has no day or the line can't be made to fit
+   *   (it is the other fields that are long). Nothing is written then. Other errors are the disk's.
    */
   async write(line: JudgeLogLine): Promise<void> {
     const given: unknown = isObject(line) && line.error === undefined ? { ...line, error: null } : line
@@ -365,6 +446,8 @@ export class JudgeLog {
       ...(source.callId === undefined ? {} : { callId: source.callId }),
       subject: maskSecrets(source.subject),
       answers: source.answers,
+      // Always listed, so that `fitLine` setting it puts it here; `JSON.stringify` leaves out what is `undefined`.
+      answersCut: source.answersCut,
       decision: source.decision,
       latencyMs: source.latencyMs,
       error: source.error === null ? null : maskSecrets(source.error),
@@ -373,26 +456,36 @@ export class JudgeLog {
     const text = `${fitLine(masked)}\n`
     const file = join(this.#directory, `${day}.jsonl`)
     await this.#serial(file, async () => {
+      // The first append to a file in this process: if the file's last line was torn off (a crash in the middle of an
+      // append), this line would be glued on to it and both would be lost. A newline first leaves the torn one on its own.
+      const first = !this.#tidy.has(file)
+      const written = first && await endsMidLine(file) ? `\n${text}` : text
+      if (first) this.#tidy.add(file)
       // O_NOFOLLOW: a link in the place of a day file is not ours to write through.
       const options = { mode: 0o600, flag: constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | NO_FOLLOW }
       try {
-        await appendFile(file, text, options)
+        await appendFile(file, written, options)
       } catch (error) {
         if (errorCode(error) !== 'ENOENT') throw error
         await mkdir(this.#directory, { recursive: true, mode: 0o700 })
-        await appendFile(file, text, options)
+        await appendFile(file, written, options)
       }
     })
   }
 
   /**
-   * Keep `content` as a withheld result: masked, and cut to `MAX_WITHHELD_BYTES` of UTF-8 between characters, with a mark
-   * where it was cut. Gives the id it is kept under, 16 random hex characters.
+   * Keep `content`, which the screen withheld from the result of `tool`, as a withheld result: masked, and cut to
+   * `MAX_WITHHELD_BYTES` of UTF-8 between characters, with a mark where it was cut. Gives the id it is kept under, 16
+   * random hex characters.
+   *
+   * The file is the tool's name (masked, and cut to 200 characters), as a JSON string on a line of its own, and the
+   * content after it.
+   * @throws TypeError if `tool` or `content` isn't a string.
    */
-  async withhold(content: string): Promise<string> {
-    if (typeof content !== 'string') throw new TypeError('content must be a string')
+  async withhold(input: { tool: string, content: string }): Promise<string> {
+    if (!isObject(input) || typeof input.tool !== 'string' || typeof input.content !== 'string') throw new TypeError('withhold takes { tool, content }, both strings')
     // Masked first, then cut: a cut can leave the start of a secret that no pattern would match any more.
-    const stored = capWithheld(maskSecrets(content))
+    const stored = `${JSON.stringify(toolName(input.tool))}\n${capWithheld(maskSecrets(input.content))}`
     const directory = join(this.#directory, WITHHELD)
     await mkdir(directory, { recursive: true, mode: 0o700 })
     for (let attempt = 0; ; attempt++) {
@@ -408,11 +501,12 @@ export class JudgeLog {
   }
 
   /**
-   * What `withhold` kept under `id`, or `undefined` if there is nothing there. `id` is checked before the file system is
-   * asked anything: anything but 16 lowercase hex characters (a path, a name with an extension, a non-string) is no id, so
-   * it is nothing there. A link in the place of the file isn't followed.
+   * What `withhold` kept under `id`: the tool and the (masked, cut) content. `undefined` if there is nothing there, or what
+   * is there isn't a file `withhold` made. `id` is checked before the file system is asked anything: anything but 16
+   * lowercase hex characters (a path, a name with an extension, a non-string) is no id, so it is nothing there. A link in
+   * the place of the file isn't followed.
    */
-  async withheld(id: string): Promise<string | undefined> {
+  async withheld(id: string): Promise<{ tool: string, content: string } | undefined> {
     if (typeof id !== 'string' || !ID.test(id)) return undefined
     let handle: FileHandle
     try {
@@ -421,12 +515,22 @@ export class JudgeLog {
       if (errorCode(error) === 'ENOENT' || errorCode(error) === 'ELOOP' || errorCode(error) === 'ENOTDIR') return undefined
       throw error
     }
+    let text: string
     try {
       if (!(await handle.stat()).isFile()) return undefined
-      return await handle.readFile('utf8')
+      text = await handle.readFile('utf8')
     } finally {
       await handle.close()
     }
+    const newline = text.indexOf('\n')
+    if (newline === -1) return undefined
+    let tool: unknown
+    try {
+      tool = JSON.parse(text.slice(0, newline))
+    } catch {
+      return undefined
+    }
+    return typeof tool === 'string' ? { tool, content: text.slice(newline + 1) } : undefined
   }
 
   /** The days there are files for, as `yyyy-mm-dd`, newest first. A name that isn't a real day, and anything that isn't a plain file, isn't one. */
@@ -463,7 +567,7 @@ export class JudgeLog {
     if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
       throw new RangeError(`limit must be a whole number from 1 to ${MAX_LIMIT}, not ${String(limit)}`)
     }
-    const cursor = query.before === undefined ? undefined : decodeCursor(query.before)
+    const cursor = query.before === undefined || query.before === '' ? undefined : decodeCursor(query.before)
     const purpose = query.purpose === undefined || (query.purpose as string) === '' ? undefined : query.purpose
     const decision = query.decision === undefined || query.decision === '' ? undefined : query.decision
 
@@ -503,10 +607,11 @@ export class JudgeLog {
   }
 
   /**
-   * Remove the day files whose whole UTC day is more than `maxAgeMs` ago, and the withheld files last written more than
-   * `maxAgeMs` ago. Gives how many of each went.
+   * Remove the day files, and the withheld files, that are more than `maxAgeMs` old. Gives how many of each went.
    *
    * - A day file goes when its day has ended by `now - maxAgeMs`, so one that still holds a line younger than that stays;
+   * - a withheld file goes by the same rule, for the UTC day it was last written in, so the line that names it is not left
+   *   in a day file that is still kept after the content is gone;
    * - only names that are a day file or a withheld file are touched, and only plain files: links aren't followed, and a
    *   `withheld` that is a link is left alone;
    * - a day file goes through its queue, after the writes already made to it.
@@ -517,9 +622,10 @@ export class JudgeLog {
     const cutoff = this.#now() - maxAgeMs
     const removed = { days: 0, withheld: 0 }
     for (const day of await this.#days()) {
-      if (dayStart(day)! + DAY_MS > cutoff) continue
+      if (dayStart(day)! + DAY_MS > cutoff) continue // its day has not ended by the cutoff
       const file = join(this.#directory, `${day}.jsonl`)
       if (await this.#serial(file, () => unlinkIfThere(file))) removed.days++
+      this.#tidy.delete(file)
     }
     const directory = join(this.#directory, WITHHELD)
     let entries
@@ -541,7 +647,8 @@ export class JudgeLog {
         if (errorCode(error) === 'ENOENT') continue
         throw error
       }
-      if (modified < cutoff && await unlinkIfThere(file)) removed.withheld++
+      // By the end of the day it was written in, as a day file is: the line that names it is in a file of about that day, and must not outlive it.
+      if (endOfDay(modified) <= cutoff && await unlinkIfThere(file)) removed.withheld++
     }
     return removed
   }
