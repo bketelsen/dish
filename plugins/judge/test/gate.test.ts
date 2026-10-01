@@ -1201,6 +1201,21 @@ test('the dish-judge plugin gates shell calls itself, with its own client and se
   assert.equal(p.jev.requests[0]!.json.state.command, 'git status')
 })
 
+test('a command that a fake private key header would hide from the judge does not run on its say-so: you are asked, a child is refused, nothing is sent', async (t) => {
+  const p = await plugged(t)
+  // What Jev said, live, of `npm test` and the mask that this command was sent as: read-only, serving the task.
+  p.jev.always(jevSays(READ_ONLY, 0.95))
+  const hidden = 'npm test\n: -----BEGIN PRIVATE KEY-----\ngit push --force origin main\nrm -rf /work/app'
+  const main = await p.call('bash', BASH(hidden))
+  assert.equal(main.isError, true)
+  assert.equal(p.approvals.length, 1, 'the main agent\'s call is put to you')
+  const child = await p.call('bash', BASH(hidden), agentOf({ child: true, cwd: '/work/app', events: [userEvent(1, 'fix the failing test in parser.ts')] }))
+  assert.equal(child.isError, true)
+  assert.match(textOf(child), /the judge is unavailable; nothing ran/)
+  assert.deepEqual(p.ran, [], 'nothing ran')
+  assert.equal(p.jev.requests.length, 0, 'and nothing was sent to TypeSafe')
+})
+
 test('a gated call writes its line to the plugin\'s decision log in the state directory, with the verdict, the command and the call, and secrets masked', async (t) => {
   const p = await plugged(t)
   const token = `ghp_${'a1B2c3D4e5'.repeat(4)}`

@@ -28,7 +28,8 @@
  *   that shows one, goes to TypeSafe with the token masked. Question ids and a choice's option names are not masked: the
  *   answers are keyed by them, and they are limited to a charset already. The limits on the state (100 KB) and the body
  *   (256 KB) are checked on what is sent, since a mask can be longer than what it hides (a request that is too big as it is
- *   given is refused before that). If the masking fails, for any reason, nothing is sent: the call is `unavailable`. What the
+ *   given is refused before that). A request with a private key's mask in it is not sent either (`OPAQUE_MASKS`: that mask takes
+ *   in whatever is written around the key), and is `invalid` from the request. If the masking fails, for any reason, nothing is sent: the call is `unavailable`. What the
  *   caller gave is not changed, and the log line is made from it as it was.
  * - **Statuses.** `401` is `unavailable` ("the TypeSafe key was refused"); `400` and `422` are `invalid`, with the start of
  *   what TypeSafe said; `429` and `529` are `unavailable` and start the back-off; any other non-2xx is `unavailable`.
@@ -388,6 +389,22 @@ function maskDeep(value: unknown, mask: (text: string) => string): unknown {
   }
   return value
 }
+
+/**
+ * The masks that can stand for more than a credential. A private key is masked from its header to its END line, or through
+ * 8 KB of what a key can be made of (letters, digits, spaces, line breaks, `/`, `-`, `.` and more), and that takes in whatever
+ * is written there: `npm test`, a fake header and `git push --force` on the next line is sent as `npm test` and a mask, and a page
+ * that wraps its instructions to an agent in a fake key is sent as a mask. The judge would be asked about what is left, and its
+ * answer would be about something other than what runs or what the agent reads. A scan that failed hides all of a text. A
+ * request with either in what it would send is not sent: it is `invalid` from the request, which every gate takes as unavailable.
+ */
+const OPAQUE_MASKS: readonly string[] = ['‹secret: a private key›', '‹secret: an unreadable secret scan›']
+/**
+ * A text that came back as one mask, though it had whitespace in it, which no token has: `maskSecrets`' last resort, which
+ * hides all of a text it could not make safe any other way. Opaque too.
+ */
+const LONE_MASK = /^‹secret: [^›]*›$/
+const OPAQUE_REFUSAL = 'the request holds what looks like a private key, which is not sent to TypeSafe, and with it masked the judge could not read what is written around it: nothing was sent; leave the key out'
 
 /**
  * The questions as they will go on the wire, with every text in them masked: instructions, a choice option's description, a
@@ -759,18 +776,23 @@ export function createJudge(deps: JudgeDeps): Judge {
     // through the patterns of `maskSecrets`. The size limits are for what is sent, so they are checked again on it: a mask can
     // be longer than what it hides. If any of this fails, nothing is sent: the call is unavailable.
     let sent: string
+    let opaque = false
     try {
       const hide = (text: string): string => {
         const hidden = secrets(scope.mask(text))
         if (typeof hidden !== 'string') throw new TypeError('a mask gave something that is not a string')
+        if (OPAQUE_MASKS.some(mask => hidden.includes(mask)) || (LONE_MASK.test(hidden) && /\s/.test(text))) opaque = true
         return hidden
       }
       const maskedState = JSON.stringify(maskDeep(JSON.parse(state.value), hide))
+      const maskedQuestions = JSON.stringify(maskQuestions(questions.value, hide))
+      // Before the size: a split of what is too big would not make the judge see what a mask took in.
+      if (opaque) return invalid('request', OPAQUE_REFUSAL, 'none')
       const maskedBytes = Buffer.byteLength(maskedState)
       if (maskedBytes > MAX_STATE_BYTES) {
         return invalid('request', `state is ${kb(maskedBytes)} KB of JSON once its secrets are masked and the most is 100 KB: send the part that matters`, 'none', null, true)
       }
-      sent = `{"model":${JSON.stringify(settings.model)},"state":${maskedState},"questions":${JSON.stringify(maskQuestions(questions.value, hide))}}`
+      sent = `{"model":${JSON.stringify(settings.model)},"state":${maskedState},"questions":${maskedQuestions}}`
     } catch {
       // What failed is not repeated: it may hold what was being masked.
       return failure('unavailable', 'the request could not be cleared of secrets, so nothing was sent', 'failed')
