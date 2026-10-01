@@ -260,27 +260,40 @@ Runtime data, not config. It lives at `$XDG_STATE_HOME/dish/judge/<yyyy-mm-dd>.j
 ## Web UI: Settings → Judge
 
 A `settings.section`, built like Prompts:
-- **Key:** a field to paste the key, through dsh's `remote.credentials`, using `set` and `unset` for `TYPESAFE_API_KEY`. The page shows only whether a key is set, never the key itself.
+- **Key:** a field to paste the key, through dsh's `remote.credentials` in the browser, using `describe`, `set` and `unset` for the credential's name (`keyName`, which `status()` gives).
+  - The key goes from the browser to dsh and to nobody else: **no method of `dishJudge` takes it or returns it**.
+  - The page shows only "set" or "not set" and where dsh says it comes from, never the key. The field is emptied the moment Save is pressed, and what a failure says has the key taken out.
+  - A key from the launch environment can't be changed from the page, and the card says so.
 - **Status:**
   - reachable, unavailable or no key;
   - the last error;
-  - p50 and p95 latency over the last 100 calls;
+  - p50 and p95 latency over the last 100 calls, and how many of those calls failed;
   - a **Test** button, which runs one fixed noul and shows the answer and latency.
 - **Thresholds:** a form over `judge.yaml`, saved as you with a base and conflict check, with History for the file.
-- **Recent decisions:** the last 200 log lines, filterable by purpose and decision, newest first.
-  - Withheld results open their stored content.
-  - Each command line shows the agent, the command, the reading and the decision.
+  - The fields are the command thresholds (`readOnly`, `reversible`, `servesTask`), the screening thresholds (`warn`, `withhold`, `chunkChars`), `timeoutMs`, `model` and the two tool lists, one name to a line.
+  - **The server validates**, with the same `parseSettings` the store applies, so there is one source of truth: a save that is refused shows its message, which names the setting by its path in the file (`commands.readOnly: ...`).
+  - **What is saved** is the shipped file with the values replaced: its key order and its comments stay, so History shows a diff of values only.
+  - **Warnings** never block a save: `tools.gated` that doesn't cover `bash` (a typo, or a list that kept only `pwsh`) leaves shell commands without a gate; and a changed `model` means the thresholds were set against the old one.
+  - A conflict keeps the form's values and offers **Reload** (drop the edit) or **Keep mine**.
+- **Recent decisions:** the log, newest first, in pages of 100 (up to 1000 lines are kept in the page), filterable by purpose and by decision.
+  - **The set of decisions is open.** The filter takes any text and suggests the known ones: `allow`, `ask`, `deny`, `cancel` (the gate); `pass`, `allowed-once`, `rejected` (the approval answerer); `withhold`, `warn`, `pass`, `not-screened`, `split` (the screen); `answered`, `refused`, `unavailable`, `too-big` (`ask_judge`); and `test` (the Test button).
+  - Each command line shows the agent, the command, the reading (the effect Jev chose with its probabilities, and whether the command serves the task) and the decision.
+  - Lines that share a `callId` (a command and its approval, or the several Jev calls of one screen) are shown together.
+  - Withheld results open their stored content on request.
+  - **Everything the log says is shown as text.** Commands, tool names, errors and withheld content are written by agents and web pages: the page never builds markup from them.
 
 The page uses its own remote, `dishJudge`:
 
 | Method | Returns |
 |---|---|
-| `status()` | `JudgeStatus` |
-| `test()` | `Outcome<{ answer, latencyMs }>` |
-| `thresholds()` | `Outcome<{ text, settings, commit }>` |
-| `saveThresholds(settings, base, note)` | `Outcome<CommitInfo \| null>` |
-| `log(purpose, decision, limit, before)` | `Outcome<LogLine[]>` |
-| `withheld(id)` | `Outcome<{ tool, content }>` |
+| `status()` | `JudgeStatus` and `keyName`, the credential's name (not an `Outcome`: it has nothing to refuse) |
+| `test()` | `Outcome<{ answer, latencyMs }>`; `JUDGE_UNAVAILABLE` with the client's message when Jev can't answer |
+| `thresholds()` | `Outcome<{ text, settings, commit, missing, problem? }>`; `commit` is `null` with no store, and `problem` says why a stored file that doesn't pass the check isn't in use |
+| `saveThresholds(settings, base, note)` | `Outcome<CommitInfo \| null>`; `INVALID` with `parseSettings`' message, `CONFLICT`, `UNAVAILABLE` with no store |
+| `log(purpose, decision, limit, before)` | `Outcome<{ lines, next?, skipped }>`: a page, newest first; pass `next` as `before` for the page after it. `''` is no filter; `limit` 0 is the default (200) |
+| `withheld(id)` | `Outcome<{ tool, content }>`; `NOT_FOUND` for an id that was never kept or has been pruned |
+
+Whatever leaves `dishJudge` that came from outside the code (log lines, withheld content, messages) passes the secret mask once more.
 
 ## Configuration
 

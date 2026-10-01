@@ -53,6 +53,7 @@ import { createJudge, currentKeyMask } from './client.ts'
 import { registerCommandGate } from './gate.ts'
 import { JudgeLog } from './log.ts'
 import type { JudgeLogLine, ReadQuery, ReadResult } from './log.ts'
+import { JudgeRemote } from './remote.ts'
 import { registerResultScreen } from './screen.ts'
 import { DEFAULT_SETTINGS, DEFAULT_TEXT, JUDGE_SPEC, parseSettings } from './settings.ts'
 import type { JudgeSettings } from './settings.ts'
@@ -633,6 +634,10 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
   // The result screen (see `screen.ts`): a `tools/post-execute` listener, not prepended. It looks the client, the settings and
   // the log up with `ctx.get` on each result.
   registerResultScreen(ctx)
+
+  // Settings → Judge's server half (see `remote.ts`): a child plugin that needs `dishJudge` and `judge`, so it goes when they do.
+  // The page sets the key through dsh's own credentials remote and never through this one, which is told only the key's name.
+  ctx.plugin(JudgeRemote, { keyName })
 
   // In the background. A failure is logged, and the plugin works all the same: old files that stay are only disk.
   return pruneAtLoad(judgeLog, { keepMs: KEEP_LOG_MS, slowAfterMs: internals.pruneSlowAfterMs ?? PRUNE_SLOW_AFTER_MS, directory, logger })
