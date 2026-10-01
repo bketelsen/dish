@@ -1,0 +1,8 @@
+# The role prompts (the dishPrompts service). It works without dish-config, on
+# the shipped defaults, and claims its documents and seeds them when the store
+# is there, so there is no order to keep. Config is optional: `stateDirectory`
+# (where per-agent snapshots are kept; the XDG state directory for dish by
+# default) and `terminal`.
+- insert:
+    - id: dish-prompts
+      name: dish-prompts

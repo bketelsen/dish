@@ -4,15 +4,33 @@
   "private": true,
   "description": "Role prompts for dish agents, kept in the config store",
   "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "files": [
     "src",
-    "defaults"
+    "defaults",
+    "cordis.patch.yml"
   ],
   "license": "MIT",
   "keywords": [
     "dsh-plugin"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "dependencies": {
-    "dish-config": "workspace:*"
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "dish-config": "workspace:*",
+    "dish-kit": "workspace:*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
   }
 }
