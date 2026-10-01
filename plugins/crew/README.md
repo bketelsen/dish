@@ -70,6 +70,7 @@ reviewerFamilies: [openai, anthropic]
   - A session can start `perSession` children in all. Follow-ups don't count toward it.
 - **Tools.**
   - A role's `tools` are an allow list. Tools the main agent can't pass on are dropped when the child starts; those are the ones on its own scope, not the preset's.
+  - Every shipped role lists `ask_judge`, which comes from [`dish-judge`](../judge/). Without that plugin there is no such tool, and the name is dropped like any other missing one: children start with the rest of their tools.
   - Whatever the file says, a child never gets `delegate`, dsh's delegation and workflow tools, the goal or plan tools, `ask_user_question` or `present`.
 
 A role also needs a prompt: `prompts/crew/<role>.md`, or a shipped default.

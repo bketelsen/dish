@@ -49,6 +49,8 @@ interface Options {
   dishConfig?: boolean
   /** Whether dsh's agent registry is there. */
   agents?: boolean
+  /** Global tools beyond the standard ones, as a plugin that isn't crew registers them (dish-judge's `ask_judge`). */
+  globalTools?: string[]
 }
 
 /** Everything a test of the `delegate` tool stands on: a real Context, the real tool registry, and recording stubs for the rest. */
@@ -107,7 +109,7 @@ async function world(options: Options = {}): Promise<World> {
   disposables.push(await ctx.plugin(ToolRuntime, {}))
   let owner!: Context
   disposables.push(await ctx.plugin({ name: 'scope-owner', inject: ['tools'], apply(own: Context) { owner = own } } as never, undefined as never))
-  for (const name of GLOBAL_TOOLS) ctx.tools.register(stubTool(name))
+  for (const name of [...GLOBAL_TOOLS, ...options.globalTools ?? []]) ctx.tools.register(stubTool(name))
   const presetKey = {}
   const preset = createScope(owner, presetKey)
   disposables.push(preset)
@@ -470,6 +472,37 @@ test('each role starts on its own model and with its own tools', async () => {
   assert.deepEqual(architect!.request.toolFilter, { allow: ['edit', 'glob', 'grep', 'read', 'send_message', 'skill', 'todo_write', 'web_fetch', 'web_search', 'write'] })
   assert.deepEqual(researcher!.request.agentOptions, { provider: 'github-copilot', model: 'claude-sonnet-5.5' })
   assert.deepEqual(researcher!.request.toolFilter, { allow: ['glob', 'grep', 'read', 'send_message', 'skill', 'todo_write', 'web_fetch', 'web_search'] })
+})
+
+test('ask_judge: every shipped role lists it, and a child starts without it when dish-judge isn\'t installed, with it when it is', async () => {
+  // Every role in one world, so the running and writer limits are raised: this isn't about them.
+  const settings = settingsFrom((d) => { d.limits.running = 10; d.limits.writers = 10 })
+  const bare = await world({ settings })
+  const installed = await world({ settings, globalTools: ['ask_judge'] })
+  for (const [role, title] of [['architect', 'plan it'], ['coder', 'add login'], ['reviewer', 'check it'], ['researcher', 'look it up'], ['ops', 'ship it'], ['writer', 'write it up']]) {
+    assert.ok(DEFAULT_SETTINGS.roles[role]!.tools.includes('ask_judge'), role)
+    const args = { role, title, task: 'Do it.', ...role === 'reviewer' ? { reviews: 'main' } : {} }
+    // No ask_judge tool exists: the name is left out of the filter, the child starts, and nothing is refused.
+    const before = bare.starts.length
+    const started = await bare.delegate(args)
+    assert.equal(bare.starts.length, before + 1, role)
+    assert.equal(started.role, role)
+    const without = bare.starts.at(-1)!.request.toolFilter!.allow!
+    assert.ok(without.length > 0 && !without.includes('ask_judge'), role)
+    // dish-judge's global tool is inherited, so it is allowed, and the rest of the list is the same.
+    await installed.delegate(args)
+    const withJudge = installed.starts.at(-1)!.request.toolFilter!.allow!
+    assert.deepEqual(withJudge, [...without, 'ask_judge'].sort(), role)
+  }
+})
+
+test('a role whose only tool is ask_judge is refused with what to do when dish-judge isn\'t installed, and nothing is started', async () => {
+  const w = await world({ settings: settingsFrom((d) => { d.roles.researcher.tools = ['ask_judge'] }) })
+  const message = await refusal(w.delegate(RESEARCHER))
+  assert.match(message, /^role researcher would have no tools here/)
+  assert.match(message, /crew\.yaml lists: ask_judge/)
+  assert.match(message, /roles\.researcher\.tools/)
+  assert.equal(w.starts.length, 0)
 })
 
 test('a model override from crew.yaml is used, and one that isn\'t is refused with the models offered', async () => {

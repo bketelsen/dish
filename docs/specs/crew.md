@@ -60,12 +60,12 @@ limits:
   writers: 1              # of those, roles with writes: true
   perSession: 30          # delegations a session may start, ever
 roles:
-  architect:  { tier: strong, family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message] }
-  coder:      { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message] }
-  reviewer:   { tier: mid,    reviews: true,                    tools: [read, glob, grep, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message] }
-  researcher: { tier: mid,    family: anthropic,                tools: [read, glob, grep, web_search, web_fetch, skill, todo_write, send_message] }
-  ops:        { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_search, web_fetch, skill, todo_write, send_message] }
-  writer:     { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message] }
+  architect:  { tier: strong, family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
+  coder:      { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
+  reviewer:   { tier: mid,    reviews: true,                    tools: [read, glob, grep, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
+  researcher: { tier: mid,    family: anthropic,                tools: [read, glob, grep, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
+  ops:        { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
+  writer:     { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
 ```
 
 **With direct API keys, a family can have a provider of its own.** The shipped file sends both families through the top-level `provider`, because Copilot serves Claude and GPT alike. With direct keys, Claude comes through an `anthropic` provider and GPT through an `openai` one, so each family says so, next to its tiers. A family without a `provider` runs on the top-level one, which stays required. This is an alternative example, not the shipped file; the `limits` and `roles` are as above.
@@ -136,6 +136,7 @@ Empty strings are treated as absent. The checks run in this order, before anythi
 
 A child's allow list is its role's `tools` from `crew.yaml`, intersected with the tools the parent can see when the child starts.
 - A tool that's missing then, such as `bash` on Windows (where it's `pwsh`) or `read_image` without attachments, is dropped, not an error.
+- **`ask_judge`** is in every shipped role. It belongs to `dish-judge`, which registers it as a global tool, so children inherit it. Without `dish-judge` installed no such tool exists, so the name is dropped like any other missing one: the child starts with the rest of its role. A role whose only tool is `ask_judge` is the "no tools" refusal below.
 - `pwsh` is added wherever `bash` is listed.
 - Whatever the file says, a child never gets these, even if a role lists them: `delegate`, `subagent`, `subagent_fork`, `subagent_codex`, `subagent_claude_code`, `list_subagent_models`, `workflow`, `ralph`, `interrupt_agent`, `list_agents`, `ask_user_question`, `create_goal`, `update_goal`, `exit_plan_mode`, `present`, or dsh's reserved `run_code`.
 - "Tools the parent can see" means tools the child can inherit: those in the parent's preset and global layers, not tools installed on the parent agent's own scope (such as dsh-schedule's), which dsh won't let a child's filter name. Children can't ask you anything: dsh runs them with approval policy `never`.

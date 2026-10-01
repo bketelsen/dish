@@ -26,6 +26,8 @@ function settingsOf(text: string): CrewSettings {
 
 const ROLES = ['architect', 'coder', 'reviewer', 'researcher', 'ops', 'writer']
 const STANDARD_TOOLS = ['read', 'glob', 'grep', 'skill', 'todo_write', 'send_message']
+/** The tool dish-judge registers. It's in every shipped role so that crew children can ask the judge. */
+const JUDGE_TOOL = 'ask_judge'
 
 // --- the shipped default --------------------------------------------------------------------------
 
@@ -85,7 +87,7 @@ test('the default has the models, limits and roles of the spec', () => {
   assert.equal(coder.family, 'anthropic')
   assert.equal(coder.writes, true)
   assert.equal(coder.reviews, false)
-  assert.deepEqual([...coder.tools], ['read', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual([...coder.tools], ['read', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message', 'ask_judge'])
   assert.equal(settings.roles.architect!.tier, 'strong')
   // writes and reviews are false unless the file says so.
   const researcher = settings.roles.researcher!
@@ -537,4 +539,30 @@ test('the default has every tool a role lists, once', () => {
     assert.equal(new Set(settings.tools).size, settings.tools.length, role)
     for (const tool of STANDARD_TOOLS) assert.ok(settings.tools.includes(tool), `${role} lacks ${tool}`)
   }
+})
+
+test('every shipped role lists ask_judge, last, and the tools it had before are unchanged', () => {
+  for (const [role, settings] of Object.entries(DEFAULT_SETTINGS.roles)) {
+    assert.equal(settings.tools.at(-1), JUDGE_TOOL, role)
+    assert.equal(settings.tools.filter(tool => tool === JUDGE_TOOL).length, 1, role)
+  }
+  // The tools before it are the spec's roles from before dish-judge: the lists only gained one name.
+  const before = (role: string) => DEFAULT_SETTINGS.roles[role]!.tools.slice(0, -1)
+  assert.deepEqual(before('architect'), ['read', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('reviewer'), ['read', 'glob', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('researcher'), ['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('writer'), ['read', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+})
+
+test('a tool name is only a name: a file that lists ask_judge is valid whether or not dish-judge is installed', () => {
+  // The settings never look at a tool registry, so no listing can make crew.yaml unsaveable. What a name means is decided
+  // when a child starts (see allow.test.ts), and a name nobody provides is left out then.
+  const text = shippedWith((d) => {
+    d.roles.researcher.tools = ['read', 'ask_judge', 'a_tool_no_plugin_provides']
+    d.roles.coder.tools = ['ask_judge']
+  })
+  assert.equal(CREW_SPEC.validate('crew.yaml', text), undefined)
+  const settings = settingsOf(text)
+  assert.deepEqual([...settings.roles.researcher!.tools], ['read', 'ask_judge', 'a_tool_no_plugin_provides'])
+  assert.deepEqual([...settings.roles.coder!.tools], ['ask_judge'])
 })
