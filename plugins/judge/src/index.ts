@@ -47,6 +47,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import { maskSecrets, printOwnLogs, xdgPaths } from 'dish-kit'
+import { askJudgeTool } from './ask.ts'
 import { createJudge, currentKeyMask } from './client.ts'
 import { registerCommandGate } from './gate.ts'
 import { JudgeLog } from './log.ts'
@@ -614,6 +615,13 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
   // `tools/result` listener that forgets a call's verdict when it settles. It looks the client, the settings and the sandbox
   // policy up with `ctx.get` on each call. The cache is for Task 5's approval answerer.
   const verdicts = registerCommandGate(ctx)
+
+  // ask_judge is a global tool, so every agent sees it (a crew child through its allow list). It registers when a `tools`
+  // service is there, through the child context, so it goes when that does, or this plugin. The judge is read with
+  // `ctx.get` on each call, as a service this block does not inject.
+  ctx.inject(['tools'], (child) => {
+    child.tools.register(askJudgeTool(() => ctx.get('judge')))
+  })
 
   // In the background. A failure is logged, and the plugin works all the same: old files that stay are only disk.
   return pruneAtLoad(judgeLog, { keepMs: KEEP_LOG_MS, slowAfterMs: internals.pruneSlowAfterMs ?? PRUNE_SLOW_AFTER_MS, directory, logger })
