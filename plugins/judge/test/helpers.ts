@@ -1,3 +1,6 @@
+import { createServer } from 'node:http'
+import type { IncomingHttpHeaders, IncomingMessage, Server, ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -129,4 +132,145 @@ export async function provideStub(ctx: Context, name: string, value: unknown): P
     name: `stub-${name}`,
     apply(own: Context) { (own as unknown as { provide(name: string, value: unknown): void }).provide(name, value) },
   } as never, undefined as never)
+}
+
+// --- a fake Jev --------------------------------------------------------------------------------------
+
+/** One request the fake Jev received, with its body read in full. */
+export interface RecordedRequest {
+  method: string
+  /** The path and query, as sent. */
+  path: string
+  headers: IncomingHttpHeaders
+  /** The body as text. */
+  text: string
+  /** The body parsed as JSON, or `undefined` if it isn't. */
+  json: any
+}
+
+/**
+ * How the fake Jev answers one request. `delayMs` holds the answer back first, so a test can run the client into its
+ * time limit; a `drop` after a delay is a connection that dies late.
+ */
+export type Behaviour = { delayMs?: number } & (
+  /** 200 with `body` as JSON. A function gets the request, so an answer can follow the questions that were asked. */
+  | { kind: 'answer', body: unknown }
+  /** Any status, with optional headers and a plain-text body. */
+  | { kind: 'status', status: number, headers?: Record<string, string>, body?: string }
+  /** 200 with a body that is not JSON (or is the given text, which the test makes sure isn't). */
+  | { kind: 'malformed', body?: string }
+  /** No answer at all: the connection is closed. */
+  | { kind: 'drop' }
+)
+
+export interface FakeJev {
+  /** `http://127.0.0.1:<port>`, no trailing slash. */
+  readonly url: string
+  /** Every request so far, in order. */
+  readonly requests: RecordedRequest[]
+  /** Answer the next requests as given, one behaviour for each, in order. */
+  queue(...behaviours: Behaviour[]): void
+  /** Answer every request the queue doesn't cover. Until set, that is a 500 saying nothing was scripted. */
+  always(behaviour: Behaviour): void
+  close(): Promise<void>
+}
+
+const servers: FakeJev[] = []
+
+after(async () => {
+  await Promise.all(servers.splice(0).map(server => server.close()))
+})
+
+/**
+ * A `node:http` server on a free localhost port that plays Jev: it records every request and answers as scripted. It is
+ * closed (its connections too, and any answer still being held back) when the test file finishes, or by `close()`.
+ */
+export async function startFakeJev(): Promise<FakeJev> {
+  const requests: RecordedRequest[] = []
+  const scripted: Behaviour[] = []
+  let fallback: Behaviour = { kind: 'status', status: 500, body: 'fake Jev: nothing scripted' }
+  const timers = new Set<NodeJS.Timeout>()
+
+  const respond = (behaviour: Behaviour, request: RecordedRequest, req: IncomingMessage, res: ServerResponse): void => {
+    switch (behaviour.kind) {
+      case 'answer': {
+        const body = typeof behaviour.body === 'function' ? (behaviour.body as (request: RecordedRequest) => unknown)(request) : behaviour.body
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(body))
+        return
+      }
+      case 'status':
+        res.writeHead(behaviour.status, { 'content-type': 'text/plain', ...behaviour.headers })
+        res.end(behaviour.body ?? '')
+        return
+      case 'malformed':
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(behaviour.body ?? '{"answers": {"truncated": ')
+        return
+      case 'drop':
+        req.socket.destroy()
+    }
+  }
+
+  const server: Server = createServer((req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (chunk: Buffer) => chunks.push(chunk))
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8')
+      let json: unknown
+      try { json = JSON.parse(text) } catch { /* not JSON: left undefined */ }
+      const request: RecordedRequest = { method: req.method ?? '', path: req.url ?? '', headers: req.headers, text, json }
+      requests.push(request)
+      const behaviour = scripted.shift() ?? fallback
+      if (behaviour.delayMs === undefined || behaviour.delayMs <= 0) {
+        respond(behaviour, request, req, res)
+        return
+      }
+      const timer = setTimeout(() => {
+        timers.delete(timer)
+        if (!res.destroyed) respond(behaviour, request, req, res)
+      }, behaviour.delayMs)
+      timers.add(timer)
+    })
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const { port } = server.address() as AddressInfo
+
+  const jev: FakeJev = {
+    url: `http://127.0.0.1:${port}`,
+    requests,
+    queue: (...behaviours) => { scripted.push(...behaviours) },
+    always: (behaviour) => { fallback = behaviour },
+    close: async () => {
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear()
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    },
+  }
+  servers.push(jev)
+  return jev
+}
+
+/** What Jev answers with: its envelope around `answers`. */
+export function jevBody(answers: Record<string, unknown>): Record<string, unknown> {
+  return { model: 'jev-1.13.0', answers, usage: { input_tokens: 304, output_tokens: 18 } }
+}
+
+/** A noul answer, as Jev writes it. */
+export function noulAnswer(p: number): unknown {
+  return { type: 'noul', noul: p }
+}
+
+/** A choice answer, as Jev writes it. */
+export function choiceAnswer(choice: string, probabilities: Record<string, number>, confidence = 0.8): unknown {
+  return { type: 'choice', choice, probabilities, confidence }
+}
+
+/** A score answer, as Jev writes it. `legend` is left out: the client doesn't need it. */
+export function scoreAnswer(score: number, probabilities: Record<string, number>, confidence = 0.9): unknown {
+  return { type: 'score', score, probabilities, confidence }
 }

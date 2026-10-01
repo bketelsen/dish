@@ -17,7 +17,8 @@
     "plugins/*/src",
     "packages/*/src",
     "packages/*/test",
-    "plugins/*/test"
+    "plugins/*/test",
+    "plugins/*/test-live"
   ],
   "exclude": [
     "plugins/*/src/client",

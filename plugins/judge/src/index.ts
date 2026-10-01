@@ -4,7 +4,9 @@
  * This is the host plugin. It is the one place the judge's pieces are wired together; for now it:
  *
  * - provides the `dishJudge` service: `settings()` is the `judge.yaml` in the config store as it is now (see
- *   `settings.ts`). Later steps add the Jev client, the decision log and the listeners to this plugin;
+ *   `settings.ts`). Later steps add the decision log and the listeners to this plugin;
+ * - provides the `judge` service, the Jev client (see `client.ts`): the key is looked up in dsh's credential store on
+ *   every call, the model and time limit are the settings of the moment;
  * - claims `judge.yaml` in the store, closed to agents, and seeds it when `dishConfig` is there. `dishConfig` is
  *   optional, so there is no order to keep: with no store, every answer is the shipped default;
  * - checks its configuration when it loads, so a bad setting fails the plugin to load rather than the first call;
@@ -16,11 +18,16 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
+import { createJudge } from './client.ts'
+import type { LogLine } from './client.ts'
 import { DEFAULT_SETTINGS, DEFAULT_TEXT, JUDGE_SPEC, parseSettings } from './settings.ts'
 import type { JudgeSettings } from './settings.ts'
 
+export { createJudge } from './client.ts'
+export type { Answer, Judge, JudgeAgent, JudgeDeps, JudgeRequest, JudgeResult, JudgeStatus, JsonValue, LogLine, Purpose, Question } from './client.ts'
 export type { CommandSettings, JudgeSettings, ParseResult, ScreeningSettings, ToolSettings } from './settings.ts'
 
 export const name = 'dish-judge'
@@ -187,10 +194,10 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  // Checked now, so a bad setting fails the plugin to load rather than the first call. The client and the log, which
-  // use them, come in later steps.
-  baseUrlOf(text(config.baseUrl))
-  keyNameOf(text(config.keyName))
+  // Checked now, so a bad setting fails the plugin to load rather than the first call. The log, which uses the state
+  // directory, comes in a later step.
+  const baseUrl = baseUrlOf(text(config.baseUrl))
+  const keyName = keyNameOf(text(config.keyName))
   resolve(stateDirectoryPath(text(config.stateDirectory)))
 
   // `ctx.get` is read on every call: the store is optional, and may come, go and come back.
@@ -217,4 +224,16 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   ctx.provide('dishJudge', { settings })
+
+  // The key is read from dsh's credential store on every call, by the name in the settings, and never kept: the client
+  // holds it for one request. `credentials` is a sibling's service, so it is looked up with `ctx.get` and may be absent;
+  // there is then no key, which is an unavailable judge, not an error. The name is an environment-variable name, which
+  // `keyNameOf` has checked, so it is a reference as dsh means it.
+  const key = async (): Promise<string | undefined> => {
+    const resolved = await ctx.get('credentials')?.resolve(keyName as CredentialRef)
+    return resolved?.value
+  }
+  // TODO(Task 3/4): write each line to the decision log (`JudgeLog`, in the state directory) once there is one.
+  const log = (_line: LogLine): void => {}
+  ctx.provide('judge', createJudge({ baseUrl, key, settings, log }))
 }
