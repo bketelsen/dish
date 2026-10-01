@@ -9,7 +9,7 @@ import { DEFAULTS } from '../src/defaults.ts'
 import type { DishPrompts, Persona } from '../src/index.ts'
 import { buildPreview, buildVariables } from '../src/preview.ts'
 import type { ErrorCode, Outcome } from '../src/protocol.ts'
-import type { PromptsRemote } from '../src/remote.ts'
+import { PromptsRemote } from '../src/remote.ts'
 import { dirs, mountConfig, mountPrompts, seeded, userWrite, waitFor, watchLogs } from './helpers.ts'
 
 const IDENTITY = 'You are an AI agent.'
@@ -307,16 +307,49 @@ test('preview of a name that is no role is NOT_FOUND, and of a role that is no r
   })
 })
 
+test('a crew role deleted between the roles check and the texts is NOT_FOUND, not an error the gateway folds; other failures still throw', async () => {
+  const gone = (what: string): DishPrompts => prompts({
+    roles: async () => ['common', 'main', 'coder', 'ghost'],
+    persona: async (role) => {
+      if (role === 'ghost') throw new Error(what)
+      return TEXTS[role]!
+    },
+  })
+  for (const [service, expected] of [[gone('unknown role "ghost"'), true], [gone('the store is gone'), false]] as const) {
+    const made = stubs()
+    made.ctx.provide('dishPrompts', service)
+    const handle = made.ctx.plugin(PromptsRemote)
+    try {
+      await handle
+      const remote = made.ctx.get('dishPromptsRemote') as PromptsRemote
+      if (expected) {
+        failed(await remote.preview('ghost'), 'NOT_FOUND')
+      } else {
+        await assert.rejects(remote.preview('ghost'), /the store is gone/)
+      }
+      // The roles that do have texts are previewed as before.
+      assert.equal(ok(await remote.preview('coder')).fallback, false)
+    } finally {
+      await handle.dispose()
+    }
+  }
+})
+
 test('with no store the preview is made from the shipped defaults', async () => {
   const where = await dirs()
   const made = stubs()
-  await mountPrompts(made.ctx, where.state)
-  const remote = await waitFor('the remote', () => made.ctx.get('dishPromptsRemote') as PromptsRemote | undefined)
-  const preview = ok(await remote.preview('main'))
-  assert.equal(preview.fallback, false)
-  assert.ok(preview.text.includes('You are dish\'s main agent, powered by the ‹model› model.'), preview.text)
-  assert.ok(preview.text.endsWith('Your working directory is ‹cwd›.\n'), preview.text)
-  assert.deepEqual(preview.unknownVariables, [])
+  const handle = mountPrompts(made.ctx, where.state)
+  try {
+    await handle
+    const remote = await waitFor('the remote', () => made.ctx.get('dishPromptsRemote') as PromptsRemote | undefined)
+    const preview = ok(await remote.preview('main'))
+    assert.equal(preview.fallback, false)
+    assert.ok(preview.text.includes('You are dish\'s main agent, powered by the ‹model› model.'), preview.text)
+    assert.ok(preview.text.endsWith('Your working directory is ‹cwd›.\n'), preview.text)
+    assert.deepEqual(preview.unknownVariables, [])
+  } finally {
+    await handle.dispose()
+  }
 })
 
 test('the fallback is logged once per process, however many previews and variable reads fall back', async () => {
@@ -357,25 +390,30 @@ test('on dsh\'s own SystemPrompt the preview is the identity line, main.md, the 
   ctx.systemPrompt.section({ name: 'tool:bash', order: 1000, text: 'Use bash in {{cwd}}.' })
   // The registry's stand-in: any scope key does, there are no scoped registrations in this context.
   ctx.provide('agentPresets', { acquireScope: async () => ({ key: {}, [Symbol.asyncDispose]: async () => {} }) } as never)
-  await mountPrompts(ctx, where.state)
-  const remote = await waitFor('the remote', () => ctx.get('dishPromptsRemote') as PromptsRemote | undefined)
+  const handle = mountPrompts(ctx, where.state)
+  try {
+    await handle
+    const remote = await waitFor('the remote', () => ctx.get('dishPromptsRemote') as PromptsRemote | undefined)
 
-  const preview = ok(await remote.preview('main'))
-  assert.equal(preview.fallback, false)
-  assert.equal(preview.text, [
-    'You are an AI agent powered by DeepSeek Harness.',
-    DEFAULTS.main!.replaceAll('{{model}}', '‹model›'),
-    'Use bash in ‹cwd›.',
-    DEFAULTS.common!.replaceAll('{{cwd}}', '‹cwd›'),
-  ].join('\n\n'))
-  assert.deepEqual(preview.unknownVariables, [])
-  assert.ok(!preview.text.includes('global prefix') && !preview.text.includes('global suffix'))
+    const preview = ok(await remote.preview('main'))
+    assert.equal(preview.fallback, false)
+    assert.equal(preview.text, [
+      'You are an AI agent powered by DeepSeek Harness.',
+      DEFAULTS.main!.replaceAll('{{model}}', '‹model›'),
+      'Use bash in ‹cwd›.',
+      DEFAULTS.common!.replaceAll('{{cwd}}', '‹cwd›'),
+    ].join('\n\n'))
+    assert.deepEqual(preview.unknownVariables, [])
+    assert.ok(!preview.text.includes('global prefix') && !preview.text.includes('global suffix'))
 
-  const crew = ok(await remote.preview('reviewer'))
-  assert.ok(crew.text.startsWith(`You are an AI agent powered by DeepSeek Harness.\n\n${DEFAULTS.reviewer!.replaceAll('{{model}}', '‹model›')}\n\n`), crew.text)
-  assert.deepEqual(ok(await remote.variables()), {
-    variables: [{ name: 'cwd', value: '' }, { name: 'model', value: '' }, { name: 'provider', value: 'acme' }],
-    fallback: false,
-  })
-  assert.deepEqual(logs, [])
+    const crew = ok(await remote.preview('reviewer'))
+    assert.ok(crew.text.startsWith(`You are an AI agent powered by DeepSeek Harness.\n\n${DEFAULTS.reviewer!.replaceAll('{{model}}', '‹model›')}\n\n`), crew.text)
+    assert.deepEqual(ok(await remote.variables()), {
+      variables: [{ name: 'cwd', value: '' }, { name: 'model', value: '' }, { name: 'provider', value: 'acme' }],
+      fallback: false,
+    })
+    assert.deepEqual(logs, [])
+  } finally {
+    await handle.dispose()
+  }
 })

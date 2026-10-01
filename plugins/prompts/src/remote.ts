@@ -23,7 +23,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import type { DishConfigService, ErrorCode as StoreErrorCode, WriteMeta } from 'dish-config'
+import type { CommitInfo as StoreCommitInfo, DishConfigService, ErrorCode as StoreErrorCode, WriteMeta } from 'dish-config'
 import { markRemote } from 'dish-kit'
 import { buildPreview, buildVariables } from './preview.ts'
 import { NAMESPACE } from './protocol.ts'
@@ -48,6 +48,7 @@ type Same<A, B> = [A] extends [B] ? [B] extends [A] ? true : false : false
 type Check<T extends true> = T
 export type WireMatchesStore = [
   Check<Same<StoreErrorCode, Exclude<ErrorCode, 'UNAVAILABLE'>>>,
+  Check<Same<StoreCommitInfo, CommitInfo>>,
 ]
 
 /** Every code the store throws on purpose, as an object so that a code the store adds is a compile error here. */
@@ -265,8 +266,18 @@ export class PromptsRemote extends TypertRemoteService {
     return outcome(async () => {
       const name = roleName(role)
       const prompts: DishPrompts = this.ctx.dishPrompts
-      if (!(await prompts.roles()).includes(name === 'common' ? 'main' : name)) throw new Refusal('NOT_FOUND', `there is no role ${JSON.stringify(name)}`)
-      return buildPreview(this.ctx, prompts, name, this.onFallback)
+      const asked = name === 'common' ? 'main' : name
+      const none = (): Refusal => new Refusal('NOT_FOUND', `there is no role ${JSON.stringify(name)}`)
+      if (!(await prompts.roles()).includes(asked)) throw none()
+      try {
+        return await buildPreview(this.ctx, prompts, name, this.onFallback)
+      } catch (error) {
+        // A crew role that exists only in the store can be deleted after the check above: the service then has no
+        // text for it, and says so with a plain `Error` (it has no code to match on), which the gateway would fold
+        // into `gateway/internal`. That one case, by its exact message, is the same answer as the check's.
+        if (error instanceof Error && error.message === `unknown role "${asked}"`) throw none()
+        throw error
+      }
     })
   }
 

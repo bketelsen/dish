@@ -1,17 +1,13 @@
 /**
  * The wire shapes shared by the server remote (`remote.ts`) and the Prompts page (`client/`). Types and one constant,
- * so both halves can import it. It imports types only, from `dish-config`, so the browser build never reaches into
- * the store.
+ * so both halves can import it, and it imports nothing: the browser build must not reach into the store (or, through
+ * it, into Node's modules). `CommitInfo` is therefore declared here, as `dish-config`'s own `protocol.ts` declares it,
+ * and `remote.ts` checks at compile time that the store's type fits it, so a change to either side is a type error.
  *
  * Everything here is plain JSON, and an empty string stands for "absent" in the parameters of a call (see
  * `remote.ts`): the page's own convention, as in `dish-config`'s remote.
  * @module dish-prompts/protocol
  */
-
-import type { CommitInfo } from 'dish-config'
-
-/** What a save or a reset returns: the store's own commit record, which is what `dish-config`'s remote sends too. */
-export type { CommitInfo }
 
 /** The remote's wire namespace: the page calls `ctx.remote.dishPrompts`. (Its Cordis service key is `dishPromptsRemote`.) */
 export const NAMESPACE = 'dishPrompts'
@@ -39,6 +35,27 @@ export type ErrorCode =
 export type Outcome<T> =
   | { ok: true, value: T }
   | { ok: false, code: ErrorCode, message: string }
+
+/** Who made a commit. `system` is the store's own. */
+export type Author =
+  | { kind: 'user' }
+  | { kind: 'agent', sessionId: string, role?: string }
+  | { kind: 'system' }
+
+/** A commit of the config store, as a save or a reset returns it (and `dish-config`'s remote sends it). */
+export interface CommitInfo {
+  /** The commit's full object id. */
+  id: string
+  /** Commit time in milliseconds since the epoch. */
+  time: number
+  author: Author
+  /** The whole commit message: subject, blank line, trailers. */
+  message: string
+  /** The note the author gave, when there was one. */
+  note?: string
+  /** The paths this commit changed, sorted. */
+  paths: string[]
+}
 
 /** One role in the page's list. */
 export interface RoleInfo {
@@ -76,7 +93,10 @@ export interface PreviewResult {
   approximate: true
   /** dsh's own assembly couldn't be used: `text` is the persona texts between `[dsh: ...]` markers in place of dsh's sections. */
   fallback: boolean
-  /** The `{{names}}` in the role's texts that have no value, left as written, in order of first appearance. */
+  /**
+   * The `{{names}}` in the role's texts that have no value, left as written, in order of first appearance. Always
+   * `[]` when `fallback` is true: without dsh's assembly there is no telling which names have a value.
+   */
   unknownVariables: string[]
 }
 
