@@ -70,11 +70,16 @@ Provided by the host plugin as `ctx.judge`:
 
 ```ts
 interface Judge {
-  /** One Jev call: one state, any number of typed questions. Never throws for a Jev failure: it returns { ok: false }. */
-  ask(request: { state: JsonValue, questions: Record<string, Question>, purpose: Purpose, agent?: Agent, signal?: AbortSignal })
-    : Promise<{ ok: true, answers: Record<string, Answer>, latencyMs: number } | { ok: false, reason: 'unavailable' | 'invalid', message: string }>
-  status(): JudgeStatus                 // last success or failure, rolling latency, key present
+  /** One Jev call: one state, any number of typed questions. Never throws: a failure is { ok: false }. */
+  ask<D extends Decision>(request: { state: JsonValue, questions: Record<string, Question>, purpose: Purpose, agent?: Agent,
+                                     signal?: AbortSignal, tool?: string, callId?: string, subject?: string,
+                                     decide?: (result: JudgeResult) => D | Promise<D> })
+    : Promise<JudgeResult & { decided?: D }>
+  status(): Promise<JudgeStatus>        // last success or failure, p50/p95, calls and failures over the last 100, key present
 }
+type JudgeResult = { ok: true, answers: Record<string, Answer>, latencyMs: number }
+                 | { ok: false, reason: 'unavailable' | 'invalid', message: string, tooBig?: true }
+type Decision = { decision: string, withheld?: string }
 type Question = { type: 'noul', instructions: string, criteria?: { true: string, false: string } }
               | { type: 'choice', instructions: string, criteria: Record<string, string | null> }     // 2–255 options
               | { type: 'score', instructions: string, criteria: string[] }                           // 2–10 levels, low → high
@@ -83,7 +88,9 @@ type Purpose = 'command' | 'approval' | 'screen' | 'ask'
 
 - **The client** calls `fetch` directly, with no SDK: `POST {baseUrl}/v1/systemone` with `Authorization: Bearer <key>` and `{ model, state, questions }`.
 - **The key** is resolved on every call. With no key, every call is `unavailable` ("no TypeSafe key: set it on Settings → Judge").
-- **Time limit:** `timeoutMs`, default 2000, covering the whole call. There are no retries inside it: a gate would rather fall back than wait. A `429` or `529` is `unavailable`, and the call's `retry-after` is respected for that kind of call by skipping Jev until it passes.
+- **Time limit:** `timeoutMs`, default 2000, covering the whole call: the settings read, the key lookup, the request and `decide`. There are no retries inside it: a gate would rather fall back than wait. A `429` or `529` is `unavailable`, and its `retry-after` (1–60 s, default 5 s) is respected by skipping Jev until it passes, timed on a monotonic clock.
+- **Statuses.** `401` is `unavailable` ("the TypeSafe key was refused"). `400` and `422` are `invalid`: the live API answers `400` for requests its own rules refuse, such as an unknown model or a state over its token limit. Every other non-2xx status is `unavailable`. Callers treat every `ok: false`, `invalid` included, as unavailable and fail closed.
+- **Too big.** A `state` over 100 KB of JSON, a request body over 256 KB, or the API's `max_tokens_exceeded` is `invalid` with `tooBig: true`, so the screen can split its content and try again. These don't change the status, so one large page doesn't mark the judge unavailable.
 - **Checking requests and responses.** Requests are checked before sending: types, criteria counts, and size, with `state` capped at ~100 KB of JSON. Responses are checked as the ten-levels client does:
   - each answer's type matches its question;
   - probabilities cover exactly the declared keys and sum to 1 ± 0.025;
@@ -91,7 +98,7 @@ type Purpose = 'command' | 'approval' | 'screen' | 'ask'
   - a score lies within its range.
 
   A malformed response is `unavailable`, and is logged.
-- **Logging.** Every call is logged (see [the log](#the-log)), whatever its outcome.
+- **Logging.** Every call is logged (see [the log](#the-log)), whatever its outcome, as one line. The caller's `decide` hook, run on the settled result, puts the decision (and a withheld id) on that line. If the hook fails, the line's decision is `null` and the caller fails closed. A call is never held up by a log write.
 
 ## `judge.yaml`
 
