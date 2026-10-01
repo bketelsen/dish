@@ -18,7 +18,8 @@
  */
 
 import { execFile } from 'node:child_process'
-import { join, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { isAbsolute, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import type { Context, Events } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
@@ -102,7 +103,7 @@ const DEFAULT_PUSH_TIMEOUT_MS = 60_000
 
 export const Config: Schema<Config> = Schema.object({
   repository: Schema.string().default('')
-    .description('The bare git repository holding the config. Leave blank for config.git in the XDG config directory for dish.'),
+    .description('The bare git repository holding the config: an absolute path, where a leading ~/ is your home directory. Leave blank for config.git in the XDG config directory for dish.'),
   remote: Schema.string().default('')
     .description('Where to push main after every commit: a URL or path git can push to. Leave blank to keep the config local. Set it per machine: two machines pushing to one remote diverge.'),
   userName: Schema.string().default('')
@@ -149,7 +150,7 @@ function text(value: string | undefined): string | undefined {
 /** One value of git's global config, read as the store reads everything (scrubbed environment, no prompts), or `undefined` if there is none. */
 async function gitGlobal(key: 'user.name' | 'user.email'): Promise<string | undefined> {
   try {
-    const { stdout } = await execFileAsync('git', ['config', '--global', '--get', key], { env: gitEnv(), timeout: 10_000, encoding: 'utf8' })
+    const { stdout } = await execFileAsync('git', ['config', '--global', '--includes', '--get', key], { env: gitEnv(), timeout: 10_000, encoding: 'utf8' })
     return text(stdout)
   } catch {
     // Not set (exit 1), or no git at all: the store will find its own way to report the latter.
@@ -168,6 +169,23 @@ async function personIdentity(config: Config): Promise<GitIdentity> {
   return { name: userName ?? gitName ?? FALLBACK_NAME, email: userEmail ?? gitEmail ?? FALLBACK_EMAIL }
 }
 
+/**
+ * Where the repository lives: the setting with a leading `~/` (or a bare `~`) taken as the home directory, else the XDG default.
+ * @throws a plain `Error` for any other relative path: what it would be relative to is not something to guess.
+ */
+function repositoryPath(setting: string | undefined): string {
+  if (setting === undefined) return join(xdgPaths('dish').config, 'config.git')
+  if (setting === '~') return homedir()
+  if (setting.startsWith('~/')) return join(homedir(), setting.slice(2))
+  if (!isAbsolute(setting)) throw new Error(`repository must be an absolute path (or start with ~/), got ${JSON.stringify(setting)}`)
+  return setting
+}
+
+/** Whether `error` is cordis refusing an effect because the plugin has been unloaded: a plugin that is going away didn't fail. */
+function unloaded(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === 'INACTIVE_EFFECT'
+}
+
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -181,7 +199,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const logger = ctx.logger(name)
   if (config.terminal) printOwnLogs(ctx, name)
 
-  const repository = resolve(text(config.repository) ?? join(xdgPaths('dish').config, 'config.git'))
+  const repository = resolve(repositoryPath(text(config.repository)))
   const remote = text(config.remote)
   const user = await personIdentity(config)
   const agent: GitIdentity = { name: text(config.agentName) ?? AGENT_NAME, email: text(config.agentEmail) ?? AGENT_EMAIL }
@@ -193,15 +211,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   let live = true
   const publish = <K extends keyof Events>(event: K, ...args: Parameters<Events[K]>): void => {
     if (!live) return
-    try {
-      ctx.parallel(event, ...args).catch((error: unknown) => {
-        for (const cause of error instanceof AggregateError ? error.errors : [error]) {
-          logger.warn('a %s listener failed: %s', event, cause)
-        }
-      })
-    } catch (error) {
-      logger.warn('could not deliver %s: %s', event, error)
-    }
+    ctx.parallel(event, ...args).catch((error: unknown) => {
+      for (const cause of error instanceof AggregateError ? error.errors : [error]) {
+        logger.warn('a %s listener failed: %s', event, cause)
+      }
+    })
   }
 
   // Terminal output follows the remote's status: a line when an error appears or goes away, and one for the first
@@ -255,6 +269,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   } catch (error) {
     // The plugin was unloaded while the store was opening, so nothing will ever close it.
     await store.close().catch(() => {})
+    if (unloaded(error)) return
     throw error
   }
 
@@ -263,7 +278,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     await store.seed({ 'README.md': README }, name)
   } catch (error) {
     // A convenience: the store itself is open and usable (a size cap smaller than the README is the usual cause).
-    logger.warn('could not seed README.md: %s', describe(error))
+    // Unless the plugin is being unloaded, which closed the store under the seed.
+    if (live) logger.warn('could not seed README.md: %s', describe(error))
   }
 
   const service: DishConfigService = {
@@ -283,7 +299,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     reject: (id, reason, meta) => store.reject(id, reason, meta),
     remoteStatus: () => store.remoteStatus(),
   }
-  ctx.provide('dishConfig', service)
+  try {
+    ctx.provide('dishConfig', service)
+  } catch (error) {
+    // Unloaded during the seed: the close effect is registered, so it closes the store. Not a failure.
+    if (unloaded(error)) return
+    throw error
+  }
   logger.info('store ready at %s', repository)
   announced = true
   if (latest !== undefined) report(latest)

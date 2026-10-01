@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
-import { promisify } from 'node:util'
+import { format, promisify } from 'node:util'
 import { Context } from '@deepseek-ai/cordis'
 import * as plugin from '../src/index.ts'
 import type { DishConfigService } from '../src/index.ts'
@@ -50,6 +50,18 @@ async function withPlugin<T>(
   } finally {
     await handle.dispose()
   }
+}
+
+/** Every warning or error logged in `ctx`, by anyone (cordis logs a plugin that failed to load), as text. */
+function watchLogs(ctx: Context): string[] {
+  const seen: string[] = []
+  ctx.logger.exporter({
+    levels: { default: 3 },
+    export: message => {
+      if (message.type === 'error' || message.type === 'warn') seen.push(`${message.type}: ${format(...message.args)}`)
+    },
+  })
+  return seen
 }
 
 /** A bare repository to push to. */
@@ -270,13 +282,17 @@ test('disposing the plugin releases the lock: while it lives a second instance i
   }, second)
 })
 
-test('unloading the plugin while the store is still opening leaves no lock behind and provides nothing', async () => {
+test('unloading the plugin while the store is still opening is no failure: no error, no lock left, nothing provided', async () => {
   for (const delay of [0, 2, 5, 10, 20, 40, 60, 90]) {
     const repository = await repoPath()
     const ctx = new Context()
+    const logs = watchLogs(ctx)
     const handle = load({ repository }, ctx)
     await new Promise(resolve => setTimeout(resolve, delay))
     await handle.dispose()
+    // The load settled without an error (a rejected load would show here, and in the log).
+    await handle
+    assert.deepEqual(logs, [], `delay ${delay}`)
     assert.equal(ctx.get('dishConfig'), undefined, `delay ${delay}`)
     await assert.rejects(access(join(repository, 'dish.lock')), { code: 'ENOENT' }, `delay ${delay}`)
     // And the repository is free for the next start.
@@ -284,6 +300,27 @@ test('unloading the plugin while the store is still opening leaves no lock behin
       assert.match(await service.head(), /^[0-9a-f]{40}$/)
     })
   }
+})
+
+test('unloading the plugin while README.md is being seeded is no failure either', async () => {
+  const repository = await repoPath()
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  const handle = load({ repository }, ctx)
+  // The seed's commit has landed (and is reported) before the seed resolves, so this is the middle of it.
+  let disposing: Promise<void> | undefined
+  ctx.on('dish-config/changed', paths => {
+    if (paths.includes('README.md')) disposing ??= handle.dispose()
+  })
+  await handle
+  assert.ok(disposing, 'the seed was reported')
+  await disposing
+  assert.deepEqual(logs, [])
+  assert.equal(ctx.get('dishConfig'), undefined)
+  await assert.rejects(access(join(repository, 'dish.lock')), { code: 'ENOENT' })
+  await withPlugin({ repository }, async (_ctx, service) => {
+    assert.ok(await service.read('README.md'), 'the seed stands')
+  })
 })
 
 test('a store a live process holds fails the load, logs why, and never provides dishConfig; the repository is usable once it lets go', async () => {
@@ -348,6 +385,37 @@ test('the config schema: every string is empty (use the default) and the numbers
   })
 })
 
+test('a repository starting with ~/ (or just ~) is in the home directory; any other relative path fails the load', async () => {
+  const home = await tempDir()
+  await withEnv({ HOME: home }, async () => {
+    await withPlugin({ repository: '~/dish-test/config.git' }, async (_ctx, service) => {
+      assert.match(await service.head(), /^[0-9a-f]{40}$/)
+    })
+    await access(join(home, 'dish-test', 'config.git', 'HEAD'))
+    // Bare ~ is the home directory itself (empty here, so it can hold a repository).
+    const bare = await tempDir()
+    await withEnv({ HOME: bare }, async () => {
+      await withPlugin({ repository: '~' }, async (_ctx, service) => {
+        assert.match(await service.head(), /^[0-9a-f]{40}$/)
+      })
+    })
+    await access(join(bare, 'HEAD'))
+  })
+
+  for (const repository of ['config.git', './config.git', '../config.git', '~other/config.git', 'a/~/b']) {
+    const ctx = new Context()
+    const handle = load({ repository }, ctx)
+    await assert.rejects(Promise.resolve(handle), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.equal(error.constructor, Error, 'a plain Error, not a store refusal')
+      assert.match(error.message, /repository must be an absolute path/)
+      return true
+    }, repository)
+    assert.equal(ctx.get('dishConfig'), undefined)
+    await handle.dispose()
+  }
+})
+
 test('an empty or blank remote means no remote', async () => {
   for (const remote of ['', '   ', '\t\n']) {
     await withPlugin({ repository: await repoPath(), remote }, async (_ctx, service) => {
@@ -386,6 +454,19 @@ test('empty-string fields fall back: the repository to the XDG config directory,
       await service.write([{ path: 't/u.md', text: 'u' }], { author: USERA })
       const repository = join(root, 'xdg2', 'dish', 'config.git')
       assert.equal(await authorOf(repository), 'Only Name <dish@localhost>')
+    })
+  })
+
+  // An identity that git reads through [include]: git config --global does not follow it unless asked.
+  const other = join(root, 'other-config')
+  await writeFile(other, '[user]\n\tname = Included Name\n\temail = included@example.test\n')
+  const including = join(root, 'including')
+  await writeFile(including, '[include]\n\tpath = other-config\n')
+  await withEnv({ XDG_CONFIG_HOME: join(root, 'xdg4'), GIT_CONFIG_GLOBAL: including }, async () => {
+    await withPlugin(blank, async (_ctx, service) => {
+      service.claim(ns('t/'))
+      await service.write([{ path: 't/u.md', text: 'u' }], { author: USERA })
+      assert.equal(await authorOf(join(root, 'xdg4', 'dish', 'config.git')), 'Included Name <included@example.test>')
     })
   })
 
