@@ -54,7 +54,7 @@ test('familyOf falls back to prefixes for a model no family lists', () => {
 })
 
 test('familyOf is undefined for a model it can\'t tell', () => {
-  for (const model of ['llama-3.3', 'mistral-large', 'omega', 'o', 'oss-120b', 'sonnet', 'my-claude', '', ' ']) {
+  for (const model of ['llama-3.3', 'mistral-large', 'omega', 'o', 'oss-120b', 'sonnet', 'sonnet-x', '', ' ']) {
     assert.equal(familyOf(model, SETTINGS), undefined, JSON.stringify(model))
   }
 })
@@ -340,8 +340,80 @@ test('vendorsOf tells the vendor of a model id by the prefix table, whatever is 
   assert.deepEqual([...vendorsOf('grok-4')], ['xai'])
   // A vendor name on its own is as good as a model prefix.
   assert.deepEqual([...vendorsOf('anthropic.something-new')], ['anthropic'])
-  for (const id of ['llama-3.3', 'mistral-large', 'omega', 'o', 'my-claude', 'deepseek-v4', '', ' ', 'meta-llama/llama-3', 'constructor', '__proto__']) {
+  for (const id of ['llama-3.3', 'mistral-large', 'omega', 'o', 'sonnet-x', 'deepseek-v4', '', ' ', 'meta-llama/llama-3', 'constructor', '__proto__']) {
     assert.equal(vendorsOf(id).size, 0, JSON.stringify(id))
+  }
+})
+
+test('vendorsOf finds a vendor in any token of the id: an alias, a hosting prefix, a fine-tune', () => {
+  const found: Array<[string, string]> = [
+    ['anthropic-claude-x', 'anthropic'],
+    ['azure-gpt-4o', 'openai'],
+    ['my-claude', 'anthropic'],
+    ['chatgpt-4o-latest', 'openai'],
+    ['github-copilot:claude-opus-4.7', 'anthropic'],
+    ['ft:gpt-4o:acme::abc123', 'openai'],
+    ['claude_opus_4_7', 'anthropic'],
+    ['claude-3-5-sonnet@20240620', 'anthropic'],
+    ['team o3 mini', 'openai'],
+    ['vertex_ai/gemini-2.5-pro', 'google'],
+    ['xai:grok-4', 'xai'],
+  ]
+  for (const [id, vendor] of found) assert.deepEqual([...vendorsOf(id)], [vendor], id)
+  // Two vendors in one id are both found, so neither can be got past the rule through it.
+  assert.deepEqual([...vendorsOf('claude-gpt-bridge')].sort(), ['anthropic', 'openai'])
+  // A token has to be a vendor's word: a letter-and-digit that merely contains an o, or a model's own name, isn't.
+  for (const id of ['4o-mini', 'sonnet-x', 'opus', 'haiku-3', 'llama-3', 'o', 'ob1']) assert.equal(vendorsOf(id).size, 0, id)
+})
+
+test('familyOf gives a family only when exactly one vendor matches', () => {
+  assert.equal(familyOf('my-claude', SETTINGS), 'anthropic')
+  assert.equal(familyOf('chatgpt-4o-latest', SETTINGS), 'openai')
+  assert.equal(familyOf('ft:gpt-4o:acme::abc123', SETTINGS), 'openai')
+  assert.equal(familyOf('claude-gpt-bridge', SETTINGS), undefined)
+  assert.equal(familyOf('sonnet-x', SETTINGS), undefined)
+})
+
+test('a family of the file whose models are aliases that name their vendor in any token is kept from the reviewer of that vendor', () => {
+  // `other` lists a Claude under a name that doesn't start with the vendor's: the probe that got past a start-of-segment check.
+  const probe = settingsOf((document) => {
+    document.families = {
+      claude: { strong: 'claude-opus-5.5', mid: 'claude-sonnet-5.5' },
+      other: { strong: 'anthropic-claude-x', mid: 'anthropic-claude-y' },
+      gpt: { strong: 'gpt-6.1-sol', mid: 'gpt-5.6-sol' },
+    }
+    document.reviewerFamilies = ['other', 'gpt']
+    for (const role of Object.values(document.roles) as any[]) if (role.family !== undefined) role.family = 'claude'
+  })
+  assert.equal(routeOf(chooseRoute({ settings: probe, role: 'reviewer', reviewed: { model: 'claude-sonnet-5.5' } })).family, 'gpt')
+  assert.equal(routeOf(chooseRoute({ settings: probe, role: 'reviewer', reviewed: { family: 'claude' } })).family, 'gpt')
+  assert.equal(routeOf(chooseRoute({ settings: probe, role: 'reviewer', reviewed: { model: 'claude-opus-4.7' } })).family, 'gpt')
+  assert.match(problemOf(chooseRoute({ settings: probe, role: 'reviewer', reviewed: { model: 'claude-sonnet-5.5' }, override: 'anthropic-claude-x' })), /different family/)
+  // Reviewing the GPT side, `other` is the Claude and is fine.
+  assert.equal(routeOf(chooseRoute({ settings: probe, role: 'reviewer', reviewed: { model: 'gpt-5.6-sol' } })).family, 'other')
+
+  // Each alias that names no vendor at its start, as a candidate family against work of its vendor.
+  const aliases: Array<[alias: string, reviewed: string, other: string]> = [
+    ['anthropic-claude-x', 'claude-opus-4.7', 'gpt-4.1'],
+    ['azure-gpt-4o', 'gpt-4.1', 'claude-opus-4.7'],
+    ['my-claude', 'claude-opus-4.7', 'gpt-4.1'],
+    ['chatgpt-4o-latest', 'gpt-4.1', 'claude-opus-4.7'],
+    ['github-copilot:claude-opus-4.7', 'claude-3-5-haiku-latest', 'gpt-4.1'],
+    ['ft:gpt-4o:acme::abc123', 'o3-mini', 'claude-opus-4.7'],
+  ]
+  for (const [alias, reviewed, other] of aliases) {
+    const settings = settingsOf((document) => {
+      document.families = {
+        alias: { strong: alias, mid: alias },
+        gem: { strong: 'gemini-3-pro', mid: 'gemini-3-flash' },
+      }
+      document.reviewerFamilies = ['alias', 'gem']
+      for (const role of Object.values(document.roles) as any[]) if (role.family !== undefined) role.family = 'gem'
+    })
+    assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: reviewed } })).family, 'gem', `${alias} reviewed on ${reviewed}`)
+    assert.match(problemOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: reviewed }, override: alias })), /different family/, alias)
+    // Work of the other vendor is fine to review on it.
+    assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: other } })).family, 'alias', `${alias} reviewed on ${other}`)
   }
 })
 

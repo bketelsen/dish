@@ -8,7 +8,8 @@
  * What counts as the same family is wider than a name. `crew.yaml` calls its families whatever it likes, and the work
  * under review can be on a model it doesn't list at all, so the family *name* of the work may be nothing the file has.
  * A reviewer is therefore kept away from the work's vendor too (`vendorsOf`: Claude, GPT, Gemini, Grok, told by model
- * id), so Claude reviewing Claude is refused whatever the file calls its families.
+ * id), so Claude reviewing Claude is refused whatever the file calls its families. An alias that names no vendor at all
+ * (`sonnet-x`) tells nothing, and can only be told apart by the name of its family.
  *
  * `settings.families` and `settings.roles` have no prototype, and every name that reaches a lookup here can come from
  * the model, so each lookup is for an own property (`Object.hasOwn` is safe on those objects as well as on ordinary
@@ -49,13 +50,16 @@ export interface ChooseRouteArgs {
   reviewed?: ReviewedWork
 }
 
-/** The vendors of the models, by what their ids start with. A vendor's name is also the family `familyOf` gives a model no family lists. */
-const VENDORS: ReadonlyArray<readonly [vendor: string, prefix: RegExp]> = [
-  ['anthropic', /^claude/i],
-  ['openai', /^(?:gpt|o\d|codex)/i],
-  ['google', /^gemini/i],
-  ['xai', /^grok/i],
+/** The vendors, by the words a token of a model id has: the vendor's own name, or what its models are called. */
+const VENDORS: ReadonlyArray<readonly [vendor: string, token: RegExp]> = [
+  ['anthropic', /^(?:anthropic$|claude)/],
+  ['openai', /^(?:openai$|codex|o\d)|gpt/],
+  ['google', /^(?:google$|gemini)/],
+  ['xai', /^(?:xai$|grok)/],
 ]
+
+/** What separates the tokens of a model id: provider and host prefixes, versions, regions and fine-tune markers all come between them. */
+const TOKEN_BREAK = /[\s/.:@_-]+/
 
 /** `value` as a message shows what a caller gave: quoted and cut short. */
 function quoted(value: string): string {
@@ -75,17 +79,18 @@ function folded(name: string): string {
 }
 
 /**
- * The vendors a model id belongs to, told by the prefix table (`claude`; `gpt`, `o<digit>`, `codex`; `gemini`; `grok`)
- * or by a vendor's own name (`anthropic`). Only the id counts, not where it's served from: whatever precedes the last
- * `/` is a provider (`github-copilot/claude-opus-4.7`, `openrouter/anthropic/claude-3.7-sonnet`), and the rest is read
- * a dotted segment at a time, so a vendor prefix like Bedrock's `us.anthropic.claude-3-5-sonnet…` is found too. An id
- * can name more than one vendor, and one no table entry matches names none.
+ * The vendors a model id belongs to. The id is cut into tokens at `/ . : @ _ -` and whitespace, and a token names a
+ * vendor if it is the vendor's name (`anthropic`), starts with what its models are called (`claude`; `codex`, `o<digit>`;
+ * `gemini`; `grok`) or, for OpenAI's, contains `gpt` (`chatgpt`). Every token counts, wherever it sits, so a provider
+ * (`github-copilot/claude-opus-4.7`), a host (`azure-gpt-4o`, `us.anthropic.claude-3-5-sonnet…`), an alias
+ * (`my-claude`) or a fine-tune (`ft:gpt-4o:…`) all name their vendor. An id can name more than one vendor, which only
+ * widens what a reviewer is kept away from, and one that names none (`sonnet-x`) names none.
  */
 export function vendorsOf(model: string): Set<string> {
   const found = new Set<string>()
-  for (const segment of model.slice(model.lastIndexOf('/') + 1).split('.')) {
-    for (const [vendor, prefix] of VENDORS) {
-      if (prefix.test(segment) || segment.toLowerCase() === vendor) found.add(vendor)
+  for (const token of model.toLowerCase().split(TOKEN_BREAK)) {
+    for (const [vendor, pattern] of VENDORS) {
+      if (pattern.test(token)) found.add(vendor)
     }
   }
   return found
