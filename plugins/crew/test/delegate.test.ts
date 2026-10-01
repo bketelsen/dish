@@ -548,6 +548,125 @@ test('never-list tools in a role are not given', async () => {
   assert.deepEqual(w.starts[0]!.request.toolFilter, { allow: ['read'] })
 })
 
+// --- a provider per family -----------------------------------------------------------------------------
+
+/** Direct API keys: Claude through `anthropic`, GPT through `openai`; the file's own provider is Copilot's. */
+function directKeys(): CrewSettings {
+  return settingsFrom((d) => {
+    d.families.anthropic.provider = 'anthropic'
+    d.families.openai.provider = 'openai'
+    d.limits = { running: 8, writers: 8, perSession: 30 }
+  })
+}
+
+test('the shipped default starts every role on github-copilot, the reviewer included', async () => {
+  const w = await world({ settings: settingsFrom((d) => { d.limits = { running: 8, writers: 8, perSession: 30 } }) })
+  for (const role of ['architect', 'coder', 'researcher', 'ops', 'writer']) await w.delegate({ role, title: 'a task', task: 'Do it.' })
+  await w.delegate({ ...REVIEW, reviews: 'main' })
+  assert.equal(w.starts.length, 6)
+  for (const spec of w.starts) assert.equal(spec.request.agentOptions?.provider, 'github-copilot', spec.label)
+  for (const resolved of w.resolves) assert.equal(resolved.config.provider, 'github-copilot')
+})
+
+test('a role starts on its family\'s provider, and the route check is made against that provider', async () => {
+  const w = await world({ settings: directKeys() })
+  const result = await w.delegate(CODER)
+  assert.deepEqual(w.starts[0]!.request.agentOptions, { provider: 'anthropic', model: 'claude-sonnet-5.5' })
+  assert.deepEqual(w.resolves[0]!.config, { provider: 'anthropic', model: 'claude-sonnet-5.5' })
+  // The label and the record carry the model alone, as they did: the model is in one family, which has one provider.
+  assert.equal(result.label, 'coder · claude-sonnet-5.5 · add login')
+  assert.equal(w.starts[0]!.label, 'coder · claude-sonnet-5.5 · add login')
+  const [recorded] = await w.records.children(SESSION)
+  assert.deepEqual({ ...recorded, startedAt: 0 }, { id: result.child, n: 1, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', startedAt: 0, followUps: 0, runs: [], last: 'running' })
+})
+
+test('an override in another family starts on that family\'s provider, however it is spelled', async () => {
+  const w = await world({ settings: directKeys() })
+  await w.delegate({ ...CODER, model: 'gpt-5.6-sol' })
+  await w.delegate({ ...RESEARCHER, model: 'openai/gpt-6.1-sol' })
+  assert.deepEqual(w.starts[0]!.request.agentOptions, { provider: 'openai', model: 'gpt-5.6-sol' })
+  assert.deepEqual(w.starts[1]!.request.agentOptions, { provider: 'openai', model: 'gpt-6.1-sol' })
+  assert.deepEqual(w.resolves.map(resolved => resolved.config), [{ provider: 'openai', model: 'gpt-5.6-sol' }, { provider: 'openai', model: 'gpt-6.1-sol' }])
+  assert.equal(w.starts[1]!.label, 'researcher · gpt-6.1-sol · survey auth libs')
+  const records = await w.records.children(SESSION)
+  assert.deepEqual(records.map(record => [record.model, record.family]), [['gpt-5.6-sol', 'openai'], ['gpt-6.1-sol', 'openai']])
+})
+
+test('the reviewer starts on its own family\'s provider: GPT for Claude work, Claude for GPT work, and for the main agent\'s own', async () => {
+  const w = await world({ settings: directKeys() })
+  const claude = await w.delegate(CODER)
+  const gpt = await w.delegate({ ...RESEARCHER, model: 'gpt-5.6-sol' })
+  const first = await w.delegate({ ...REVIEW, reviews: claude.child })
+  const second = await w.delegate({ ...REVIEW, reviews: gpt.child })
+  const third = await w.delegate({ ...REVIEW, reviews: 'main' })
+  assert.deepEqual([first.model, second.model, third.model], ['gpt-5.6-sol', 'claude-sonnet-5.5', 'gpt-5.6-sol'])
+  assert.deepEqual(w.starts[2]!.request.agentOptions, { provider: 'openai', model: 'gpt-5.6-sol' })
+  assert.deepEqual(w.starts[3]!.request.agentOptions, { provider: 'anthropic', model: 'claude-sonnet-5.5' })
+  assert.deepEqual(w.starts[4]!.request.agentOptions, { provider: 'openai', model: 'gpt-5.6-sol' })
+  assert.deepEqual(w.resolves.slice(2).map(resolved => resolved.config.provider), ['openai', 'anthropic', 'openai'])
+  // A reviewer override is in the other family and takes its provider.
+  const other = await w.delegate({ ...REVIEW, reviews: claude.child, model: 'openai/gpt-6.1-sol' })
+  assert.equal(other.model, 'gpt-6.1-sol')
+  assert.deepEqual(w.starts[5]!.request.agentOptions, { provider: 'openai', model: 'gpt-6.1-sol' })
+  assert.match(await refusal(w.delegate({ ...REVIEW, reviews: claude.child, model: 'anthropic/claude-opus-5.5' })), /different family/)
+})
+
+test('a reviewer follow-up under family providers goes through, and starts nothing', async () => {
+  const w = await world({ settings: directKeys() })
+  const coder = await w.delegate(CODER)
+  const reviewer = await w.delegate({ ...REVIEW, reviews: coder.child })
+  w.agents.set(reviewer.child, { status: 'idle' })
+  await w.records.endRun(reviewer.child, { stopReason: 'completed', closing: 'x' })
+  const resolved = w.resolves.length
+  await w.delegate({ ...REVIEW, task: 'Look again.', to: reviewer.child })
+  assert.equal(w.sends.length, 1)
+  assert.equal(w.starts.length, 2)
+  assert.equal(w.resolves.length, resolved)
+})
+
+test('the reviewer rule reads models, not providers: a provider named anthropic-proxy on the openai family changes nothing', async () => {
+  const w = await world({ settings: settingsFrom((d) => { d.families.openai.provider = 'anthropic-proxy'; d.limits = { running: 8, writers: 8, perSession: 30 } }) })
+  const claude = await w.delegate(CODER)
+  const result = await w.delegate({ ...REVIEW, reviews: claude.child })
+  assert.equal(result.model, 'gpt-5.6-sol')
+  assert.deepEqual(w.starts[1]!.request.agentOptions, { provider: 'anthropic-proxy', model: 'gpt-5.6-sol' })
+  assert.deepEqual(w.resolves[1]!.config, { provider: 'anthropic-proxy', model: 'gpt-5.6-sol' })
+  // GPT work is reviewed on Claude, the file's provider; and a Claude reviewer is refused for Claude work as before.
+  const gpt = await w.delegate({ ...RESEARCHER, model: 'gpt-5.6-sol' })
+  assert.deepEqual(w.starts[2]!.request.agentOptions, { provider: 'anthropic-proxy', model: 'gpt-5.6-sol' })
+  const again = await w.delegate({ ...REVIEW, reviews: gpt.child })
+  assert.equal(again.model, 'claude-sonnet-5.5')
+  assert.deepEqual(w.starts[3]!.request.agentOptions, { provider: 'github-copilot', model: 'claude-sonnet-5.5' })
+  assert.match(await refusal(w.delegate({ ...REVIEW, reviews: claude.child, model: 'claude-opus-5.5' })), /different family/)
+})
+
+test('a route that doesn\'t resolve names its provider, and lists the models as provider/model', async () => {
+  const w = await world({ settings: directKeys() })
+  w.stub.resolveFails = new Error('no key for anthropic')
+  const message = await refusal(w.delegate(CODER))
+  assert.match(message, /^model anthropic\/claude-sonnet-5\.5 is not available \(no key for anthropic\)\. /)
+  assert.match(message, /Models crew\.yaml offers: anthropic\/claude-opus-5\.5, anthropic\/claude-sonnet-5\.5, openai\/gpt-6\.1-sol, openai\/gpt-5\.6-sol\./)
+  assert.equal(w.starts.length, 0)
+  assert.deepEqual(await w.records.children(SESSION), [])
+  // On the file's provider the models are listed as they were.
+  const plain = await world()
+  plain.stub.resolveFails = new Error('down')
+  assert.match(await refusal(plain.delegate(CODER)), /Models crew\.yaml offers: claude-opus-5\.5, claude-sonnet-5\.5, gpt-6\.1-sol, gpt-5\.6-sol\./)
+})
+
+test('an override that isn\'t offered is refused with the models as provider/model, and what is listed can be passed back', async () => {
+  const w = await world({ settings: directKeys() })
+  const message = await refusal(w.delegate({ ...CODER, model: 'llama-9' }))
+  assert.match(message, /"llama-9"/)
+  assert.match(message, /anthropic: anthropic\/claude-opus-5\.5, anthropic\/claude-sonnet-5\.5; openai: openai\/gpt-6\.1-sol, openai\/gpt-5\.6-sol/)
+  assert.equal(w.starts.length, 0)
+  // A provider that is not the model's family's is no way to name the model.
+  assert.match(await refusal(w.delegate({ ...CODER, model: 'anthropic/gpt-5.6-sol' })), /not one crew\.yaml offers/)
+  assert.equal(w.starts.length, 0)
+  const ok = await w.delegate({ ...CODER, model: 'openai/gpt-5.6-sol' })
+  assert.equal(ok.model, 'gpt-5.6-sol')
+})
+
 // --- the order -----------------------------------------------------------------------------------------
 
 test('the checks run in the spec\'s order, each before the next', async () => {

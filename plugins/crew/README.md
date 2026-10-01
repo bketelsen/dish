@@ -51,9 +51,20 @@ roles:
   writer:     { tier: mid,    family: anthropic, writes: true,  tools: [...] }
 ```
 
+For direct API keys, with Claude through an `anthropic` provider and GPT through an `openai` one, give each family its provider and keep the rest of the file (`limits` and `roles` as above). Use the model ids the provider's API names:
+
+```yaml
+provider: anthropic       # required: the provider of any family that doesn't have its own
+families:
+  anthropic: { provider: anthropic, strong: claude-opus-5.5, mid: claude-sonnet-5.5 }
+  openai:    { provider: openai,    strong: gpt-6.1-sol,     mid: gpt-5.6-sol }
+reviewerFamilies: [openai, anthropic]
+```
+
 - **A broken file can't be saved.** It is checked when written: unknown keys, model ids padded with spaces, a model listed in two families, a role with no tools, and more are refused, each with the path at fault.
 - **Families and tiers.** Each role uses its family's model at its tier. The main agent may pass `model` to pick another model listed in `families`.
-- **The reviewer** has no `family`. It takes the first `reviewerFamilies` entry that isn't the reviewed work's family, and that lists no model of the same vendor.
+- **A provider per family.** `provider` at the top is where every family runs, and it is required. A family may add its own `provider` next to its tiers, for direct API keys, where Claude and GPT come through different providers (the example above). A model override runs on the provider of the family its model is in. When a refusal lists the models, a family with its own provider shows them as `provider/model`, and either form is accepted back as `model`.
+- **The reviewer** has no `family`. It takes the first `reviewerFamilies` entry that isn't the reviewed work's family, and that lists no model of the same vendor. That is told by model ids, never by provider names, and it runs on the provider of the family it lands in.
 - **Limits.**
   - At most `running` children run at once, and at most `writers` of the roles marked `writes: true`. Until per-task worktrees exist (roadmap step 6), children share one directory, so one writer at a time.
   - A session can start `perSession` children in all. Follow-ups don't count toward it.

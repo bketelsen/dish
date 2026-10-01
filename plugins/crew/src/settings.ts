@@ -18,8 +18,10 @@ import { LISTED, SHOWN, listed as listNames, truncate } from './text.ts'
 /** The two sizes of model a family has. */
 export type Tier = 'strong' | 'mid'
 
-/** The model a family uses at each tier. */
+/** The model a family uses at each tier, and the provider it runs on if that isn't the file's own. */
 export interface FamilySettings {
+  /** The provider the family's models run on, where that isn't the top-level `provider`: direct API keys, say, with Claude on `anthropic` and GPT on `openai`. Absent for a family on the file's own. */
+  readonly provider?: string
   readonly strong: string
   readonly mid: string
 }
@@ -46,6 +48,7 @@ export interface RoleSettings {
 
 /** Everything in it is frozen, and the types say so: copy before changing anything. */
 export interface CrewSettings {
+  /** The provider every family runs on, unless the family has its own. */
   readonly provider: string
   /** Model ids per family and tier; a family's models identify it. */
   readonly families: Readonly<Record<string, FamilySettings>>
@@ -58,6 +61,7 @@ export type ParseResult = { ok: true, settings: CrewSettings } | { ok: false, pr
 
 const TIERS: readonly Tier[] = ['strong', 'mid']
 const TOP_KEYS = ['provider', 'families', 'reviewerFamilies', 'limits', 'roles'] as const
+const FAMILY_KEYS = ['provider', ...TIERS] as const
 const LIMIT_KEYS = ['running', 'writers', 'perSession'] as const
 const ROLE_KEYS = ['tier', 'family', 'writes', 'reviews', 'tools'] as const
 
@@ -143,7 +147,8 @@ function parseFamilies(value: unknown): Record<string, FamilySettings> {
     unpadded(name, path)
     if (!FAMILY_NAME.test(name)) refuse(path, `${shown(name)} is not a valid family name (lowercase letters, digits and hyphens, starting with a letter)`)
     if (!isMapping(models)) refuse(path, `must be a mapping with strong and mid models (got ${shown(models)})`)
-    noOtherKeys(models, path, TIERS)
+    noOtherKeys(models, path, FAMILY_KEYS)
+    const provider = models.provider === undefined ? undefined : plainString(models.provider, at(path, 'provider'), 'a provider id')
     const chosen = {} as Record<Tier, string>
     for (const tier of TIERS) {
       const model = plainString(required(models, tier, path, 'a model id'), at(path, tier), 'a model id')
@@ -154,7 +159,7 @@ function parseFamilies(value: unknown): Record<string, FamilySettings> {
       owner.set(model, name)
       chosen[tier] = model
     }
-    families[name] = { strong: chosen.strong, mid: chosen.mid }
+    families[name] = { ...provider === undefined ? {} : { provider }, strong: chosen.strong, mid: chosen.mid }
   }
   return families
 }
