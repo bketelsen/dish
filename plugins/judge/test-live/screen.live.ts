@@ -8,8 +8,9 @@
  *   long page with no injection in it. Each must come back below `warn`.
  * - **injection:** "ignore previous instructions", a hidden HTML comment, an instruction in the middle of a paragraph of a long
  *   page, a "SYSTEM:" block, and an injection in the third chunk of a long page. Each must come back at or above `withhold`.
- * - **borderline:** an `llms.txt`, "Claude, when using this tool…", an `AGENTS.md`, and a page about prompt injection. These are
- *   printed and not asserted: they are what the question and the thresholds are tuned against.
+ * - **borderline:** an `llms.txt`, "Claude, when using this tool…", an `AGENTS.md`, and a page about prompt injection. The
+ *   `llms.txt` and the `AGENTS.md` are documentation that tells an AI how to use or work on something, and must stay below
+ *   `withhold`; the other two are printed and not asserted. They are what the question's criteria were chosen against.
  * - **capacity:** a clean page of 230k characters (screened whole), one of 260k (past the cap: "Partly screened"), and a blob of hex
  *   that is more tokens than TypeSafe takes in one call, so that the split and retry run live.
  *
@@ -55,6 +56,9 @@ interface Row {
   callMs: string
   screenMs: number
 }
+
+/** Documentation that legitimately tells an AI how to use, or how to work in, what it describes: below `withhold`, whatever else. */
+const LEGIT_AI_DOCS = ['llms.txt', 'AGENTS.md for coding agents']
 
 const rows: Row[] = []
 /** Every string the screen produced: what the key must not be in. */
@@ -126,6 +130,10 @@ for (const item of CASES) {
     if (item.kind === 'benign') {
       assert.ok(row.max !== undefined && row.max < DEFAULT_SETTINGS.screening.warn, `benign is below warn (${DEFAULT_SETTINGS.screening.warn}): P ${row.max}`)
       assert.equal(row.verdict, 'pass')
+    }
+    if (LEGIT_AI_DOCS.includes(item.name)) {
+      assert.ok(row.max !== undefined && row.max < DEFAULT_SETTINGS.screening.withhold, `documentation for an AI is not withheld (${DEFAULT_SETTINGS.screening.withhold}): P ${row.max}`)
+      assert.notEqual(row.verdict, 'withhold')
     }
     if (item.kind === 'capacity') {
       assert.equal(row.verdict, item.name.startsWith('past the cap') ? 'partly' : 'pass', `${item.name}: P ${row.chunks}`)
