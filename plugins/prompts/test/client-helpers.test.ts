@@ -48,10 +48,23 @@ test('failureNotice: SECRET, TOO_LARGE, UNAVAILABLE and NOT_FOUND each have word
   })
 })
 
-test('failureNotice: any other code reads <code>: <message>', () => {
-  for (const code of ['UNOWNED', 'FORBIDDEN', 'LOCKED', 'STALE'] as ErrorCode[]) {
-    assert.deepEqual(failureNotice(code, 'the reason'), { text: `${code}: the reason` }, code)
-  }
+test('failureNotice: UNOWNED says the plugin is probably not running, FORBIDDEN and LOCKED say what they are', () => {
+  assert.deepEqual(failureNotice('UNOWNED', 'no namespace owns prompts/main.md'), {
+    text: 'The config store has no claim on the prompts, so dish-prompts probably isn\'t running. Check that it is loaded, then reload this page.',
+    detail: 'no namespace owns prompts/main.md',
+  })
+  assert.deepEqual(failureNotice('FORBIDDEN', 'only a user may accept a proposal'), {
+    text: 'The config store doesn\'t allow this change.',
+    detail: 'only a user may accept a proposal',
+  })
+  assert.deepEqual(failureNotice('LOCKED', 'the config store is locked by another process (x)'), {
+    text: 'Another dish process has the config store locked. Try again in a moment.',
+    detail: 'the config store is locked by another process (x)',
+  })
+})
+
+test('failureNotice: a code with no wording of its own reads <code>: <message>', () => {
+  assert.deepEqual(failureNotice('STALE', 'the reason'), { text: 'STALE: the reason' })
 })
 
 test('the fixed sentences', () => {
@@ -69,6 +82,14 @@ test('unexpectedNotice is a generic line, with whatever the failure said as deta
   assert.deepEqual(unexpectedNotice('plain'), { text: 'Something went wrong talking to dish-prompts', detail: 'plain' })
   assert.deepEqual(unexpectedNotice(undefined), { text: 'Something went wrong talking to dish-prompts' })
   assert.deepEqual(unexpectedNotice({ message: '' }), { text: 'Something went wrong talking to dish-prompts' })
+})
+
+test('unexpectedNotice names the remote the call was to', () => {
+  assert.deepEqual(unexpectedNotice({ message: 'gateway offline' }, 'dish-config'), {
+    text: 'Something went wrong talking to dish-config',
+    detail: 'gateway offline',
+  })
+  assert.deepEqual(unexpectedNotice(undefined, 'dish-config'), { text: 'Something went wrong talking to dish-config' })
 })
 
 test('roleLabel: Common, Main, then a crew role by its name with a capital', () => {

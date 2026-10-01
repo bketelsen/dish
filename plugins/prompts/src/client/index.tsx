@@ -44,7 +44,7 @@ function registerPrompts(ctx: Context): void {
     id: 'dish-prompts',
     order: ORDER,
     label: () => 'Prompts',
-    inject: () => prompts,
+    inject: () => prompts.face,
   }, Prompts))
 }
 

@@ -25,7 +25,8 @@ export const ALREADY_DEFAULT = 'Already the default — nothing to do'
 export const SAME_AS_DEFAULT = 'Same as the default.'
 
 /**
- * What a store refusal (`{ ok: false, code, message }`) is called. A code with no wording of its own reads `<code>: <message>`.
+ * What a store refusal (`{ ok: false, code, message }`) is called. A code with no wording of its own (`STALE`, which the page
+ * never causes) reads `<code>: <message>`.
  * @param action - what was being done. A `CONFLICT` on a save means what the page loaded is out of date, and the draft is
  *   safe; on a revert it means a later commit touched the same file, which reloading does not help.
  */
@@ -45,6 +46,13 @@ export function failureNotice(code: ErrorCode, message: string, action: Action =
       return { text: 'The config store isn\'t running, so prompts are read-only. Start dish-config to change them.' }
     case 'NOT_FOUND':
       return { text: 'Not found: it may have been deleted or reverted elsewhere.', detail: message }
+    case 'UNOWNED':
+      // The store knows no claim on the prompts' paths: the plugin that makes the claim, this one's host half, isn't running.
+      return { text: 'The config store has no claim on the prompts, so dish-prompts probably isn\'t running. Check that it is loaded, then reload this page.', detail: message }
+    case 'FORBIDDEN':
+      return { text: 'The config store doesn\'t allow this change.', detail: message }
+    case 'LOCKED':
+      return { text: 'Another dish process has the config store locked. Try again in a moment.', detail: message }
     default:
       return { text: `${code}: ${message}` }
   }
@@ -54,9 +62,10 @@ export function failureNotice(code: ErrorCode, message: string, action: Action =
  * What a call that failed for a reason other than a store refusal is called: the Remote's own failure (a carrier that
  * is down, the gateway's `internal`), or anything thrown.
  * @param failure - the `RemoteResult`'s error, or what was thrown.
+ * @param remote - which remote the call was to: this page talks to dish-prompts' and, for the History tab, dish-config's.
  */
-export function unexpectedNotice(failure: unknown): Notice {
-  const text = 'Something went wrong talking to dish-prompts'
+export function unexpectedNotice(failure: unknown, remote = 'dish-prompts'): Notice {
+  const text = `Something went wrong talking to ${remote}`
   const detail = describe(failure)
   return detail === '' ? { text } : { text, detail }
 }

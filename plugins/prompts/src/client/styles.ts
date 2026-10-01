@@ -3,7 +3,11 @@
  * plugin's id and removes it on unload.
  *
  * Colours come from `--dsw-alias-*` tokens only, so the page follows the theme. Nothing here sets a width wider than
- * its container: at phone width the page does not scroll sideways. Below 640px the list of roles gives way to a select.
+ * its container: at phone width the page does not scroll sideways.
+ *
+ * The layout follows the width of the page itself, not the window's: it sits in Settings' content column, which the nav
+ * makes much narrower than the window. So `.dish-prompts` is a size container (as dsh's own settings pages are, with the
+ * `width: 100%` that keeps a size container from collapsing), and the list of roles gives way to a select below 560px.
  *
  * The diff's own rules (`.dish-diff-*`) are dish-kit's, added by `DiffView`'s module when this bundle loads.
  */
@@ -14,8 +18,10 @@ const css = `
   flex-direction: column;
   gap: 12px;
   box-sizing: border-box;
+  width: 100%;
   min-width: 0;
   max-width: 880px;
+  container: dish-prompts / inline-size;
   color: var(--dsw-alias-label-primary);
   font-size: 13px;
   line-height: 20px;
@@ -199,6 +205,28 @@ const css = `
   color: var(--dsw-alias-label-primary);
 }
 
+/*
+ * The tabs are dsh's SegmentedTabs: equal columns that can't be narrower than their label, since a grid item's minimum is its
+ * content. At a narrow width the labels ran into each other. The tab gives up its minimum and the label shortens with an
+ * ellipsis instead, so neighbours never overlap, and the padding and size come down as the page narrows.
+ */
+.dish-prompts-tabs {
+  min-width: 0;
+}
+.dish-prompts-tabs [role="tab"] {
+  min-width: 0;
+  padding: 0 8px;
+  overflow: hidden;
+  font-size: 13px;
+}
+.dish-prompts-tab-label {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* The editor */
 .dish-prompts-textarea {
   display: block;
@@ -371,7 +399,7 @@ const css = `
   color: var(--dsw-alias-state-error-primary);
 }
 
-@media (max-width: 639px) {
+@container dish-prompts (width < 560px) {
   .dish-prompts-layout {
     grid-template-columns: minmax(0, 1fr);
     gap: 12px;
@@ -381,6 +409,12 @@ const css = `
   }
   .dish-prompts-role-select {
     display: block;
+  }
+}
+@container dish-prompts (width < 420px) {
+  .dish-prompts-tabs [role="tab"] {
+    padding: 0 4px;
+    font-size: 12px;
   }
 }
 `

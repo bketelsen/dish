@@ -152,6 +152,7 @@ function RoleView({ state, role, actions }: { state: PageState, role: RoleInfo |
       {state.document === 'ready' && (
         <>
           <SegmentedTabs
+            className="dish-prompts-tabs"
             label="Prompt views"
             value={tab}
             onChange={(next) => { void actions.setTab(next) }}
@@ -170,5 +171,5 @@ function RoleView({ state, role, actions }: { state: PageState, role: RoleInfo |
 }
 
 function tabItem(tab: Tab): SegmentedTab<Tab> {
-  return { value: tab, label: TAB_LABEL[tab], id: `dish-prompts-tab-${tab}`, panelId: 'dish-prompts-panel' }
+  return { value: tab, label: <span className="dish-prompts-tab-label">{TAB_LABEL[tab]}</span>, id: `dish-prompts-tab-${tab}`, panelId: 'dish-prompts-panel' }
 }

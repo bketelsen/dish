@@ -26,13 +26,20 @@ import { unifiedDiff } from 'dish-kit/ui/diff'
 import type { FileDiff } from 'dish-kit/ui/diff'
 import { interpolate } from '../interpolate.ts'
 import type { CommitInfo, ErrorCode, Outcome, PreviewResult, ReadResult, RoleInfo, VariableInfo } from '../protocol.ts'
-import { shortId } from './format.ts'
+import { roleLabel, shortId } from './format.ts'
 import { ALREADY_DEFAULT, NOTHING_TO_REVERT, failureNotice, unexpectedNotice } from './outcome.ts'
 import type { Action, Notice } from './outcome.ts'
 import type { ConfigCalls, ConfigEvent, PromptsApi } from './remote.ts'
 
 /** How many commits the History tab asks for. */
 export const HISTORY_PAGE = 20
+
+/** The note a reset carries, so that its commit says what it was in the history. */
+export const RESET_NOTE = 'Reset to the default'
+
+/** What the page calls its two remotes when a call fails before the store is reached. */
+const PROMPTS = 'dish-prompts'
+const CONFIG = 'dish-config'
 
 /** The page's tabs. `default` is there only for a role with a shipped default, `history` only with dish-config's remote. */
 export type Tab = 'edit' | 'default' | 'preview' | 'history'
@@ -164,7 +171,9 @@ export interface PromptsActions {
   dismiss(): void
 }
 
-export interface PromptsController extends PromptsActions {
+export interface PromptsController {
+  /** What the component gets: the observable and the actions, and nothing that feeds the controller. */
+  face: PromptsActions
   getState(): PageState
   /**
    * One item of dish-config's `watch`. `opening` is whether it is the first of a stream the page has (re)opened: events
@@ -204,21 +213,27 @@ function unknownIn(text: string, variables: VariablesState): string[] {
   return interpolate(text, Object.fromEntries(variables.list.map(variable => [variable.name, '']))).unknown
 }
 
-type Settled<T> = { ok: true, value: T } | { ok: false, notice: Notice, code?: ErrorCode }
+/** What a call that did not succeed is, for the page: its notice, and for a refusal by the store its code and its own words. */
+type Failed = { ok: false, notice: Notice, code?: ErrorCode, message?: string }
+
+type Settled<T> = { ok: true, value: T } | Failed
 
 /**
  * Wait for a call and fold both kinds of failure (the carrier's and the store's) into a `Notice`. Never throws.
  * @param action - what the person was doing, for the refusals whose wording depends on it.
+ * @param remote - which remote the call is to, for the failures that name it.
  */
-async function settle<T>(task: () => Promise<RemoteResult<Outcome<T>>>, action?: Action): Promise<Settled<T>> {
+async function settle<T>(task: () => Promise<RemoteResult<Outcome<T>>>, action?: Action, remote = PROMPTS): Promise<Settled<T>> {
   try {
     const result = await task()
-    if (!result.ok) return { ok: false, notice: unexpectedNotice(result.error) }
+    if (!result.ok) return { ok: false, notice: unexpectedNotice(result.error, remote) }
     const outcome = result.value
-    if (!outcome.ok) return { ok: false, notice: failureNotice(outcome.code, outcome.message, action), code: outcome.code }
+    if (!outcome.ok) {
+      return { ok: false, notice: failureNotice(outcome.code, outcome.message, action), code: outcome.code, message: outcome.message }
+    }
     return { ok: true, value: outcome.value }
   } catch (error) {
-    return { ok: false, notice: unexpectedNotice(error) }
+    return { ok: false, notice: unexpectedNotice(error, remote) }
   }
 }
 
@@ -264,9 +279,8 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
   const get = (): PageState => store.getSnapshot()
   const patch = (next: Partial<PageState>): void => { store.set({ ...get(), ...next }) }
 
-  /** Bumped when an answer in flight stops being wanted: a newer read of the document, another role, a newer list. */
+  /** Bumped when an answer in flight stops being wanted: a newer read of the document or a write that is newer than it, another role. */
   let documentGeneration = 0
-  let rolesGeneration = 0
   let previewGeneration = 0
   let historyGeneration = 0
   /** Bumped when another role is opened (or the same one from nothing): a write's answer for an earlier one is not for this page. */
@@ -328,11 +342,14 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
     ensureTab()
   }
 
-  /** What the tab shown needs, after the role changed. */
-  const loadShownTab = async (): Promise<void> => {
-    const { tab } = get()
-    if (tab === 'preview') await loadPreview()
-    else if (tab === 'history') await loadHistory()
+  /**
+   * What the tab shown needs when it has nothing: after a role was opened, or after a read that took the place of the one that
+   * would have opened it. A tab that has something is left to the events that refresh it.
+   */
+  const loadMissingTab = async (): Promise<void> => {
+    const { tab, preview, history } = get()
+    if (tab === 'preview' && preview === undefined) await loadPreview()
+    else if (tab === 'history' && history === undefined) await loadHistory()
   }
 
   /** Open `role` from nothing: what was shown of the last one goes. */
@@ -366,7 +383,7 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
       return
     }
     adopt(result.value)
-    await loadShownTab()
+    await loadMissingTab()
   }
 
   /**
@@ -394,6 +411,8 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
       eventWhileWriting = true
     } else if (!state.dirty) {
       adopt(read)
+      // This read may have taken the place of the one that was to open the role, and with it the tab's load.
+      await loadMissingTab()
     } else if (read.text !== state.saved?.text) {
       patch({ conflict: { theirs: read.text, commit: read.commit }, readOnly: read.commit === null })
     } else if (state.conflict !== undefined) {
@@ -401,34 +420,75 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
     }
   }
 
-  /** Read the document again and take it, draft included. */
+  /**
+   * Read the document again and take it, draft included. The draft goes first, before the read: a live event that comes while
+   * it is out would otherwise find edits to protect and make a conflict of the very text this is fetching. If the read fails the
+   * edit comes back, unless the person has typed since.
+   */
   const reload = async (): Promise<void> => {
     const role = get().selected
     if (role === undefined) return
     const generation = ++documentGeneration
-    if (get().saved === undefined) patch({ document: 'loading', documentError: undefined })
+    const before = get()
+    const { saved } = before
+    if (saved === undefined) {
+      patch({ document: 'loading', documentError: undefined })
+    } else {
+      patch({ draft: saved.text, note: '', dirty: false, conflict: undefined, unknownVariables: unknownIn(saved.text, before.variables) })
+    }
     const result = await settle(() => api.read(role))
     if (generation !== documentGeneration) return
     if (!result.ok) {
-      if (get().saved === undefined) patch({ document: 'error', documentError: result.notice })
-      else patch({ notice: { tone: 'error', ...result.notice } })
+      if (saved === undefined) {
+        patch({ document: 'error', documentError: result.notice })
+      } else {
+        const kept = get().dirty ? {} : { draft: before.draft, note: before.note, dirty: before.dirty, conflict: before.conflict, unknownVariables: before.unknownVariables }
+        patch({ ...kept, notice: { tone: 'error', ...result.notice } })
+      }
       return
     }
     adopt(result.value)
+    await loadMissingTab()
   }
 
   // --- the roles and the variables ----------------------------------------------------------------
 
-  const refreshRoles = async (): Promise<RoleInfo[] | undefined> => {
-    const generation = ++rolesGeneration
+  /** The roles as the server lists them now, `undefined` when it could not say. */
+  const readRoles = async (): Promise<RoleInfo[] | undefined> => {
     const result = await settle(() => api.roles())
-    if (generation !== rolesGeneration) return undefined
     if (!result.ok) {
       patch({ rolesLoaded: true, rolesError: result.notice })
       return undefined
     }
     patch({ roles: result.value, rolesLoaded: true, rolesError: undefined })
     return result.value
+  }
+
+  let rolesRunning: Promise<RoleInfo[] | undefined> | undefined
+  let rolesAgain = false
+
+  /**
+   * Read the roles, one read at a time: a call while one is under way waits for it, and the roles are read once more after it, for
+   * whatever changed meanwhile. Every caller gets the last answer, so none of them is left waiting on a read that was set aside.
+   */
+  const refreshRoles = (): Promise<RoleInfo[] | undefined> => {
+    if (rolesRunning !== undefined) {
+      rolesAgain = true
+      return rolesRunning
+    }
+    rolesRunning = (async () => {
+      try {
+        let roles: RoleInfo[] | undefined
+        do {
+          rolesAgain = false
+          roles = await readRoles()
+        } while (rolesAgain)
+        return roles
+      } finally {
+        rolesRunning = undefined
+      }
+    })()
+    return rolesRunning
   }
 
   const loadVariables = async (): Promise<void> => {
@@ -467,7 +527,7 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
       return
     }
     patch({ history: { status: 'loading', commits, details } })
-    const result = await settle(() => calls.history(path, HISTORY_PAGE, ''))
+    const result = await settle(() => calls.history(path, HISTORY_PAGE, ''), undefined, CONFIG)
     if (generation !== historyGeneration) return
     const current = get().history?.details ?? details
     patch({
@@ -489,7 +549,7 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
       if (current !== undefined) patch({ history: { ...current, details: { ...current.details, [id]: detail } } })
     }
     setDetail({ status: 'loading' })
-    const result = await settle(() => calls.commit(id))
+    const result = await settle(() => calls.commit(id), undefined, CONFIG)
     // The log was left (another role) or the row is gone: this answer is for nothing.
     if (get().history?.details[id]?.status !== 'loading') return
     setDetail(result.ok ? { status: 'ready', info: result.value.info, diffs: result.value.diffs } : { status: 'error', error: result.notice })
@@ -505,9 +565,9 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
   }
 
   const refreshHistory = async (): Promise<void> => {
-    if (get().history === undefined) return
+    // The tab shown loads even when it has nothing yet: a role opened just now may not have got to it.
     if (get().tab === 'history') await loadHistory()
-    else {
+    else if (get().history !== undefined) {
       historyGeneration++
       patch({ history: undefined })
     }
@@ -515,10 +575,18 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
 
   // --- writing --------------------------------------------------------------------------------------
 
-  /** A refusal of a write: the notice, and after a `CONFLICT` the text that is there now, so the person can see what changed. */
-  const refused = async (result: Extract<Settled<unknown>, { ok: false }>, role: string, chosen: number): Promise<void> => {
-    patch({ notice: { tone: 'error', ...result.notice } })
-    if (result.code === 'CONFLICT') {
+  /**
+   * A refusal of a write: the notice, and after a `CONFLICT` the text that is there now, so the person can see what changed. For a
+   * role the page has left, the notice says which one, in the store's own words: what the friendly text says of "the editor" is
+   * not true of it any more.
+   */
+  const refused = async (failure: Failed, role: string, chosen: number, verb: 'save' | 'reset'): Promise<void> => {
+    if (chosen === selection) {
+      patch({ notice: { tone: 'error', ...failure.notice } })
+    } else {
+      patch({ notice: { tone: 'error', text: `Couldn't ${verb} ${roleLabel(role)}`, detail: failure.message ?? failure.notice.text } })
+    }
+    if (failure.code === 'CONFLICT' && chosen === selection) {
       const theirs = await settle(() => api.read(role))
       if (theirs.ok && chosen === selection) patch({ conflict: { theirs: theirs.value.text, commit: theirs.value.commit } })
     }
@@ -537,24 +605,30 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
     if (!state.dirty || state.busy !== undefined || state.conflict !== undefined || role === undefined || saved === undefined) return
     const text = state.draft
     const chosen = selection
+    const label = roleLabel(role)
     patch({ busy: 'save', notice: undefined })
     const result = await settle(() => api.save(role, text, saved.commit ?? '', state.note), 'save')
     patch({ busy: undefined })
     if (!result.ok) {
-      await refused(result, role, chosen)
+      await refused(result, role, chosen, 'save')
       return
     }
     const commit = result.value
     if (commit === null) {
       // The document already says this. Its commit is the one to save over from now on.
-      patch({ notice: { tone: 'info', text: 'Nothing to save: the store already has this text.' } })
-      const read = await settle(() => api.read(role))
-      if (read.ok && chosen === selection) rebase(read.value)
+      patch({ notice: { tone: 'info', text: `Nothing to save for ${label}: the store already has this text.` } })
+      if (chosen === selection) {
+        const generation = ++documentGeneration
+        const read = await settle(() => api.read(role))
+        if (read.ok && generation === documentGeneration) rebase(read.value)
+      }
       await settleEvents()
       return
     }
-    patch({ notice: { tone: 'success', text: `Saved as ${shortId(commit.id)}` } })
+    patch({ notice: { tone: 'success', text: `Saved ${label} as ${shortId(commit.id)}` } })
     if (chosen === selection) {
+      // A read that began before this save is older than it, and must not put the old text back when it lands.
+      documentGeneration++
       // What was typed while the save was under way stays, and is still unsaved.
       patch({
         saved: { text, commit: commit.id },
@@ -572,31 +646,39 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
     const { selected: role, saved } = state
     if (state.busy !== undefined || role === undefined || saved === undefined || state.defaultText === null) return
     const chosen = selection
+    const label = roleLabel(role)
     patch({ busy: 'reset', notice: undefined })
-    const result = await settle(() => api.reset(role, saved.commit ?? '', state.note), 'reset')
+    const result = await settle(() => api.reset(role, saved.commit ?? '', RESET_NOTE), 'reset')
     patch({ busy: undefined })
     if (!result.ok) {
-      await refused(result, role, chosen)
+      await refused(result, role, chosen, 'reset')
       return
     }
     const commit = result.value
     patch({
       notice: commit === null
-        ? { tone: 'info', text: ALREADY_DEFAULT }
-        : { tone: 'success', text: `Reset to the default as ${shortId(commit.id)}` },
+        ? { tone: 'info', text: `${label}: ${ALREADY_DEFAULT}` }
+        : { tone: 'success', text: `Reset ${label} to the default as ${shortId(commit.id)}` },
     })
-    // The editor shows the default, an unsaved edit included: that is what the person asked for.
-    const read = await settle(() => api.read(role))
-    if (read.ok && chosen === selection) adopt(read.value)
-    eventWhileWriting = false
-    await refreshAfterWrite()
+    if (chosen === selection) {
+      // The editor shows the default, an unsaved edit included: that is what the person asked for. A read that began before the
+      // reset is older than it, so this one takes the place of any that is out.
+      const generation = ++documentGeneration
+      const read = await settle(() => api.read(role))
+      if (read.ok && generation === documentGeneration && chosen === selection) {
+        adopt(read.value)
+        // What a held live event would have shown is in what was just read.
+        eventWhileWriting = false
+      }
+    }
+    await Promise.all([refreshAfterWrite(), settleEvents()])
   }
 
   const revert = async (id: string): Promise<void> => {
     const calls = configCalls
     if (calls === undefined || get().busy !== undefined) return
     patch({ busy: `revert:${id}`, notice: undefined })
-    const result = await settle(() => calls.revert(id), 'revert')
+    const result = await settle(() => calls.revert(id), 'revert', CONFIG)
     patch({ busy: undefined })
     if (!result.ok) {
       patch({ notice: { tone: 'error', ...result.notice } })
@@ -630,20 +712,21 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
     else if (tab === 'history') await loadHistory()
   }
 
-  return {
-    hooks: { page: store },
-    getState: get,
+  const open = async (): Promise<void> => {
+    const [roles] = await Promise.all([refreshRoles(), loadVariables()])
+    if (get().selected !== undefined) {
+      await refreshSelected()
+      return
+    }
+    const list = roles ?? get().roles
+    const first = list.find(role => role.role === 'main') ?? list[0]
+    if (first !== undefined) await choose(first.role)
+  }
 
-    async open() {
-      const [roles] = await Promise.all([refreshRoles(), loadVariables()])
-      if (get().selected !== undefined) {
-        await refreshSelected()
-        return
-      }
-      const list = roles ?? get().roles
-      const first = list.find(role => role.role === 'main') ?? list[0]
-      if (first !== undefined) await choose(first.role)
-    },
+  const face: PromptsActions = {
+    // A store to read and subscribe to, not the one the controller writes.
+    hooks: { page: { getSnapshot: store.getSnapshot, subscribe: store.subscribe } },
+    open,
     select,
     async confirmSwitch() {
       const role = get().switching
@@ -684,6 +767,11 @@ export function createPrompts(api: PromptsApi, config?: ConfigCalls): PromptsCon
     dismiss() {
       patch({ notice: undefined })
     },
+  }
+
+  return {
+    face,
+    getState: get,
 
     async onConfigEvent(event, opening = false) {
       if (opening) {

@@ -63,6 +63,8 @@ class FakePrompts {
   variablesResult: RemoteResult<Outcome<VariablesResult>> = ok(VARIABLES)
   previewResult: RemoteResult<Outcome<PreviewResult>> = ok({ text: 'PREVIEW', approximate: true, fallback: false, unknownVariables: [] })
   readDown = false
+  /** The next read fails at the carrier, once. */
+  failNextRead = false
   /** The next write answers `null`, as the store does for a text the document already has. */
   forceNull = false
 
@@ -77,8 +79,12 @@ class FakePrompts {
     return id(this.head)
   }
 
+  /** Hold the call that reaches `name` until its gate opens. A gate holds one call: the next to reach the name goes straight through. */
   private async wait(name: string): Promise<void> {
-    await this.gates.get(name)?.opened
+    const held = this.gates.get(name)
+    if (held === undefined) return
+    this.gates.delete(name)
+    await held.opened
   }
 
   private commitInfo(role: string, note: string): CommitInfo {
@@ -115,7 +121,10 @@ class FakePrompts {
     },
     read: async (role) => {
       this.calls.push(`read ${role}`)
-      if (this.readDown) return { ok: false, error: { message: 'gateway offline' } } as unknown as RemoteResult<never>
+      if (this.readDown || this.failNextRead) {
+        this.failNextRead = false
+        return { ok: false, error: { message: 'gateway offline' } } as unknown as RemoteResult<never>
+      }
       // The answer is what the document says when the read is made, not when the gate lets it through.
       const doc = this.docs.get(role)!
       const answer: ReadResult = { text: doc.text, commit: this.up ? id(this.head) : null, defaultText: DEFAULTS[role] ?? null, missing: false }
@@ -130,7 +139,8 @@ class FakePrompts {
       return answer
     },
     reset: async (role, base, note) => {
-      this.calls.push(`reset ${role} ${base === '' ? '-' : base.slice(0, 7)}`)
+      this.calls.push(`reset ${role} ${base === '' ? '-' : base.slice(0, 7)} ${note === '' ? '-' : note}`)
+      await this.wait('reset')
       const shipped = DEFAULTS[role]
       if (shipped === undefined) return refused('INVALID', `"${role}" has no shipped default to go back to`)
       return this.write(role, shipped, base, note)
@@ -152,20 +162,29 @@ class FakeConfig {
   calls: string[] = []
   log: CommitInfo[] = []
   reverts: Array<CommitInfo | null | 'conflict'> = []
+  /** The carrier is down: every call fails before the store is reached. */
+  down = false
+
+  private carrierDown(): RemoteResult<never> {
+    return { ok: false, error: { message: 'gateway offline' } } as unknown as RemoteResult<never>
+  }
 
   readonly api: ConfigCalls = {
     history: async (prefix, limit, before) => {
       this.calls.push(`history ${prefix} ${limit} ${before === '' ? '-' : before}`)
+      if (this.down) return this.carrierDown()
       return ok(this.log)
     },
     commit: async (commit) => {
       this.calls.push(`commit ${commit}`)
+      if (this.down) return this.carrierDown()
       const info = this.log.find(candidate => candidate.id === commit)
       if (info === undefined) return refused('NOT_FOUND', `there is no commit ${commit}`)
       return ok({ info, diffs: [{ path: info.paths[0]!, status: 'modified' as const, patch: '--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n' }] })
     },
     revert: async (commit) => {
       this.calls.push(`revert ${commit}`)
+      if (this.down) return this.carrierDown()
       const next = this.reverts.shift() ?? null
       if (next === 'conflict') return refused('CONFLICT', 'a later change touched the same files')
       return ok(next)
@@ -191,10 +210,18 @@ function setup(options: { config?: boolean } = {}): Setup {
   return { fake, config, page, state: () => page.getState() }
 }
 
+/** Wait until `check` holds: the fakes answer on later ticks, and a test needs to act once a call has reached them. */
+async function until(what: string, check: () => boolean): Promise<void> {
+  for (let tries = 0; !check(); tries++) {
+    if (tries > 2_000) throw new Error(`timed out waiting for ${what}`)
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+}
+
 /** An opened page, with `main` selected. */
 async function opened(options: { config?: boolean } = {}): Promise<Setup> {
   const made = setup(options)
-  await made.page.open()
+  await made.page.face.open()
   return made
 }
 
@@ -218,13 +245,13 @@ test('open loads the roles and the variables, and selects main', async () => {
 
 test('select loads another role, with a fresh draft, note and tab-appropriate state', async () => {
   const { page, state } = await opened()
-  page.edit('something else\n')
-  page.setNote('why')
+  page.face.edit('something else\n')
+  page.face.setNote('why')
   assert.equal(state().dirty, true)
-  await page.select('common')
+  await page.face.select('common')
   assert.equal(state().switching, 'common', 'a draft is not thrown away silently')
   assert.equal(state().selected, 'main')
-  await page.confirmSwitch()
+  await page.face.confirmSwitch()
   assert.equal(state().selected, 'common')
   assert.equal(state().switching, undefined)
   assert.deepEqual(state().saved, { text: DEFAULTS.common, commit: id(0) })
@@ -235,13 +262,13 @@ test('select loads another role, with a fresh draft, note and tab-appropriate st
 
 test('selecting while clean switches at once, and cancelling a switch keeps the draft', async () => {
   const { page, state } = await opened()
-  await page.select('coder')
+  await page.face.select('coder')
   assert.equal(state().selected, 'coder')
   assert.equal(state().switching, undefined)
-  page.edit('x')
-  await page.select('main')
+  page.face.edit('x')
+  await page.face.select('main')
   assert.equal(state().switching, 'main')
-  page.cancelSwitch()
+  page.face.cancelSwitch()
   assert.equal(state().switching, undefined)
   assert.equal(state().selected, 'coder')
   assert.equal(state().draft, 'x')
@@ -251,8 +278,8 @@ test('an answer for a role that is no longer selected is dropped', async () => {
   const { fake, page, state } = await opened()
   const slow = gate()
   fake.gates.set('read coder', slow)
-  const pending = page.select('coder')
-  await page.select('common')
+  const pending = page.face.select('coder')
+  await page.face.select('common')
   assert.equal(state().selected, 'common')
   slow.release()
   await pending
@@ -263,12 +290,12 @@ test('an answer for a role that is no longer selected is dropped', async () => {
 test('a read the carrier failed is an error with a way to try again, and reload tries again', async () => {
   const { fake, page, state } = setup()
   fake.readDown = true
-  await page.open()
+  await page.face.open()
   assert.equal(state().document, 'error')
   assert.equal(state().documentError?.text, 'Something went wrong talking to dish-prompts')
   assert.equal(state().documentError?.detail, 'gateway offline')
   fake.readDown = false
-  await page.reload()
+  await page.face.reload()
   assert.equal(state().document, 'ready')
   assert.equal(state().draft, DEFAULTS.main)
 })
@@ -276,17 +303,17 @@ test('a read the carrier failed is an error with a way to try again, and reload 
 test('a read with no commit means no store: the page is read-only', async () => {
   const { fake, page, state } = setup()
   fake.up = false
-  await page.open()
+  await page.face.open()
   assert.equal(state().readOnly, true)
   assert.equal(state().saved?.commit, null)
-  await page.save()
-  page.edit('changed')
-  await page.save()
+  await page.face.save()
+  page.face.edit('changed')
+  await page.face.save()
   assert.equal(state().notice?.tone, 'error')
   assert.match(state().notice?.text ?? '', /config store isn't running/)
   assert.equal(state().draft, 'changed', 'the draft stays')
   fake.up = true
-  await page.reload()
+  await page.face.reload()
   assert.equal(state().readOnly, false)
 })
 
@@ -295,18 +322,18 @@ test('a read with no commit means no store: the page is read-only', async () => 
 test('edit tracks whether the draft differs from what is saved', async () => {
   const { page, state } = await opened()
   assert.equal(state().dirty, false)
-  page.edit('You are main, on {{model}}.\nMore.\n')
+  page.face.edit('You are main, on {{model}}.\nMore.\n')
   assert.equal(state().dirty, true)
   assert.equal(state().draft, 'You are main, on {{model}}.\nMore.\n')
-  page.edit(DEFAULTS.main!)
+  page.face.edit(DEFAULTS.main!)
   assert.equal(state().dirty, false, 'typing back to what is saved is clean')
 })
 
 test('discard returns the draft to the saved text and drops the note', async () => {
   const { page, state } = await opened()
-  page.edit('x')
-  page.setNote('because')
-  page.discard()
+  page.face.edit('x')
+  page.face.setNote('because')
+  page.face.discard()
   assert.equal(state().draft, DEFAULTS.main)
   assert.equal(state().note, '')
   assert.equal(state().dirty, false)
@@ -317,16 +344,16 @@ test('discard returns the draft to the saved text and drops the note', async () 
 test('save with nothing changed does nothing', async () => {
   const { fake, page } = await opened()
   const before = fake.calls.length
-  await page.save()
+  await page.face.save()
   assert.equal(fake.calls.length, before)
 })
 
 test('save writes the draft on the commit the page loaded, with the note, and refreshes saved and the roles', async () => {
   const { fake, page, state } = await opened()
-  page.edit('You are main, on {{model}}. Be brief.\n')
-  page.setNote('shorter')
+  page.face.edit('You are main, on {{model}}. Be brief.\n')
+  page.face.setNote('shorter')
   const rolesBefore = fake.calls.filter(call => call === 'roles').length
-  await page.save()
+  await page.face.save()
   assert.ok(fake.calls.includes(`save main ${id(0).slice(0, 7)} shorter`), fake.calls.join(', '))
   assert.deepEqual(state().saved, { text: 'You are main, on {{model}}. Be brief.\n', commit: id(1) })
   assert.equal(state().dirty, false)
@@ -340,10 +367,10 @@ test('save writes the draft on the commit the page loaded, with the note, and re
 
 test('after a save the next one is made on the new commit', async () => {
   const { fake, page } = await opened()
-  page.edit('one\n')
-  await page.save()
-  page.edit('two\n')
-  await page.save()
+  page.face.edit('one\n')
+  await page.face.save()
+  page.face.edit('two\n')
+  await page.face.save()
   assert.ok(fake.calls.includes(`save main ${id(1).slice(0, 7)} -`), fake.calls.join(', '))
 })
 
@@ -351,10 +378,10 @@ test('what is typed while a save is under way is kept, and is still unsaved', as
   const { fake, page, state } = await opened()
   const slow = gate()
   fake.gates.set('save', slow)
-  page.edit('first\n')
-  const saving = page.save()
+  page.face.edit('first\n')
+  const saving = page.face.save()
   assert.equal(state().busy, 'save')
-  page.edit('first\nsecond\n')
+  page.face.edit('first\nsecond\n')
   slow.release()
   await saving
   assert.equal(state().saved?.text, 'first\n')
@@ -366,8 +393,8 @@ test('the live event for this page\'s own save, arriving before the save\'s answ
   const { fake, page, state } = await opened()
   const slow = gate()
   fake.gates.set('save answer', slow)
-  page.edit('mine\n')
-  const saving = page.save()
+  page.face.edit('mine\n')
+  const saving = page.face.save()
   while (fake.head < 1) await new Promise(resolve => setTimeout(resolve, 1))
   // The store has committed and said so, and the answer to the save is still on its way.
   await page.onConfigEvent({ kind: 'changed', commit: id(1), paths: ['prompts/main.md'] })
@@ -384,9 +411,9 @@ test('a second save while one is under way is not started', async () => {
   const { fake, page } = await opened()
   const slow = gate()
   fake.gates.set('save', slow)
-  page.edit('first\n')
-  const saving = page.save()
-  await page.save()
+  page.face.edit('first\n')
+  const saving = page.face.save()
+  await page.face.save()
   slow.release()
   await saving
   assert.equal(fake.calls.filter(call => call.startsWith('save ')).length, 1)
@@ -396,8 +423,8 @@ test('save that finds the document already says this has nothing to commit, and 
   const { fake, page, state } = await opened()
   fake.external('main', 'same text\n')
   fake.forceNull = true
-  page.edit('same text\n')
-  await page.save()
+  page.face.edit('same text\n')
+  await page.face.save()
   assert.equal(fake.calls.some(call => call.startsWith('save main')), true)
   assert.equal(state().notice?.tone, 'info')
   assert.equal(state().dirty, false)
@@ -406,8 +433,8 @@ test('save that finds the document already says this has nothing to commit, and 
 
 test('save with an empty draft is refused as INVALID, with the store\'s message, and the draft stays', async () => {
   const { page, state } = await opened()
-  page.edit('   \n')
-  await page.save()
+  page.face.edit('   \n')
+  await page.face.save()
   assert.equal(state().notice?.tone, 'error')
   assert.match(state().notice?.text ?? '', /can't be empty/)
   assert.equal(state().draft, '   \n')
@@ -416,9 +443,9 @@ test('save with an empty draft is refused as INVALID, with the store\'s message,
 
 test('save that hits CONFLICT keeps the draft and puts theirs in conflict', async () => {
   const { fake, page, state } = await opened()
-  page.edit('mine\n')
+  page.face.edit('mine\n')
   fake.external('main', 'theirs\n')
-  await page.save()
+  await page.face.save()
   assert.equal(state().draft, 'mine\n')
   assert.equal(state().dirty, true)
   assert.deepEqual(state().conflict, { theirs: 'theirs\n', commit: id(1) })
@@ -429,21 +456,21 @@ test('save that hits CONFLICT keeps the draft and puts theirs in conflict', asyn
 
 test('while a conflict is open save does nothing: Reload or Keep mine comes first', async () => {
   const { fake, page, state } = await opened()
-  page.edit('mine\n')
+  page.face.edit('mine\n')
   fake.external('main', 'theirs\n')
-  await page.save()
+  await page.face.save()
   assert.ok(state().conflict !== undefined)
   const before = fake.calls.length
-  await page.save()
+  await page.face.save()
   assert.equal(fake.calls.length, before, 'no second attempt on the old base')
 })
 
 test('Reload after a conflict adopts theirs and drops the draft', async () => {
   const { fake, page, state } = await opened()
-  page.edit('mine\n')
+  page.face.edit('mine\n')
   fake.external('main', 'theirs\n')
-  await page.save()
-  await page.reload()
+  await page.face.save()
+  await page.face.reload()
   assert.equal(state().conflict, undefined)
   assert.equal(state().draft, 'theirs\n')
   assert.deepEqual(state().saved, { text: 'theirs\n', commit: id(1) })
@@ -452,15 +479,15 @@ test('Reload after a conflict adopts theirs and drops the draft', async () => {
 
 test('Keep mine after a conflict makes theirs the base, keeps the draft, and the next save goes through', async () => {
   const { fake, page, state } = await opened()
-  page.edit('mine\n')
+  page.face.edit('mine\n')
   fake.external('main', 'theirs\n')
-  await page.save()
-  page.keepMine()
+  await page.face.save()
+  page.face.keepMine()
   assert.equal(state().conflict, undefined)
   assert.equal(state().draft, 'mine\n')
   assert.deepEqual(state().saved, { text: 'theirs\n', commit: id(1) })
   assert.equal(state().dirty, true)
-  await page.save()
+  await page.face.save()
   assert.equal(state().notice?.tone, 'success')
   assert.deepEqual(state().saved, { text: 'mine\n', commit: id(2) })
 })
@@ -468,8 +495,8 @@ test('Keep mine after a conflict makes theirs the base, keeps the draft, and the
 test('a save while the store is not running says so, and keeps the draft', async () => {
   const { fake, page, state } = await opened()
   fake.up = false
-  page.edit('x\n')
-  await page.save()
+  page.face.edit('x\n')
+  await page.face.save()
   assert.equal(state().notice?.tone, 'error')
   assert.match(state().notice?.text ?? '', /config store isn't running/)
   assert.equal(state().draft, 'x\n')
@@ -490,7 +517,7 @@ test('a change to the selected path while clean reloads the document', async () 
 
 test('a change to the selected path while dirty sets conflict and keeps the draft', async () => {
   const { fake, page, state } = await opened()
-  page.edit('my edit\n')
+  page.face.edit('my edit\n')
   const commit = fake.external('main', 'edited elsewhere\n')
   await page.onConfigEvent({ kind: 'changed', commit, paths: ['prompts/main.md'] })
   assert.equal(state().draft, 'my edit\n')
@@ -500,9 +527,9 @@ test('a change to the selected path while dirty sets conflict and keeps the draf
 
 test('the echo of this page\'s own save is no conflict, even with a new edit under way', async () => {
   const { page, state } = await opened()
-  page.edit('one\n')
-  await page.save()
-  page.edit('one\ntwo\n')
+  page.face.edit('one\n')
+  await page.face.save()
+  page.face.edit('one\ntwo\n')
   await page.onConfigEvent({ kind: 'changed', commit: id(1), paths: ['prompts/main.md'] })
   assert.equal(state().conflict, undefined)
   assert.equal(state().draft, 'one\ntwo\n')
@@ -511,7 +538,7 @@ test('the echo of this page\'s own save is no conflict, even with a new edit und
 
 test('a change to another path leaves the document alone and refreshes the list; one to no prompt does nothing', async () => {
   const { fake, page, state } = await opened()
-  page.edit('my edit\n')
+  page.face.edit('my edit\n')
   const commit = fake.external('coder', 'changed coder\n')
   const before = fake.calls.length
   await page.onConfigEvent({ kind: 'changed', commit, paths: ['prompts/crew/coder.md'] })
@@ -551,11 +578,11 @@ test('the first event of a stream reads again what the page has, and a remote st
 
 test('reset writes the default on the commit the page loaded, and the editor shows it', async () => {
   const { fake, page, state } = await opened()
-  page.edit('custom\n')
-  await page.save()
-  page.edit('custom\nmore\n')
-  await page.reset()
-  assert.ok(fake.calls.includes(`reset main ${id(1).slice(0, 7)}`), fake.calls.join(', '))
+  page.face.edit('custom\n')
+  await page.face.save()
+  page.face.edit('custom\nmore\n')
+  await page.face.reset()
+  assert.ok(fake.calls.includes(`reset main ${id(1).slice(0, 7)} Reset to the default`), fake.calls.join(', '))
   assert.equal(state().draft, DEFAULTS.main, 'an unsaved edit is replaced by the default too')
   assert.equal(state().saved?.text, DEFAULTS.main)
   assert.equal(state().saved?.commit, id(2))
@@ -566,16 +593,16 @@ test('reset writes the default on the commit the page loaded, and the editor sho
 
 test('reset of a prompt that already is the default says so', async () => {
   const { page, state } = await opened()
-  await page.reset()
+  await page.face.reset()
   assert.equal(state().notice?.tone, 'info')
   assert.match(state().notice?.text ?? '', /Already the default/)
 })
 
 test('reset that hits CONFLICT keeps the draft and shows theirs', async () => {
   const { fake, page, state } = await opened()
-  page.edit('mine\n')
+  page.face.edit('mine\n')
   fake.external('main', 'theirs\n')
-  await page.reset()
+  await page.face.reset()
   assert.equal(state().draft, 'mine\n')
   assert.deepEqual(state().conflict, { theirs: 'theirs\n', commit: id(1) })
   assert.equal(state().notice?.tone, 'error')
@@ -583,9 +610,9 @@ test('reset that hits CONFLICT keeps the draft and shows theirs', async () => {
 
 test('a role with no shipped default can\'t be reset', async () => {
   const { fake, page, state } = await opened()
-  await page.select('analyst')
+  await page.face.select('analyst')
   const before = fake.calls.length
-  await page.reset()
+  await page.face.reset()
   assert.equal(fake.calls.length, before)
   assert.equal(state().defaultText, null)
 })
@@ -596,8 +623,8 @@ test('defaultView: the same text is "same", a different one is a diff from the d
   const { page, state } = await opened()
   assert.deepEqual(defaultView(state()), { kind: 'same' })
 
-  page.edit('You are main, on {{model}}.\nAnd more.\n')
-  await page.save()
+  page.face.edit('You are main, on {{model}}.\nAnd more.\n')
+  await page.face.save()
   const view = defaultView(state())
   assert.equal(view.kind, 'diff')
   if (view.kind === 'diff') {
@@ -607,25 +634,25 @@ test('defaultView: the same text is "same", a different one is a diff from the d
     assert.match(view.diff.patch, /\+And more\.\n/)
   }
 
-  await page.select('analyst')
+  await page.face.select('analyst')
   assert.deepEqual(defaultView(state()), { kind: 'none' })
 })
 
 test('the draft does not change the Default view: it compares what is saved', async () => {
   const { page, state } = await opened()
-  page.edit('entirely different\n')
+  page.face.edit('entirely different\n')
   assert.deepEqual(defaultView(state()), { kind: 'same' })
 })
 
 test('a role with no default has no Default tab, and selecting one while on that tab goes back to Edit', async () => {
   const { page, state } = await opened()
   assert.deepEqual(visibleTabs(state()), ['edit', 'default', 'preview', 'history'])
-  await page.setTab('default')
+  await page.face.setTab('default')
   assert.equal(state().tab, 'default')
-  await page.select('analyst')
+  await page.face.select('analyst')
   assert.deepEqual(visibleTabs(state()), ['edit', 'preview', 'history'])
   assert.equal(state().tab, 'edit')
-  await page.setTab('default')
+  await page.face.setTab('default')
   assert.equal(state().tab, 'edit', 'a tab that is not there can\'t be opened')
 })
 
@@ -634,28 +661,28 @@ test('a role with no default has no Default tab, and selecting one while on that
 test('unknown variables: the names in the draft that the preset has no variable for, as a warning that never blocks', async () => {
   const { page, state } = await opened()
   assert.deepEqual(state().unknownVariables, [])
-  page.edit('Hi {{model}} in {{cwd}} on {{today}}; {{nope}}, {{ spaced }}, {{Upper}} and {{nope}} again.\n')
+  page.face.edit('Hi {{model}} in {{cwd}} on {{today}}; {{nope}}, {{ spaced }}, {{Upper}} and {{nope}} again.\n')
   assert.deepEqual(state().unknownVariables, ['nope'], 'once, in order; a malformed group is not a reference')
-  page.edit('{{zed}} {{alpha}}')
+  page.face.edit('{{zed}} {{alpha}}')
   assert.deepEqual(state().unknownVariables, ['zed', 'alpha'], 'in order of first appearance')
-  await page.save()
+  await page.face.save()
   assert.equal(state().notice?.tone, 'success', 'the warning did not stop the save')
-  page.edit(DEFAULTS.main!)
+  page.face.edit(DEFAULTS.main!)
   assert.deepEqual(state().unknownVariables, [])
 })
 
 test('unknown variables: none while dsh\'s assembly was not usable (fallback), nor when the variables could not be read', async () => {
   const fallback = setup()
   fallback.fake.variablesResult = ok({ variables: [], fallback: true })
-  await fallback.page.open()
-  fallback.page.edit('{{anything}} {{at_all}}')
+  await fallback.page.face.open()
+  fallback.page.face.edit('{{anything}} {{at_all}}')
   assert.deepEqual(fallback.state().unknownVariables, [])
   assert.equal(fallback.state().variables.fallback, true)
 
   const failed = setup()
   failed.fake.variablesResult = refused('NOT_FOUND', 'x')
-  await failed.page.open()
-  failed.page.edit('{{anything}}')
+  await failed.page.face.open()
+  failed.page.face.edit('{{anything}}')
   assert.deepEqual(failed.state().unknownVariables, [])
   assert.equal(failed.state().variables.status, 'error')
 })
@@ -663,11 +690,11 @@ test('unknown variables: none while dsh\'s assembly was not usable (fallback), n
 test('unknown variables are worked out again when the variables arrive after the draft', async () => {
   const made = setup()
   made.fake.variablesResult = ok({ variables: [], fallback: true })
-  await made.page.open()
-  made.page.edit('{{x}}')
+  await made.page.face.open()
+  made.page.face.edit('{{x}}')
   assert.deepEqual(made.state().unknownVariables, [])
   made.fake.variablesResult = ok(VARIABLES)
-  await made.page.loadVariables()
+  await made.page.face.loadVariables()
   assert.deepEqual(made.state().unknownVariables, ['x'])
 })
 
@@ -675,7 +702,7 @@ test('unknown variables are worked out again when the variables arrive after the
 
 test('opening the Preview tab loads the preview of the selected role', async () => {
   const { fake, page, state } = await opened()
-  await page.setTab('preview')
+  await page.face.setTab('preview')
   assert.equal(state().tab, 'preview')
   assert.deepEqual(state().preview, { status: 'ready', value: { text: 'PREVIEW', approximate: true, fallback: false, unknownVariables: [] } })
   assert.ok(fake.calls.includes('preview main'))
@@ -684,32 +711,32 @@ test('opening the Preview tab loads the preview of the selected role', async () 
 test('a preview that failed is an error with a notice, and a fallback preview is kept as it is', async () => {
   const { fake, page, state } = await opened()
   fake.previewResult = refused('NOT_FOUND', 'there is no role "main"')
-  await page.loadPreview()
+  await page.face.loadPreview()
   assert.equal(state().preview?.status, 'error')
   assert.match(state().preview?.error?.text ?? '', /Not found/)
   fake.previewResult = ok({ text: 'FB', approximate: true, fallback: true, unknownVariables: [] })
-  await page.loadPreview()
+  await page.face.loadPreview()
   assert.equal(state().preview?.value?.fallback, true)
 })
 
 test('a save refreshes the open preview, and drops one that is not shown', async () => {
   const { fake, page, state } = await opened()
-  await page.setTab('preview')
-  page.edit('new\n')
+  await page.face.setTab('preview')
+  page.face.edit('new\n')
   const before = fake.calls.filter(call => call === 'preview main').length
-  await page.save()
+  await page.face.save()
   assert.equal(fake.calls.filter(call => call === 'preview main').length, before + 1)
 
-  await page.setTab('edit')
-  page.edit('newer\n')
-  await page.save()
+  await page.face.setTab('edit')
+  page.face.edit('newer\n')
+  await page.face.save()
   assert.equal(state().preview, undefined, 'it will be loaded again when the tab opens')
 })
 
 test('selecting another role while on Preview loads that role\'s preview', async () => {
   const { fake, page } = await opened()
-  await page.setTab('preview')
-  await page.select('coder')
+  await page.face.setTab('preview')
+  await page.face.select('coder')
   assert.ok(fake.calls.includes('preview coder'))
 })
 
@@ -718,7 +745,7 @@ test('selecting another role while on Preview loads that role\'s preview', async
 test('the History tab loads this document\'s log, 20 at a time, with the newest page first', async () => {
   const { config, page, state } = await opened()
   config!.log = [commitOf(3, ['prompts/main.md'], 'tighter'), commitOf(1, ['prompts/main.md'])]
-  await page.setTab('history')
+  await page.face.setTab('history')
   assert.deepEqual(config!.calls, ['history prompts/main.md 20 -'])
   assert.equal(state().history?.status, 'ready')
   assert.deepEqual(state().history?.commits.map(commit => commit.id), [id(3), id(1)])
@@ -727,9 +754,9 @@ test('the History tab loads this document\'s log, 20 at a time, with the newest 
 test('a commit\'s diff is fetched when asked for, once', async () => {
   const { config, page, state } = await opened()
   config!.log = [commitOf(3, ['prompts/main.md'])]
-  await page.setTab('history')
-  await page.loadCommit(id(3))
-  await page.loadCommit(id(3))
+  await page.face.setTab('history')
+  await page.face.loadCommit(id(3))
+  await page.face.loadCommit(id(3))
   assert.equal(config!.calls.filter(call => call.startsWith('commit ')).length, 1)
   const detail = state().history?.details[id(3)]
   assert.equal(detail?.status, 'ready')
@@ -738,8 +765,8 @@ test('a commit\'s diff is fetched when asked for, once', async () => {
 
 test('a commit that can\'t be read has an error of its own', async () => {
   const { page, state } = await opened()
-  await page.setTab('history')
-  await page.loadCommit(id(7))
+  await page.face.setTab('history')
+  await page.face.loadCommit(id(7))
   const detail = state().history?.details[id(7)]
   assert.equal(detail?.status, 'error')
 })
@@ -748,10 +775,10 @@ test('revert undoes a commit with a new one, then reads again the log, the roles
   const { fake, config, page, state } = await opened()
   config!.log = [commitOf(1, ['prompts/main.md'])]
   config!.reverts = [commitOf(2, ['prompts/main.md'])]
-  await page.setTab('history')
+  await page.face.setTab('history')
   const rolesBefore = fake.calls.filter(call => call === 'roles').length
   const readsBefore = fake.calls.filter(call => call === 'read main').length
-  await page.revert(id(1))
+  await page.face.revert(id(1))
   assert.ok(config!.calls.includes(`revert ${id(1)}`))
   assert.equal(state().notice?.tone, 'success')
   assert.match(state().notice?.text ?? '', /c1eeeee/)
@@ -766,8 +793,8 @@ test('revert that finds nothing left to undo says "Already reverted"', async () 
   const { config, page, state } = await opened()
   config!.log = [commitOf(1, ['prompts/main.md'])]
   config!.reverts = [null]
-  await page.setTab('history')
-  await page.revert(id(1))
+  await page.face.setTab('history')
+  await page.face.revert(id(1))
   assert.equal(state().notice?.tone, 'info')
   assert.match(state().notice?.text ?? '', /^Already reverted/)
 })
@@ -776,8 +803,8 @@ test('revert that hits CONFLICT says to revert the later change first', async ()
   const { config, page, state } = await opened()
   config!.log = [commitOf(1, ['prompts/main.md'])]
   config!.reverts = ['conflict']
-  await page.setTab('history')
-  await page.revert(id(1))
+  await page.face.setTab('history')
+  await page.face.revert(id(1))
   assert.equal(state().notice?.tone, 'error')
   assert.match(state().notice?.text ?? '', /later change/)
 })
@@ -785,7 +812,7 @@ test('revert that hits CONFLICT says to revert the later change first', async ()
 test('an event for the selected path reads the open history again', async () => {
   const { config, page } = await opened()
   config!.log = [commitOf(1, ['prompts/main.md'])]
-  await page.setTab('history')
+  await page.face.setTab('history')
   config!.log = [commitOf(2, ['prompts/main.md']), commitOf(1, ['prompts/main.md'])]
   await page.onConfigEvent({ kind: 'changed', commit: id(2), paths: ['prompts/main.md'] })
   assert.equal(config!.calls.filter(call => call.startsWith('history')).length, 2)
@@ -799,11 +826,11 @@ test('without a config remote the History tab is hidden, opening it does nothing
   assert.equal(state().hasHistory, false)
   assert.equal(state().stream, 'off')
   assert.deepEqual(visibleTabs(state()), ['edit', 'default', 'preview'])
-  await page.setTab('history')
+  await page.face.setTab('history')
   assert.equal(state().tab, 'edit')
-  await page.loadHistory()
+  await page.face.loadHistory()
   assert.equal(state().history, undefined)
-  await page.revert(id(1))
+  await page.face.revert(id(1))
   assert.equal(state().notice, undefined)
 })
 
@@ -815,7 +842,7 @@ test('a config remote that arrives later turns History and live updates on, and 
   assert.equal(state().hasHistory, true)
   assert.equal(state().stream, 'connecting')
   assert.deepEqual(visibleTabs(state()), ['edit', 'default', 'preview', 'history'])
-  await page.setTab('history')
+  await page.face.setTab('history')
   assert.equal(state().history?.commits.length, 1)
 
   page.setConfig(undefined)
@@ -829,26 +856,368 @@ test('a config remote that arrives later turns History and live updates on, and 
 
 test('dismiss clears the notice, and the store\'s hooks tell subscribers what changed', async () => {
   const { page, state } = await opened()
-  page.edit('x\n')
-  await page.save()
+  page.face.edit('x\n')
+  await page.face.save()
   assert.ok(state().notice !== undefined)
   let heard = 0
-  const stop = page.hooks.page.subscribe(() => { heard++ })
-  page.dismiss()
+  const stop = page.face.hooks.page.subscribe(() => { heard++ })
+  page.face.dismiss()
   assert.equal(state().notice, undefined)
   assert.ok(heard > 0)
   stop()
   const after = heard
-  page.edit('y\n')
+  page.face.edit('y\n')
   assert.equal(heard, after, 'an unsubscribed listener hears nothing')
-  assert.equal(page.hooks.page.getSnapshot(), state())
+  assert.equal(page.face.hooks.page.getSnapshot(), state())
 })
 
-test('the config events the page hears have the shape dish-config sends', () => {
-  const events: ConfigEvent[] = [
-    { kind: 'changed', commit: id(1), paths: ['prompts/main.md'] },
-    { kind: 'proposal', id: 'abcd1234', status: 'accepted' },
-    { kind: 'remote', status: { pending: 1, lastError: 'no route' } },
+test('each kind of config event does what its kind says, and no more', async () => {
+  const { fake, page } = await opened()
+  const events: Array<[ConfigEvent, string[]]> = [
+    // A commit to the selected prompt: the list, and the document itself.
+    [{ kind: 'changed', commit: id(1), paths: ['prompts/main.md'] }, ['roles', 'read main']],
+    // A commit to another prompt: the list only.
+    [{ kind: 'changed', commit: id(2), paths: ['prompts/crew/coder.md'] }, ['roles']],
+    // Commits that are no prompt's: nothing.
+    [{ kind: 'changed', commit: id(3), paths: ['crew.yaml', 'README.md'] }, []],
+    // A proposal: the list, for its counts.
+    [{ kind: 'proposal', id: 'abcd1234', status: 'open' }, ['roles']],
+    // The remote's own status is the History page's business.
+    [{ kind: 'remote', status: { pending: 1, lastError: 'no route' } }, []],
   ]
-  assert.equal(events.length, 3)
+  for (const [event, expected] of events) {
+    const before = fake.calls.length
+    await page.onConfigEvent(event)
+    assert.deepEqual(fake.calls.slice(before).sort(), [...expected].sort(), JSON.stringify(event))
+  }
+})
+
+// --- races -----------------------------------------------------------------------------------------
+
+test('the History tab loads when an event beat the role\'s first read to it', async () => {
+  const { fake, config, page, state } = await opened()
+  config!.log = [commitOf(1, ['prompts/crew/coder.md'])]
+  await page.face.setTab('history')
+  const slow = gate()
+  fake.gates.set('read coder', slow)
+  const choosing = page.face.select('coder')
+  const commit = fake.external('coder', 'edited elsewhere\n')
+  await page.onConfigEvent({ kind: 'changed', commit, paths: ['prompts/crew/coder.md'] })
+  slow.release()
+  await choosing
+  assert.equal(state().selected, 'coder')
+  assert.equal(state().draft, 'edited elsewhere\n')
+  assert.equal(state().history?.status, 'ready', 'not left on "Loading…"')
+  assert.ok(config!.calls.includes('history prompts/crew/coder.md 20 -'), config!.calls.join(', '))
+})
+
+test('the History tab loads on an event for the role even when the read that event started failed', async () => {
+  const { fake, config, page, state } = await opened()
+  config!.log = [commitOf(1, ['prompts/crew/coder.md'])]
+  await page.face.setTab('history')
+  const slow = gate()
+  fake.gates.set('read coder', slow)
+  const choosing = page.face.select('coder')
+  await until('coder to be read', () => fake.calls.includes('read coder'))
+  fake.failNextRead = true
+  await page.onConfigEvent({ kind: 'changed', commit: id(1), paths: ['prompts/crew/coder.md'] })
+  slow.release()
+  await choosing
+  assert.equal(state().history?.status, 'ready', 'the log does not depend on the document\'s read')
+  assert.deepEqual(state().history?.commits.map(commit => commit.id), [id(1)])
+})
+
+test('the Preview tab loads when a refresh or a reload took the role\'s first read over', async () => {
+  for (const takeOver of ['open', 'reload'] as const) {
+    const { fake, page, state } = await opened()
+    await page.face.setTab('preview')
+    const slow = gate()
+    fake.gates.set('read coder', slow)
+    const choosing = page.face.select('coder')
+    await until('coder to be read', () => fake.calls.includes('read coder'))
+    await (takeOver === 'open' ? page.face.open() : page.face.reload())
+    slow.release()
+    await choosing
+    assert.equal(state().selected, 'coder', takeOver)
+    assert.equal(state().document, 'ready', takeOver)
+    assert.deepEqual(state().preview?.status, 'ready', `${takeOver}: not left with nothing`)
+    assert.ok(fake.calls.includes('preview coder'), takeOver)
+  }
+})
+
+test('the History tab loads when a refresh or a reload took the role\'s first read over', async () => {
+  for (const takeOver of ['open', 'reload'] as const) {
+    const { fake, config, page, state } = await opened()
+    config!.log = [commitOf(1, ['prompts/crew/coder.md'])]
+    await page.face.setTab('history')
+    const slow = gate()
+    fake.gates.set('read coder', slow)
+    const choosing = page.face.select('coder')
+    await until('coder to be read', () => fake.calls.includes('read coder'))
+    await (takeOver === 'open' ? page.face.open() : page.face.reload())
+    slow.release()
+    await choosing
+    assert.equal(state().history?.status, 'ready', takeOver)
+    assert.deepEqual(state().history?.commits.map(commit => commit.id), [id(1)], takeOver)
+  }
+})
+
+test('a reset whose answer comes after the page moved to another role leaves that role\'s held event to be read', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('main, edited\n')
+  await page.face.save()
+  const slow = gate()
+  fake.gates.set('reset', slow)
+  const resetting = page.face.reset()
+  await until('the reset to be asked for', () => fake.calls.some(call => call.startsWith('reset main')))
+  await page.face.select('coder')
+  assert.equal(state().selected, 'coder')
+  // An agent edits coder while main's reset is under way: the event waits for the reset to end.
+  const commit = fake.external('coder', 'written by an agent\n')
+  await page.onConfigEvent({ kind: 'changed', commit, paths: ['prompts/crew/coder.md'] })
+  assert.equal(state().draft, DEFAULTS.coder, 'held, not read yet')
+  slow.release()
+  await resetting
+  assert.equal(state().selected, 'coder')
+  assert.equal(state().draft, 'written by an agent\n', 'the held event was read after the reset')
+  assert.deepEqual(state().saved, { text: 'written by an agent\n', commit: id(fake.head) })
+})
+
+test('a reset whose own read failed still reads the event that was held, and shows the default', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('main, edited\n')
+  await page.face.save()
+  const slow = gate()
+  fake.gates.set('reset', slow)
+  const resetting = page.face.reset()
+  await until('the reset to be asked for', () => fake.calls.some(call => call.startsWith('reset main')))
+  // The echo of the reset's own commit may come before its answer: it waits.
+  await page.onConfigEvent({ kind: 'changed', commit: id(2), paths: ['prompts/main.md'] })
+  assert.equal(state().draft, 'main, edited\n')
+  fake.failNextRead = true
+  slow.release()
+  await resetting
+  assert.equal(state().draft, DEFAULTS.main, 'the page was not left showing what was reset')
+  assert.deepEqual(state().saved, { text: DEFAULTS.main, commit: id(2) })
+})
+
+test('Reload is not undone by a live event that arrives while it reads', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('mine\n')
+  const commit = fake.external('main', 'theirs\n')
+  await page.onConfigEvent({ kind: 'changed', commit, paths: ['prompts/main.md'] })
+  assert.ok(state().conflict !== undefined)
+  const slow = gate()
+  fake.gates.set('read main', slow)
+  const reloading = page.face.reload()
+  assert.equal(state().conflict, undefined, 'the draft is dropped at once')
+  assert.equal(state().dirty, false)
+  await page.onConfigEvent({ kind: 'changed', commit, paths: ['prompts/main.md'] })
+  slow.release()
+  await reloading
+  assert.equal(state().conflict, undefined)
+  assert.equal(state().draft, 'theirs\n')
+  assert.deepEqual(state().saved, { text: 'theirs\n', commit: id(1) })
+  assert.equal(state().dirty, false)
+})
+
+test('a Reload that could not read gives the person\'s edit and the conflict back', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('mine\n')
+  page.face.setNote('because')
+  const commit = fake.external('main', 'theirs\n')
+  await page.onConfigEvent({ kind: 'changed', commit, paths: ['prompts/main.md'] })
+  fake.readDown = true
+  await page.face.reload()
+  assert.equal(state().draft, 'mine\n')
+  assert.equal(state().note, 'because')
+  assert.equal(state().dirty, true)
+  assert.deepEqual(state().conflict, { theirs: 'theirs\n', commit: id(1) })
+  assert.equal(state().notice?.tone, 'error')
+  assert.equal(state().notice?.detail, 'gateway offline')
+})
+
+test('a read that began before a save does not put the old text back when it lands after it', async () => {
+  const { fake, page, state } = await opened()
+  const stale = gate()
+  fake.gates.set('read main', stale)
+  const refreshing = page.face.open()
+  await until('the refresh to read main', () => fake.calls.filter(call => call === 'read main').length === 2)
+  page.face.edit('NEW\n')
+  await page.face.save()
+  assert.deepEqual(state().saved, { text: 'NEW\n', commit: id(1) })
+  stale.release()
+  await refreshing
+  assert.deepEqual(state().saved, { text: 'NEW\n', commit: id(1) }, 'neither the text nor the base went back')
+  assert.equal(state().draft, 'NEW\n')
+  assert.equal(state().dirty, false)
+})
+
+test('the same for a reset, and for a save that found the document already had the text', async () => {
+  const reset = await opened()
+  reset.page.face.edit('custom\n')
+  await reset.page.face.save()
+  const staleReset = gate()
+  reset.fake.gates.set('read main', staleReset)
+  const refreshing = reset.page.face.open()
+  await until('the refresh to read main', () => reset.fake.calls.filter(call => call === 'read main').length === 2)
+  await reset.page.face.reset()
+  assert.deepEqual(reset.state().saved, { text: DEFAULTS.main, commit: id(2) })
+  staleReset.release()
+  await refreshing
+  assert.deepEqual(reset.state().saved, { text: DEFAULTS.main, commit: id(2) })
+  assert.equal(reset.state().draft, DEFAULTS.main)
+
+  const nothing = await opened()
+  const staleNull = gate()
+  nothing.fake.gates.set('read main', staleNull)
+  const refreshingNull = nothing.page.face.open()
+  await until('the refresh to read main', () => nothing.fake.calls.filter(call => call === 'read main').length === 2)
+  // The refresh has read main as it was. Now the store gets the text this page is about to save.
+  nothing.fake.external('main', 'same text\n')
+  nothing.fake.forceNull = true
+  nothing.page.face.edit('same text\n')
+  await nothing.page.face.save()
+  assert.deepEqual(nothing.state().saved, { text: 'same text\n', commit: id(1) })
+  staleNull.release()
+  await refreshingNull
+  assert.deepEqual(nothing.state().saved, { text: 'same text\n', commit: id(1) })
+  assert.equal(nothing.state().draft, 'same text\n')
+  assert.equal(nothing.state().dirty, false)
+})
+
+test('open selects a role even when the roles were asked for again while it waited for them', async () => {
+  const { fake, page, state } = setup()
+  const first = gate()
+  fake.gates.set('roles', first)
+  const opening = page.face.open()
+  await until('the roles to be asked for', () => fake.calls.includes('roles'))
+  // The stream's first item asks for the roles too, and its answer is the one that arrives last.
+  const second = gate()
+  fake.gates.set('roles', second)
+  const event = page.onConfigEvent({ kind: 'remote', status: { pending: 0 } }, true)
+  first.release()
+  await new Promise(resolve => setTimeout(resolve, 5))
+  second.release()
+  await Promise.all([opening, event])
+  assert.equal(state().selected, 'main')
+  assert.equal(state().document, 'ready')
+  assert.equal(state().roles.length, 4)
+})
+
+test('the roles are never read twice at once: a call while one is under way waits for that one, and reads once more', async () => {
+  const { fake, page } = setup()
+  const first = gate()
+  fake.gates.set('roles', first)
+  const opening = page.face.open()
+  await until('the roles to be asked for', () => fake.calls.includes('roles'))
+  const again = page.onConfigEvent({ kind: 'proposal', id: 'abcd1234', status: 'open' })
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.equal(fake.calls.filter(call => call === 'roles').length, 1, 'no second read while the first is out')
+  first.release()
+  await Promise.all([opening, again])
+  assert.equal(fake.calls.filter(call => call === 'roles').length, 2, 'one more after it, for what changed meanwhile')
+})
+
+// --- notices and the remote they name ------------------------------------------------------------
+
+test('a save names its role in the notice, and still does when the page has moved on to another', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('one\n')
+  await page.face.save()
+  assert.match(state().notice?.text ?? '', /^Saved Main as c1eeeee/)
+
+  const slow = gate()
+  fake.gates.set('save answer', slow)
+  page.face.edit('two\n')
+  const saving = page.face.save()
+  await until('the save to be made', () => fake.head === 2)
+  await page.face.select('coder')
+  await page.face.confirmSwitch()
+  slow.release()
+  await saving
+  assert.equal(state().selected, 'coder')
+  assert.match(state().notice?.text ?? '', /^Saved Main as c2eeeee/, 'not mistaken for coder\'s')
+  assert.equal(state().saved?.text, DEFAULTS.coder, 'coder\'s own text is what the editor has')
+  assert.equal(state().dirty, false)
+})
+
+test('a refused save for a role the page has left is said to be about that role, and does not claim the editor holds its text', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('mine\n')
+  fake.external('main', 'theirs\n')
+  const slow = gate()
+  fake.gates.set('save answer', slow)
+  const saving = page.face.save()
+  await until('the save to be refused', () => fake.calls.some(call => call.startsWith('save main')))
+  await page.face.select('coder')
+  await page.face.confirmSwitch()
+  slow.release()
+  await saving
+  assert.equal(state().notice?.tone, 'error')
+  assert.equal(state().notice?.text, 'Couldn\'t save Main')
+  assert.match(state().notice?.detail ?? '', /prompts\/main\.md changed since c0eeeee/, 'the store\'s own words')
+  assert.equal(state().conflict, undefined, 'a conflict is for the role in the editor')
+})
+
+test('a reset is noted as one, and names its role', async () => {
+  const { fake, page, state } = await opened()
+  page.face.edit('custom\n')
+  await page.face.save()
+  await page.face.reset()
+  assert.ok(fake.calls.includes(`reset main ${id(1).slice(0, 7)} Reset to the default`), 'the note is fixed, not what is in the Edit tab\'s field')
+  assert.match(state().notice?.text ?? '', /^Reset Main to the default as c2eeeee/)
+})
+
+test('the Edit tab\'s note goes with a save but not with a reset', async () => {
+  const { fake, page } = await opened()
+  page.face.edit('custom\n')
+  page.face.setNote('my reason')
+  await page.face.save()
+  page.face.edit('custom, more\n')
+  page.face.setNote('another reason')
+  await page.face.reset()
+  assert.ok(fake.calls.includes(`save main ${id(0).slice(0, 7)} my reason`), fake.calls.join(', '))
+  assert.ok(fake.calls.includes(`reset main ${id(1).slice(0, 7)} Reset to the default`), fake.calls.join(', '))
+})
+
+test('a failure to reach dish-config says dish-config, and one to reach dish-prompts says dish-prompts', async () => {
+  const { fake, config, page, state } = await opened()
+  config!.log = [commitOf(1, ['prompts/main.md'])]
+  await page.face.setTab('history')
+  config!.down = true
+  await page.face.loadHistory()
+  assert.equal(state().history?.status, 'error')
+  assert.equal(state().history?.error?.text, 'Something went wrong talking to dish-config')
+  assert.equal(state().history?.error?.detail, 'gateway offline')
+
+  config!.down = false
+  await page.face.loadHistory()
+  config!.down = true
+  await page.face.loadCommit(id(1))
+  const detail = state().history?.details[id(1)]
+  assert.equal(detail?.status === 'error' ? detail.error.text : '', 'Something went wrong talking to dish-config')
+
+  await page.face.revert(id(1))
+  assert.equal(state().notice?.text, 'Something went wrong talking to dish-config')
+
+  fake.readDown = true
+  await page.face.reload()
+  assert.equal(state().notice?.text, 'Something went wrong talking to dish-prompts')
+})
+
+// --- the face --------------------------------------------------------------------------------------
+
+test('the face the component gets is the actions and the observable, and none of what feeds the controller', () => {
+  const { page } = setup()
+  assert.deepEqual(Object.keys(page.face).sort(), [
+    'cancelSwitch', 'confirmSwitch', 'discard', 'dismiss', 'edit', 'hooks', 'keepMine', 'loadCommit', 'loadHistory', 'loadPreview',
+    'loadVariables', 'open', 'reload', 'reset', 'revert', 'save', 'select', 'setNote', 'setTab',
+  ])
+  assert.deepEqual(Object.keys(page.face.hooks), ['page'])
+  assert.deepEqual(Object.keys(page.face.hooks.page).sort(), ['getSnapshot', 'subscribe'], 'a store to read, not one to write')
+  for (const internal of ['getState', 'onConfigEvent', 'setConfig', 'streamDown']) {
+    assert.equal(internal in page.face, false, internal)
+    assert.equal(typeof (page as unknown as Record<string, unknown>)[internal], 'function', `${internal} stays on the controller`)
+  }
 })

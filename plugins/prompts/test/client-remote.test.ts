@@ -10,8 +10,9 @@ import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
 import { jsonCodec } from 'dish-kit/client'
 import type { FileDiff } from 'dish-kit/ui/diff'
 import type { CommitInfo as StoreCommit, ConfigEvent as StoreEvent, FileDiff as StoreDiff } from '../../config/src/protocol.ts'
+import type { ConfigRemote } from '../../config/src/remote.ts'
 import { promptsRemote } from '../src/client/remote.ts'
-import type { ConfigEvent, ConfigHistoryApi } from '../src/client/remote.ts'
+import type { ConfigCalls, ConfigEvent } from '../src/client/remote.ts'
 import type { CommitInfo } from '../src/protocol.ts'
 import { PromptsRemote } from '../src/remote.ts'
 
@@ -25,8 +26,22 @@ export type PageMatchesStore = [
   Check<Same<FileDiff, StoreDiff>>,
 ]
 
-/** What the page calls of dish-config's remote, beside `watch`: its answers are `Outcome`s the page reads as its own. */
-export type HistoryApiReturnsOutcomes = Check<Same<Awaited<ReturnType<ConfigHistoryApi['revert']>>['ok'], boolean>>
+/**
+ * What the page calls of dish-config's remote must be what that remote's methods take and give: the same parameters, and the
+ * same value inside the `Outcome` (the page's own `Outcome` has one more code, `UNAVAILABLE`, which dish-config never says, so
+ * the value is compared and not the whole). A change to `ConfigRemote`'s signature is a type error here.
+ */
+type Value<R> = R extends { ok: true, value: infer V } ? V : never
+type Served<K extends keyof ConfigCalls> = Value<Awaited<ReturnType<ConfigRemote[K]>>>
+type Called<K extends keyof ConfigCalls> = Value<Value<Awaited<ReturnType<ConfigCalls[K]>>>>
+export type CallsMatchTheRemote = [
+  Check<Same<Parameters<ConfigCalls['history']>, Parameters<ConfigRemote['history']>>>,
+  Check<Same<Parameters<ConfigCalls['commit']>, Parameters<ConfigRemote['commit']>>>,
+  Check<Same<Parameters<ConfigCalls['revert']>, Parameters<ConfigRemote['revert']>>>,
+  Check<Same<Called<'history'>, Served<'history'>>>,
+  Check<Same<Called<'commit'>, Served<'commit'>>>,
+  Check<Same<Called<'revert'>, Served<'revert'>>>,
+]
 
 /** The gateway's source-mode reading of a method's parameter names: the text between its first parentheses, split on commas. */
 function parameterNames(method: (...args: never[]) => unknown): string[] {
