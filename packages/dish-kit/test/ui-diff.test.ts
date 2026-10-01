@@ -366,7 +366,7 @@ function gitHunks(before: string, after: string): string {
   mkdirSync(join(dir, 'b'))
   writeFileSync(join(dir, 'a', 'f'), before)
   writeFileSync(join(dir, 'b', 'f'), after)
-  const run = spawnSync('git', ['diff', '--no-index', '--no-color', '-U3', '--', 'a/f', 'b/f'], {
+  const run = spawnSync('git', ['diff', '--no-index', '--no-ext-diff', '--no-color', '-U3', '--', 'a/f', 'b/f'], {
     cwd: dir,
     encoding: 'utf8',
     env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
