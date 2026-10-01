@@ -47,6 +47,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import { maskSecrets, printOwnLogs, xdgPaths } from 'dish-kit'
+import { registerApprovalAnswerer } from './answerer.ts'
 import { askJudgeTool } from './ask.ts'
 import { createJudge, currentKeyMask } from './client.ts'
 import { registerCommandGate } from './gate.ts'
@@ -613,8 +614,13 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
 
   // The command gate (see `gate.ts`): a prepended `tools/pre-execute` listener for the tools in `tools.gated`, and a
   // `tools/result` listener that forgets a call's verdict when it settles. It looks the client, the settings and the sandbox
-  // policy up with `ctx.get` on each call. The cache is for Task 5's approval answerer.
+  // policy up with `ctx.get` on each call. The cache is the approval answerer's.
   const verdicts = registerCommandGate(ctx)
+
+  // The approval answerer (see `answerer.ts`): a prepended `approval/request` listener that decides every child's request
+  // (never by `next()`) and passes the main agent's on to you, except an escalation the gate covered; the switch that makes
+  // crew's children `ask` (`agent/created`); and, when this plugin goes, the restore of `never` on the children it switched.
+  registerApprovalAnswerer(ctx, verdicts, tell)
 
   // ask_judge is a global tool, so every agent sees it (a crew child through its allow list). It registers when a `tools`
   // service is there, through the child context, so it goes when that does, or this plugin. The judge is read with
