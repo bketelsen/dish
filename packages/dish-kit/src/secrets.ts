@@ -31,6 +31,19 @@ interface SecretPattern {
   mask?: RegExp
 }
 
+/**
+ * The start of a TypeSafe API key that is long enough to be one: `apikey_` and 32 hex digits. It is the point at which a run
+ * of something else (a private key's base64, another key's hex) has to stop, so that the key is at the end of the mask and
+ * is masked in its turn.
+ */
+const APIKEY_START = String.raw`apikey_[0-9a-fA-F]{32}`
+/**
+ * One hex digit of a TypeSafe API key as `maskSecrets` takes it: not one that starts another key. Hex digits include the
+ * `a` of the next key's `apikey_` and the `A` of an AKIA or ASIA key, so a plain run of them would eat the first letter of
+ * what follows and leave the rest of it a prefix short, which is no key to look for.
+ */
+const APIKEY_HEX = String.raw`(?:(?!${APIKEY_START}|(?:AKIA|ASIA)[0-9A-Z]{16})[0-9a-fA-F])`
+
 // No `\b` anchors: `_` is a word character, so `\b` would let `TOKEN_ghp_...` and `_ghp_..._` through. A lookbehind
 // for a letter or digit still keeps `risk-...`, `task-...` and `xghp_...` from matching.
 const PATTERNS: readonly SecretPattern[] = [
@@ -40,7 +53,7 @@ const PATTERNS: readonly SecretPattern[] = [
     body: /gh[pousr]_[A-Za-z0-9]{36,}/,
     // The body is as short as it can be and stops before another token's prefix. The greedy body above eats the letters
     // of a token that follows it (`ghp_<A>ghp_<B>`), stops at that token's `_`, and so leaves all of its body unmasked.
-    mask: /gh[pousr]_[A-Za-z0-9]{36,}?(?=gh[pousr]_|github_pat_|sk-|[^A-Za-z0-9]|$)/,
+    mask: /gh[pousr]_[A-Za-z0-9]{36,}?(?=gh[pousr]_|github_pat_|sk-|apikey_|[^A-Za-z0-9]|$)/,
   },
   {
     // Real fine-grained tokens have 82 characters after the prefix; 50 leaves room without matching `github_pat_token_for_deploy_scripts`.
@@ -51,6 +64,27 @@ const PATTERNS: readonly SecretPattern[] = [
     mask: /github_pat_[A-Za-z0-9_]{50,}?(?=sk-|[^A-Za-z0-9_]|$)/,
   },
   { label: 'an sk- API key', before: NOT_AFTER_ALNUM, body: /sk-[A-Za-z0-9_-]{32,}/ },
+  {
+    // `apikey_`, 35 hex digits, `_`, and 64 hex digits, which is what a TypeSafe API key is. Detected from 32 digits of the
+    // first part, whatever follows:
+    // - 32 is the floor of a first part that is 35 (a little under it, for a key of another length; capitals for another
+    //   case). It is 128 bits, so no word or name has that many hex digits after `apikey_`: `apikey_placeholder` and
+    //   `apikey_environment_variable_name` are not hex at all, and 31 digits and an underscore is not a key;
+    // - the second part, which may be 64 digits or any number a cut leaves, is not asked for. A key that is cut after its
+    //   first part (a log line, a command that was cut, a truncated result) is half of a credential, and is masked with
+    //   what it has of the rest. A false detection here is a name or a hash that has 32 hex digits after `apikey_`, and a
+    //   refusal of that is the safe way to be wrong.
+    //
+    // The mask takes the first part, and an underscore and the second as far as it is hex. It has no `-` or other letter in it, so
+    // it stops at the first character of whatever token follows it (`ghp_`, `sk-`, `github_pat_`, `-----BEGIN`), which is
+    // masked in its turn. Only AKIA and ASIA and another `apikey_` start with a hex digit, and it stops before those, by their
+    // whole shape (`APIKEY_HEX`). It is not stopped by a token of a kind whose characters include a key's: an `sk-` or a
+    // fine-grained token that comes before one takes the whole of it, in one mask.
+    label: 'a TypeSafe API key',
+    before: NOT_AFTER_ALNUM,
+    body: /apikey_[0-9a-fA-F]{32,}/,
+    mask: new RegExp(String.raw`apikey_${APIKEY_HEX}{32,}(?:_${APIKEY_HEX}*)?`),
+  },
   {
     // Any PEM private key header: RSA, EC, OPENSSH, ENCRYPTED, and PGP's `PRIVATE KEY BLOCK`. The gaps are bounded so
     // that a long near-miss (`-----BEGIN ` and a megabyte of `PRIVATE KEY`) takes a fixed time for each start, not time
@@ -67,9 +101,9 @@ const PATTERNS: readonly SecretPattern[] = [
     //   breaks, and the backslash of a `\n` that is written out. The first other character ends it, so that
     //   `grep "-----BEGIN RSA PRIVATE KEY-----" ~/.ssh/id_rsa | wc -l` keeps all but the header. It stops before a token
     //   (a prefix with the body to go with it), so that the token is at the end of the mask and is masked in its turn: the
-    //   letters of `ghp`, `github` and `sk-` are among the characters, and it would otherwise run into the token and stop at
-    //   its `_`, leaving the rest of the token. A prefix with no token behind it (`risk-free`) is not a place to stop.
-    mask: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----(?:(?:(?!-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY)[\s\S]){0,8192}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----|(?:(?!gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|sk-[A-Za-z0-9_-]{32})[A-Za-z0-9+\/=:,\s\\.()@<>-]){0,8192})/,
+    //   letters of `ghp`, `github`, `sk-` and `apikey` are among the characters, and it would otherwise run into the token and
+    //   stop at its `_`, leaving the rest of the token. A prefix with no token behind it (`risk-free`) is not a place to stop.
+    mask: new RegExp(String.raw`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----(?:(?:(?!-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY)[\s\S]){0,8192}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----|(?:(?!gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|sk-[A-Za-z0-9_-]{32}|${APIKEY_START})[A-Za-z0-9+\/=:,\s\\.()@<>-]){0,8192})`),
   },
   // AKIA is a long-term access key, ASIA a temporary one.
   { label: 'an AWS access key ID', before: NOT_AFTER_UPPER, body: /(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])/ },
@@ -192,16 +226,20 @@ const MAX_PASSES = 8
  * - **Glued secrets** (`ghp_…ghp_…`, with nothing between): the second follows a letter, so on its own it isn't a match,
  *   but it is the moment the first is a mask. Each is masked, as two masks.
  * - **Masking is idempotent and complete.** The result is a fixed point: `secretKind` finds nothing in it and masking it
- *   changes nothing. A text that is not one after `MAX_PASSES` passes is replaced by one mask for what it still holds.
+ *   changes nothing. A text that is not one (after `MAX_PASSES` passes, or because a pattern finds in it what its mask
+ *   doesn't) is replaced by one mask for what it still holds.
  * - **Text with no secret** comes back unchanged.
  */
 export function maskSecrets(text: string): string {
   let current = text
   for (let pass = 0; pass < MAX_PASSES; pass++) {
     const masked = maskOnce(current)
-    if (masked === current) return current
+    if (masked === current) break
     current = masked
   }
+  // What is left should have nothing in it that a pattern finds. If it has, a pattern finds what its mask doesn't, in a text
+  // I haven't thought of (two keys, the first cut so that its last digit is the second's first letter): better one mask than
+  // a secret in a log.
   const kind = secretKind(current)
   return kind === undefined ? current : maskFor(kind)
 }

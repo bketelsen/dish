@@ -329,6 +329,33 @@ test('checkContent allows a token-shaped run that follows a plain letter, escape
   }
 })
 
+// A TypeSafe API key is `apikey_`, 35 hex digits, `_`, and 64 hex digits. This one is random, made for this file: not a key.
+const TS_FIRST = '760816af9c2088fea182638699c0065a826'
+const TS_KEY = `apikey_${TS_FIRST}_${'1d2f9a11c37d3bf93c0a50d186c1cabbb20936b507f96d71b7b75782f1750b1b'}`
+
+test('checkContent refuses a TypeSafe API key, whole or cut, naming the kind and the path but never the key', () => {
+  for (const text of [
+    `typesafe_api_key: ${TS_KEY}`,
+    `note: "first line\\n${TS_KEY}"`,
+    `{"key": "${TS_KEY}"}`,
+    `Authorization: Bearer ${TS_KEY}`,
+    // A key that was cut off in a log or a paste: half of a credential, from 32 digits of its first part.
+    `cut: ${TS_KEY.slice(0, 7 + 35 + 1 + 10)}`,
+    `cut: apikey_${TS_FIRST}`,
+    `cut: apikey_${TS_FIRST.slice(0, 32)}`,
+    `capitals: ${TS_KEY.toUpperCase().replace('APIKEY_', 'apikey_')}`,
+  ]) {
+    const error = refusal('prompts/coder.md', `before\n${text}\nafter\n`)
+    assert.equal(error.code, 'SECRET', text)
+    assert.equal(error.message, 'prompts/coder.md: looks like a TypeSafe API key', text)
+    assertNoLeak(error.message, TS_KEY)
+  }
+  // A name, a placeholder, and a stub that is too short to be one are not.
+  for (const text of ['Set apikey_ to your key.', 'apikey_placeholder', 'apikey_YOUR_KEY_HERE', `apikey_${TS_FIRST.slice(0, 31)}`, `my${TS_KEY}`]) {
+    assert.doesNotThrow(() => checkContent('prompts/coder.md', `before\n${text}\nafter\n`, MAX), text)
+  }
+})
+
 test('secretKind names the kind of the first secret in a text, or nothing', () => {
   assert.equal(secretKind(`key ${GH}`), 'a GitHub token')
   assert.equal(secretKind(`key ${AKIA}`), 'an AWS access key ID')

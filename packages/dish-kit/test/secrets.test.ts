@@ -28,9 +28,18 @@ const PEM_BLOCK = `${PEM}\n${PEM_BODY}\n${PEM_BODY2}\n${PEM_END}`
 const PEM_CUT = `${PEM}\n${PEM_BODY}\n${PEM_BODY2}`
 /** An sk- key whose body has underscores and dashes in it. */
 const SK_U = `sk-${'aB3_dE5-gH9_'.repeat(4)}`
+// A TypeSafe API key is `apikey_`, 35 hex digits, `_`, and 64 hex digits. These are random, made for this file: not a key.
+const KEY_A = '760816af9c2088fea182638699c0065a826'
+const KEY_B = '1d2f9a11c37d3bf93c0a50d186c1cabbb20936b507f96d71b7b75782f1750b1b'
+const KEY2_A = '6a4a972c0341da8eb57a6a8819d3b64e322'
+const KEY2_B = '336456890e5286d3e97b297d2cd245878bb5c0ec18c5af538dc4f98e586b31ab'
+const APIKEY = `apikey_${KEY_A}_${KEY_B}`
+const APIKEY2 = `apikey_${KEY2_A}_${KEY2_B}`
+/** The same in capitals, which a later format of the key might have. */
+const APIKEY_UPPER = `apikey_${KEY2_A.toUpperCase()}_${KEY2_B.toUpperCase()}`
 
 /** Everything in a fixture that must not survive masking. */
-const BODIES = [GH_BODY, GH2_BODY, PAT_BODY, SK_BODY, 'aB3_dE5-gH9_', AKIA_BODY, PEM_BODY, PEM_BODY2, PEM_HALF, 'PRIVATE KEY-----', 'ghp_', 'ghs_', 'github_pat_', 'AKIA', 'ASIA']
+const BODIES = [GH_BODY, GH2_BODY, PAT_BODY, SK_BODY, 'aB3_dE5-gH9_', AKIA_BODY, PEM_BODY, PEM_BODY2, PEM_HALF, 'PRIVATE KEY-----', 'ghp_', 'ghs_', 'github_pat_', 'AKIA', 'ASIA', KEY_A, KEY_B, KEY2_A, KEY2_B, KEY2_A.toUpperCase(), KEY2_B.toUpperCase(), 'apikey_']
 
 /** Assert that none of a fixture is in `masked`. A text with no pattern match in it can still hold the whole of a body. */
 function assertNoBodies(masked: string, what: string): void {
@@ -43,6 +52,7 @@ const PAT_MASK = mask('a GitHub fine-grained token')
 const SK_MASK = mask('an sk- API key')
 const PEM_MASK = mask('a private key')
 const AKIA_MASK = mask('an AWS access key ID')
+const KEY_MASK = mask('a TypeSafe API key')
 
 /** How long `run` takes, in milliseconds. */
 function took(run: () => unknown): number {
@@ -86,6 +96,32 @@ test('secretKind finds every private key header: RSA, EC, OPENSSH, ENCRYPTED, ba
   assert.equal(secretKind(`-----BEGIN ${'A'.repeat(39)} PRIVATE KEY-----`), 'a private key')
 })
 
+test('a TypeSafe API key is detected from 32 hex digits after apikey_, in either case, and not before', () => {
+  for (const secret of [APIKEY, APIKEY2, APIKEY_UPPER, `apikey_${KEY_A}`, `apikey_${KEY_A.slice(0, 32)}`, `apikey_${KEY_A}_${KEY_B.slice(0, 5)}`, `apikey_${KEY_A}_`, `apikey_${KEY_A}_${KEY_B}_more`]) {
+    assert.equal(secretKind(secret), 'a TypeSafe API key', secret)
+    assert.equal(secretKind(`TYPESAFE_API_KEY=${secret}\n`), 'a TypeSafe API key')
+  }
+  // Mixed case is hex too.
+  assert.equal(secretKind(`apikey_${KEY_A.slice(0, 20)}${KEY_A.slice(20).toUpperCase()}`), 'a TypeSafe API key')
+})
+
+test('what is not 32 hex digits after apikey_ is not a TypeSafe API key: names, placeholders, cut stubs, other prefixes', () => {
+  for (const text of [
+    'apikey_', 'apikey_placeholder', 'apikey_short', 'apikey_YOUR_KEY_HERE', 'apikey_environment_variable_name_for_the_production_service',
+    'apikey_deadbeef', `apikey_${KEY_A.slice(0, 31)}`, `apikey_${KEY_A.slice(0, 31)}_${KEY_B}`, `apikey_${KEY_A.slice(0, 31)}g${KEY_A}`,
+    `apikey_${'g'.repeat(64)}`, `apikey_${KEY_A.slice(0, 16)}-${KEY_A.slice(16)}`, `apikey-${KEY_A}`, `apikey${KEY_A}`, `API_KEY_${KEY_A}`,
+    // A plain letter or digit right before it, as with any token.
+    `my${APIKEY}`, `x${APIKEY}`, `1${APIKEY}`, `deadbeef${APIKEY}`, `\\nc${APIKEY}`,
+  ]) {
+    assert.equal(secretKind(text), undefined, text)
+    assert.equal(maskSecrets(text), text, text)
+  }
+  // A name, or a dash, or an underscore before it is no letter.
+  for (const text of [`my_${APIKEY}`, `-${APIKEY}`, `"${APIKEY}"`, `Bearer ${APIKEY}`, `x-api-key: ${APIKEY}`, `TYPESAFE_API_KEY=${APIKEY}`]) {
+    assert.equal(secretKind(text), 'a TypeSafe API key', text)
+  }
+})
+
 // --- maskSecrets: each kind ------------------------------------------------------------------
 
 const kinds: Array<{ name: string, secret: string, kind: string, header?: true }> = [
@@ -98,6 +134,13 @@ const kinds: Array<{ name: string, secret: string, kind: string, header?: true }
   { name: 'a fine-grained token', secret: PAT, kind: 'a GitHub fine-grained token' },
   { name: 'an sk- key', secret: SK, kind: 'an sk- API key' },
   { name: 'an sk- key with - and _', secret: `sk-proj-${'aB3_dE5-'.repeat(5)}`, kind: 'an sk- API key' },
+  { name: 'a TypeSafe key', secret: APIKEY, kind: 'a TypeSafe API key' },
+  { name: 'a TypeSafe key in capitals', secret: APIKEY_UPPER, kind: 'a TypeSafe API key' },
+  { name: 'a TypeSafe key of other lengths', secret: `apikey_${KEY2_A.slice(0, 32)}_${KEY2_B.slice(0, 40)}`, kind: 'a TypeSafe API key' },
+  { name: 'a TypeSafe key cut in its second part', secret: `apikey_${KEY_A}_${KEY_B.slice(0, 12)}`, kind: 'a TypeSafe API key' },
+  { name: 'a TypeSafe key cut after its first part and the underscore', secret: `apikey_${KEY_A}_`, kind: 'a TypeSafe API key' },
+  { name: 'a TypeSafe key cut after its first part', secret: `apikey_${KEY_A}`, kind: 'a TypeSafe API key' },
+  { name: 'a TypeSafe key cut at 32 digits', secret: `apikey_${KEY_A.slice(0, 32)}`, kind: 'a TypeSafe API key' },
   { name: 'an AKIA key', secret: AKIA, kind: 'an AWS access key ID' },
   { name: 'an ASIA key', secret: ASIA, kind: 'an AWS access key ID' },
   // A header with nothing after it: what follows (up to 8 KB) is taken for the key.
@@ -126,7 +169,7 @@ test('maskSecrets masks each of several of the same kind', () => {
 })
 
 test('maskSecrets leaves text with no secret exactly as it is', () => {
-  for (const text of ['', 'git status', 'a GitHub token, an AWS key, a PEM header', 'sk-short', 'ghp_short', '-----BEGIN PUBLIC KEY-----\nMII\n-----END PUBLIC KEY-----', 'unicode: ünï ‹ › 日本語 😀', 'line one\nline two\r\n']) {
+  for (const text of ['', 'git status', 'a GitHub token, an AWS key, a PEM header', 'sk-short', 'ghp_short', 'apikey_placeholder and apikey_short', '-----BEGIN PUBLIC KEY-----\nMII\n-----END PUBLIC KEY-----', 'unicode: ünï ‹ › 日本語 😀', 'line one\nline two\r\n']) {
     assert.equal(maskSecrets(text), text)
   }
 })
@@ -172,6 +215,8 @@ const escapable: Array<[string, string, string]> = [
   ['another GitHub token', GH2, GH_MASK],
   ['a fine-grained token', PAT, PAT_MASK],
   ['an sk- key', SK, SK_MASK],
+  ['a TypeSafe API key', APIKEY, KEY_MASK],
+  ['a TypeSafe API key in capitals', APIKEY_UPPER, KEY_MASK],
   ['an AWS access key', AKIA, AKIA_MASK],
   ['a temporary AWS access key', ASIA, AKIA_MASK],
 ]
@@ -197,17 +242,18 @@ for (const [name, secret, masked] of escapable) {
 
 /** What `secretKind` says of a fixture of one of the kinds above. */
 function kindOf(secret: string): string {
-  return secret === SK ? 'an sk- API key' : secret === PAT ? 'a GitHub fine-grained token' : secret === AKIA || secret === ASIA ? 'an AWS access key ID' : 'a GitHub token'
+  return secret === APIKEY || secret === APIKEY_UPPER ? 'a TypeSafe API key' : secret === SK ? 'an sk- API key' : secret === PAT ? 'a GitHub fine-grained token' : secret === AKIA || secret === ASIA ? 'an AWS access key ID' : 'a GitHub token'
 }
 
 test('secrets either side of an escape sequence are each masked', () => {
   assert.equal(maskSecrets(`${GH}\\n${GH2}`), `${GH_MASK}\\n${GH_MASK}`)
   assert.equal(maskSecrets(`${SK}\\n${GH}\\t${AKIA}`), `${SK_MASK}\\n${GH_MASK}\\t${AKIA_MASK}`)
   assert.equal(maskSecrets(`${AKIA}\\n${PAT}`), `${AKIA_MASK}\\n${PAT_MASK}`)
+  assert.equal(maskSecrets(`${APIKEY}\\n${GH}\\t${APIKEY2}`), `${KEY_MASK}\\n${GH_MASK}\\t${KEY_MASK}`)
 })
 
 test('a plain letter or digit before a token still blocks it, and so does one that is not right after a backslash', () => {
-  for (const secret of [GH, PAT, SK]) {
+  for (const secret of [GH, PAT, SK, APIKEY]) {
     for (const text of [
       `x${secret}`, `n${secret}`, `1${secret}`, `xn${secret}`,
       // The letter before the token follows another letter, not a backslash: `\\ncghp_…` is a `c`, not an escape.
@@ -339,6 +385,13 @@ test('a token after a key that has no END line is masked, whatever the key ends 
     ['a cut key, a whole key, then AKIA and a token', `${PEM_CUT}\n${PEM_BLOCK}\n${AKIA}${GH}`, PEM_MASK + GH_MASK],
     ['two cut keys, then a token', `${PEM_CUT}\n${PEM_CUT}${GH2}`, PEM_MASK + GH_MASK],
     ['a token, a cut key, a token', `${GH} ${PEM_CUT}${PAT}`, `${GH_MASK} ${PEM_MASK}${PAT_MASK}`],
+    ['AKIA, then a TypeSafe key', `${PEM_CUT}\n${AKIA}${APIKEY}`, PEM_MASK + KEY_MASK],
+    ['a TypeSafe key glued to the base64', `${PEM_CUT}${APIKEY}`, PEM_MASK + KEY_MASK],
+    ['a TypeSafe key in capitals glued to the base64', `${PEM_CUT}${APIKEY_UPPER}`, PEM_MASK + KEY_MASK],
+    ['a TypeSafe key cut after its first part, glued to the base64', `${PEM_CUT}apikey_${KEY_A}`, PEM_MASK + KEY_MASK],
+    ['a TypeSafe key glued to a short body', `${PEM}\nMIIEowIBAAKCAQEAabc${APIKEY}`, PEM_MASK + KEY_MASK],
+    ['a cut key and two TypeSafe keys', `${PEM_CUT}${APIKEY}${APIKEY2}`, PEM_MASK + KEY_MASK + KEY_MASK],
+    ['a TypeSafe key, then a cut key, then a token', `${APIKEY} ${PEM_CUT}${GH}`, `${KEY_MASK} ${PEM_MASK}${GH_MASK}`],
   ] as const) {
     const masked = maskSecrets(text)
     assert.equal(masked, expected, name)
@@ -401,6 +454,31 @@ const glued: Array<[string, string, string]> = [
   ['an AWS key and a private key', AKIA + PEM_BLOCK, AKIA_MASK + PEM_MASK],
   ['a private key and a GitHub token', PEM_BLOCK + GH, PEM_MASK + GH_MASK],
   ['a private key and an AWS key', PEM_BLOCK + AKIA, PEM_MASK + AKIA_MASK],
+  // A TypeSafe key is hex and underscores. Another token that follows it is cut off from it at its first letter that is not
+  // hex (every prefix but AKIA and ASIA, which start with a hex digit, and are told by their 16 more characters).
+  ['a TypeSafe key and a GitHub token', APIKEY + GH, KEY_MASK + GH_MASK],
+  ['a TypeSafe key and a fine-grained token', APIKEY + PAT, KEY_MASK + PAT_MASK],
+  ['a TypeSafe key and an sk- key', APIKEY + SK, KEY_MASK + SK_MASK],
+  ['a TypeSafe key and an sk- key with underscores', APIKEY + SK_U, KEY_MASK + SK_MASK],
+  ['a TypeSafe key and an AWS key', APIKEY + AKIA, KEY_MASK + AKIA_MASK],
+  ['a TypeSafe key and a temporary AWS key', APIKEY + ASIA, KEY_MASK + AKIA_MASK],
+  ['a TypeSafe key in capitals and an AWS key', APIKEY_UPPER + AKIA, KEY_MASK + AKIA_MASK],
+  ['a TypeSafe key and a private key', APIKEY + PEM_BLOCK, KEY_MASK + PEM_MASK],
+  ['a TypeSafe key and a cut private key', APIKEY + PEM_CUT, KEY_MASK + PEM_MASK],
+  ['a TypeSafe key and another', APIKEY + APIKEY2, KEY_MASK + KEY_MASK],
+  ['a TypeSafe key and itself', APIKEY + APIKEY, KEY_MASK + KEY_MASK],
+  ['a TypeSafe key and one in capitals', APIKEY + APIKEY_UPPER, KEY_MASK + KEY_MASK],
+  ['a TypeSafe key cut after its first part and another', `apikey_${KEY_A}${APIKEY2}`, KEY_MASK + KEY_MASK],
+  ['a GitHub token and a TypeSafe key', GH + APIKEY, GH_MASK + KEY_MASK],
+  ['another GitHub token and a TypeSafe key in capitals', GH2 + APIKEY_UPPER, GH_MASK + KEY_MASK],
+  // A fine-grained token's characters are letters, digits and `_`, and a key has no `-`: it runs over the whole of the key.
+  ['a fine-grained token and a TypeSafe key', PAT + APIKEY, PAT_MASK],
+  // An sk- key's characters take in a whole key as well.
+  ['an sk- key and a TypeSafe key', SK + APIKEY, SK_MASK],
+  ['an AWS key and a TypeSafe key', AKIA + APIKEY, AKIA_MASK + KEY_MASK],
+  ['a temporary AWS key and a TypeSafe key in capitals', ASIA + APIKEY_UPPER, AKIA_MASK + KEY_MASK],
+  ['a private key and a TypeSafe key', PEM_BLOCK + APIKEY, PEM_MASK + KEY_MASK],
+  ['a cut private key and a TypeSafe key', PEM_CUT + APIKEY, PEM_MASK + KEY_MASK],
 ]
 
 for (const [name, text, expected] of glued) {
@@ -418,10 +496,40 @@ test('three and more glued secrets are each masked, whatever the order', () => {
   assert.equal(maskSecrets(AKIA + GH + SK + PAT), AKIA_MASK + GH_MASK + SK_MASK, 'an sk- key runs over what follows it')
   assert.equal(maskSecrets(`${GH}${GH2}-${GH}_${GH2}`), `${GH_MASK}${GH_MASK}-${GH_MASK}_${GH_MASK}`)
   assert.equal(maskSecrets(GH + SK + GH2), GH_MASK + SK_MASK)
+  assert.equal(maskSecrets(AKIA + APIKEY + GH + APIKEY2 + ASIA), AKIA_MASK + KEY_MASK + GH_MASK + KEY_MASK + AKIA_MASK)
+  assert.equal(maskSecrets(`${APIKEY}_${GH}_${APIKEY2}-${AKIA}`), `${KEY_MASK}_${GH_MASK}_${KEY_MASK}-${AKIA_MASK}`)
+})
+
+test('what follows a TypeSafe key that is not part of a key is not masked with it', () => {
+  for (const [text, expected] of [
+    [`${APIKEY}.`, `${KEY_MASK}.`],
+    [`${APIKEY}\n`, `${KEY_MASK}\n`],
+    [`${APIKEY}\\n${APIKEY2}`, `${KEY_MASK}\\n${KEY_MASK}`],
+    [`"${APIKEY}","${APIKEY2}"`, `"${KEY_MASK}","${KEY_MASK}"`],
+    [`${APIKEY} and apikey_placeholder`, `${KEY_MASK} and apikey_placeholder`],
+    // A second part that goes on in hex is the key's; letters that are not hex are not.
+    [`${APIKEY}xyz`, `${KEY_MASK}xyz`],
+    [`${APIKEY}_${GH}`, `${KEY_MASK}_${GH_MASK}`],
+    [`${APIKEY}_ghp_short`, `${KEY_MASK}_ghp_short`],
+  ] as const) {
+    assert.equal(maskSecrets(text), expected, text)
+  }
+})
+
+test('a text that a pattern detects and cannot mask is masked whole, not left', () => {
+  // 31 digits and then the `a` of a second key: the first key's 32nd digit is the second one's first letter, so the first
+  // is a key to `secretKind`, and the mask cannot end it there without taking the second's `a`, and the second is not a
+  // key to look for after a digit. Neither a half-mask nor a leak of the second key will do.
+  const text = `apikey_${KEY_A.slice(0, 31)}apikey_${KEY2_A}_${KEY2_B}`
+  assert.equal(secretKind(text), 'a TypeSafe API key')
+  const masked = maskSecrets(text)
+  assert.equal(secretKind(masked), undefined)
+  assertNoBodies(masked, 'two keys, the first cut short')
+  assert.equal(maskSecrets(masked), masked)
 })
 
 test('no pattern that looks for a secret at the end of a mask starts with a lookbehind', () => {
-  assert.equal(GLUED_SOURCES.length, 5)
+  assert.equal(GLUED_SOURCES.length, 6)
   for (const source of GLUED_SOURCES) {
     assert.ok(!source.startsWith('(?<'), source)
     assert.doesNotThrow(() => new RegExp(source, 'y'), source)
@@ -493,7 +601,7 @@ test('the mask text is not itself a secret, for every kind', () => {
 test('no secret is left in any mixture of secrets and what goes between them, and masking the result changes nothing', () => {
   // Secrets, and what a text puts between and around them. Every sequence of up to three. A secret here is one a pattern
   // matches where it stands: not after a letter, and an AWS key not before a capital, which are not secrets on their own.
-  const secrets = [GH, GH2, PAT, SK, AKIA, ASIA, PEM_BLOCK]
+  const secrets = [GH, GH2, PAT, SK, AKIA, ASIA, PEM_BLOCK, APIKEY, APIKEY_UPPER]
   const parts = [...secrets, ' ', '\n', '_', '-', '.']
   const sequences: string[] = []
   const walk = (prefix: string, depth: number): void => {
@@ -502,7 +610,7 @@ test('no secret is left in any mixture of secrets and what goes between them, an
     for (const part of parts) walk(prefix + part, depth - 1)
   }
   walk('', 3)
-  assert.ok(sequences.length > 1_500)
+  assert.ok(sequences.length > 2_500)
   let tested = 0
   for (const text of sequences) {
     if (/(?:AKIA|ASIA)[0-9A-Z]{16}(?:AKIA|ASIA)/.test(text)) continue
@@ -513,11 +621,11 @@ test('no secret is left in any mixture of secrets and what goes between them, an
     assert.equal(maskSecrets(once), once, JSON.stringify(text))
     assert.equal(once.includes('‹secret:'), secrets.some(secret => text.includes(secret)), JSON.stringify(text))
   }
-  assert.ok(tested > 1_400)
+  assert.ok(tested > 2_300)
 })
 
 test('no secret is left in a mixture that has keys that were cut off, secrets glued to them, and what goes between', () => {
-  const secrets = [PEM_CUT, PEM_BLOCK, AKIA, ASIA, GH, PAT, SK, SK_U]
+  const secrets = [PEM_CUT, PEM_BLOCK, AKIA, ASIA, GH, PAT, SK, SK_U, APIKEY, APIKEY_UPPER, `apikey_${KEY_A}`]
   const parts = [...secrets, ' ', '\n', '_', '-', '.']
   // Every sequence of up to three, and then a long run of pseudo-random ones, up to six: a cut key takes in what follows it,
   // so a secret behind one is masked as the end of the mask, whatever the run of base64 and AKIA in front of it was.
@@ -549,7 +657,7 @@ test('no secret is left in a mixture that has keys that were cut off, secrets gl
 })
 
 test('no body is left, and the text around is, in a mixture with words between the secrets', () => {
-  const secrets = [GH, GH2, PAT, SK, AKIA, PEM_BLOCK]
+  const secrets = [GH, GH2, PAT, SK, AKIA, PEM_BLOCK, APIKEY, APIKEY_UPPER]
   for (const first of secrets) {
     for (const second of secrets) {
       for (const between of [' and ', '\n', ', ', '=']) {
@@ -581,6 +689,13 @@ const nearMisses: Array<[string, () => string]> = [
   ['valid headers, each followed by fake BEGIN lines, over and over', () => `-----BEGIN PRIVATE KEY-----"${'-----BEGIN x. '.repeat(20)}`.repeat(MEGABYTE / 300)],
   ['a cut key and a megabyte of fake BEGIN lines', () => `-----BEGIN PRIVATE KEY-----\n${'-----BEGIN x. '.repeat(MEGABYTE / 14)}`],
   ['cut keys with token prefixes in them, over and over', () => `-----BEGIN PRIVATE KEY-----\nghp_sk-github_pat_ghp_${'A'.repeat(30)}"`.repeat(MEGABYTE / 80)],
+  ['TypeSafe key starts, 31 digits, an underscore and 31 digits, over and over', () => `apikey_${'a'.repeat(31)}_${'b'.repeat(31)} `.repeat(MEGABYTE / 71)],
+  ['TypeSafe key starts, 31 digits, an underscore and 31 digits, glued, over and over', () => `apikey_${'a'.repeat(31)}_${'b'.repeat(31)}`.repeat(MEGABYTE / 70)],
+  ['apikey_ over and over', () => 'apikey_'.repeat(MEGABYTE / 7)],
+  ['apikey_ and a megabyte of hex digits', () => `apikey_${'a1'.repeat(MEGABYTE / 2)}`],
+  ['apikey_ and a megabyte of hex digits and underscores', () => `apikey_${'a1'.repeat(40)}_${'b2'.repeat(MEGABYTE / 2)}`],
+  ['apikey_ and a megabyte of letters that are not hex', () => `apikey_${'g'.repeat(MEGABYTE)}`],
+  ['apikey_, 40 hex digits and an AKIA, over and over', () => `apikey_${'a'.repeat(40)}AKIA${'A'.repeat(15)} `.repeat(MEGABYTE / 67)],
   ['headers with an END over and over', () => `${PEM_BLOCK}\n`.repeat(MEGABYTE / (PEM_BLOCK.length + 1))],
   ['a header and END lines that are not its', () => `-----BEGIN PRIVATE KEY-----${'-----END PRIVATE KEY'.repeat(MEGABYTE / 20)}`],
   ['ghp_ over and over', () => 'ghp_'.repeat(MEGABYTE / 4)],
