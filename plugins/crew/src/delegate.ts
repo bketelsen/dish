@@ -26,8 +26,12 @@
  * What counts as running: the child's agent is stepping, or the record says running and the agent exists (accepted, not
  * stepping yet). A record that says running with no agent is a crash's, and isn't running.
  *
+ * The row also rewrites the finish notices of this agent's crew children, so that each names its role, title and model and
+ * where its report is (`notice.ts`): one `agent/pre-step` listener, registered here so that it is the preset's and hears
+ * only the agents under it.
+ *
  * This module is the row and little else: everything it loads of the plugin is plain code over plain data (`models`,
- * `allow`, `text`), and the services come in by `import type`.
+ * `allow`, `notice`, `text`), and the services come in by `import type`.
  *
  * @module dish-crew/delegate
  */
@@ -44,6 +48,7 @@ import { allowList, visibleTools } from './allow.ts'
 import type { DishCrew } from './index.ts'
 import { chooseRoute, offeredModels } from './models.ts'
 import type { ReviewedWork, Route } from './models.ts'
+import { noticeListener } from './notice.ts'
 import type { ChildRecord } from './record.ts'
 import type { CrewSettings, RoleSettings } from './settings.ts'
 import { listed, truncate } from './text.ts'
@@ -214,6 +219,10 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       // Nothing to do about it.
     }
   }
+
+  // The finish notices of this agent's crew children. A row's listener is the preset's: dsh-scope delivers it the steps of
+  // the agents under the preset, and `noticeListener` leaves a message that isn't this agent's own child's alone.
+  ctx.on('agent/pre-step', noticeListener(ctx, warn))
 
   /** The child `id` if this session started it. @throws a refusal that names the session's children, if not. */
   async function ownChild(call: Call, id: string, what: string, hint: string): Promise<ChildRecord> {
