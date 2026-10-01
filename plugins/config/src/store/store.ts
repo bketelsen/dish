@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
-import { basename, dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { ConfigStoreError } from './errors.ts'
 import { Git, literal, pathProblem } from './git.ts'
 import type { Change, GitIdentity } from './git.ts'
@@ -130,8 +130,8 @@ const STALE_TEMP_MS = 60_000
 const GIT_INIT_ENTRIES: readonly string[] = ['HEAD', 'branches', 'config', 'description', 'hooks', 'info', 'objects', 'refs']
 /** The files `git init` writes through a lock, which a crash can leave behind and which would make the next `git init` fail. */
 const GIT_INIT_LOCKS: readonly string[] = ['config.lock', 'HEAD.lock']
-/** What a restore from the remote is fetched into, next to the repository: `<name>.clone-<16 hex>`. */
-const CLONE_SUFFIX = /^\.clone-[0-9a-f]{16}$/
+/** What a restore from the remote is fetched into, inside the repository directory: `dish-restore-<16 hex>`. */
+const RESTORE_DIR = /^dish-restore-[0-9a-f]{16}$/
 
 /** What `write`, `seed`, `revert` and the proposals hand to `commitPrepared` once every check has passed. Package-internal. */
 export interface Prepared {
@@ -777,7 +777,7 @@ export class ConfigStore {
    * contacts the remote here.
    */
   private async ensureRepository(): Promise<void> {
-    await this.removeStaleClones()
+    await this.removeStaleRestores()
     // A stray `HEAD` file doesn't make a repository: it is whatever git itself accepts.
     const check = await this.git.run(['rev-parse', '--git-dir'], { allowFail: true })
     if (check.code === 0) {
@@ -806,11 +806,12 @@ export class ConfigStore {
   }
 
   /**
-   * Make `<repository>` a copy of the remote's `main`. It is fetched into a new bare repository next
-   * to this one (`<repository>.clone-<hex>`, SHA-1 and loose refs whatever the user's git config says,
-   * `main` only, no remote configured in it) and checked there; then each of its entries is moved
-   * into this directory, `refs` and `HEAD` last, and the temporary directory is removed. It is
-   * removed when anything fails too, and nothing has been touched by then.
+   * Make `<repository>` a copy of the remote's `main`. It is fetched into a new bare repository in a
+   * directory of its own inside this one (`dish-restore-<hex>`: the same filesystem, whatever is mounted
+   * where, and under our lock; SHA-1 and loose refs whatever the user's git config says, `main` only, no
+   * remote configured in it) and checked there; then each of its entries is moved up into this directory,
+   * `refs` and `HEAD` last, and the restore directory is removed. It is removed when anything fails too,
+   * and nothing has been touched by then.
    *
    * This directory may hold what a crashed `git init` or an earlier restore's first renames left
    * (`entries`), which is replaced, unless `objects` or `refs` hold a file: that could be commits.
@@ -825,7 +826,7 @@ export class ConfigStore {
         throw new Error(`${this.repository} is not a repository but holds parts of one (${name}), refusing to replace them from the remote; remove ${name} (or the whole directory) to restore`)
       }
     }
-    const temp = `${this.repository}.clone-${randomBytes(8).toString('hex')}`
+    const temp = join(this.repository, `dish-restore-${randomBytes(8).toString('hex')}`)
     try {
       const fetched = new Git(temp)
       await fetched.initBare('main')
@@ -843,20 +844,14 @@ export class ConfigStore {
   }
 
   /**
-   * Delete the temporary directories a crashed restore left next to the repository
-   * (`<repository>.clone-<16 hex>`). Safe: this process holds the lock, and only a restore makes them.
+   * Delete the restore directories a crashed restore left in the repository directory
+   * (`dish-restore-<16 hex>`, directories only). Safe: this process holds the lock, and only a restore makes them.
+   * Runs before anything decides what the directory is, so a leftover is never mistaken for someone's file.
    */
-  private async removeStaleClones(): Promise<void> {
-    const name = basename(this.repository)
-    let siblings: string[]
-    try {
-      siblings = await readdir(dirname(this.repository))
-    } catch (error) {
-      if (['ENOENT', 'EACCES', 'EPERM'].includes((error as { code?: string }).code ?? '')) return
-      throw error
-    }
-    const stale = siblings.filter(entry => entry.startsWith(name) && CLONE_SUFFIX.test(entry.slice(name.length)))
-    await Promise.all(stale.map(entry => rm(join(dirname(this.repository), entry), { recursive: true, force: true })))
+  private async removeStaleRestores(): Promise<void> {
+    const entries = await readdir(this.repository, { withFileTypes: true })
+    const stale = entries.filter(entry => entry.isDirectory() && RESTORE_DIR.test(entry.name))
+    await Promise.all(stale.map(entry => rm(join(this.repository, entry.name), { recursive: true, force: true })))
   }
 
   /**

@@ -224,7 +224,9 @@ function warn(message: string): void {
  *   notes that more has come and pushes once more when it is done, so a burst of writes costs a
  *   few pushes, not one each.
  * - A failed push is retried after a delay that grows (`delays`, the last repeating) and starts over
- *   after a success. While a retry is waiting, `schedule()` does not push early: the retry carries everything.
+ *   after a success. A new commit shortens a retry that is waiting longer than the first delay to the first
+ *   delay (so a save after a long outage is tried within a moment, not minutes), and never lengthens one. It
+ *   doesn't touch the count of failures: if the remote is still dead, the wait goes straight back to the long delay.
  * - It is `git push --porcelain <remote> refs/heads/main:refs/heads/main`, to the URL itself and never
  *   forced: no remote is configured in the repository, no tracking ref is written, no local ref
  *   is locked. A rejection means the remote has commits this store lacks (another machine pushed);
@@ -242,6 +244,8 @@ export class PushQueue {
   private lastAttempt: number | undefined
   private failures = 0
   private timer: NodeJS.Timeout | undefined
+  /** When the waiting retry fires, in milliseconds since the epoch; only meaningful while `timer` is set. */
+  private due = 0
   private running: Promise<void> | undefined
   private current: NetworkRun | undefined
   private again = false
@@ -262,9 +266,10 @@ export class PushQueue {
   /** A commit has landed on `main` (or this is a start): push soon. Never throws, never waits. */
   schedule(): void {
     if (this.closed) return
-    // Running: pushed again when it ends. Backing off: the coming retry carries it.
+    // Running: pushed again when it ends (or, if it fails, tried soon). Backing off: the coming retry carries it.
     if (this.running !== undefined) this.again = true
     else if (this.timer === undefined) this.start()
+    else if (this.due - Date.now() > this.delays[0]!) this.arm(this.delays[0]!)
     this.notify()
   }
 
@@ -302,15 +307,23 @@ export class PushQueue {
       const ok = await this.attempt()
       if (this.closed) return
       if (!ok) {
-        this.backOff()
+        // A commit that came in during the attempt may be newer than what it tried: not left waiting for the long delay either.
+        this.backOff(this.again)
         return
       }
       if (!this.again) return
     }
   }
 
-  private backOff(): void {
+  /** Wait before the next try: the delay for this many failures, or the first delay if a commit came in meanwhile. */
+  private backOff(sooner: boolean): void {
     const delay = this.delays[Math.min(this.failures - 1, this.delays.length - 1)]!
+    this.arm(sooner ? Math.min(delay, this.delays[0]!) : delay)
+  }
+
+  private arm(delay: number): void {
+    clearTimeout(this.timer)
+    this.due = Date.now() + delay
     // A retry that is only waiting must not keep an otherwise finished process alive.
     this.timer = setTimeout(() => {
       this.timer = undefined
