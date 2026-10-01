@@ -1,11 +1,18 @@
+import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
 import type { DishConfigService } from 'dish-config'
 import * as plugin from '../src/index.ts'
 import type { DishCrew } from '../src/index.ts'
+import { CrewRecords } from '../src/record.ts'
+import type { NewChild } from '../src/record.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from '../src/settings.ts'
 import {
   captureStderr, dirs, mountConfig, mountCrew, seeded, shippedWith, tempDir, waitFor, watchLogs, withEnv,
@@ -62,7 +69,7 @@ test('dishCrew is provided when the plugin loads, with settings(), and goes when
   const handle = mountCrew(ctx, where.data)
   await handle
   const service: DishCrew = ctx.dishCrew
-  assert.deepEqual(Object.keys(service), ['settings'])
+  assert.deepEqual(Object.keys(service), ['settings', 'records', 'whenRecorded'])
   await handle.dispose()
   assert.equal(ctx.get('dishCrew'), undefined)
 })
@@ -385,4 +392,372 @@ test('terminal prints this plugin\'s warnings to stderr, and terminal: false doe
   const printed = await run(true)
   assert.ok(printed.some(line => /^\[dish-crew\] warn: .*shipped crew\.yaml/.test(line)), printed.join('\n'))
   assert.deepEqual(await run(false), [])
+})
+
+// --- the record and run capture -------------------------------------------------------------------
+
+const DAY = 24 * 60 * 60 * 1000
+
+function sha(text: string): string {
+  return createHash('sha256').update(text).digest('hex')
+}
+
+function crewChild(id: string, overrides: Partial<NewChild> = {}): NewChild {
+  return { id, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', ...overrides }
+}
+
+/** The part of an agent that `agent/error` listeners here use. */
+function agentOf(id: string): Agent {
+  return { id } as unknown as Agent
+}
+
+function errored(ctx: Context, id: string, error: unknown): void {
+  ctx.emit('agent/error', { agent: agentOf(id), turn: 1, step: 2, error })
+}
+
+function ended(ctx: Context, id: string, stopReason: string, lastAssistantMessage?: unknown[]): void {
+  ctx.emit('subagent/end', {
+    runId: 'run-1', provider: 'spawn', id, local: true, stopReason,
+    ...lastAssistantMessage === undefined ? {} : { lastAssistantMessage },
+  } as unknown as SubagentRunEndInfo)
+}
+
+async function exists(path: string): Promise<boolean> {
+  return stat(path).then(() => true, () => false)
+}
+
+function sessionPath(where: Dirs, session: string, ...rest: string[]): string {
+  return join(where.data, 'sessions', sha(session), ...rest)
+}
+
+/** A plugin mounted on `where.data` in a fresh `Context`, and what unmounts it. */
+async function mounted(where: Dirs): Promise<{ ctx: Context, handle: ReturnType<typeof mountCrew>, logs: string[] }> {
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  const handle = mountCrew(ctx, where.data)
+  await handle
+  return { ctx, handle, logs }
+}
+
+/** A short wait, for the case a test needs something to have been given the time to do nothing. */
+function pause(ms = 100): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+test('dishCrew.records is the record on the data directory, and nothing is written until a child is added', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    const { records } = ctx.dishCrew
+    assert.ok(records instanceof CrewRecords)
+    assert.equal(await exists(where.data), false)
+    const added = await records.addChild('s1', crewChild('c1'))
+    assert.equal(added.n, 1)
+    assert.ok(await exists(sessionPath(where, 's1', 'children.json')))
+    assert.equal(ctx.dishCrew.whenRecorded('c1'), undefined)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('an agent/error and a subagent/end for a crew child are recorded: the report holds the closing message, the run holds the error', async () => {
+  const where = await dirs()
+  const { ctx, handle, logs } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    errored(ctx, 'c1', new Error('429 rate limited'))
+    ended(ctx, 'c1', 'error', [
+      { type: 'reasoning', text: 'thinking about it' },
+      { type: 'text', text: 'I got as far as the router.' },
+      { type: 'tool_use', id: 't1', name: 'read', input: {} },
+      { type: 'text', text: '   ' },
+      { type: 'text', text: 'Then the API stopped answering.' },
+    ])
+    const recorded = await ctx.dishCrew.whenRecorded('c1')
+    const report = sessionPath(where, 's1', '1-coder-1.md')
+    assert.deepEqual(recorded, { report })
+    assert.equal(await readFile(report, 'utf8'), 'I got as far as the router.\n\nThen the API stopped answering.\n')
+    const [child] = await ctx.dishCrew.records.children('s1')
+    assert.equal(child!.last, 'failed')
+    assert.equal(child!.runs.length, 1)
+    assert.deepEqual({ ...child!.runs[0]!, endedAt: 0 }, { endedAt: 0, stopReason: 'error', error: '429 rate limited', report })
+    // The file on disk is what the record says.
+    const onDisk = JSON.parse(await readFile(sessionPath(where, 's1', 'children.json'), 'utf8'))
+    assert.equal(onDisk.children[0].runs[0].error, '429 rate limited')
+    assert.deepEqual(logs, [])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('a run that finished with no error is finished; a missing last message is a report that says so', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    await ctx.dishCrew.records.addChild('s1', crewChild('c2', { role: 'researcher' }))
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'Done.' }])
+    ended(ctx, 'c2', 'aborted')
+    await ctx.dishCrew.whenRecorded('c1')
+    await ctx.dishCrew.whenRecorded('c2')
+    assert.equal(await readFile(sessionPath(where, 's1', '1-coder-1.md'), 'utf8'), 'Done.\n')
+    assert.equal(await readFile(sessionPath(where, 's1', '2-researcher-1.md'), 'utf8'), '(no closing message)\n')
+    const [one, two] = await ctx.dishCrew.records.children('s1')
+    assert.deepEqual([one!.last, two!.last], ['finished', 'stopped'])
+    assert.ok(!('error' in one!.runs[0]!))
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('an error and an end in the same tick still meet, and an end clears the error so the next run does not have it', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    errored(ctx, 'c1', new Error('first run broke'))
+    errored(ctx, 'c1', new Error('and then the last thing that broke'))
+    ended(ctx, 'c1', 'error')
+    await ctx.dishCrew.whenRecorded('c1')
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'second run is fine' }])
+    await ctx.dishCrew.whenRecorded('c1')
+    const [child] = await ctx.dishCrew.records.children('s1')
+    assert.deepEqual(child!.runs.map(run => run.error), ['and then the last thing that broke', undefined])
+    assert.deepEqual(child!.runs.map(run => run.report.split('/').pop()), ['1-coder-1.md', '1-coder-2.md'])
+    assert.equal(child!.last, 'finished')
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('two runs that end close together are recorded in the order they ended', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    for (let run = 1; run <= 6; run++) {
+      // An error only for the odd ones: its lookup is slower than none, which must not let a later end overtake.
+      if (run % 2 === 1) errored(ctx, 'c1', new Error(`error ${run}`))
+      ended(ctx, 'c1', run % 2 === 1 ? 'error' : 'completed', [{ type: 'text', text: `run ${run}` }])
+    }
+    await ctx.dishCrew.whenRecorded('c1')
+    const [child] = await ctx.dishCrew.records.children('s1')
+    assert.deepEqual(child!.runs.map(run => run.error), ['error 1', undefined, 'error 3', undefined, 'error 5', undefined])
+    for (const [index, run] of child!.runs.entries()) assert.equal(await readFile(run.report, 'utf8'), `run ${index + 1}\n`)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('whenRecorded is the run being recorded: there as soon as the event is, the report when it settles, then gone', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    assert.equal(ctx.dishCrew.whenRecorded('c1'), undefined)
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'x' }])
+    const pending = ctx.dishCrew.whenRecorded('c1')
+    assert.ok(pending instanceof Promise)
+    assert.deepEqual(await pending, { report: sessionPath(where, 's1', '1-coder-1.md') })
+    assert.equal(ctx.dishCrew.whenRecorded('c1'), undefined)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('the errors and ends of agents crew did not start are ignored: nothing is written, and an error is not kept for later', async () => {
+  const where = await dirs()
+  const { ctx, handle, logs } = await mounted(where)
+  try {
+    errored(ctx, 'stranger', new Error('not ours'))
+    ended(ctx, 'stranger', 'error', [{ type: 'text', text: 'not ours' }])
+    assert.equal(await ctx.dishCrew.whenRecorded('stranger'), undefined)
+    assert.equal(await exists(where.data), false)
+    // An error for an id that is not a crew child is not remembered, so if it becomes one it doesn't have it.
+    errored(ctx, 'late', new Error('before it was ours'))
+    await pause()
+    await ctx.dishCrew.records.addChild('s1', crewChild('late'))
+    ended(ctx, 'late', 'completed', [{ type: 'text', text: 'fine' }])
+    await ctx.dishCrew.whenRecorded('late')
+    const [child] = await ctx.dishCrew.records.children('s1')
+    assert.ok(!('error' in child!.runs[0]!))
+    assert.deepEqual(logs, [])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('an error is remembered as its message, or a short form of it', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    const cases: Array<[unknown, string]> = [
+      [new Error('boom'), 'boom'],
+      [new TypeError(''), 'TypeError'],
+      ['plain text', 'plain text'],
+      [{ message: 'from an object', code: 1 }, 'from an object'],
+      [{ code: 42 }, '{"code":42}'],
+      [undefined, 'unknown error'],
+      [null, 'unknown error'],
+      [42, '42'],
+      ['x'.repeat(5000), `${'x'.repeat(999)}…`],
+    ]
+    for (const [index] of cases.entries()) await ctx.dishCrew.records.addChild('s1', crewChild(`c${index}`))
+    for (const [index, [error]] of cases.entries()) {
+      errored(ctx, `c${index}`, error)
+      ended(ctx, `c${index}`, 'error')
+    }
+    for (const [index] of cases.entries()) await ctx.dishCrew.whenRecorded(`c${index}`)
+    const listed = await ctx.dishCrew.records.children('s1')
+    assert.deepEqual(listed.map(child => child.runs[0]!.error), cases.map(([, expected]) => expected))
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('what is remembered for errors is bounded: the oldest are forgotten first', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    const total = plugin.ERROR_MEMORY + 3
+    const ids = Array.from({ length: total }, (_, index) => `c${index}`)
+    for (const id of ids) await ctx.dishCrew.records.addChild('s1', crewChild(id))
+    for (const id of ids) errored(ctx, id, new Error(`error of ${id}`))
+    await pause(300)
+    for (const id of [ids[0]!, ids[1]!, ids[total - 1]!]) ended(ctx, id, 'error')
+    for (const id of [ids[0]!, ids[1]!, ids[total - 1]!]) await ctx.dishCrew.whenRecorded(id)
+    const errors = Object.fromEntries((await ctx.dishCrew.records.children('s1')).map(child => [child.id, child.runs[0]?.error]))
+    assert.equal(errors[ids[0]!], undefined)
+    assert.equal(errors[ids[1]!], undefined)
+    assert.equal(errors[ids[total - 1]!], `error of ${ids[total - 1]}`)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('a record that can not be written is logged, never thrown, and whenRecorded still resolves', async () => {
+  const where = await dirs()
+  const { ctx, handle, logs } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    const file = sessionPath(where, 's1', 'children.json')
+    await rm(file)
+    await mkdir(file)
+    errored(ctx, 'c1', new Error('x'))
+    assert.doesNotThrow(() => { ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'x' }]) })
+    assert.equal(await ctx.dishCrew.whenRecorded('c1'), undefined)
+    const lines = logs.filter(line => line.startsWith('[dish-crew] warn:'))
+    assert.ok(lines.some(line => /could not record the end of child c1: /.test(line)), logs.join('\n'))
+    // The next one after the trouble is gone is recorded.
+    await rm(file, { recursive: true })
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'y' }])
+    assert.ok(await ctx.dishCrew.whenRecorded('c1'))
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('events with nothing in them are no trouble: the listeners take what they are given and do not throw', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    const odd: unknown[] = [undefined, null, 5, 'text', {}, { agent: null }, { agent: {} }, { agent: { id: 5 } }, { id: '' }, { id: 7 }, { id: 'x', stopReason: 5, lastAssistantMessage: 'text' }, { id: 'x', lastAssistantMessage: [null, 5, { type: 'text' }, { type: 'text', text: 5 }] }]
+    for (const payload of odd) {
+      assert.doesNotThrow(() => { ctx.emit('agent/error', payload as never) }, JSON.stringify(payload))
+      assert.doesNotThrow(() => { ctx.emit('subagent/end', payload as never) }, JSON.stringify(payload))
+    }
+    await pause()
+    assert.equal(await exists(where.data), false)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('the listeners go with the plugin, and the unmount waits for a record that is being written', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+  await ctx.dishCrew.records.addChild('s1', crewChild('c2'))
+  ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'written before the unmount finished' }])
+  await handle.dispose()
+  assert.equal(await readFile(sessionPath(where, 's1', '1-coder-1.md'), 'utf8'), 'written before the unmount finished\n')
+  const records = new CrewRecords(where.data)
+  ended(ctx, 'c2', 'completed', [{ type: 'text', text: 'after' }])
+  await pause()
+  assert.deepEqual((await records.children('s1'))[1]!.runs, [])
+  assert.equal(ctx.get('dishCrew'), undefined)
+})
+
+// --- pruning at start, and what the record logs ---------------------------------------------------
+
+/** A session in `where.data` whose files were last written `ageMs` ago. */
+async function seedSession(where: Dirs, session: string, ageMs: number): Promise<void> {
+  const records = new CrewRecords(where.data)
+  await records.addChild(session, crewChild(`${session}-child`))
+  await records.endRun(`${session}-child`, { stopReason: 'completed', closing: 'x' })
+  const dir = sessionPath(where, session)
+  const when = new Date(Date.now() - ageMs)
+  for (const name of await readdir(dir)) await utimes(join(dir, name), when, when)
+}
+
+test('at start, sessions not written to for 180 days are pruned, before dishCrew is provided, and the rest are kept', async () => {
+  const where = await dirs()
+  await seedSession(where, 'old', 181 * DAY)
+  await seedSession(where, 'recent', 179 * DAY)
+  const ctx = new Context()
+  // Whether the old session was still there when the service appeared: the prune comes first.
+  let oldWhenProvided: boolean | undefined
+  ctx.on('internal/service', (name) => {
+    if (name === 'dishCrew' && oldWhenProvided === undefined) oldWhenProvided = existsSync(sessionPath(where, 'old'))
+  })
+  const handle = mountCrew(ctx, where.data)
+  try {
+    await handle
+    assert.equal(await exists(sessionPath(where, 'old')), false)
+    assert.equal(await exists(sessionPath(where, 'recent')), true)
+    assert.equal(await exists(join(where.data, 'by-child', sha('old-child'))), false)
+    assert.equal(await exists(join(where.data, 'by-child', sha('recent-child'))), true)
+    assert.equal((await ctx.dishCrew.records.children('recent')).length, 1)
+    assert.equal((await ctx.dishCrew.records.children('old')).length, 0)
+    assert.equal(oldWhenProvided, false)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('a prune that fails is logged and the service is provided all the same', async () => {
+  const where = await dirs()
+  // A data directory that is a file: nothing under it can be listed.
+  await writeFile(where.data, 'not a directory')
+  const ctx = new Context()
+  const seen = watchLogs(ctx)
+  const handle = mountCrew(ctx, where.data)
+  try {
+    await handle
+    assert.ok(ctx.get('dishCrew'))
+    const lines = seen.filter(line => line.startsWith('[dish-crew] warn:'))
+    assert.equal(lines.length, 1, seen.join('\n'))
+    assert.match(lines[0]!, /could not prune the crew's old records in .*: /)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('a children.json that is not valid is logged with where it went and what happens to the count', async () => {
+  const where = await dirs()
+  const { ctx, handle, logs } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    await writeFile(sessionPath(where, 's1', 'children.json'), '{ nope')
+    assert.deepEqual(await ctx.dishCrew.records.children('s1'), [])
+    const lines = logs.filter(line => line.startsWith('[dish-crew] warn:'))
+    assert.equal(lines.length, 1, logs.join('\n'))
+    assert.match(lines[0]!, /the record of session s1 is not valid; it was moved to .*children\.json\.corrupt-\d+ and the session starts a new one, so its delegation count starts again from 0/)
+    const moved = (await readdir(sessionPath(where, 's1'))).filter(name => name.startsWith('children.json.corrupt-'))
+    assert.equal(moved.length, 1)
+    assert.ok(lines[0]!.includes(join(sessionPath(where, 's1'), moved[0]!)))
+  } finally {
+    await handle.dispose()
+  }
 })

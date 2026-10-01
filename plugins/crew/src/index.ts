@@ -5,7 +5,12 @@
  * reads what is provided here. The plugin:
  *
  * - provides the `dishCrew` service: `settings()` is the `crew.yaml` in the config store as it is now (see
- *   `settings.ts`), or the shipped default;
+ *   `settings.ts`), `records` is the crew's own record of its children and their reports (see `record.ts`), and
+ *   `whenRecorded(child)` is the run of that child that is being recorded now, if there is one;
+ * - captures every crew child's runs: the error an `agent/error` reports is held for the child, and `subagent/end`
+ *   files the run, with that error and the closing message, in the record. Both listeners are the host's, so they hear
+ *   every agent, and they act only on children the record knows. They never throw;
+ * - at start, before it provides the service, removes the sessions' records not written to for 180 days;
  * - claims `crew.yaml` in the store and seeds it when `dishConfig` is there. `dishConfig` is optional, so there is no
  *   order to keep: with no store, every answer is the shipped default;
  * - logs as `dish-crew`.
@@ -18,10 +23,14 @@ import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
+import { CrewRecords } from './record.ts'
+import type { EndedRun } from './record.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from './settings.ts'
 import type { CrewSettings } from './settings.ts'
 
 export type { CrewSettings, FamilySettings, Limits, ParseResult, RoleSettings, Tier } from './settings.ts'
+export type { ChildRecord, ChildStatus, EndedRun, NewChild, RunEnd, RunRecord } from './record.ts'
+export { CrewRecords, statusFor } from './record.ts'
 
 export const name = 'dish-crew'
 
@@ -33,6 +42,14 @@ export interface DishCrew {
    * shipped default, with one logged warning for each distinct problem. Never rejects.
    */
   settings(): Promise<CrewSettings>
+  /** The crew's record: its children by session, and each run's report. */
+  readonly records: CrewRecords
+  /**
+   * The latest `subagent/end` of `childId` that is still being recorded, or `undefined` if none is. It resolves, never
+   * rejects, with where the report went, or `undefined` if the child isn't a crew child or recording failed (which is
+   * logged). Once it has resolved it is gone from here: the run is in `records`.
+   */
+  whenRecorded(childId: string): Promise<EndedRun | undefined> | undefined
 }
 
 // Here, with the type, so that whoever imports it also gets `ctx.get('dishCrew')` typed.
@@ -133,19 +150,145 @@ function createSettingsReader(store: () => Reader | undefined, logger: Logger): 
   }
 }
 
+/** How long a session's record is kept without being written to. */
+const KEEP_RECORDS_MS = 180 * 24 * 60 * 60 * 1000
+/** How many children's errors are held for the `subagent/end` that follows. A child ends within moments of its error. */
+export const ERROR_MEMORY = 64
+/** The longest an error is kept, in characters: a record of it, not a copy of a stack. */
+const MAX_ERROR_LENGTH = 1000
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/** An agent's or a child's id from `value`, if it has one: a non-empty string `id`. */
+function idOf(value: unknown): string | undefined {
+  const id = isObject(value) ? value.id : undefined
+  return typeof id === 'string' && id !== '' ? id : undefined
+}
+
+/** `error` as a short line: an error's message, a string, a message in an object, or a short form of anything else. */
+function errorText(error: unknown): string {
+  let text = ''
+  try {
+    if (error instanceof Error) text = error.message.trim() || error.name
+    else if (typeof error === 'string') text = error.trim()
+    else if (isObject(error) && typeof error.message === 'string' && error.message.trim() !== '') text = error.message.trim()
+    else if (error !== undefined && error !== null) text = JSON.stringify(error) ?? String(error)
+  } catch {
+    try {
+      text = String(error)
+    } catch {
+      text = ''
+    }
+  }
+  if (text === '') return 'unknown error'
+  return text.length > MAX_ERROR_LENGTH ? `${text.slice(0, MAX_ERROR_LENGTH - 1)}…` : text
+}
+
+/** The text of a child's final message: its text blocks, each as it is, joined by blank lines. `''` if it has none. */
+function closingText(blocks: unknown): string {
+  if (!Array.isArray(blocks)) return ''
+  const texts: string[] = []
+  for (const block of blocks) {
+    if (isObject(block) && block.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '') texts.push(block.text)
+  }
+  return texts.join('\n\n')
+}
+
+/** Whether `error` is cordis refusing an effect because the plugin has been unloaded: a plugin that is going away didn't fail. */
+function unloaded(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === 'INACTIVE_EFFECT'
+}
+
 /**
  * Provide `dishCrew`, and claim and seed `crew.yaml` whenever the store is there.
  * @throws a plain `Error` for a `dataDirectory` that is a relative path.
  */
-export function apply(ctx: Context, config: Config): void {
+export async function apply(ctx: Context, config: Config): Promise<void> {
   const logger = ctx.logger(name)
   if (config.terminal) printOwnLogs(ctx, name)
+  /** A logger that throws is not worth a failed event, a failed lookup or a failed start. */
+  const warn = (format: string, ...args: unknown[]): void => {
+    try {
+      logger.warn(format, ...args)
+    } catch {
+      // Nothing to do about it.
+    }
+  }
 
   // Checked now, so a bad setting fails the plugin to load rather than the first delegation.
-  resolve(dataDirectoryPath(text(config.dataDirectory)))
+  const directory = resolve(dataDirectoryPath(text(config.dataDirectory)))
+  const records = new CrewRecords(directory, (session, path) => {
+    warn('the record of session %s is not valid; it was moved to %s and the session starts a new one, so its delegation count starts again from 0', session, path)
+  })
+
+  // The error each crew child's agent last reported, until its `subagent/end`. The promise answers whether the agent is a
+  // crew child (the record has to be asked), and an agent that isn't takes its entry out, so what is kept is the
+  // children's and no more. Oldest first, and bounded: a child whose end never comes can't grow this.
+  const remembered = new Map<string, Promise<string | undefined>>()
+  // The run of each child that is being recorded now, until it is. Never rejects.
+  const pending = new Map<string, Promise<EndedRun | undefined>>()
+
+  ctx.on('agent/error', (payload) => {
+    try {
+      const event: unknown = payload
+      const id = idOf(isObject(event) ? event.agent : undefined)
+      if (id === undefined) return
+      const message = errorText((event as { error?: unknown }).error)
+      const found = records.lookup(id).then(
+        hit => hit === undefined ? undefined : message,
+        (cause: unknown) => {
+          warn('could not tell whether agent %s is a crew child: %s', id, describe(cause))
+          return undefined
+        })
+      // Last, so that the oldest entry is the first out.
+      remembered.delete(id)
+      remembered.set(id, found)
+      while (remembered.size > ERROR_MEMORY) remembered.delete(remembered.keys().next().value!)
+      void found.then((kept) => {
+        if (kept === undefined && remembered.get(id) === found) remembered.delete(id)
+      })
+    } catch (cause) {
+      warn('could not note the error of an agent: %s', describe(cause))
+    }
+  })
+
+  ctx.on('subagent/end', (info) => {
+    try {
+      const event: unknown = info
+      const id = idOf(event)
+      if (id === undefined) return
+      const { stopReason, lastAssistantMessage } = event as { stopReason?: unknown, lastAssistantMessage?: unknown }
+      const error = remembered.get(id)
+      remembered.delete(id)
+      const closing = closingText(lastAssistantMessage)
+      // After the run of this child that is still being recorded, so that runs are numbered as they ended.
+      const previous = pending.get(id)
+      const run: Promise<EndedRun | undefined> = (async () => {
+        await previous
+        return records.endRun(id, { stopReason: stopReason as string, error: await error, closing })
+      })().catch((cause: unknown) => {
+        warn('could not record the end of child %s: %s', id, describe(cause))
+        return undefined
+      })
+      pending.set(id, run)
+      void run.then(() => {
+        if (pending.get(id) === run) pending.delete(id)
+      })
+    } catch (cause) {
+      warn('could not record the end of a child: %s', describe(cause))
+    }
+  })
+
+  // A shutdown waits for the runs being recorded: one that ended just before it is not lost.
+  ctx.effect(() => async () => {
+    await Promise.all([...pending.values()])
+    await records.flush()
+  })
 
   // `ctx.get` is read on every call: the store is optional, and may come, go and come back.
-  ctx.provide('dishCrew', { settings: createSettingsReader(() => ctx.get('dishConfig'), logger) })
+  const settings = createSettingsReader(() => ctx.get('dishConfig'), logger)
 
   // With the store there: claim crew.yaml, as an effect so it goes when the store, or this plugin, does, and seed it.
   // A claim that is refused (someone else owns the path) or a seed that fails leaves the store as it is.
@@ -156,14 +299,31 @@ export function apply(ctx: Context, config: Config): void {
     try {
       child.effect(() => child.dishConfig.claim(CREW_SPEC))
     } catch (error) {
-      logger.warn('could not claim crew.yaml: %s', describe(error))
+      warn('could not claim crew.yaml: %s', describe(error))
       return
     }
     try {
       await store.seed({ 'crew.yaml': DEFAULT_TEXT }, name)
     } catch (error) {
       // Unless the store is going away, which closed it under the seed.
-      if (present) logger.warn('could not seed crew.yaml: %s', describe(error))
+      if (present) warn('could not seed crew.yaml: %s', describe(error))
     }
   })
+
+  // Before the service is there, so that nothing asks the record while it is pruned. A failure is logged, and the crew
+  // works all the same: old records that stay are only disk.
+  try {
+    const removed = await records.prune(KEEP_RECORDS_MS)
+    if (removed > 0) logger.info('removed the records of %d crew session(s) not written to for 180 days', removed)
+  } catch (error) {
+    warn('could not prune the crew\'s old records in %s: %s', directory, describe(error))
+  }
+
+  try {
+    ctx.provide('dishCrew', { settings, records, whenRecorded: (childId: string) => pending.get(childId) })
+  } catch (error) {
+    // Unloaded while it was pruning: the plugin is going away, and didn't fail.
+    if (unloaded(error)) return
+    throw error
+  }
 }
