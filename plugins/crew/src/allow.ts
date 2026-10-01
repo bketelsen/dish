@@ -10,18 +10,24 @@
  * @module dish-crew/allow
  */
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type {} from '@deepseek-ai/dsh-tools'
+import { listed } from './text.ts'
 
 /**
- * Tools no child gets, whatever `crew.yaml` says a role lists: delegation (only the main agent delegates, and children
- * never nest), the main agent's own controls, and anything that asks you something. Children can't ask: dsh runs
- * them with approval policy `never`.
+ * Tools no child gets, whatever `crew.yaml` says a role lists: delegation, whether crew's own or dsh's (only the main agent
+ * delegates, and children never nest), the main agent's own controls, and anything that asks you something. Children
+ * can't ask: dsh runs them with approval policy `never`.
  */
 export const NEVER: ReadonlySet<string> = new Set([
   'delegate',
   'subagent',
   'subagent_fork',
+  'subagent_codex',
+  'subagent_claude_code',
+  'list_subagent_models',
   'workflow',
+  'ralph',
   'interrupt_agent',
   'list_agents',
   'ask_user_question',
@@ -38,14 +44,8 @@ export const NEVER: ReadonlySet<string> = new Set([
  */
 const TRANSPORT = 'run_code'
 
-/** The most names a problem lists, so a long registry can't make a long message. */
+/** The most tool names a problem lists, so a long registry can't make a long message. */
 const LISTED = 60
-
-function listed(names: readonly string[]): string {
-  if (names.length === 0) return 'none'
-  const head = names.slice(0, LISTED).join(', ')
-  return names.length > LISTED ? `${head}, …` : head
-}
 
 export type AllowResult = { ok: true, allow: string[] } | { ok: false, problem: string }
 
@@ -71,20 +71,30 @@ export function allowList(roleTools: readonly string[], visible: ReadonlySet<str
   const where = role === undefined || role === '' ? 'tools' : `roles.${role}.tools`
   return {
     ok: false,
-    problem: `${named} would have no tools here (visible: ${listed([...visible].filter(name => name !== TRANSPORT).sort())}); `
-      + `crew.yaml lists: ${listed([...new Set(roleTools)])}. Children never get ${[...NEVER].join(', ')}. `
+    problem: `${named} would have no tools here (visible: ${listed([...visible].filter(name => name !== TRANSPORT).sort(), LISTED)}); `
+      + `crew.yaml lists: ${listed([...new Set(roleTools)], LISTED)}. Children never get ${[...NEVER].join(', ')}. `
       + `Put tools that are visible here in ${where}.`,
   }
 }
 
 /**
- * The names of the tools `agent` can see now: what dsh's registry lists for it, which is what a child it starts is
- * filtered against (`tools.restrict` checks names against the registry the child inherits from the same preset). The
- * reserved `run_code` transport is left out, since a filter can't name it.
+ * The names of the tools a child of `agent` can be restricted to: what `agent` can see now, that a child it starts will
+ * inherit.
  *
- * A snapshot: call it when starting the child, not earlier. A tool registered only on the parent's own scope, and not
- * by its preset or globally, is listed here but isn't the child's to restrict; no role lists one.
+ * dsh checks a child's filter against the tools the child inherits (global ones, and those of the scopes above it),
+ * never the ones its own scope registers. A child joins its parent's preset, not the parent: so a tool the parent
+ * registered on its own scope (dsh-schedule's `schedule_*`, for one) is visible to the parent and unknown to the child's
+ * `tools.restrict`, which throws. So this is the parent's view intersected with the view of its enclosing scope, the
+ * preset's (`scopeParentOf`; with no preset that is the global view, which is what the child inherits then). The
+ * reserved `run_code` transport is left out too, since a filter can't name it.
+ *
+ * A snapshot: call it when starting the child, not earlier.
+ *
+ * `scopeParentOf` is `@deepseek-ai/dsh-scope`'s, so this package declares it as a peer, to share the host's instance: a
+ * second copy has a scope relation of its own and would report every agent as having no preset.
  */
 export function visibleTools(agent: Agent): ReadonlySet<string> {
-  return new Set(agent.ctx.tools.schemas(agent).map(schema => schema.name).filter(name => name !== TRANSPORT))
+  const tools = agent.ctx.tools
+  const inherited = new Set(tools.schemas(scopeParentOf(agent)).map(schema => schema.name))
+  return new Set(tools.schemas(agent).map(schema => schema.name).filter(name => name !== TRANSPORT && inherited.has(name)))
 }

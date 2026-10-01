@@ -2,8 +2,13 @@
  * Which model a child runs on: model families, the route a role gets, and the reviewer rule.
  *
  * A reviewer is never in the model family of the work it reviews, whichever way it's asked for. `chooseRoute` is where
- * that is decided, and `familyOf` is how the reviewed work's family is told. Both are plain functions over
- * `CrewSettings`, so the rules can be tested without dsh.
+ * that is decided. Both it and `familyOf` are plain functions over `CrewSettings`, so the rules can be tested without
+ * dsh.
+ *
+ * What counts as the same family is wider than a name. `crew.yaml` calls its families whatever it likes, and the work
+ * under review can be on a model it doesn't list at all, so the family *name* of the work may be nothing the file has.
+ * A reviewer is therefore kept away from the work's vendor too (`vendorsOf`: Claude, GPT, Gemini, Grok, told by model
+ * id), so Claude reviewing Claude is refused whatever the file calls its families.
  *
  * `settings.families` and `settings.roles` have no prototype, and every name that reaches a lookup here can come from
  * the model, so each lookup is for an own property (`Object.hasOwn` is safe on those objects as well as on ordinary
@@ -12,6 +17,7 @@
  * @module dish-crew/models
  */
 import type { CrewSettings, RoleSettings, Tier } from './settings.ts'
+import { LISTED, listed, truncate } from './text.ts'
 
 /** Where and on what a child runs. */
 export interface Route {
@@ -23,40 +29,37 @@ export interface Route {
 
 export type RouteResult = { ok: true, route: Route } | { ok: false, problem: string }
 
+/** The work a reviewer reviews, by the model it ran on and/or the name of its family. */
+export interface ReviewedWork {
+  /** The model id the work ran on, listed in `crew.yaml` or not. */
+  model?: string
+  /** A family name: one of the file's, or a vendor's (`anthropic`), as `familyOf` says of a model the file doesn't list. */
+  family?: string
+}
+
 export interface ChooseRouteArgs {
   settings: CrewSettings
   role: string
   /** A model id to use instead of the default, which must be one the families list. Empty means none. */
   override?: string
-  /** The family of the work the reviewer reviews: required for the reviewer, ignored for any other role. */
-  reviewedFamily?: string
+  /**
+   * The work the reviewer reviews: required for the reviewer (a model or a family, empty strings being none), and the
+   * reviewer is kept away from every family and vendor either points at. Ignored for any other role.
+   */
+  reviewed?: ReviewedWork
 }
 
-/** The families a model id's prefix tells, for a model no family lists. */
-const PREFIXES: ReadonlyArray<readonly [RegExp, string]> = [
-  [/^claude/i, 'anthropic'],
-  [/^(?:gpt|o\d|codex)/i, 'openai'],
-  [/^gemini/i, 'google'],
-  [/^grok/i, 'xai'],
+/** The vendors of the models, by what their ids start with. A vendor's name is also the family `familyOf` gives a model no family lists. */
+const VENDORS: ReadonlyArray<readonly [vendor: string, prefix: RegExp]> = [
+  ['anthropic', /^claude/i],
+  ['openai', /^(?:gpt|o\d|codex)/i],
+  ['google', /^gemini/i],
+  ['xai', /^grok/i],
 ]
-
-/** The most names listed in a problem, so a long file can't make a long message. */
-const LISTED = 12
-/** The longest a name from the caller is shown. */
-const SHOWN = 40
-
-function truncate(text: string, length = SHOWN): string {
-  return text.length > length ? `${text.slice(0, length)}…` : text
-}
 
 /** `value` as a message shows what a caller gave: quoted and cut short. */
 function quoted(value: string): string {
   return JSON.stringify(truncate(value))
-}
-
-function listed(names: readonly string[]): string {
-  const head = names.slice(0, LISTED).join(', ')
-  return names.length > LISTED ? `${head}, …` : head
 }
 
 /** `text` if it's a string with something in it, trimmed; else `undefined`. Models fill every optional field, often with ''. */
@@ -66,9 +69,26 @@ function given(text: unknown): string | undefined {
   return trimmed === '' ? undefined : trimmed
 }
 
-/** Whether two family names are the same family. Case and padding don't make a different family, so they can't get a reviewer past the rule. */
-function sameFamily(a: string, b: string): boolean {
-  return a.trim().toLowerCase() === b.trim().toLowerCase()
+/** A family name as it's compared: case and padding don't make a different family, so they can't get a reviewer past the rule. */
+function folded(name: string): string {
+  return name.trim().toLowerCase()
+}
+
+/**
+ * The vendors a model id belongs to, told by the prefix table (`claude`; `gpt`, `o<digit>`, `codex`; `gemini`; `grok`)
+ * or by a vendor's own name (`anthropic`). Only the id counts, not where it's served from: whatever precedes the last
+ * `/` is a provider (`github-copilot/claude-opus-4.7`, `openrouter/anthropic/claude-3.7-sonnet`), and the rest is read
+ * a dotted segment at a time, so a vendor prefix like Bedrock's `us.anthropic.claude-3-5-sonnet…` is found too. An id
+ * can name more than one vendor, and one no table entry matches names none.
+ */
+export function vendorsOf(model: string): Set<string> {
+  const found = new Set<string>()
+  for (const segment of model.slice(model.lastIndexOf('/') + 1).split('.')) {
+    for (const [vendor, prefix] of VENDORS) {
+      if (prefix.test(segment) || segment.toLowerCase() === vendor) found.add(vendor)
+    }
+  }
+  return found
 }
 
 /** The settings' families as `[name, models]`, in the file's order. */
@@ -76,15 +96,20 @@ function familyEntries(settings: CrewSettings): Array<[string, readonly string[]
   return Object.entries(settings.families).map(([name, family]) => [name, [...new Set([family.strong, family.mid])]])
 }
 
+/** The models a family of the file lists, whose name is `name` by the reviewer rule's reckoning (case and padding aside). */
+function modelsOf(settings: CrewSettings, name: string): string[] {
+  return familyEntries(settings).filter(([candidate]) => folded(candidate) === folded(name)).flatMap(([, models]) => models)
+}
+
 /** Every model the families list, once, family by family. */
 export function offeredModels(settings: CrewSettings): string[] {
   return familyEntries(settings).flatMap(([, models]) => models)
 }
 
-/** The models offered as a message lists them, family by family, leaving out `except`'s family. */
-function offered(settings: CrewSettings, except?: string): string {
+/** The models offered as a message lists them, family by family, leaving out the families `skip` says to. */
+function offered(settings: CrewSettings, skip: (family: string) => boolean = () => false): string {
   const entries = familyEntries(settings)
-    .filter(([name]) => except === undefined || !sameFamily(name, except))
+    .filter(([name]) => !skip(name))
     .map(([name, models]) => `${name}: ${models.join(', ')}`)
   const head = entries.slice(0, LISTED).join('; ')
   return entries.length > LISTED ? `${head}; …` : head
@@ -106,16 +131,14 @@ function modelAt(settings: CrewSettings, family: string, tier: Tier): string | u
 
 /**
  * The family a model is in. The families in `crew.yaml` come first: a model one of them lists is in that family. Only
- * a model no family lists is told by its prefix (`claude` is anthropic; `gpt`, `o<digit>` and `codex` are openai;
- * `gemini` is google; `grok` is xai). Otherwise it's `undefined`.
+ * a model no family lists is told by its vendor (see `vendorsOf`): `anthropic`, `openai`, `google` or `xai`, whatever
+ * the file calls its own families. A model that names no vendor, or two, has no family: `undefined`.
  */
 export function familyOf(model: string, settings: CrewSettings): string | undefined {
   const listedIn = listedFamily(settings, model)
   if (listedIn !== undefined) return listedIn
-  for (const [prefix, family] of PREFIXES) {
-    if (prefix.test(model)) return family
-  }
-  return undefined
+  const vendors = vendorsOf(model)
+  return vendors.size === 1 ? [...vendors][0] : undefined
 }
 
 function ok(settings: CrewSettings, model: string, family: string): RouteResult {
@@ -142,26 +165,79 @@ function ordinaryRoute(settings: CrewSettings, name: string, role: RoleSettings,
   return ok(settings, model, family)
 }
 
-function reviewerRoute(settings: CrewSettings, name: string, role: RoleSettings, override: string | undefined, reviewedFamily: string | undefined): RouteResult {
-  if (reviewedFamily === undefined) {
-    return refuse(`the ${name} role runs on a different model family from the work it reviews, so it needs the family of the work and none was given. Set reviews to a crew child's id, or "main" for your own work.`)
+/** What a reviewer has to keep away from, for one piece of reviewed work. */
+interface Avoided {
+  /** The reviewed work as a message names it: its family, or the vendor of its model. */
+  label: string
+  /** Whether a family of the file is one the reviewer must not run in. */
+  excludes: (family: string) => boolean
+}
+
+/**
+ * What a reviewer must avoid for work on `model` and/or in `family`. A family of the file is out if any of these holds:
+ * - its name is the work's family, or the family of the file that lists the work's model (case and padding aside);
+ * - it lists a model of a vendor the work is on. That is the vendor of the work's model, of any model of the work's
+ *   family (when that is a family of the file), or the work's family name itself when that is a vendor's (`anthropic`).
+ *
+ * A family that lists models of two vendors counts as both. Returns a problem instead when the work can't be placed:
+ * a model the file doesn't list, whose id names no vendor, and no family given to say.
+ */
+function avoided(settings: CrewSettings, model: string | undefined, family: string | undefined): Avoided | { problem: string } {
+  const names = new Set<string>()
+  const vendors = new Set<string>()
+  const reviewedModels: string[] = []
+  let label = family
+  if (family !== undefined) {
+    names.add(folded(family))
+    reviewedModels.push(...modelsOf(settings, family))
+    if (VENDORS.some(([vendor]) => vendor === folded(family))) vendors.add(folded(family))
   }
-  const shown = truncate(reviewedFamily)
-  if (override !== undefined) {
-    const family = listedFamily(settings, override)
-    if (family === undefined) {
-      return refuse(`model ${quoted(override)} is not one crew.yaml offers for reviewing ${shown} work. Models offered outside that family: ${offered(settings, reviewedFamily)}. Or leave model out and one is chosen for you.`)
+  if (model !== undefined) {
+    reviewedModels.push(model)
+    const home = listedFamily(settings, model)
+    if (home !== undefined) {
+      names.add(folded(home))
+      reviewedModels.push(...modelsOf(settings, home))
     }
-    if (sameFamily(family, reviewedFamily)) {
-      const others = offered(settings, reviewedFamily)
-      return refuse(`model ${quoted(override)} is in family ${family}, the family of the work under review; the ${name} must run on a different family. `
+    const own = vendorsOf(model)
+    if (family === undefined && home === undefined && own.size === 0) {
+      return { problem: `can't tell the family of model ${quoted(model)}, so there's no telling a different family from it; add it to a family in crew.yaml.` }
+    }
+    label ??= home ?? [...own][0] ?? truncate(model)
+  }
+  for (const reviewed of reviewedModels) for (const vendor of vendorsOf(reviewed)) vendors.add(vendor)
+  return {
+    label: truncate(label ?? ''),
+    excludes: (candidate) => {
+      if (names.has(folded(candidate))) return true
+      return modelsOf(settings, candidate).some(listedModel => [...vendorsOf(listedModel)].some(vendor => vendors.has(vendor)))
+    },
+  }
+}
+
+function reviewerRoute(settings: CrewSettings, name: string, role: RoleSettings, override: string | undefined, reviewed: ReviewedWork | undefined): RouteResult {
+  const model = given(reviewed?.model)
+  const family = given(reviewed?.family)
+  if (model === undefined && family === undefined) {
+    return refuse(`the ${name} role runs on a different model family from the work it reviews, so it needs the model or family of the work and none was given. Set reviews to a crew child's id, or "main" for your own work.`)
+  }
+  const avoid = avoided(settings, model, family)
+  if ('problem' in avoid) return refuse(avoid.problem)
+  if (override !== undefined) {
+    const home = listedFamily(settings, override)
+    if (home === undefined) {
+      return refuse(`model ${quoted(override)} is not one crew.yaml offers for reviewing ${avoid.label} work. Models offered outside that family: ${offered(settings, avoid.excludes)}. Or leave model out and one is chosen for you.`)
+    }
+    if (avoid.excludes(home)) {
+      const others = offered(settings, avoid.excludes)
+      return refuse(`model ${quoted(override)} is in family ${home}, which counts as the family of the work under review (${avoid.label}); the ${name} must run on a different family. `
         + (others === '' ? 'crew.yaml offers no model in another family; add a family to it.' : `Models offered outside it: ${others}. Or leave model out and one is chosen for you.`))
     }
-    return ok(settings, override, family)
+    return ok(settings, override, home)
   }
-  const family = settings.reviewerFamilies.find(candidate => !sameFamily(candidate, reviewedFamily) && modelAt(settings, candidate, role.tier) !== undefined)
-  if (family === undefined) return refuse(`no reviewer family differs from ${shown}; add one to reviewerFamilies in crew.yaml`)
-  return ok(settings, modelAt(settings, family, role.tier)!, family)
+  const chosen = settings.reviewerFamilies.find(candidate => !avoid.excludes(candidate) && modelAt(settings, candidate, role.tier) !== undefined)
+  if (chosen === undefined) return refuse(`no reviewer family differs from ${avoid.label}; add one to reviewerFamilies in crew.yaml`)
+  return ok(settings, modelAt(settings, chosen, role.tier)!, chosen)
 }
 
 /**
@@ -169,9 +245,10 @@ function reviewerRoute(settings: CrewSettings, name: string, role: RoleSettings,
  *
  * - **An ordinary role** runs on its own family at its own tier. `override` replaces the model with one the families
  *   list; the route's family is that model's.
- * - **The reviewer** (the role with `reviews: true`, whatever it's called) needs `reviewedFamily`. It runs on the first
- *   of `reviewerFamilies` that isn't that family, at its tier. An `override` is accepted only if the families list it
- *   and its family is a different one.
+ * - **The reviewer** (the role with `reviews: true`, whatever it's called) needs `reviewed`: the model and/or family of
+ *   the work. It runs on the first of `reviewerFamilies` that the work isn't in, at its tier. An `override` is accepted
+ *   only if the families list it and its family is one the work isn't in. "In" is by name and by vendor (see `avoided`),
+ *   so the file's names for its families can't hide a Claude reviewing Claude.
  *
  * It never throws. A refusal is a `problem` the model can act on, and it names what to use instead.
  */
@@ -183,6 +260,6 @@ export function chooseRoute(args: ChooseRouteArgs): RouteResult {
   const role = settings.roles[name]!
   const override = given(args.override)
   return role.reviews
-    ? reviewerRoute(settings, name, role, override, given(args.reviewedFamily))
+    ? reviewerRoute(settings, name, role, override, args.reviewed)
     : ordinaryRoute(settings, name, role, override)
 }

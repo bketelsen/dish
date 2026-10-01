@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { chooseRoute, familyOf, offeredModels } from '../src/models.ts'
+import { chooseRoute, familyOf, offeredModels, vendorsOf } from '../src/models.ts'
 import type { Route, RouteResult } from '../src/models.ts'
 import { DEFAULT_SETTINGS, parseSettings } from '../src/settings.ts'
 import type { CrewSettings } from '../src/settings.ts'
@@ -144,8 +144,8 @@ test('lookups are for own properties even when the settings are ordinary objects
   // A role whose family is an Object member, not a family of the file: a problem, not a crash or a made-up model.
   assert.match(problemOf(chooseRoute({ settings: plain, role: 'worker' })), /has no model to run on/)
   // A reviewer family that is an Object member is skipped, not chosen.
-  assert.deepEqual(routeOf(chooseRoute({ settings: plain, role: 'judge', reviewedFamily: 'b' })), { provider: 'p', model: 'a-small', family: 'a' })
-  assert.deepEqual(routeOf(chooseRoute({ settings: plain, role: 'judge', reviewedFamily: 'a' })), { provider: 'p', model: 'b-small', family: 'b' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: plain, role: 'judge', reviewed: { family: 'b' } })), { provider: 'p', model: 'a-small', family: 'a' })
+  assert.deepEqual(routeOf(chooseRoute({ settings: plain, role: 'judge', reviewed: { family: 'a' } })), { provider: 'p', model: 'b-small', family: 'b' })
   assert.equal(familyOf('constructor', plain), undefined)
   assert.equal(familyOf('b-big', plain), 'b')
 })
@@ -155,29 +155,29 @@ test('a long role name from the model is cut short in the problem', () => {
   assert.ok(problem.length < 600, String(problem.length))
 })
 
-test('a non-reviewer ignores reviewedFamily', () => {
-  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'coder', reviewedFamily: 'anthropic' })).model, 'claude-sonnet-5.5')
+test('a non-reviewer ignores reviewed', () => {
+  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'coder', reviewed: { family: 'anthropic' } })).model, 'claude-sonnet-5.5')
 })
 
 // --- the reviewer ---------------------------------------------------------------------------------
 
 test('the reviewer runs in the first reviewer family that isn\'t the reviewed work\'s, at its tier', () => {
   // Reviewing a Claude coder: openai first.
-  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'anthropic' })),
+  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'anthropic' } })),
     { provider: 'github-copilot', model: 'gpt-5.6-sol', family: 'openai' })
   // Reviewing a GPT coder: anthropic.
-  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'openai' })),
+  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'openai' } })),
     { provider: 'github-copilot', model: 'claude-sonnet-5.5', family: 'anthropic' })
   // Reviewing a Gemini coder, a family the file doesn't have: openai, the first.
-  assert.deepEqual(routeOf(chooseRoute({ settings: WITH_GOOGLE, role: 'reviewer', reviewedFamily: familyOf('gemini-3-pro', WITH_GOOGLE) })).family, 'openai')
-  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: familyOf('gemini-3-pro', SETTINGS) })).family, 'openai')
-  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: familyOf('grok-4', SETTINGS) })).family, 'openai')
+  assert.deepEqual(routeOf(chooseRoute({ settings: WITH_GOOGLE, role: 'reviewer', reviewed: { family: familyOf('gemini-3-pro', WITH_GOOGLE) } })).family, 'openai')
+  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: familyOf('gemini-3-pro', SETTINGS) } })).family, 'openai')
+  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: familyOf('grok-4', SETTINGS) } })).family, 'openai')
 })
 
 test('the reviewer takes its tier from the file', () => {
   const settings = settingsOf((document) => { document.roles.reviewer.tier = 'strong' })
-  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewedFamily: 'anthropic' })).model, 'gpt-6.1-sol')
-  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewedFamily: 'openai' })).model, 'claude-opus-5.5')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'anthropic' } })).model, 'gpt-6.1-sol')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'openai' } })).model, 'claude-opus-5.5')
 })
 
 test('the order of reviewerFamilies decides, skipping the reviewed family', () => {
@@ -185,61 +185,63 @@ test('the order of reviewerFamilies decides, skipping the reviewed family', () =
     document.families.google = { strong: 'gemini-3-pro', mid: 'gemini-3-flash' }
     document.reviewerFamilies = ['anthropic', 'google', 'openai']
   })
-  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewedFamily: 'openai' })).family, 'anthropic')
-  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewedFamily: 'anthropic' })).family, 'google')
-  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewedFamily: 'google' })).family, 'anthropic')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'openai' } })).family, 'anthropic')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'anthropic' } })).family, 'google')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'google' } })).family, 'anthropic')
 })
 
-test('a reviewer needs to know the reviewed family: without it there is no review', () => {
+test('a reviewer needs to know the reviewed work: without a model or a family there is no review', () => {
   for (const reviewedFamily of [undefined, '', '  ']) {
-    const problem = problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily }))
-    assert.match(problem, /family of the work/, problem)
+    const problem = problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: reviewedFamily } }))
+    assert.match(problem, /model or family/, problem)
   }
+  assert.match(problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { model: ' ', family: '' } })), /model or family/)
+  assert.match(problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: {} })), /model or family/)
   // Even with an override: it can't be checked against nothing.
-  assert.match(problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', override: 'gpt-5.6-sol' })), /family of the work/)
+  assert.match(problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', override: 'gpt-5.6-sol' })), /model or family/)
 })
 
 test('a reviewer override in the reviewed family is refused, and the problem offers the other families\' models', () => {
-  const problem = problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'anthropic', override: 'claude-opus-5.5' }))
+  const problem = problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'claude-opus-5.5' }))
   assert.ok(problem.includes('claude-opus-5.5'), problem)
   assert.ok(problem.includes('anthropic'), problem)
   assert.ok(problem.includes('gpt-6.1-sol') && problem.includes('gpt-5.6-sol'), problem)
-  const other = problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'openai', override: 'gpt-6.1-sol' }))
+  const other = problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'openai' }, override: 'gpt-6.1-sol' }))
   assert.ok(other.includes('claude-opus-5.5') && other.includes('claude-sonnet-5.5'), other)
 })
 
 test('a reviewer override in another family is accepted', () => {
-  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'anthropic', override: 'gpt-6.1-sol' })),
+  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'gpt-6.1-sol' })),
     { provider: 'github-copilot', model: 'gpt-6.1-sol', family: 'openai' })
-  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'openai', override: 'claude-opus-5.5' })),
+  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'openai' }, override: 'claude-opus-5.5' })),
     { provider: 'github-copilot', model: 'claude-opus-5.5', family: 'anthropic' })
   // Work in a family the file doesn't have, reviewed on one it does.
-  assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'google', override: 'claude-sonnet-5.5' })).family, 'anthropic')
+  assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'google' }, override: 'claude-sonnet-5.5' })).family, 'anthropic')
 })
 
 test('a reviewer override the families don\'t list is refused, whatever its prefix says', () => {
   for (const override of ['gpt-9', 'claude-haiku-4.5', 'gemini-3-pro', '__proto__']) {
-    const problem = problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'google', override }))
+    const problem = problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'google' }, override }))
     assert.ok(problem.includes(JSON.stringify(override)), problem)
     assert.ok(problem.includes('gpt-5.6-sol') && problem.includes('claude-sonnet-5.5'), problem)
   }
 })
 
 test('case and padding don\'t make a different family', () => {
-  assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'Anthropic' })).family, 'openai')
-  assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: ' OPENAI ' })).family, 'anthropic')
-  assert.match(problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'ANTHROPIC', override: 'claude-opus-5.5' })), /different family/)
+  assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'Anthropic' } })).family, 'openai')
+  assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: ' OPENAI ' } })).family, 'anthropic')
+  assert.match(problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'ANTHROPIC' }, override: 'claude-opus-5.5' })), /different family/)
 })
 
 test('with no family that differs there is no reviewer, and the problem says what to change', () => {
   const settings = settingsOf((document) => { document.reviewerFamilies = ['openai'] })
-  assert.equal(problemOf(chooseRoute({ settings, role: 'reviewer', reviewedFamily: 'openai' })),
+  assert.equal(problemOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'openai' } })),
     'no reviewer family differs from openai; add one to reviewerFamilies in crew.yaml')
   // The other direction still works.
-  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewedFamily: 'anthropic' })).family, 'openai')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'anthropic' } })).family, 'openai')
   // An empty list means no reviewer for anyone.
   const none = settingsOf((document) => { document.reviewerFamilies = [] })
-  assert.match(problemOf(chooseRoute({ settings: none, role: 'reviewer', reviewedFamily: 'anthropic' })), /^no reviewer family differs from anthropic; add one to reviewerFamilies in crew\.yaml/)
+  assert.match(problemOf(chooseRoute({ settings: none, role: 'reviewer', reviewed: { family: 'anthropic' } })), /^no reviewer family differs from anthropic; add one to reviewerFamilies in crew\.yaml/)
 })
 
 test('the reviewer is the role with reviews: true, not the role called reviewer', () => {
@@ -250,10 +252,10 @@ test('the reviewer is the role with reviews: true, not the role called reviewer'
   assert.equal(settings.roles.critic!.reviews, true)
   assert.equal(settings.roles.reviewer!.reviews, false)
   // `critic` follows the reviewer rule.
-  assert.equal(routeOf(chooseRoute({ settings, role: 'critic', reviewedFamily: 'anthropic' })).family, 'openai')
-  assert.equal(routeOf(chooseRoute({ settings, role: 'critic', reviewedFamily: 'openai' })).family, 'anthropic')
-  assert.match(problemOf(chooseRoute({ settings, role: 'critic' })), /family of the work/)
-  assert.match(problemOf(chooseRoute({ settings, role: 'critic', reviewedFamily: 'anthropic', override: 'claude-opus-5.5' })), /different|differs/)
+  assert.equal(routeOf(chooseRoute({ settings, role: 'critic', reviewed: { family: 'anthropic' } })).family, 'openai')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'critic', reviewed: { family: 'openai' } })).family, 'anthropic')
+  assert.match(problemOf(chooseRoute({ settings, role: 'critic' })), /model or family/)
+  assert.match(problemOf(chooseRoute({ settings, role: 'critic', reviewed: { family: 'anthropic' }, override: 'claude-opus-5.5' })), /different|differs/)
   // `reviewer` is an ordinary role: its own family, no reviewed work needed.
   assert.deepEqual(routeOf(chooseRoute({ settings, role: 'reviewer' })), { provider: 'github-copilot', model: 'claude-opus-5.5', family: 'anthropic' })
 })
@@ -271,7 +273,7 @@ test('the reviewer never runs in the reviewed family, for any reviewed family, o
       })
       for (const reviewedFamily of reviewed) {
         for (const override of [undefined, ...offeredModels(settings), 'gpt-9', 'claude-haiku-4.5']) {
-          const result = chooseRoute({ settings, role: 'reviewer', reviewedFamily, override })
+          const result = chooseRoute({ settings, role: 'reviewer', reviewed: { family: reviewedFamily }, override })
           if (!result.ok) continue
           accepted++
           const label = `${order.join(',')} ${tier} reviewing ${reviewedFamily} override ${override}`
@@ -292,10 +294,208 @@ test('a reviewed model in the file and a reviewer picked for it never share a fa
   for (const model of offeredModels(WITH_GOOGLE)) {
     const reviewedFamily = familyOf(model, WITH_GOOGLE)
     assert.ok(reviewedFamily !== undefined, model)
-    const route = routeOf(chooseRoute({ settings: WITH_GOOGLE, role: 'reviewer', reviewedFamily }))
+    const route = routeOf(chooseRoute({ settings: WITH_GOOGLE, role: 'reviewer', reviewed: { family: reviewedFamily } }))
     assert.notEqual(route.family, reviewedFamily, model)
     assert.notEqual(familyOf(route.model, WITH_GOOGLE), familyOf(model, WITH_GOOGLE), model)
   }
+})
+
+// --- the reviewer rule, by vendor -----------------------------------------------------------------
+
+/** The families of the file may be called anything: here `claude` and `gpt`, with the models the default has. */
+const RENAMED = settingsOf((document) => {
+  document.families = {
+    claude: { strong: 'claude-opus-5.5', mid: 'claude-sonnet-5.5' },
+    gpt: { strong: 'gpt-6.1-sol', mid: 'gpt-5.6-sol' },
+  }
+  document.reviewerFamilies = ['claude', 'gpt']
+  for (const role of Object.values(document.roles) as any[]) if (role.family !== undefined) role.family = 'claude'
+})
+
+/** Reviewed models that no family of the file lists, in the forms a model id comes in: bare, provider-qualified, regional. */
+const UNLISTED_CLAUDE = [
+  'claude-opus-4.7',
+  'claude-3-5-haiku-latest',
+  'CLAUDE-OPUS-4.7',
+  'github-copilot/claude-opus-4.7',
+  'openrouter/anthropic/claude-3.7-sonnet',
+  'us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+  'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+  'anthropic.claude-v2',
+  'claude-3-5-sonnet@20240620',
+]
+const UNLISTED_GPT = ['gpt-4.1', 'o3-mini', 'codex-mini-latest', 'github-copilot/gpt-5', 'openai/gpt-4o', 'eu.openai.gpt-oss-120b-1:0']
+
+test('vendorsOf tells the vendor of a model id by the prefix table, whatever is around it', () => {
+  assert.deepEqual([...vendorsOf('claude-opus-4.7')], ['anthropic'])
+  assert.deepEqual([...vendorsOf('github-copilot/claude-opus-4.7')], ['anthropic'])
+  assert.deepEqual([...vendorsOf('openrouter/anthropic/claude-3.7-sonnet')], ['anthropic'])
+  assert.deepEqual([...vendorsOf('us.anthropic.claude-3-5-sonnet-20241022-v2:0')], ['anthropic'])
+  assert.deepEqual([...vendorsOf('eu.openai.gpt-oss-120b-1:0')], ['openai'])
+  assert.deepEqual([...vendorsOf('gpt-5.6-sol')], ['openai'])
+  assert.deepEqual([...vendorsOf('o3-mini')], ['openai'])
+  assert.deepEqual([...vendorsOf('codex-mini')], ['openai'])
+  assert.deepEqual([...vendorsOf('gemini-2.5-flash')], ['google'])
+  assert.deepEqual([...vendorsOf('google/gemini-3-pro')], ['google'])
+  assert.deepEqual([...vendorsOf('grok-4')], ['xai'])
+  // A vendor name on its own is as good as a model prefix.
+  assert.deepEqual([...vendorsOf('anthropic.something-new')], ['anthropic'])
+  for (const id of ['llama-3.3', 'mistral-large', 'omega', 'o', 'my-claude', 'deepseek-v4', '', ' ', 'meta-llama/llama-3', 'constructor', '__proto__']) {
+    assert.equal(vendorsOf(id).size, 0, JSON.stringify(id))
+  }
+})
+
+test('familyOf reads a provider-qualified id by its vendor, and a list still beats it', () => {
+  assert.equal(familyOf('github-copilot/claude-opus-4.7', SETTINGS), 'anthropic')
+  assert.equal(familyOf('us.anthropic.claude-3-5-sonnet-20241022-v2:0', SETTINGS), 'anthropic')
+  assert.equal(familyOf('openai/gpt-4o', SETTINGS), 'openai')
+  assert.equal(familyOf('claude-opus-5.5', RENAMED), 'claude')
+  // Unlisted, the vendor's own name: the file's names for its families don't change what a vendor is called.
+  assert.equal(familyOf('claude-opus-4.7', RENAMED), 'anthropic')
+})
+
+test('renamed families and an unlisted reviewed model: the default reviewer is never the same vendor', () => {
+  for (const model of UNLISTED_CLAUDE) {
+    const route = routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model } }))
+    assert.equal(route.family, 'gpt', model)
+    assert.equal(route.model, 'gpt-5.6-sol', model)
+  }
+  // The other direction: reviewerFamilies still lists claude first, and claude differs from a GPT.
+  for (const model of UNLISTED_GPT) {
+    assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model } })).family, 'claude', model)
+  }
+})
+
+test('renamed families and an unlisted reviewed model: an override in the same vendor is refused, one in another is accepted', () => {
+  for (const model of UNLISTED_CLAUDE) {
+    for (const override of ['claude-sonnet-5.5', 'claude-opus-5.5']) {
+      const problem = problemOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model }, override }))
+      assert.match(problem, /different family/, `${model} ${override}`)
+      assert.ok(problem.includes('gpt-6.1-sol') && problem.includes('gpt-5.6-sol'), problem)
+      assert.ok(!problem.includes('Models offered outside it: claude'), problem)
+    }
+    assert.deepEqual(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model }, override: 'gpt-6.1-sol' })),
+      { provider: 'github-copilot', model: 'gpt-6.1-sol', family: 'gpt' }, model)
+  }
+  for (const model of UNLISTED_GPT) {
+    assert.match(problemOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model }, override: 'gpt-5.6-sol' })), /different family/, model)
+    assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model }, override: 'claude-opus-5.5' })).family, 'claude', model)
+  }
+})
+
+test('the reviewed family given as a vendor name excludes the families of the file that hold that vendor\'s models', () => {
+  // `anthropic` is what familyOf says of an unlisted Claude, though the file calls its Claude family `claude`.
+  assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { family: 'anthropic' } })).family, 'gpt')
+  assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { family: 'ANTHROPIC' } })).family, 'gpt')
+  assert.match(problemOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'claude-sonnet-5.5' })), /different family/)
+  assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { family: 'openai' } })).family, 'claude')
+})
+
+test('the reviewed family given by the file\'s own name excludes every family that holds a model of the same vendor', () => {
+  const settings = settingsOf((document) => {
+    document.families = {
+      claude: { strong: 'claude-opus-5.5', mid: 'claude-sonnet-5.5' },
+      'claude-small': { strong: 'claude-haiku-9', mid: 'claude-haiku-8' },
+      gpt: { strong: 'gpt-6.1-sol', mid: 'gpt-5.6-sol' },
+    }
+    document.reviewerFamilies = ['claude-small', 'claude', 'gpt']
+    for (const role of Object.values(document.roles) as any[]) if (role.family !== undefined) role.family = 'claude'
+  })
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'claude' } })).family, 'gpt')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: 'claude-sonnet-5.5' } })).family, 'gpt')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: 'claude-haiku-8' } })).family, 'gpt')
+  assert.match(problemOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'claude' }, override: 'claude-haiku-9' })), /different family/)
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'gpt' } })).family, 'claude-small')
+})
+
+test('a family that holds models of two vendors counts as both, so it is excluded when either is reviewed', () => {
+  const settings = settingsOf((document) => {
+    document.families = {
+      mixed: { strong: 'claude-mixed', mid: 'gpt-mixed' },
+      gemini: { strong: 'gemini-3-pro', mid: 'gemini-3-flash' },
+    }
+    document.reviewerFamilies = ['mixed', 'gemini']
+    for (const role of Object.values(document.roles) as any[]) if (role.family !== undefined) role.family = 'mixed'
+  })
+  for (const model of ['claude-opus-4.7', 'gpt-4.1', 'claude-mixed', 'gpt-mixed']) {
+    assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model } })).family, 'gemini', model)
+  }
+  // Reviewing Gemini work, the mixed family is fine.
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: 'gemini-9' } })).family, 'mixed')
+})
+
+test('model and family together: the reviewer differs from both', () => {
+  assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model: 'gemini-3-pro', family: 'google' } })).family, 'claude')
+  // A family label and a model that disagree: both are kept away from, so with only two families there's no reviewer.
+  assert.match(problemOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model: 'gpt-4.1', family: 'claude' } })), /^no reviewer family differs from claude/)
+})
+
+test('a reviewed model whose family can\'t be told is refused, and the problem names it', () => {
+  for (const model of ['llama-3.3', 'deepseek-v4', 'meta-llama/llama-3', 'mistral-large']) {
+    const problem = problemOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model } }))
+    assert.ok(problem.includes(`can't tell the family of model ${JSON.stringify(model)}`), problem)
+    assert.match(problem, /add it to a family in crew\.yaml/)
+  }
+  // With a family given as well, the family is what tells.
+  assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model: 'llama-3.3', family: 'meta' } })).family, 'claude')
+  // A model the file lists is told by the list, whatever it is called.
+  const settings = settingsOf((document) => { document.families.inhouse = { strong: 'llama-3.3', mid: 'llama-3.1' } })
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: 'llama-3.3' } })).family, 'openai')
+})
+
+test('no reviewer family differs when every candidate is the reviewed vendor, and the problem says what to change', () => {
+  const settings = settingsOf((document) => {
+    document.families = { claude: { strong: 'claude-opus-5.5', mid: 'claude-sonnet-5.5' }, gpt: { strong: 'gpt-6.1-sol', mid: 'gpt-5.6-sol' } }
+    document.reviewerFamilies = ['claude']
+    for (const role of Object.values(document.roles) as any[]) if (role.family !== undefined) role.family = 'claude'
+  })
+  assert.equal(problemOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: 'claude-opus-4.7' } })),
+    'no reviewer family differs from anthropic; add one to reviewerFamilies in crew.yaml')
+  assert.equal(problemOf(chooseRoute({ settings, role: 'reviewer', reviewed: { family: 'claude' } })),
+    'no reviewer family differs from claude; add one to reviewerFamilies in crew.yaml')
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: 'gpt-4.1' } })).family, 'claude')
+})
+
+test('whatever the families are called and however the reviewed model is spelled, the reviewer shares no vendor and no family with it', () => {
+  const namings: Array<Record<string, [string, string]>> = [
+    { claude: ['claude-opus-5.5', 'claude-sonnet-5.5'], gpt: ['gpt-6.1-sol', 'gpt-5.6-sol'] },
+    { a: ['claude-opus-5.5', 'claude-sonnet-5.5'], b: ['gpt-6.1-sol', 'gpt-5.6-sol'], c: ['gemini-3-pro', 'gemini-3-flash'] },
+    { anthropic: ['gpt-6.1-sol', 'gpt-5.6-sol'], openai: ['claude-opus-5.5', 'claude-sonnet-5.5'] },
+    { 'claude-x': ['claude-opus-5.5', 'claude-sonnet-5.5'], 'claude-y': ['claude-haiku-9', 'claude-haiku-8'], gpt: ['gpt-6.1-sol', 'gpt-5.6-sol'], mixed: ['claude-m', 'gpt-m'] },
+  ]
+  const reviewedModels = [...UNLISTED_CLAUDE, ...UNLISTED_GPT, 'gemini-3-pro', 'grok-4', 'claude-opus-5.5', 'gpt-5.6-sol', 'claude-m', 'gpt-m', 'claude-haiku-9']
+  let accepted = 0
+  for (const naming of namings) {
+    const names = Object.keys(naming)
+    for (const order of [names, [...names].reverse()]) {
+      const settings = settingsOf((document) => {
+        document.families = Object.fromEntries(Object.entries(naming).map(([name, [strong, mid]]) => [name, { strong, mid }]))
+        document.reviewerFamilies = order
+        for (const role of Object.values(document.roles) as any[]) if (role.family !== undefined) role.family = names[0]
+      })
+      for (const model of reviewedModels) {
+        for (const family of [undefined, 'anthropic', 'openai', 'google', ...names]) {
+          for (const override of [undefined, ...offeredModels(settings), 'claude-opus-4.7', 'gpt-4.1']) {
+            const result = chooseRoute({ settings, role: 'reviewer', reviewed: { model, family }, override })
+            if (!result.ok) continue
+            accepted++
+            const label = `${names.join(',')} / ${order.join(',')} reviewing ${model} (${family}) override ${override}`
+            const reviewedVendors = new Set<string>([...vendorsOf(model)])
+            const routeVendors = vendorsOf(result.route.model)
+            for (const vendor of routeVendors) assert.ok(!reviewedVendors.has(vendor), `${label}: both are ${vendor}`)
+            // A model the file lists is in the family that lists it. (For one it doesn't, familyOf says a vendor, which is no family of the file.)
+            if (offeredModels(settings).includes(model)) assert.notEqual(result.route.family, familyOf(model, settings), label)
+            if (family !== undefined) assert.notEqual(result.route.family.toLowerCase(), family, label)
+            // Nothing in the chosen family is the reviewed vendor either.
+            for (const listed of offeredModels({ ...settings, families: { [result.route.family]: settings.families[result.route.family]! } })) {
+              for (const vendor of vendorsOf(listed)) assert.ok(!reviewedVendors.has(vendor), `${label}: family ${result.route.family} holds ${listed}`)
+            }
+          }
+        }
+      }
+    }
+  }
+  assert.ok(accepted > 200, `only ${accepted} routes were ever accepted`)
 })
 
 // --- offeredModels --------------------------------------------------------------------------------
@@ -316,7 +516,7 @@ test('chooseRoute never throws, and doesn\'t touch the settings', () => {
   for (const role of [...odd, 'coder', 'reviewer']) {
     for (const override of [undefined, ...odd, 'gpt-5.6-sol']) {
       for (const reviewedFamily of [undefined, ...odd, 'anthropic']) {
-        const result = chooseRoute({ settings: SETTINGS, role, override, reviewedFamily })
+        const result = chooseRoute({ settings: SETTINGS, role, override, reviewed: { family: reviewedFamily } })
         assert.equal(typeof result.ok, 'boolean')
         if (!result.ok) assert.ok(result.problem.length > 0 && result.problem.length < 2_000, result.problem.slice(0, 80))
       }
@@ -330,7 +530,7 @@ test('a problem is a sentence to act on: it says what was wrong and what to do',
     problemOf(chooseRoute({ settings: SETTINGS, role: 'nope' })),
     problemOf(chooseRoute({ settings: SETTINGS, role: 'coder', override: 'nope' })),
     problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer' })),
-    problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewedFamily: 'anthropic', override: 'claude-opus-5.5' })),
+    problemOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'anthropic' }, override: 'claude-opus-5.5' })),
   ]
   for (const problem of problems) {
     assert.ok(problem.length > 30, problem)

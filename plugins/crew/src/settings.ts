@@ -13,6 +13,7 @@
 import { readFileSync } from 'node:fs'
 import type { NamespaceSpec } from 'dish-config'
 import { JSON_SCHEMA, load, YAMLException } from 'js-yaml'
+import { LISTED, SHOWN, listed as listNames, truncate } from './text.ts'
 
 /** The two sizes of model a family has. */
 export type Tier = 'strong' | 'mid'
@@ -67,20 +68,12 @@ const FAMILY_NAME = /^[a-z][a-z0-9-]*$/
 /** `common` and `main` have documents of their own, so no crew role can have those names. */
 const RESERVED = ['common', 'main']
 
-/** The longest a value or a name is shown in a message, so one bad key can't make a message the size of the file. */
-const SHOWN = 40
-/** The most names listed in a message. */
-const LISTED = 12
 /** The longest a YAML parser's own reason is shown. */
 const REASON = 160
 
 /** A mapping with no prototype, so a name like `constructor` or `__proto__` is an ordinary key. */
 function dictionary<T>(): Record<string, T> {
   return Object.create(null) as Record<string, T>
-}
-
-function truncate(text: string, length = SHOWN): string {
-  return text.length > length ? `${text.slice(0, length)}…` : text
 }
 
 /** `value` as a message shows it: a string quoted and cut short, a collection by its kind, anything else as it is. */
@@ -91,11 +84,9 @@ function shown(value: unknown): string {
   return String(value)
 }
 
-/** The first few of `names`, for a message. */
+/** The first few of `names`, for a message, each cut short. */
 function listed(names: readonly string[]): string {
-  if (names.length === 0) return 'none'
-  const head = names.slice(0, LISTED).map(name => truncate(name)).join(', ')
-  return names.length > LISTED ? `${head}, …` : head
+  return listNames(names, LISTED, SHOWN)
 }
 
 /** The path of `key` under `path`: `roles.coder`, or `roles["odd name"]` for a name that isn't plain. */

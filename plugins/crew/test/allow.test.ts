@@ -1,6 +1,10 @@
+import { realpathSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
+import { createScope } from '@deepseek-ai/dsh-scope'
 import { RUN_CODE_NAME, ToolRuntime, defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { NEVER, allowList, visibleTools } from '../src/allow.ts'
@@ -8,7 +12,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
 
 /** Every name of the never-list, as the plan's Global Constraints spell it. */
-const NEVER_NAMES = ['delegate', 'subagent', 'subagent_fork', 'workflow', 'interrupt_agent', 'list_agents', 'ask_user_question', 'create_goal', 'update_goal', 'exit_plan_mode', 'present']
+const NEVER_NAMES = ['delegate', 'subagent', 'subagent_fork', 'subagent_codex', 'subagent_claude_code', 'list_subagent_models', 'workflow', 'ralph', 'interrupt_agent', 'list_agents', 'ask_user_question', 'create_goal', 'update_goal', 'exit_plan_mode', 'present']
 
 function allowed(roleTools: string[], visible: string[]): string[] {
   const result = allowList(roleTools, new Set(visible))
@@ -26,7 +30,7 @@ function problemOf(roleTools: string[], visible: string[], role?: string): strin
 
 test('NEVER is exactly the never-list: nothing a child must not have is missing, and nothing else is in it', () => {
   assert.deepEqual([...NEVER].sort(), [...NEVER_NAMES].sort())
-  assert.equal(NEVER.size, 11)
+  assert.equal(NEVER.size, 15)
 })
 
 // --- allowList ------------------------------------------------------------------------------------
@@ -146,37 +150,127 @@ function stub(name: string): ToolDefinition {
   }) as ToolDefinition
 }
 
-/** A context with a real tool registry (and a stub system prompt, which is all the registry needs of it). */
-async function withTools(...names: string[]): Promise<Context> {
+/** What a test of `visibleTools` stands on: dsh's real tool registry and real scopes, laid out as dsh does. */
+interface World {
+  ctx: Context
+  /** The scope the agents' preset registers its tools in, which every agent under it inherits. `undefined` when there is no preset. */
+  preset: { ctx: Context, key: object } | undefined
+  /** A new agent: the scope key and the owner of a scope under the preset (or the root), as dsh's agent loop makes one. */
+  agent(id: string): Agent
+}
+
+/**
+ * A context with a real tool registry (and a stub system prompt, which is all the registry needs of it). Global tools are
+ * `globals`. With `presetTools` there's a preset scope, as the agent preset registry mints one, and each agent joins
+ * it with `bindScopeParent`: its scope's parent is the preset's, which is what `composeFrom` does for a child too.
+ */
+async function world(globals: string[], presetTools?: string[]): Promise<World> {
   const ctx = new Context()
   ctx.provide('systemPrompt', { tools() {}, section() {}, getSectionOrder: () => 1 } as never)
   registries.push(await ctx.plugin(ToolRuntime, {}))
-  for (const name of names) ctx.tools.register(stub(name))
-  return ctx
+  // Scopes are minted under a plugin that has the registry injected, as the agent loop and the preset registry are.
+  let owner!: Context
+  registries.push(await ctx.plugin({ name: 'scope-owner', inject: ['tools'], apply(own: Context) { owner = own } } as never, undefined as never))
+  for (const name of globals) ctx.tools.register(stub(name))
+  let preset: World['preset']
+  if (presetTools !== undefined) {
+    const key = {}
+    const scope = createScope(owner, key)
+    registries.push(scope)
+    for (const name of presetTools) scope.ctx.tools.register(stub(name))
+    preset = { ctx: scope.ctx, key }
+  }
+  return {
+    ctx,
+    preset,
+    agent(id) {
+      const agent = { id } as unknown as Agent
+      const scope = createScope(owner, agent, preset === undefined ? {} : { parent: preset.key })
+      registries.push(scope)
+      ;(agent as { ctx: Context }).ctx = scope.ctx
+      return agent
+    },
+  }
 }
 
-/** The parent agent as `visibleTools` reads it: its `ctx`, whose registry it is looked up in. */
-const agentOn = (ctx: Context): Agent => ({ id: 'parent', ctx }) as unknown as Agent
+const names = (ctx: Context, scope: object): string[] => ctx.tools.schemas(scope).map(schema => schema.name).sort()
 
-test('visibleTools names the tools the parent agent can see, as the registry lists them for it', async () => {
-  const ctx = await withTools('read', 'bash', 'delegate', 'send_message')
-  const agent = agentOn(ctx)
-  const visible = visibleTools(agent)
-  assert.deepEqual([...visible].sort(), ['bash', 'delegate', 'read', 'send_message'])
-  assert.deepEqual(new Set(ctx.tools.schemas(agent).map(schema => schema.name)), visible)
-  // It's a snapshot of now: a tool registered later is in the next one.
-  const dispose = ctx.tools.register(stub('write'))
-  assert.ok(visibleTools(agent).has('write'))
-  assert.ok(!visible.has('write'))
-  dispose()
-  assert.ok(!visibleTools(agent).has('write'))
+test('visibleTools lists global and preset tools, and leaves out a tool on the parent agent\'s own scope: the child can\'t restrict that', async () => {
+  const { ctx, agent } = await world(['glob'], ['read', 'delegate', 'send_message'])
+  const parent = agent('parent')
+  // dsh-schedule's schedule_*, agent-team's tools and the subagent tool's model selection register like this.
+  parent.ctx.tools.register(stub('schedule_create'))
+  // The registry shows the parent all four.
+  assert.deepEqual(names(ctx, parent), ['delegate', 'glob', 'read', 'schedule_create', 'send_message'])
+  // A child it starts joins the preset, not the parent, and can restrict only what it inherits.
+  const child = agent('child')
+  assert.throws(() => child.ctx.tools.restrict({ allow: ['read', 'schedule_create'] }), /unknown global tool "schedule_create"/)
+  // So that's what visibleTools says.
+  assert.deepEqual([...visibleTools(parent)].sort(), ['delegate', 'glob', 'read', 'send_message'])
 })
 
-test('the allow list over the visible tools of a real registry never names the never-list, and each name is one the registry has', async () => {
-  const ctx = await withTools('read', 'glob', 'grep', 'pwsh', 'delegate', 'subagent', 'send_message', 'ask_user_question')
-  const visible = visibleTools(agentOn(ctx))
-  const result = allowList(['read', 'glob', 'bash', 'delegate', 'subagent', 'send_message', 'ask_user_question', 'web_search'], visible)
+test('a filter made from visibleTools is one the child\'s restrict accepts, and the child then sees exactly it', async () => {
+  const { ctx, agent } = await world(['glob', 'pwsh', 'subagent'], ['read', 'delegate', 'send_message', 'web_fetch'])
+  const parent = agent('parent')
+  parent.ctx.tools.register(stub('schedule_create'))
+  parent.ctx.tools.register(stub('schedule_list'))
+  const result = allowList(['read', 'glob', 'bash', 'schedule_create', 'schedule_list', 'delegate', 'subagent', 'send_message', 'web_search'], visibleTools(parent), 'coder')
   assert.ok(result.ok)
   assert.deepEqual(result.allow, ['glob', 'pwsh', 'read', 'send_message'])
-  for (const name of result.allow) assert.ok(ctx.tools.get(name, agentOn(ctx)) !== undefined, name)
+  const child = agent('child')
+  child.ctx.tools.restrict({ allow: result.allow })
+  assert.deepEqual(names(ctx, child), result.allow)
+})
+
+test('without a preset the child inherits the global tools only, and so does the list', async () => {
+  const { ctx, agent } = await world(['read', 'glob', 'send_message'])
+  const parent = agent('parent')
+  parent.ctx.tools.register(stub('schedule_create'))
+  assert.deepEqual([...visibleTools(parent)].sort(), ['glob', 'read', 'send_message'])
+  const result = allowList(['read', 'schedule_create', 'glob'], visibleTools(parent))
+  assert.ok(result.ok)
+  const child = agent('child')
+  child.ctx.tools.restrict({ allow: result.allow })
+  assert.deepEqual(names(ctx, child), ['glob', 'read'])
+})
+
+test('a tool the parent has restricted away isn\'t listed', async () => {
+  const { agent } = await world(['glob'], ['read', 'write', 'send_message'])
+  const parent = agent('parent')
+  parent.ctx.tools.restrict({ deny: ['write'] })
+  assert.deepEqual([...visibleTools(parent)].sort(), ['glob', 'read', 'send_message'])
+})
+
+test('the reserved run_code transport of a parent in a code mode is left out, and the filter without it is accepted', async () => {
+  const { ctx, agent } = await world(['glob'], ['read', 'send_message'])
+  const parent = agent('parent')
+  parent.ctx.tools.presentAs('ptc')
+  assert.ok(names(ctx, parent).includes(RUN_CODE_NAME), 'the registry lists it for the parent')
+  const visible = visibleTools(parent)
+  assert.ok(!visible.has(RUN_CODE_NAME))
+  const child = agent('child')
+  assert.throws(() => child.ctx.tools.restrict({ allow: [...names(ctx, parent)] }), /run_code/)
+  const result = allowList(['read', 'run_code', 'glob'], visible)
+  assert.ok(result.ok)
+  assert.deepEqual(result.allow, ['glob', 'read'])
+  child.ctx.tools.restrict({ allow: result.allow })
+  assert.deepEqual(names(ctx, child), ['glob', 'read'])
+})
+
+test('visibleTools is a snapshot of now: a tool registered later is in the next one', async () => {
+  const { ctx, agent } = await world(['glob'], ['read'])
+  const parent = agent('parent')
+  const before = visibleTools(parent)
+  const dispose = ctx.tools.register(stub('write'))
+  assert.ok(visibleTools(parent).has('write'))
+  assert.ok(!before.has('write'))
+  dispose()
+  assert.ok(!visibleTools(parent).has('write'))
+})
+
+test('dsh-scope is the instance dsh-tools uses: scopes made here are the scopes the registry reads', () => {
+  // Two copies of the package would each have their own scope relation, and a scope made by one would look unscoped to the other.
+  const here = realpathSync(fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-scope')))
+  const toolsUses = realpathSync(createRequire(import.meta.resolve('@deepseek-ai/dsh-tools')).resolve('@deepseek-ai/dsh-scope'))
+  assert.equal(here, toolsUses)
 })
