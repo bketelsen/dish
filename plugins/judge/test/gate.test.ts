@@ -58,7 +58,7 @@ function fakeJudge(script: (request: JudgeRequest<any>) => JudgeResult | Promise
       if (options.throws === true) throw new Error('the fake judge fell over')
       const result = await script(request)
       if (options.skipDecide === true || request.decide === undefined) return result
-      const decided = await request.decide(result)
+      const decided = await request.decide(result, { signal: new AbortController().signal })
       decisions.push(decided.decision)
       return { ...result, decided } as JudgeResult & { decided?: Decision }
     },
@@ -327,7 +327,7 @@ const ROWS: Row[] = [
   { name: 'read-only exactly at the bar (0.90)', probabilities: { read_only: 0.9, reversible: 0.05, irreversible: 0.03, other: 0.02 }, serves: 0.9, allowed: true },
   { name: 'read-only just under the first bar, but read-only + reversible reaches the second', probabilities: { read_only: 0.89, reversible: 0.07, irreversible: 0.03, other: 0.01 }, serves: 0.9, allowed: true },
   { name: 'reversible above the second bar', probabilities: REVERSIBLE, serves: 0.9, allowed: true },
-  { name: 'read-only + reversible exactly at 0.95, as floating point sees it', probabilities: { read_only: 0.5, reversible: 0.45, irreversible: 0.03, other: 0.02 }, serves: 0.9, allowed: true },
+  { name: 'read-only + reversible exactly at 0.95, as floating point sees it', probabilities: { read_only: 0.5, reversible: 0.45, irreversible: 0.03, other: 0.02 }, serves: 0.9, allowed: true, settings: settingsWith(d => { d.commands.reversible = 0.95 }) },
   {
     name: 'read-only 0.06 + reversible 0.84 reaches a 0.90 bar, though floating point makes it 0.8999999999999999',
     probabilities: { read_only: 0.06, reversible: 0.84, irreversible: 0.06, other: 0.04 },
@@ -335,7 +335,7 @@ const ROWS: Row[] = [
     allowed: true,
     settings: settingsWith(d => { d.commands.reversible = 0.9 }),
   },
-  { name: 'read-only + reversible just under 0.95', probabilities: { read_only: 0.5, reversible: 0.44, irreversible: 0.04, other: 0.02 }, serves: 0.9, allowed: false },
+  { name: 'read-only + reversible just under 0.90', probabilities: { read_only: 0.5, reversible: 0.39, irreversible: 0.08, other: 0.03 }, serves: 0.9, allowed: false },
   { name: 'irreversible', probabilities: IRREVERSIBLE, serves: 0.91, allowed: false },
   { name: 'read-only, but not serving the task', probabilities: READ_ONLY, serves: 0.12, allowed: false },
   { name: 'serving the task exactly at the bar (0.50)', probabilities: READ_ONLY, serves: 0.5, allowed: true },
@@ -1201,8 +1201,9 @@ test('a gated call writes its line to the plugin\'s decision log in the state di
   assert.equal(onDisk.trim().split('\n').length, 5)
   assert.ok(onDisk.includes('"callId":"line-deny"'))
   assert.ok(!onDisk.includes(token) && !onDisk.includes(KEY))
-  // What Jev was sent is the real command: the judge needs to read it.
-  assert.equal(p.jev.requests[1]!.json.state.command, command)
+  // What Jev was sent is the command with its secrets masked: the judge can still read what it does.
+  assert.equal(p.jev.requests[1]!.json.state.command, command.replace(token, '‹secret: a GitHub token›'))
+  assert.ok(!JSON.stringify(p.jev.requests.map(r => r.json)).includes(token), 'no token went to Jev')
   assert.equal(p.jev.requests[0]!.json.state.task, 'fix the failing test in parser.ts')
   assert.equal(p.jev.requests[0]!.json.state.cwd, '/work/app')
   assert.deepEqual(Object.keys(p.jev.requests[0]!.json.questions).sort(), ['effect', 'serves_task'])
