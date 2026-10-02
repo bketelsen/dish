@@ -23,7 +23,7 @@
  * - **Removal and moving away ask first** (`confirm`): a removal says the clone and workspace stay, and leaving a form with
  *   edits asks whether to drop them.
  * - **Status arrives by polling.** Onboarding runs in the background and there is no stream for it, so while any project is
- *   pending, cloning or in setup the list is read again every 5 seconds. Only while the page is shown (`open` to `close`: a
+ *   pending, cloning or in setup the list is read again every 5 seconds. Only while the page is shown (`open` to `hide`: a
  *   tab that never opened Settings → Projects doesn't poll); it stops when no project is being onboarded, when a read fails,
  *   and when the stream is lost (until the next stream opens, or the page is opened again).
  * - **Throwing it away.** `dispose` clears every timer and makes what is still out change nothing, for the scope that ends
@@ -164,8 +164,12 @@ export interface ProjectsActions {
   hooks: { page: ObservableSnapshot<PageState> }
   /** The page was shown: load what it needs, or read again what it has, and keep the status of onboarding fresh. */
   open(): Promise<void>
-  /** The page was hidden: stop polling. (`open` starts it again.) */
-  close(): void
+  /**
+   * The page was hidden: stop polling. (`open` starts it again.) Not called `close`: the settings shell hands every section a
+   * `close` prop of its own (it closes Settings), the shell's props win over a face's, and a component reading `close` would get
+   * the shell's.
+   */
+  hide(): void
   /** Show a project. With a form that has edits it only asks (`confirm`); `confirmDiscard` or `cancelConfirm` answers. */
   select(name: string): void
   /** Open the form on a new project. With a form that has edits it asks first. Refused, with the reason, without a store. */
@@ -408,7 +412,7 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
   let eventWhileWriting = false
   /** The next read of the list follows a write that was refused as a `CONFLICT`: a new project's form is told whether the name is taken now. */
   let conflictRead = false
-  /** `face.open` was called and `face.close` wasn't: the page is shown, and only then is the status polled. */
+  /** `face.open` was called and `face.hide` wasn't: the page is shown, and only then is the status polled. */
   let shown = false
   /** The stream was lost: the poll stays off until the next stream opens (or the page is opened again), whatever reads land meanwhile. */
   let streamLost = false
@@ -929,7 +933,7 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     // A store to read and subscribe to, not the one the controller writes.
     hooks: { page: { getSnapshot: store.getSnapshot, subscribe: store.subscribe } },
     open,
-    close() {
+    hide() {
       shown = false
       disarmPoll()
     },

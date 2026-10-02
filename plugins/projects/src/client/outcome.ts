@@ -12,6 +12,12 @@ export interface Notice {
   detail?: string
 }
 
+/** Said where the page can't change anything: there is no store to write to. */
+export const STORE_MISSING = 'The config store isn\'t running, so projects are read-only.'
+
+/** Where a registry that doesn't parse is looked at and undone: the History page lists every change to the file. */
+export const BROKEN_FILE_HISTORY = 'Look at its changes on History (Settings → History) and revert the one that broke it, or fix the file in the config repository.'
+
 /** What the person was doing when the call was refused, for the codes whose remedy depends on it. */
 export type Action = 'save' | 'remove' | 'retry'
 
@@ -37,7 +43,7 @@ export function failureNotice(code: ErrorCode, message: string, action: Action =
     case 'TOO_LARGE':
       return { text: 'projects.yaml is too large for the store.', detail: message }
     case 'UNAVAILABLE':
-      return { text: 'The config store isn\'t running, so projects are read-only. Start dish-config to change them.' }
+      return { text: `${STORE_MISSING} Start dish-config to change them.` }
     case 'NOT_FOUND':
       return { text: 'Not found: it may have been removed elsewhere.', detail: message }
     case 'UNOWNED':
@@ -50,6 +56,31 @@ export function failureNotice(code: ErrorCode, message: string, action: Action =
     default:
       return { text: `${code}: ${message}` }
   }
+}
+
+/**
+ * What the page says of a stored `projects.yaml` that doesn't parse (a hand edit in the repository): the registry's own
+ * sentence about the problem, that nothing is listed or onboarded until it is fixed, and where to undo it.
+ * @param problem - the registry's sentence, which names the project and the field (`projects.yaml: acme/widget: gate is blank`).
+ */
+export function brokenFileText(problem: string): string {
+  return `${problem.replace(/[.\s]+$/, '')}. The stored projects.yaml doesn't parse, so no project is listed or onboarded until it does. ${BROKEN_FILE_HISTORY}`
+}
+
+/** The proposals waiting for `projects.yaml`, and where they are decided. */
+export function proposalsText(count: number): string {
+  return count === 1
+    ? '1 proposal for projects.yaml: review it on History'
+    : `${count} proposals for projects.yaml: review them on History`
+}
+
+/**
+ * The question before a project is removed. Removing it changes the registry and nothing on disk, and the answer says so.
+ * @param clone - where its clone is, when dish-workspaces has one to describe.
+ */
+export function removeQuestion(name: string, clone: string | null): string {
+  const where = clone === null ? 'Its clone' : `Its clone at ${clone}`
+  return `Remove ${name} from projects.yaml? ${where} and its workspace stay; dish stops fetching, sweeping and gating it.`
 }
 
 /**

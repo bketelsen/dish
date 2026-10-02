@@ -1312,13 +1312,13 @@ test('nothing polls before the page has been opened: a read made for another rea
   assert.equal(timer.armed(), 0)
 })
 
-test('close stops the polling and nothing starts it until the page is opened again', async () => {
+test('hide stops the polling and nothing starts it until the page is opened again', async () => {
   const made = setup()
   const { fake, page, timer } = made
   fake.states.set('acme/gadget', 'cloning')
   await page.face.open()
   assert.equal(timer.armed(POLL_INTERVAL), 1)
-  page.face.close()
+  page.face.hide()
   assert.equal(timer.armed(POLL_INTERVAL), 0)
   await page.onStatus()
   await page.onConfigEvent(changed(['projects.yaml']))
@@ -1327,7 +1327,13 @@ test('close stops the polling and nothing starts it until the page is opened aga
   assert.equal(timer.armed(POLL_INTERVAL), 1)
 })
 
-test('a read in flight when the page is closed does not poll on landing', async () => {
+test('the face has no member the settings shell\'s own props use: the shell\'s wins, and `close` there closes Settings', () => {
+  const { page } = setup()
+  assert.equal('close' in page.face, false)
+  assert.equal(typeof page.face.hide, 'function')
+})
+
+test('a read in flight when the page is hidden does not poll on landing', async () => {
   const made = setup()
   const { fake, page, timer } = made
   fake.states.set('acme/gadget', 'cloning')
@@ -1336,7 +1342,7 @@ test('a read in flight when the page is closed does not poll on landing', async 
   fake.gates.set('projects', slow)
   timer.fire(POLL_INTERVAL)
   await until('the read to be out', () => count(fake.calls, 'projects') === 2)
-  page.face.close()
+  page.face.hide()
   slow.release()
   await new Promise(resolve => setTimeout(resolve, 10))
   assert.equal(timer.armed(POLL_INTERVAL), 0)

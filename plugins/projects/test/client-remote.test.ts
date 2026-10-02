@@ -13,7 +13,9 @@ import { RESERVED_REMOTE_METHODS, jsonCodec } from 'dish-kit/client'
 import type { FileDiff } from 'dish-kit/ui/diff'
 import type { CommitInfo as StoreCommit, ConfigEvent as StoreEvent, FileDiff as StoreDiff } from '../../config/src/protocol.ts'
 import type { ConfigRemote } from '../../config/src/remote.ts'
+import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { NEW_FIELDS, PROJECTS_FILE } from '../src/client/controller.ts'
+import type { ProjectsActions } from '../src/client/controller.ts'
 import { projectsRemote } from '../src/client/remote.ts'
 import type { ConfigCalls, ConfigEvent, ProjectsApi } from '../src/client/remote.ts'
 import type { CommitInfo } from '../src/protocol.ts'
@@ -66,6 +68,16 @@ export type ApiMatchesTheProjectsRemote = [
   Check<Same<CalledOn<'save'>, ServedBy<'save'>>>,
   Check<Same<CalledOn<'removeProject'>, ServedBy<'removeProject'>>>,
   Check<Same<CalledOn<'retry'>, ServedBy<'retry'>>>,
+]
+
+/**
+ * The slot renderer lets a section's owner props win over its injected face's, and the settings shell hands every section a
+ * `close` of its own (it closes Settings). A face member with that name would never reach the component, which would call the
+ * shell's instead. So the face must have no member the shell's props have. (Found building the page: the face's `close`, which
+ * stopped the polling, became `hide`.)
+ */
+export type FaceStaysClearOfTheShellsProps = [
+  Check<[Extract<keyof SettingsSectionOwnerProps, keyof ProjectsActions>] extends [never] ? true : false>,
 ]
 
 /** The gateway's source-mode reading of a method's parameter names: the text between its first parentheses, split on commas. */
