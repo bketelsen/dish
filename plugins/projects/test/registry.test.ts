@@ -108,7 +108,7 @@ function only(text: string): Project {
 test('the constants are the ones the spec names', () => {
   assert.equal(PROJECTS_PATH, 'projects.yaml')
   assert.equal(SEED_TEXT, 'projects: {}\n')
-  assert.deepEqual([...RESERVED_OWNERS], ['scratch'])
+  assert.deepEqual([...RESERVED_OWNERS], ['scratch', 'tokens'])
   assert.deepEqual({ ...GATE_TIMEOUT }, { min: 10_000, max: 600_000 })
   assert.deepEqual({ ...SETUP_TIMEOUT }, { min: 10_000, max: 3_600_000, fallback: '15m' })
   // dsh's own scrub pattern (the pin against dsh's constant is dish-workspaces' env test).
@@ -296,6 +296,14 @@ test('nameProblem names the rule', () => {
   assert.match(nameProblem('a/x.git')!, /\.git/)
   assert.match(nameProblem('a/..')!, /"\.\."/)
   assert.match(nameProblem('a/b c')!, /repository/)
+})
+
+test('the owner tokens is reserved, in any case: the token files live in <state>/workspaces/tokens/', () => {
+  for (const name of ['tokens/x', 'Tokens/x', 'TOKENS/repo']) {
+    assert.match(nameProblem(name)!, /tokens is reserved for dish-workspaces' token files/, name)
+  }
+  assert.equal(nameProblem('tokensmith/x'), undefined)
+  assert.equal(nameProblem('acme/tokens'), undefined)
 })
 
 test('the owner scratch is reserved, in any case', () => {

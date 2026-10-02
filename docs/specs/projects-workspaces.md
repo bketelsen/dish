@@ -58,7 +58,7 @@ projects:
 
 - **Namespace:** `projects.yaml` is claimed by `dish-projects` with agent policy `propose`, and seeded empty.
 - **Validation** refuses (`INVALID`):
-  - keys that aren't `owner/name` (GitHub's grammar), or whose owner is `scratch` (reserved for the [scratch workspace](#the-scratch-workspace)), or two keys that differ only in case (GitHub's names don't);
+  - keys that aren't `owner/name` (GitHub's grammar), or whose owner is `scratch` (reserved for the [scratch workspace](#the-scratch-workspace)) or `tokens` (dish-workspaces' token directory, `<state>/workspaces/tokens/`, would collide with that owner's state), or two keys that differ only in case (GitHub's names don't);
   - a missing or blank `family`, `role`, `gate` or `gateTimeout`;
   - timeouts that aren't `<n>s`, `<n>m` or `<n>h` between 10s and 10m for the gate, or between 10s and 1h for setup. `setupTimeout` defaults to 15m;
   - a `gateEnv` that isn't a map of variable names to strings, or that names a variable starting with `DSH_` or looking like a secret (`KEY`, `TOKEN`, `SECRET` or `PASSWORD` in the name, as dsh's own scrub reads them). The values may use `<clone>` and `<worktree>`, which 6c expands;

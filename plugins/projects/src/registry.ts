@@ -20,8 +20,17 @@ export const PROJECTS_PATH = 'projects.yaml'
 /** The registry at first: no projects. */
 export const SEED_TEXT = 'projects: {}\n'
 
-/** Owners no project may have. `scratch` is where the scratch workspace lives, so its clones would land in it. */
-export const RESERVED_OWNERS: readonly string[] = ['scratch']
+/**
+ * Owners no project may have, each with why. `scratch` is where the scratch workspace lives, so its clones would land
+ * in it; `tokens` is dish-workspaces' token directory, `<state>/workspaces/tokens/`, which a project's state directory,
+ * `<state>/workspaces/<owner>/<repo>/`, would collide with.
+ */
+export const RESERVED: Readonly<Record<string, string>> = Object.freeze({
+  scratch: 'is reserved for the scratch workspace',
+  tokens: "is reserved for dish-workspaces' token files",
+})
+/** The reserved owners' names. */
+export const RESERVED_OWNERS: readonly string[] = Object.freeze(Object.keys(RESERVED))
 
 /** GitHub's account names: 1 to 39 of letters, digits and hyphens, with no hyphen at either end or twice in a row. */
 export const OWNER = /^(?=.{1,39}$)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/
@@ -159,7 +168,7 @@ export function nameProblem(name: string): string | undefined {
   }
   const reserved = RESERVED_OWNERS.find(candidate => candidate === owner.toLowerCase())
   if (reserved !== undefined) {
-    return `${bad}: ${reserved} is reserved for the scratch workspace and can't be an owner, in any case`
+    return `${bad}: ${reserved} ${RESERVED[reserved]} and can't be an owner, in any case`
   }
   if (!REPO.test(repo)) {
     return `${bad}: the repository must be 1 to 100 letters, digits, ".", "_" and "-"`
