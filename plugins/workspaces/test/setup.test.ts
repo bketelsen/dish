@@ -238,6 +238,19 @@ test("one line over 64 KB is cut to the last 64 KB, masked; once output was drop
   assert.equal(await readFile(dropped.log, 'utf8'), "[setup's last 80 KB of output were part of one line; not kept]\n")
 })
 
+test('once output was dropped, a kept part that is one line ending in a newline gives the note too, not an empty log', async () => {
+  const dir = await tempDir()
+  const note = "[setup's last 80 KB of output were part of one line; not kept]\n"
+  const ok = await setupIn(dir, "echo start; head -c 100000 /dev/zero | tr '\\0' y; echo")
+  assert.equal(ok.exitCode, 0)
+  assert.equal(await readFile(ok.log, 'utf8'), note)
+  assert.equal(ok.tail, note.trimEnd())
+  const failed = await setupIn(dir, "echo start; head -c 100000 /dev/zero | tr '\\0' y; echo; exit 1")
+  assert.equal(failed.exitCode, 1)
+  assert.equal(await readFile(failed.log, 'utf8'), note)
+  assert.equal(failed.tail, note.trimEnd(), 'a failed setup shows the note as its last lines')
+})
+
 test('a timeout ends the whole process group: bash and the grandchild it started are gone, and nothing is left', async () => {
   const dir = await tempDir()
   const pidFile = join(dir, 'pids')

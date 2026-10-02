@@ -383,7 +383,8 @@ function logText(output: Buffer, dropped: boolean): string {
   if (dropped || raw.length > LOG_TAIL_BYTES) {
     const from = Math.max(raw.length - LOG_TAIL_BYTES, dropped ? Math.min(MASK_MARGIN_BYTES, raw.length) : 0)
     const firstLine = dropped ? raw.indexOf(0x0a) + 1 : 0
-    if (dropped && firstLine === 0) return `[setup's last ${Math.round(raw.length / 1024)} KB of output were part of one line; not kept]\n`
+    // No line start after the dropped part's line (none at all, or only the newline that ends it): nothing to show.
+    if (dropped && (firstLine === 0 || firstLine >= raw.length)) return `[setup's last ${Math.round(raw.length / 1024)} KB of output were part of one line; not kept]\n`
     const at = Math.max(from, firstLine)
     const newline = raw.indexOf(0x0a, at - 1)
     // A line start if there is one; else the middle of the last line, which began after the first (so it is masked
