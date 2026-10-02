@@ -60,6 +60,7 @@ test('SAFE_FLAGS turn hooks, fsmonitor, submodule recursion, replace refs and ba
     '-c', 'fetch.recurseSubmodules=false', '-c', 'submodule.recurse=false',
     '-c', 'core.useReplaceRefs=false', '-c', 'safe.bareRepository=explicit',
     '-c', 'advice.graftFileDeprecated=false', '-c', 'credential.interactive=false',
+    '-c', 'core.commitGraph=false',
   ])
   assert.equal(Object.isFrozen(SAFE_FLAGS), true)
   assert.equal(DEFAULT_GIT_TIMEOUT_MS, 120_000)

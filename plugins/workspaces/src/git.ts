@@ -36,7 +36,8 @@ import { childEnvironment } from './env.ts'
 
 /**
  * Passed before every git command dish runs, whatever the clone's own files say (`-c` beats every config file): no
- * hooks, no fsmonitor, no recursion into submodules, no replace refs, and a bare repository only when named.
+ * hooks, no fsmonitor, no recursion into submodules, no replace refs, no commit-graph (a forged one fakes ancestry), no credential prompt, and a bare repository only when
+ * named.
  * Grafts are switched off through `GIT_GRAFT_FILE` in the environment, since no `-c` key does it; setting that var
  * makes git print a deprecation hint on every command that parses commits, which would push the real `fatal:` line
  * out of `GitError`'s first-line message, so the hint is silenced here.
@@ -46,6 +47,7 @@ export const SAFE_FLAGS: readonly string[] = Object.freeze([
   '-c', 'fetch.recurseSubmodules=false', '-c', 'submodule.recurse=false',
   '-c', 'core.useReplaceRefs=false', '-c', 'safe.bareRepository=explicit',
   '-c', 'advice.graftFileDeprecated=false', '-c', 'credential.interactive=false',
+  '-c', 'core.commitGraph=false',
 ])
 /** How long one git command may run before its process group is killed. */
 export const DEFAULT_GIT_TIMEOUT_MS = 120_000
