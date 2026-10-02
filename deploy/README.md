@@ -90,11 +90,41 @@ dsh then sets a cookie for that name, which lasts 30 days and survives restarts:
 
 Use the tailnet name, not the VM's tailnet IP or short name. dsh answers `/api` calls only for the loopback and the trusted host, so another name loads the page and nothing on it works.
 
+## Changing host settings: through a tunnel
+
+dsh lets a browser change the host's own settings only when the page was opened on a loopback name (`localhost`, `127.x` or `[::1]`). It decides from the address in your browser. On `https://dish.<tailnet>.ts.net`, the chat, Prompts, History and the Judge page's thresholds all work. **Settings → Models**, provider sign-ins and the other host settings fail with "settings are unavailable in this browser".
+
+For those, open a tunnel from your desktop to the VM's `127.0.0.1:3080`, through Minideb, as fleet's `docs/dish.md` reaches the guest:
+
+```sh
+ssh -i ~/.ssh/semaphore-fleet-hosts \
+  -o ProxyCommand="ssh -i ~/.ssh/semaphore-fleet-hosts -W %h:%p bjk@10.0.1.175" \
+  -N -L 127.0.0.1:3081:127.0.0.1:3080 fleet@<the guest's address>
+```
+
+Then open `http://127.0.0.1:3081/?token=…`, with the same token as above. dsh sets a separate cookie for that address. Close the tunnel when you're done.
+
 ## One-time steps on the VM
 
-Both are entered on the VM's own Settings pages, so neither passes through fleet or Git. dsh keeps them in `~dish/.dsh/.credentials.yaml`, and they survive restarts and updates.
-- **Copilot.** Sign in on **Settings → Models**. The card shows a device code, and "Open GitHub" opens in your own browser, not the VM's.
+Each is entered through the tunnel above, so nothing passes through fleet or Git. dsh keeps the sign-ins in `~dish/.dsh/.credentials.yaml`, and they survive restarts and updates.
+- **Copilot, the first sign-in.** On a fresh install, Settings → Models has no Copilot provider yet. dish-copilot adds the `github-copilot` route only after a first sign-in, and its card sits on that route's card. So start the first sign-in on the VM:
+  1. Add this row to `~dish/.dsh/profiles/web/cordis.patch.yml`:
+
+     ```yaml
+     - id: dish-copilot
+       name: dish-copilot
+       config:
+         terminalSignIn: true
+     ```
+  2. Restart the unit: `systemctl --user -M dish@ restart dish-web.service`, as root.
+  3. Read the device code from the journal (`… | grep dish-copilot`).
+  4. Approve it at <https://github.com/login/device>. The route and the model list appear.
+  5. Remove the row again.
+
+  Later sign-ins, after a sign-out, use the card on Settings → Models.
 - **TypeSafe.** Paste the key on **Settings → Judge**. Without it the judge fails closed: the main agent asks you for every shell command, and a crew child's is refused.
+- **A workspace.** A fresh VM has none. Add one, such as `/home/dish/dish`, from the workspace menu of a new chat.
+- **The model.** A new chat may start on DeepSeek's own model, which has no key here. Pick a Copilot model (e.g. GPT-6.1 Sol) from the model menu.
 
 ## Before the first start
 
@@ -103,7 +133,7 @@ Only one machine may push to `bketelsen/dish-config`. Until the move your deskto
 1. **Stop the desktop pushing.** On the desktop, remove `remote` from the `dish-config` row of `~/.dsh/profiles/web/cordis.patch.yml`, and restart its `dsh web`. Check that `main` of `bketelsen/dish-config` equals the desktop store's `main`, so nothing unpushed is left behind.
 2. **Start the VM.** Fleet holds the unit back until `fleet_dish_service_enabled` is set. Set it and rerun the guest play. The first start finds no store, restores `~/.config/dish/config.git` from GitHub, and pushes from then on.
 3. **Check it.** `crew.yaml`, `judge.yaml` and the prompts on the VM match GitHub, and a change made on the VM appears there.
-4. **Sign in.** Copilot and the TypeSafe key, as above.
+4. **Sign in.** Copilot and the TypeSafe key, through the tunnel, as above.
 
 Afterwards your desktop profile is a dev profile: it keeps its local store, with no remote. See the [spec](../docs/specs/deploy.md#moving-the-config-store) for the checks.
 

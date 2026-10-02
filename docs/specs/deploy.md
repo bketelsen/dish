@@ -1,6 +1,6 @@
 # Spec: dish on its own VM (`deploy`)
 
-Status: draft, 2026-10-01. Implements roadmap step 5. Builds on:
+Status: implemented and rolled out, 2026-10-01 (see [notes from the rollout](#notes-from-the-rollout)). Implements roadmap step 5. Builds on:
 - the [design](../design.md), "Hosting" and open question 6;
 - the [config store](config-store.md) spec, for the store's remote and its single pusher;
 - the [judge](judge.md) spec, which is the guardrail that makes an always-on agent host acceptable.
@@ -143,3 +143,19 @@ Once the VM is up and its first fleet run has passed, in this order:
     - the store's own commits go through its guard;
     - the judge gates `git push`;
     - nothing in the repo is a secret.
+
+## Notes from the rollout
+
+dish runs on Minideb as of 2026-10-01, at `https://dish.goat-snake.ts.net`. What the rollout taught, beyond what the sections above say:
+- **Host settings need a loopback page.** dsh lets a browser change host settings (models, provider sign-ins, presets) only from `localhost` or `127.x`, as judged by the address in the browser. Through the tailnet name, chats, Prompts, History and the Judge thresholds work, but Settings → Models fails with "settings are unavailable in this browser". The fix is an SSH tunnel to the VM's `127.0.0.1:3080`; see `deploy/README.md`.
+- **The first Copilot sign-in goes through the terminal.** On a fresh profile there is no `github-copilot` route, so no provider card to carry dish-copilot's sign-in. dish-copilot's `terminalSignIn` starts the device flow at startup and logs the code; after approval the plugin adds the route. A follow-up could let the card appear without a route.
+- **The `dish` project blocks VM nesting, and Incus then wants `security.nesting=false` set explicitly** on the VM; an unset value is refused at creation (fleet PR #36).
+- **Fleet keeps no secret in Semaphore.** The guest play runs from the workstation, with the deploy keys from their files and the Tailscale key at a hidden prompt. The OpenTofu step runs in Semaphore and needs no secret.
+- **The `dish-config` deploy key needs write access**, set when it is added; GitHub can't change it afterwards, so a read-only key is deleted and added again. A fresh store's first push then clears the "unpushed" count, which counts every commit until the store has pushed once.
+- **A new VM has no workspace,** and a new chat may start on DeepSeek's model, which has no key there. Add a workspace and pick a Copilot model.
+- **Verified live:**
+  - the judge's Test (244 ms);
+  - `git status` allowed;
+  - a push asked about (irreversible 0.96) and refused for a coder child (0.98);
+  - crew delegation on a Copilot model;
+  - the store restored from GitHub, and pushing.
