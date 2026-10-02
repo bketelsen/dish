@@ -14,6 +14,12 @@ export interface XdgPaths {
  */
 export const INSTANCE_HOME = 'DSH_DISH_HOME'
 
+/** The instance home when DSH_DISH_HOME is set and absolute; an empty or relative value counts as unset. */
+function instanceHome(env: NodeJS.ProcessEnv): string | undefined {
+  const value = env[INSTANCE_HOME]
+  return value && path.isAbsolute(value) ? value : undefined
+}
+
 /**
  * Resolve the XDG base directories for an app. A variable counts only when it
  * is set and absolute; the spec says relative values must be ignored.
@@ -26,8 +32,8 @@ export function xdgPaths(
   env: NodeJS.ProcessEnv = process.env,
   home: string = homedir(),
 ): XdgPaths {
-  const instance = env[INSTANCE_HOME]
-  if (instance && path.isAbsolute(instance)) {
+  const instance = instanceHome(env)
+  if (instance) {
     return {
       config: path.join(instance, 'config', app),
       data: path.join(instance, 'data', app),
@@ -46,4 +52,13 @@ export function xdgPaths(
     state: base('XDG_STATE_HOME', '.local/state'),
     cache: base('XDG_CACHE_HOME', '.cache'),
   }
+}
+
+/**
+ * Where an instance's clones and scratch workspace live: `<DSH_DISH_HOME>/work` when that is set and absolute (dev),
+ * else `<home>/work` (prod: the unit's WorkingDirectory). An empty or relative DSH_DISH_HOME is ignored, as in
+ * xdgPaths. The XDG variables play no part: the work root isn't an XDG directory.
+ */
+export function workRoot(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+  return path.join(instanceHome(env) ?? home, 'work')
 }
