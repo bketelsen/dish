@@ -11,6 +11,8 @@
  *   on `retry`; a ready project is only prepared at start. Removing a project aborts its onboarding. Each project's
  *   status is kept in `<state>/projects/status.json` (`<state>` is dish-kit's `xdgPaths('dish').state`).
  * - It emits `dish-projects/changed` (the registry changed) and `dish-projects/status` (a project's status changed).
+ * - The Projects page's server half is the `dishProjectsRemote` Typert remote (see `remote.ts`), served by the
+ *   gateway when there is one and idle otherwise.
  * - Nothing in `apply` waits for the store or dish-workspaces, and dsh's start never waits on onboarding. Only the
  *   small status file is read at once, so that a ready project reads ready from the first moment.
  *
@@ -23,6 +25,7 @@ import { printOwnLogs, xdgPaths } from 'dish-kit'
 import { statusMessage } from './onboarding.ts'
 import type { WorkspacesDriver } from './onboarding.ts'
 import { PROJECTS_PATH, SEED_TEXT, namespaceSpec } from './registry.ts'
+import { ProjectsRemote } from './remote.ts'
 import { createDishProjects } from './service.ts'
 import type { DishProjects } from './service.ts'
 import { StatusStore } from './status.ts'
@@ -105,6 +108,8 @@ export function apply(ctx: Context, config: Config): void {
     problem: () => service.problem(),
   }
   ctx.provide('dishProjects', dishProjects)
+  // Settings → Projects' server half: a child plugin that needs `dishProjects`, so it goes when the service does.
+  ctx.plugin(ProjectsRemote)
 
   ctx.on('dish-config/changed', (paths) => {
     if (paths.includes(PROJECTS_PATH)) void service.drive()
