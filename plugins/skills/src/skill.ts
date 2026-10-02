@@ -140,7 +140,8 @@ function noAliases(root: unknown): void {
     if (typeof value !== 'object' || value === null) continue
     if (seen.has(value)) refuse('the frontmatter reuses a value through a YAML alias; write it out')
     seen.add(value)
-    pending.push(...Object.values(value))
+    // One at a time: spreading a list of a hundred thousand entries into `push` overflows the stack.
+    for (const inner of Object.values(value)) pending.push(inner)
   }
 }
 

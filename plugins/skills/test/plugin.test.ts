@@ -50,7 +50,14 @@ function linking(replace: Record<string, readonly string[]>, changed: () => void
   }
 }
 
-const settle = (ms = 60): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+/** Start the store half with `replace`, and wait until it has tried the seed (it tells `changed()` then). */
+async function relink(ctx: Context, replace: Record<string, readonly string[]>) {
+  let tried = false
+  const handle = ctx.plugin(linking(replace, () => { tried = true }))
+  await handle
+  await waitFor('the seed to be tried', () => tried)
+  return handle
+}
 
 // --- the service ------------------------------------------------------------------------------------
 
@@ -107,8 +114,8 @@ test('the store appearing and going away tells the listeners, and the catalog fo
   const withStore = await ctx.dishSkills.catalog()
   assert.equal(withStore.commit, await ctx.dishConfig.head())
   assert.equal(withStore.skills.length, 18)
-  // The seed is a change under skills/ itself, and the store appearing is another.
-  await settle()
+  // The seed is a change under skills/ itself, and the store appearing is another: two in all, on a fresh store.
+  await waitFor('the seed and the store appearing to be told', () => told >= 2)
 
   const before = told
   await config.dispose()
@@ -215,6 +222,26 @@ test('the namespace: a person writes valid skills, an agent can only propose, an
   })
 })
 
+test('a skill with a very long list in its metadata is saved, proposed and served like any other', async () => {
+  await withBoth(await dirs(), async (ctx) => {
+    const store = ctx.dishConfig
+    // 130000 entries fit the store's size limit, and used to overflow the stack in the validator.
+    const long = (name: string): string => `---\nname: ${name}\ndescription: Use when testing.\nmetadata:\n  other: [${'a,'.repeat(130_000)}a]\n---\nBody.\n`
+    assert.ok(long('long-one').length < 262_144)
+    assert.ok(await userWrite(store, 'long-one', long('long-one')))
+    const proposal = await store.propose([{ path: pathFor('long-two'), text: long('long-two') }], { author: AGENT, title: 'A long one', rationale: 'a test' })
+    await store.accept(proposal.id, { author: USER })
+    // Refused as a document is, not thrown: a bad name in the same shape.
+    await assert.rejects(userWrite(store, 'long-one', long('long-other')), { code: 'INVALID', message: /name is "long-other" but the folder is "long-one"/ })
+
+    const catalog = await ctx.dishSkills.catalog()
+    assert.equal(catalog.commit, await store.head())
+    assert.deepEqual(catalog.skills.map(skill => skill.name).filter(name => name.startsWith('long-')), ['long-one', 'long-two'])
+    assert.equal(catalog.skills.length, 20)
+    assert.deepEqual(catalog.problems, [])
+  })
+})
+
 test('the namespace is claimed as dish-skills\'s, and released with the store', async () => {
   const where = await dirs()
   const ctx = new Context()
@@ -260,23 +287,29 @@ test('a seed that fails is logged, and the plugin carries on', async () => {
   await waitFor('the failure to be logged', () => logs.some(line => /^\[dish-skills\] warn: could not seed/.test(line)))
   assert.match(logs.join('\n'), /\[dish-skills\] warn: could not seed the default skills: /)
   assert.deepEqual(await ctx.dishConfig.list('skills/'), [])
-  // The store is there and has no skills: the catalog is the store's.
-  assert.deepEqual((await ctx.dishSkills.catalog()).skills, [])
+  // The store is there and has no skills: the catalog is the shipped one until it has.
+  const catalog = await ctx.dishSkills.catalog()
+  assert.equal(catalog.commit, null)
+  assert.deepEqual(catalog.skills.map(skill => skill.name), Object.keys(DEFAULTS).sort())
   await skills.dispose()
   await config.dispose()
 })
 
 test('terminal prints this plugin\'s warnings to stderr, and terminal: false does not', async () => {
+  const seedFailure = /^\[dish-skills\] warn: could not seed/
   const run = async (terminal: boolean) => {
     const where = await dirs()
     const out = captureStderr()
     try {
       const ctx = new Context()
+      const logs = watchLogs(ctx)
       const config = mountConfig(ctx, where.repository, { maxBytes: 200 })
       await config
       const skills = mountSkills(ctx, { terminal })
       await skills
-      await settle(150)
+      // Whatever the setting, the warning is logged; whether it is printed is what is asked.
+      await waitFor('the seed to fail', () => logs.some(line => seedFailure.test(line)))
+      if (terminal) await waitFor('the warning to be printed', () => out.lines().some(line => seedFailure.test(line)))
       await skills.dispose()
       await config.dispose()
     } finally {
@@ -285,7 +318,7 @@ test('terminal prints this plugin\'s warnings to stderr, and terminal: false doe
     return out.lines()
   }
   const printed = await run(true)
-  assert.ok(printed.some(line => /^\[dish-skills\] warn: could not seed/.test(line)), printed.join('\n'))
+  assert.ok(printed.some(line => seedFailure.test(line)), printed.join('\n'))
   assert.deepEqual(await run(false), [])
 })
 
@@ -305,8 +338,7 @@ test('seeding with replace: a stored default that still matches an earlier text 
   const ours = skillText('writing-for-readers', ['writer'], 'A person\'s own text, after an earlier shipped one.')
 
   // The first start, with no earlier texts to replace; then the store holds what an older version of dish seeded...
-  const first = ctx.plugin(linking({}))
-  await first
+  const first = await relink(ctx, {})
   await seeded(store)
   await store.write([
     { path: brainstorming, text: earlier },
@@ -317,13 +349,12 @@ test('seeding with replace: a stored default that still matches an earlier text 
 
   // ...and the next start knows those texts as earlier shipped ones. Only the first two are listed with the text they
   // have now; the third is listed with some other earlier text, so what is stored there is the person's.
-  const next = ctx.plugin(linking({
+  const next = await relink(ctx, {
     [brainstorming]: [sha256('some other text'), sha256(earlier)],
     [researching]: [sha256(earlierResearching)],
     [writing]: [sha256('an earlier shipped text nobody kept')],
-  }))
-  await next
-  await waitFor('the defaults to be put back', async () => await store.read(brainstorming) === DEFAULTS.brainstorming)
+  })
+  assert.equal(await store.read(brainstorming), DEFAULTS.brainstorming)
   assert.equal(await store.read(researching), DEFAULTS.researching)
   assert.equal(await store.read(writing), ours)
   const [commit] = await store.history({ prefix: 'skills/' })
@@ -335,9 +366,7 @@ test('seeding with replace: a stored default that still matches an earlier text 
   const edited = skillText('brainstorming', ['main'], 'Edited after the upgrade.')
   await store.write([{ path: brainstorming, text: edited }], { author: USER })
   await next.dispose()
-  const after = ctx.plugin(linking({ [brainstorming]: [sha256(earlier)] }))
-  await after
-  await settle(150)
+  const after = await relink(ctx, { [brainstorming]: [sha256(earlier)] })
   assert.equal(await store.read(brainstorming), edited)
   await after.dispose()
   await config.dispose()
@@ -368,33 +397,41 @@ test('linkStore tells changed() when the store appears (after the seed) and when
 // --- changes ---------------------------------------------------------------------------------------------
 
 test('a change under skills/ tells the listeners once, and a change anywhere else tells them nothing', async () => {
-  await withBoth(await dirs(), async (ctx) => {
-    const store = ctx.dishConfig
-    const release = store.claim({ prefix: 'other/', owner: 'test', agent: 'write', validate: () => undefined })
-    try {
-      // Let what the start still has to say be said.
-      await settle()
-      let told = 0
-      ctx.dishSkills.onChange(() => { told++ })
-      // Registered after the plugin's own listener, so it hears each event once the plugin has: what the plugin did
-      // about it is what `told` is by then.
-      const seen: { paths: string[], told: number }[] = []
-      ctx.on('dish-config/changed', (paths) => { seen.push({ paths, told }) })
+  const where = await dirs()
+  const ctx = new Context()
+  const config = mountConfig(ctx, where.repository)
+  await config
+  const skills = mountSkills(ctx)
+  await skills
+  // Listening from the start, to know when what the start has to say has been said: the seed is a change under
+  // skills/, and the store being there is another. (The seed takes git processes, so this is before either.)
+  let told = 0
+  ctx.dishSkills.onChange(() => { told++ })
+  const store = ctx.dishConfig
+  const release = store.claim({ prefix: 'other/', owner: 'test', agent: 'write', validate: () => undefined })
+  try {
+    await waitFor('the start to be told', () => told >= 2)
+    const base = told
+    // Registered after the plugin's own listener, so it hears each event once the plugin has: what the plugin did
+    // about it is what `told` is by then.
+    const seen: { paths: string[], told: number }[] = []
+    ctx.on('dish-config/changed', (paths) => { seen.push({ paths, told: told - base }) })
 
-      await userWrite(store, 'first', skillText('first'))
-      await store.write([{ path: 'other/a.md', text: 'elsewhere' }], { author: USER })
-      await userWrite(store, 'second', skillText('second'))
-      await store.write([{ path: 'other/a.md', text: 'elsewhere again' }, { path: pathFor('first'), text: skillText('first', ['main']) }], { author: USER })
-      await waitFor('the four changes to be heard', () => seen.length === 4)
+    await userWrite(store, 'first', skillText('first'))
+    await store.write([{ path: 'other/a.md', text: 'elsewhere' }], { author: USER })
+    await userWrite(store, 'second', skillText('second'))
+    await store.write([{ path: 'other/a.md', text: 'elsewhere again' }, { path: pathFor('first'), text: skillText('first', ['main']) }], { author: USER })
+    await waitFor('the four changes to be heard', () => seen.length === 4)
 
-      assert.deepEqual(seen.map(event => event.paths), [
-        ['skills/first/SKILL.md'], ['other/a.md'], ['skills/second/SKILL.md'], ['other/a.md', 'skills/first/SKILL.md'],
-      ])
-      assert.deepEqual(seen.map(event => event.told), [1, 1, 2, 3])
-    } finally {
-      release()
-    }
-  })
+    assert.deepEqual(seen.map(event => event.paths), [
+      ['skills/first/SKILL.md'], ['other/a.md'], ['skills/second/SKILL.md'], ['other/a.md', 'skills/first/SKILL.md'],
+    ])
+    assert.deepEqual(seen.map(event => event.told), [1, 1, 2, 3])
+  } finally {
+    release()
+    await skills.dispose()
+    await config.dispose()
+  }
 })
 
 test('an edit shows in the catalog at once', async () => {

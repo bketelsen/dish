@@ -3,12 +3,14 @@
  *
  * The documents live in the config store (`dishConfig`, `skills/<name>/SKILL.md`), and the store is optional. A
  * call looks the store up when it is made, so a store that appears or goes away is handled call by call, and with
- * none (or one that fails to answer) the answer is the shipped defaults, at `commit: null`.
+ * none (or one that fails to answer, or one that has no skill documents at all, as before its first seed) the
+ * answer is the shipped defaults, at `commit: null`: agents are never left with no skills for want of a seed.
  *
  * - `catalog()` is every skill at `main`: the valid documents, sorted by name, and the ones that don't parse in
  *   `problems`. A document nobody could have saved through the store (a hand edit in git) is a problem and
- *   nothing else: the rest of the catalog serves, so one bad file never costs an agent its skills. Only
- *   documents at `skills/<name>/SKILL.md` count; anything else under `skills/` is not a skill and not a problem.
+ *   nothing else, even if parsing it throws: the rest of the catalog serves, so one bad file never costs an agent
+ *   its skills. Only documents at `skills/<name>/SKILL.md` count; anything else under `skills/` is not a skill
+ *   and not a problem. Documents that are all problems are still the store's answer, with the problems listed.
  * - The catalog is read once per commit. The head is asked on every call, which is what tells a new commit from
  *   the one remembered, and concurrent calls share one read. `changed()` forgets it at once (the store announces
  *   a change after the fact, and the provider caches built on this want a fresh read) and tells every listener.
@@ -21,8 +23,8 @@
  */
 import type { DishConfigService } from 'dish-config'
 import { DEFAULTS, defaultText } from './defaults.ts'
-import { SHIPPED_ROLES, SKILLS_PREFIX, nameFor, offeredTo, parseSkill, pathFor, validate } from './skill.ts'
-import type { ParsedSkill } from './skill.ts'
+import { SHIPPED_ROLES, SKILLS_PREFIX, nameFor, offeredTo, parseSkill, pathFor } from './skill.ts'
+import type { ParseResult, ParsedSkill } from './skill.ts'
 
 /** A valid skill document: what it says, where it is and its whole text. */
 export interface SkillDoc extends ParsedSkill {
@@ -42,7 +44,7 @@ export interface Catalog {
 }
 
 export interface DishSkills {
-  /** The skills at `main` now (or the shipped defaults, `commit: null`). Never rejects because of the store. */
+  /** The skills at `main` now, or the shipped defaults at `commit: null` (no store, a store that fails, or one with no skill documents). Never rejects because of the store. */
   catalog(): Promise<Catalog>
   /** `catalog()`'s skills that `role` is offered, sorted by name: those that name it and those that name no role. */
   forRole(role: string): Promise<SkillDoc[]>
@@ -110,6 +112,35 @@ function deepFreeze<T>(value: T): T {
   return value
 }
 
+/**
+ * The catalog of `entries`, the documents `[path, text]` at `commit`'s `skills/`. Each document is on its own: one
+ * that does not parse, or whose parsing throws, is a problem with its own message, and never costs the others.
+ * `parse` is `parseSkill`; a test can pass one that throws.
+ */
+export function buildCatalog(
+  commit: string | null,
+  entries: readonly (readonly [path: string, text: string])[],
+  parse: (path: string, text: string) => ParseResult = parseSkill,
+): Catalog {
+  const skills: SkillDoc[] = []
+  const problems: { path: string, message: string }[] = []
+  for (const [path, text] of entries) {
+    try {
+      const result = parse(path, text)
+      if (result.ok) {
+        skills.push(deepFreeze({ ...result.skill, path, text }))
+      } else {
+        // The page shows the path beside the message, so the message does not repeat it.
+        const prefix = `${path}: `
+        problems.push({ path, message: result.problem.startsWith(prefix) ? result.problem.slice(prefix.length) : result.problem })
+      }
+    } catch (error) {
+      problems.push({ path, message: describe(error) })
+    }
+  }
+  return { commit, skills: skills.sort(byName), problems: problems.sort(byPath) }
+}
+
 /** The most kinds of trouble remembered as told: a trouble that keeps changing its words is not worth a list that grows. */
 const MAX_TOLD = 50
 
@@ -137,35 +168,23 @@ export function createDishSkills(options: ServiceOptions): DishSkills {
   const listeners = new Set<() => void>()
   /** Bumped by `changed()`: a read that began before it is out of date and takes neither the memo nor the in-flight slot. */
   let generation = 0
-  /** The latest read of the store; it has a commit. */
-  let memo: Catalog | undefined
+  /** The latest read of the store, and the commit it was of. (Its catalog is the shipped one for a store with no skills.) */
+  let memo: { commit: string, catalog: Catalog } | undefined
   let inflight: Promise<Catalog> | undefined
   /** The documents of the commit last read that were told as problems, so each is told once per commit. */
   let toldProblems: { commit: string, paths: Set<string> } | undefined
   let shipped: Catalog | undefined
 
-  /** The catalog of `entries`, the documents at `commit`'s `skills/`. */
-  function build(commit: string | null, entries: readonly (readonly [path: string, text: string])[]): Catalog {
-    const skills: SkillDoc[] = []
-    const problems: { path: string, message: string }[] = []
-    for (const [path, text] of entries) {
-      const result = parseSkill(path, text)
-      if (result.ok) skills.push(deepFreeze({ ...result.skill, path, text }))
-      else problems.push({ path, message: validate(path, text) ?? result.problem })
-    }
-    return { commit, skills: skills.sort(byName), problems: problems.sort(byPath) }
-  }
-
   /** The catalog of the shipped skills. They are constants, so it is built once. */
   function defaults(): Catalog {
-    shipped ??= build(null, Object.entries(DEFAULTS).map(([name, text]) => [pathFor(name), text] as const))
+    shipped ??= buildCatalog(null, Object.entries(DEFAULTS).map(([name, text]) => [pathFor(name), text] as const))
     return shipped
   }
 
-  function tellProblems(catalog: Catalog & { commit: string }): void {
-    const told = toldProblems?.commit === catalog.commit ? toldProblems.paths : new Set<string>()
-    toldProblems = { commit: catalog.commit, paths: told }
-    for (const { path, message } of catalog.problems) {
+  function tellProblems(commit: string, problems: readonly { path: string, message: string }[]): void {
+    const told = toldProblems?.commit === commit ? toldProblems.paths : new Set<string>()
+    toldProblems = { commit, paths: told }
+    for (const { path, message } of problems) {
       if (told.has(path)) continue
       told.add(path)
       warn('the skill document %s is not valid and is left out: %s', path, message)
@@ -174,13 +193,23 @@ export function createDishSkills(options: ServiceOptions): DishSkills {
 
   async function read(store: StoreReader, started: number): Promise<Catalog> {
     const commit = await store.head()
-    if (memo?.commit === commit) return memo
+    if (memo?.commit === commit) {
+      // The store answered, as it did for this commit before: a trouble it has again is news.
+      toldStore.clear()
+      return memo.catalog
+    }
     const paths = (await store.list(SKILLS_PREFIX, commit)).filter(path => nameFor(path) !== undefined)
     const entries = await Promise.all(paths.map(async (path) => [path, await store.read(path, commit)] as const))
-    const catalog = build(commit, entries.filter((entry): entry is readonly [string, string] => entry[1] !== undefined))
+    const stored = buildCatalog(commit, entries.filter((entry): entry is readonly [string, string] => entry[1] !== undefined))
+    // A store with no skill documents (before its first seed, or one that cannot be seeded) leaves agents with the shipped
+    // ones. Documents that are all problems are an answer, and the page shows the problems.
+    const catalog = stored.skills.length === 0 && stored.problems.length === 0 ? defaults() : stored
     toldStore.clear()
-    tellProblems({ ...catalog, commit })
-    if (generation === started) memo = catalog
+    // A read that `changed()` outdated says nothing: the fresh read of that commit, or a later one, does.
+    if (generation === started) {
+      tellProblems(commit, stored.problems)
+      memo = { commit, catalog }
+    }
     return catalog
   }
 

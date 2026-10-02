@@ -126,6 +126,8 @@ function git(gitDir: string, args: string[], options: { input?: string, env?: Re
       if (error) reject(new Error(`git ${args.join(' ')} failed: ${stderr.trim() || error.message}`))
       else resolve(stdout.trim())
     })
+    // A git that needs no input can exit before this is written; the exit code and stderr say how it went, not the pipe.
+    child.stdin?.on('error', () => {})
     child.stdin?.end(options.input ?? '')
   })
 }

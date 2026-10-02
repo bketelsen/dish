@@ -291,6 +291,25 @@ test('parseSkill refuses a small alias bomb quickly', () => {
   assert.equal(validate(PATH, text), 'the frontmatter reuses a value through a YAML alias; write it out')
 })
 
+/** The most entries of a flat list that fit in the store's 256 KiB limit as `a,a,a,...`. */
+const LONG_LIST = 130_000
+
+test('a list of 130000 entries is no problem: the alias check walks it without spreading it onto the stack', () => {
+  const list = `[${'a,'.repeat(LONG_LIST)}a]`
+  const text = doc(['name: x', 'description: Use when testing.', 'metadata:', `  other: ${list}`])
+  assert.ok(text.length < 262_144, `${text.length} bytes fit the store's limit`)
+  // Nothing throws: the document is valid, and what the store's validator says is that it is.
+  const skill = skillOf(text)
+  assert.equal((skill.metadata.other as unknown[]).length, LONG_LIST + 1)
+  assert.equal(validate(PATH, text), undefined)
+  assert.deepEqual(checkSkill(PATH, text, SHIPPED_ROLES).problems, [])
+})
+
+test('a very long list is still searched for a reused value', () => {
+  const text = doc(['name: x', 'description: d', 'metadata:', `  other: [&r [1], ${'a,'.repeat(LONG_LIST)} *r]`])
+  assert.equal(validate(PATH, text), 'the frontmatter reuses a value through a YAML alias; write it out')
+})
+
 test('parseSkill reads dates and timestamps as the plain strings they are', () => {
   const skill = skillOf(doc(['name: x', 'description: d', 'metadata:', '  updated: 2026-10-02']))
   assert.equal(skill.metadata.updated, '2026-10-02')

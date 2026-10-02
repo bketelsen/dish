@@ -4,9 +4,9 @@ import { format } from 'node:util'
 import { Context } from '@deepseek-ai/cordis'
 import type { DishConfigService } from 'dish-config'
 import { DEFAULTS } from '../src/defaults.ts'
-import { createDishSkills } from '../src/service.ts'
+import { buildCatalog, createDishSkills } from '../src/service.ts'
 import type { DishSkills, ServiceOptions } from '../src/service.ts'
-import { SHIPPED_ROLES, namespaceSpec, pathFor } from '../src/skill.ts'
+import { SHIPPED_ROLES, namespaceSpec, parseSkill, pathFor } from '../src/skill.ts'
 import { COMMIT, dirs, mountConfig, outsideCommit, skillText, userWrite } from './helpers.ts'
 
 type StoreReader = NonNullable<ReturnType<ServiceOptions['store']>>
@@ -110,12 +110,33 @@ test('invocation flags come from the document', async () => {
   })
 })
 
-test('a store with no skills gives an empty catalog at its commit, not the defaults', async () => {
+test('a store with no skill documents at all gives the shipped defaults at commit null, and the stored skills once there are some', async () => {
   await withStore(async (harness) => {
+    const reader = readerWith(harness.store)
+    const service = serviceFor(harness, { store: () => reader })
+    const catalog = await service.catalog()
+    assert.equal(catalog.commit, null)
+    assert.deepEqual(names(catalog.skills), Object.keys(DEFAULTS).sort())
+    assert.deepEqual(catalog.problems, [])
+    assert.deepEqual(harness.warnings, [])
+    // The empty answer is read once per commit like any other.
+    assert.deepEqual(await service.catalog(), catalog)
+    assert.deepEqual(reader.calls, { head: 2, list: 1, read: 0 })
+
+    await userWrite(harness.store, 'mine', skillText('mine'))
+    const stored = await service.catalog()
+    assert.equal(stored.commit, await harness.store.head())
+    assert.deepEqual(names(stored.skills), ['mine'])
+  })
+})
+
+test('a store whose only skill documents are broken answers with those problems, not the defaults', async () => {
+  await withStore(async (harness) => {
+    await outsideCommit(harness.repository, [{ path: 'skills/broken/SKILL.md', text: 'no frontmatter at all\n' }])
     const catalog = await serviceFor(harness).catalog()
     assert.equal(catalog.commit, await harness.store.head())
     assert.deepEqual(catalog.skills, [])
-    assert.deepEqual(catalog.problems, [])
+    assert.deepEqual(catalog.problems.map(problem => problem.path), ['skills/broken/SKILL.md'])
   })
 })
 
@@ -176,6 +197,53 @@ test('a broken document that is then fixed leaves the problems', async () => {
     assert.deepEqual(catalog.problems, [])
     assert.deepEqual(names(catalog.skills), ['mend'])
   })
+})
+
+test('a hand-edited document with a very long list is served like any other, at the store\'s commit', async () => {
+  await withStore(async (harness) => {
+    await userWrite(harness.store, 'good', skillText('good'))
+    // 130000 entries: it fits the store's size limit, and used to overflow the stack in the alias check.
+    const big = `---\nname: big\ndescription: Use when testing.\nmetadata:\n  other: [${'a,'.repeat(130_000)}a]\n---\nBody.\n`
+    await outsideCommit(harness.repository, [{ path: 'skills/big/SKILL.md', text: big }])
+    const head = await harness.store.head()
+    const reader = readerWith(harness.store)
+    const service = serviceFor(harness, { store: () => reader })
+
+    const catalog = await service.catalog()
+    assert.equal(catalog.commit, head)
+    assert.deepEqual(names(catalog.skills), ['big', 'good'])
+    assert.deepEqual(catalog.problems, [])
+    assert.deepEqual(harness.warnings, [])
+    // And it is memoized: the user's skills do not cost a re-parse on every call.
+    await service.catalog()
+    assert.equal(reader.calls.list, 1)
+  })
+})
+
+test('buildCatalog: a document whose parsing throws is a problem of its own, and the others are served', () => {
+  const commit = 'c'.repeat(40)
+  const parse = (path: string, text: string) => {
+    if (text === 'overflow') throw new RangeError('Maximum call stack size exceeded')
+    if (text === 'string') throw 'a thrown string'
+    return parseSkill(path, text)
+  }
+  const catalog = buildCatalog(commit, [
+    [pathFor('zed'), skillText('zed')],
+    [pathFor('boom'), 'overflow'],
+    [pathFor('good'), skillText('good')],
+    [pathFor('odd'), 'string'],
+    [pathFor('plain'), 'no frontmatter'],
+  ], parse)
+  assert.equal(catalog.commit, commit)
+  assert.deepEqual(names(catalog.skills), ['good', 'zed'])
+  assert.deepEqual(catalog.problems, [
+    { path: 'skills/boom/SKILL.md', message: 'Maximum call stack size exceeded' },
+    { path: 'skills/odd/SKILL.md', message: 'a thrown string' },
+    { path: 'skills/plain/SKILL.md', message: 'the frontmatter is missing; the document must start with a --- line' },
+  ])
+  // The real parser throws for none of these, and the message of a refusal does not repeat the path.
+  assert.deepEqual(buildCatalog(null, [[pathFor('plain'), 'no frontmatter']]).problems.map(problem => problem.message),
+    ['the frontmatter is missing; the document must start with a --- line'])
 })
 
 // --- memoizing -------------------------------------------------------------------------------------
@@ -276,6 +344,41 @@ test('changed() while a read is under way: the next call reads again, and the ol
   })
 })
 
+test('a read that changed() outdated does not tell problems again, or reset what was told', async () => {
+  await withStore(async (harness) => {
+    await outsideCommit(harness.repository, [{ path: 'skills/broken/SKILL.md', text: 'no frontmatter at all\n' }])
+    await userWrite(harness.store, 'old', skillText('old'))
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let gated = true
+    const reader = readerWith(harness.store, {
+      list: async (prefix, ref) => {
+        const paths = await harness.store.list(prefix, ref)
+        if (gated) {
+          gated = false
+          await gate
+        }
+        return paths
+      },
+    })
+    const service = serviceFor(harness, { store: () => reader })
+
+    const slow = service.catalog()
+    while (reader.calls.list === 0) await new Promise(resolve => setTimeout(resolve, 5))
+    await userWrite(harness.store, 'new', skillText('new'))
+    service.changed()
+    await service.catalog()
+    // The fresh read told the broken document, once.
+    assert.equal(harness.warnings.length, 1)
+
+    release()
+    await slow
+    service.changed()
+    await service.catalog()
+    assert.equal(harness.warnings.length, 1, harness.warnings.join('\n'))
+  })
+})
+
 // --- the shipped defaults --------------------------------------------------------------------------
 
 test('without a store the catalog is the shipped defaults at commit null', async () => {
@@ -346,6 +449,28 @@ test('a store that fails to answer gives the defaults, and the failure is logged
     failing = 'head'
     assert.equal((await service.catalog()).commit, null)
     assert.equal(harness.warnings.length, 4)
+  })
+})
+
+test('a failure that comes back after the store answered from its memo is logged again', async () => {
+  await withStore(async (harness) => {
+    await userWrite(harness.store, 'mine', skillText('mine'))
+    let failing = false
+    const reader = readerWith(harness.store, { head: () => failing ? Promise.reject(new Error('the store is on fire')) : harness.store.head() })
+    const service = serviceFor(harness, { store: () => reader })
+
+    assert.equal((await service.catalog()).commit, await harness.store.head())
+    failing = true
+    assert.equal((await service.catalog()).commit, null)
+    assert.equal(harness.warnings.length, 1)
+    // The store answers again at the same commit, so from the memo...
+    failing = false
+    assert.deepEqual(names((await service.catalog()).skills), ['mine'])
+    assert.equal(reader.calls.list, 1)
+    // ...and the same trouble is news.
+    failing = true
+    assert.equal((await service.catalog()).commit, null)
+    assert.equal(harness.warnings.length, 2)
   })
 })
 

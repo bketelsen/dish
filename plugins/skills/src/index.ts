@@ -7,7 +7,7 @@
  * - `dishConfig` is optional. When the store is there, the plugin claims the `skills/` subtree (an agent may only
  *   propose changes) and seeds the shipped defaults, which never overwrites an edit: a stored default is only
  *   replaced when its text is one of an earlier shipped version that nobody has edited since (`defaults/previous.json`).
- *   While the store isn't there, every answer is the shipped defaults;
+ *   While the store isn't there, or has no skill documents yet, every answer is the shipped defaults;
  * - a change under `skills/` in the store, and the store coming or going, is told to the service's listeners.
  *
  * @module dish-skills
