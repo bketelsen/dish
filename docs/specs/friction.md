@@ -1,6 +1,6 @@
 # Spec: friction fixes from the first local-model session
 
-Status: planned, 2026-10-02, on branch `friction` (the plan is [docs/plans/2026-10-02-friction.md](../plans/2026-10-02-friction.md)). It comes from a review of the 2026-10-02 session in which `qwen3.8-flash-next` (provider `selfie`) ran as dish's main agent and built an Astro blog with five crew children. You approved items 1–4 of the review's proposal; this spec fixes them, corrected by the [Checks](#checks-2026-10-02) against dsh 0.2.0-rc.2's sources. It changes `dish-judge`, `dish-prompts` and `dish-crew`, and nothing outside them.
+Status: built on branch `friction`, 2026-10-02; awaiting review and the rollout (the plan is [docs/plans/2026-10-02-friction.md](../plans/2026-10-02-friction.md); what differed from this spec is under [Notes from the build](#notes-from-the-build)). **Task 5 did not run:** [question 2](#questions-for-you) was settled on option C, `main.md`'s rule, which is built. Option A, crew's own `send_message`, is on the roadmap's backlog for after 6b merges. Option B, the 600-character guard, was not taken and is **not done**; you can still ask for it. It comes from a review of the 2026-10-02 session in which `qwen3.8-flash-next` (provider `selfie`) ran as dish's main agent and built an Astro blog with five crew children. You approved items 1–4 of the review's proposal; this spec fixes them, corrected by the [Checks](#checks-2026-10-02) against dsh 0.2.0-rc.2's sources. It changes `dish-judge`, `dish-prompts` and `dish-crew`, and nothing outside them.
 
 The review (the "friction report") numbers its findings A1–A5, B6–B10, C11–C14, D15–D19 and E20–E24, and its recommendations 1–13. They are cited that way below.
 
@@ -42,16 +42,18 @@ The work got done: 9 commits, every acceptance check passed, and a cross-family 
 ```ts
 /** One message is cut to this many characters, by taking out its middle. */
 export const MAX_PART_CHARS = 4000
+/** A message between the first and the newest is cut to this many, so that more of them fit. */
+export const MAX_MIDDLE_CHARS = 1000
 /** The task is kept within this many characters (the first and the newest message are always in). */
 export const MAX_TASK_CHARS = 8000
 /** `text` within `max` characters: its first and last halves, joined by `\n[…]\n`, with no half of a surrogate pair left at either cut. */
 export function clipMiddle(text: string, max: number): string
 ```
 
-- **A top-level agent.** Every `user/message` event whose `source.kind` is `user`, read as today (`promptText`: the text blocks, joined by `\n`, trimmed), oldest first. One equal to the one before it is dropped. Each is clipped to `MAX_PART_CHARS`. The task is the first, then a gap line if any were left out, then the newest ones that fit, oldest of them first, joined by a blank line. "Fit" counts the separators and the gap line: a middle message is added only while the whole stays within `MAX_TASK_CHARS`. So a task is at most `MAX_TASK_CHARS` plus a separator and a gap line.
+- **A top-level agent.** Every `user/message` event whose `source.kind` is `user`, read as today (`promptText`: the text blocks, joined by `\n`, trimmed), oldest first. One equal to the one before it is dropped. The first and the newest are clipped to `MAX_PART_CHARS`, and the ones between to `MAX_MIDDLE_CHARS`. The task is the first, then a gap line if any were left out, then the newest ones that fit, oldest of them first, joined by a blank line. "Fit" counts the separators and the gap line: a middle message is added only while the whole stays within `MAX_TASK_CHARS`. Only the first and the newest can take it past that: a task is at most `MAX_TASK_CHARS` plus a gap line and two separators.
 - **A child.** Its own events (from `inheritedEventCount`, as today):
   - the brief is the first `user/message` with `source.kind: 'user'`, and of it only the first non-empty text block;
-  - the latest instruction is the last `user/message` after the brief that has `source.kind: 'agent-message'` and `source.senderSessionId === header.parentSession`, or `source.kind: 'user'`. Its text blocks are joined, without dsh's leading block `Agent <id> sent a message: `. A child whose header has no `parentSession` reads no `agent-message`;
+  - the latest instruction is the last `user/message` after the brief that has `source.kind: 'agent-message'` and `source.senderSessionId === header.parentSession`, or `source.kind: 'user'` with a string `rpcId` (which dsh's `subagent.prompt` gives a prompt a person typed into the child). Its text blocks are joined, without dsh's leading block `Agent <id> sent a message: `. A child whose header has no `parentSession` reads no `agent-message`;
   - the task is the brief, clipped, and then, after a blank line, the latest instruction, clipped.
 - **What never counts:** a child's `agent-message` to the main agent, `subagent-settled` notices, tool results, `goal`, `runtime-context`, `skill-catalog`, `agent-instructions`, `tool-jobs` and every other injected kind, and an `agent-message` from anyone but the parent. An instruction from the parent has the same standing as the brief it follows, which also came from the parent.
 - **The spec's state line** (`docs/specs/judge.md`, "The command gate") becomes: `"task": "<the agent's task: the main agent's first and latest prompts, or a child's brief and its latest instruction; see below>"`, with a short "The task" paragraph that says the above.
@@ -112,7 +114,7 @@ Only the coder gets it, as approved. The architect, the writer and ops also have
 
 `plugins/prompts/src/persona.ts`, the listener:
 - **Today** it patches the persona sections, interpolating from the assembly it was given, and then returns `next()`. That assembly's `model` is dsh-agent-loop's provider, `agent.options.model`: the global default when the agent was created or resumed. dsh-agent's model-selection listener replaces `model` and `provider` with the session's selection **after** its own `next()`, so the persona never sees it.
-- **After:** `const result = await next()`, then `applyPersona(result, …)`, interpolating from `result.variables`, and `return result`. It's registered with `{ prepend: true }`, so it is outermost and its `next()` returns after the selection's listener has run, whatever order the preset and the agent were set up in. dsh's own `dsh-session-reference` reads the selected model the same way.
+- **After:** `const result = await next()`, then `applyPersona(result, …)`, interpolating from `result.variables`, and `return result`. It's registered with `{ prepend: true }`, so it runs ahead of every listener registered without `prepend`, the selection's among them, and its `next()` returns after the selection's listener has run, whatever order the preset and the agent were set up in (see [Notes from the build](#notes-from-the-build)). dsh's own `dsh-session-reference` reads the selected model the same way.
 - Everything else is unchanged: a step never fails because of the row, an assembly without an agent is passed through, the failure paths (no service, a snapshot that fails, a section it can't patch) still call `next()` exactly once, and a child's prefix is still rendered leniently.
 - **Children** have no selection listener: their `model` stays `options.model`, which is crew's route model. That is already right.
 - The preview calls `applyPersona` itself, without the listener, and is unaffected. `{{provider}}` follows the selection too.
@@ -153,6 +155,8 @@ Only the coder gets it, as approved. The architect, the writer and ops also have
 - **Two approvals for one escalated command?** For the main agent, the gate's own `ask` and then the tool's escalation request both look like they fall through to you (the answerer's `ask` row). The rollout checks it with one `mise install`; if it asks twice, the answerer could let your yes to the gate's ask cover that call's escalation.
 - **A no-op escalation reads as one.** The GPT reviewer sent `sandbox_permissions: "workspace-write"` (its mode already) on 9 calls. dsh ignores it (`dsh-tool-bash` `lib/index.js:238`), but the gate puts the escalation question to the judge. The gate could drop a `sandbox_permissions` equal to the session's mode.
 - **The `write`/`edit` bullet** for the architect, the writer and ops, which also edit files.
+- **Crew's own `send_message`** (question 2, option A), after 6b merges, so that dsh's "send your result" note isn't appended to children.
+- **A headless browser and `libxml2-utils` on the VM**, and **a way to open an agent's dev server from your browser** (a second `tailscale serve` port to a fixed local port, named in `common.md`). Both are asked for in the roadmap's backlog; the first is the VM-tools item above, the second the preview-ports item.
 
 ## Questions for you
 
@@ -163,6 +167,28 @@ Only the coder gets it, as approved. The architect, the writer and ops also have
    - **C.** `main.md`'s new rule only: the main agent waits for the finished notice.
 
    *Recommendation:* C (planned) and B now (Task 5, which runs only if you say yes), and A as a follow-up after 6b merges.
+
+   *Outcome:* C is built. B (Task 5) did not run and is not done: say so if you want it. A is on the roadmap's backlog.
+
+## Notes from the build
+
+What differed from the spec as it was first written; the sections above now say the shipped thing.
+
+- **Task 5 did not run** (see the status line). The report guard's `messageLimit` is still 1,200.
+- **The judge's task** (Task 1's review):
+  - The messages between the first and the newest are clipped to `MAX_MIDDLE_CHARS` (1,000), not 4,000. A trivial first prompt followed by the request and two long pastes pushed the request out of the task; clipped to 1,000, it stays in.
+  - A child's later typed prompt (`source.kind: 'user'`) counts as an instruction only with a string `rpcId`, which dsh's `subagent.prompt` gives it; dsh's auto-review reads a human instruction the same way. Without one it isn't something a person typed.
+  - The bound sentence was one separator short: a task is at most `MAX_TASK_CHARS` plus a gap line and two separators.
+- **The prompt texts** (Task 2's review changed the texts in [The prompt texts](#the-prompt-texts), which now show what shipped):
+  - `main.md` runs the steps its skills give the main agent (a gate run to verify, a worktree, bringing commits onto the plan branch, a push) itself, and keeps only the task's builds, installs and commits for a coder or ops. The carve-out was added so the main agent isn't told to delegate what a skill tells it to run.
+  - A child's install report names the command and its `workdir`. The main agent runs it in that `workdir`, then resumes the child with `delegate` and `to`, saying the command ran.
+  - The rule on hiding output is wider than `2>&1 | tail`: no `2>&1`, `2>/dev/null` or pipe into `tail` or `head`, because dsh already shows stderr and keeps the tail of long output.
+  - `workdir` or `git -C`, not a `cd` that is expected to carry over.
+  - The full path `sudo /usr/local/sbin/dish-apt-get`, which fails inside the sandbox too.
+  - A bare `node` or `pnpm` on the VM is dish's own (`/opt/dish/node/bin`), so a project's is `mise exec -- pnpm …`.
+  - Scratch files go only in a git-ignored directory of the workspace (`.worktrees/` when `git check-ignore -q .worktrees` succeeds), and are never committed.
+- **The persona row** (Task 3): it is registered with `prepend: true` and calls `next()` once, as specified. A prepend listener registered before the row runs inside it, so the row is not outermost; what it does is run ahead of every listener registered without `prepend`, dsh-agent's model selection among them. That is what makes `{{model}}` right, and [the prompts spec](prompts.md#the-persona-row-dish-promptspersona) says it that way. `{{model}}` also changes mid-chat when you switch models: the prompt is assembled on every step.
+- **Crew's alias risk** (Task 4): a model that `crew.yaml` doesn't list and whose id names no known vendor is its own family. Two sentences in the crew spec that said such a model can never get a same-vendor reviewer were reworded: an alias that hides its vendor can. Listing it in a family in `crew.yaml` closes that.
 
 ## Checks (2026-10-02)
 
