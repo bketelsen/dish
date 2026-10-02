@@ -14,9 +14,9 @@
  *   (`installModelSelection`) returns `{ ...assembled, variables: { ...assembled.variables, provider, model } }` after
  *   its own `next()`, while the variables the waterfall starts with hold only the global default the agent was created
  *   with. A listener that interpolates before `next()` would say the default. So this one asks for the snapshot
- *   first, calls `next()` once, and patches what `next()` returned. Registered with `prepend: true`, it is the
- *   outermost listener, so its `next()` returns after every other listener of the waterfall has run, whatever order
- *   the preset and the agent registered theirs in. (`dsh-session-reference` reads the selected model the same way.)
+ *   first, calls `next()` once, and patches what `next()` returned. Registered with `prepend: true`, it runs ahead
+ *   of every listener registered without `prepend`, dsh-agent's model selection among them, so its `next()` returns
+ *   after the selection has set `model`, whatever order the preset and the agent registered theirs in. (`dsh-session-reference` reads the selected model the same way.)
  *   The cost: a listener inside the waterfall that reads the persona sections' text sees the preset's text.
  *
  * - **A prompt's text never fails a step.** dsh's own interpolation throws on a malformed, unknown or valueless
@@ -243,7 +243,8 @@ export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger(LOGGER_NAME)
   // Read on every call: the service is optional, and may come, go and come back.
   const listener = personaListener({ role: config.role, service: () => ctx.get('dishPrompts'), logger })
-  // Prepended: outermost, so that `next()` returns after dsh-agent's model selection has set `model` (see the module comment).
+  // Prepended: ahead of every listener registered without `prepend`, so that `next()` returns after dsh-agent's model
+  // selection has set `model` (see the module comment).
   ctx.on('system-prompt/assemble', listener, { prepend: true })
   // What is told about an agent is told once, and not kept after the agent is gone.
   ctx.on('agent/disposed', ({ agent }) => {
