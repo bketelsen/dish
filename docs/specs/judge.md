@@ -148,8 +148,15 @@ A host-level `tools/pre-execute` listener, prepended, for tools listed in `tools
 ```json
 { "command": "<the command text>", "cwd": "<the session's working directory>", "workspace": "<the sandbox's workspace root>",
   "escalation": "<sandbox_permissions and justification, if any>",
-  "task": "<the agent's task: the main agent's latest user message, or a child's brief; up to 4000 characters>" }
+  "task": "<the agent's task: the main agent's first and latest prompts, or a child's brief and its latest instruction; see below>" }
 ```
+
+**The task** (since 2026-10-02; see the [friction spec](friction.md#the-judges-task-dish-judge)):
+- **The main agent's:** its prompts, the messages a human wrote (`source.kind: 'user'`, text blocks joined), oldest first, with a resend (one equal to the one before it) counted once. The first is always in, and so is the newest. The ones between are added newest first while the task stays within 8,000 characters, the separators and the gap line counted. A gap reads `[… N earlier messages left out]`. Messages are joined by a blank line.
+- **A child's,** from its own events (after `inheritedEventCount`): the brief, which is the first non-empty text block of its first prompt, so crew's closing note and dsh's return note after it are left out; then, after a blank line, the latest instruction after the brief, if there is one. That is a prompt typed into the child, or an `agent-message` from its parent (`senderSessionId` equal to the header's `parentSession`: a `delegate` with `to`, or the parent's `send_message`), without dsh's leading `Agent <id> sent a message: ` block.
+- **Each message is cut to 4,000 characters** by taking out its middle: about 2,000 from the head and 2,000 from the tail stay, joined by `\n[…]\n`, with no surrogate pair split. A brief's commit and report instructions, which tend to come last, survive. Only the first and the newest can take the main agent's task past 8,000 characters: two full messages, a gap line and the blank lines between them come to a little over.
+- **What never counts:** a child's `agent-message` to the main agent, `subagent-settled` notices, tool results, `goal`, `runtime-context`, `skill-catalog`, `agent-instructions`, `tool-jobs` and every other injected kind, and an `agent-message` from anyone but the parent. A child whose header names no parent reads no `agent-message`. An instruction from the parent has the same standing as the brief, which the parent also wrote.
+- **The bar is unchanged:** `servesTask` stays 0.50, and the questions are as they were. Before this, the main agent's task was only its latest message, and a child's the first 4,000 characters of its brief. Commits then scored `serves_task` 0.17–0.48 against a message that only gave the site URL, and a coder was refused commits whose instruction came past the cut. The fix was to give the judge the task, not to lower the bar.
 
 **Questions,** which live in code and are reviewed like code:
 - **`effect`** (choice): "What would running `command` from `cwd` do to files, systems and data?" The options are:
@@ -325,7 +332,14 @@ Whatever leaves `dishJudge` that came from outside the code (log lines, withheld
   - the cache;
   - Jev unavailable;
   - non-gated tools pass through;
-  - task text from the main agent and from a child.
+  - task text from the main agent and from a child:
+    - the site-URL session: every prompt, "hello!" once, with no child's message and no notice;
+    - a long chat: the first prompt, the gap line and the newest that fit, within 8,000 characters; the first and the newest always in;
+    - clipping: the head and the tail kept, a message of exactly 4,000 unchanged, no surrogate split, a tiny limit kept;
+    - the 5.8k brief: it keeps its commit instructions, without crew's and dsh's notes;
+    - the fix round: the brief and the parent's follow-up, without dsh's leading line; the later of two; a typed message after the brief;
+    - not the parent's: another agent's message, notices, `goal` and `tool-jobs` change nothing, and a child with no `parentSession` reads no `agent-message`;
+    - a fork, and the task through the gate.
 - **The approval answerer:** the four cases, for main and child; a child is never sent through `next()`; the child's policy switches to `ask` and stays put across a resume.
 - **The screen:**
   - withhold, warn and pass;

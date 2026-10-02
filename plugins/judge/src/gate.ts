@@ -43,20 +43,33 @@
  *   canonical (symlinks resolved), or the service's configured root when the session has none. It is what the sandbox
  *   enforces, and what `bash` itself uses. With no such service, or if it throws, the workspace is `cwd`.
  * - **The task.** `exec.agent.session.snapshotEvents(fromSeq?)` returns the session's frozen events; a `user/message` event's
- *   `data` is a `UserMessage` `{ id, role: 'user', content: ContentBlock[], source }`, and `source.kind === 'user'` marks a
- *   prompt that a human (or, for a child, its parent's brief) wrote, as against context dsh injected (`goal`, `schedule`,
- *   `user-approval`, tool results and so on). For a top-level agent the task is the last such message; for a child it is the
- *   first one among its own events, which `session.inheritedEventCount` says where they start (a forked child's log begins
- *   with its parent's). Text blocks only, joined, cut to 4000 characters. `snapshotEvents` is marked deprecated in dsh ("new
- *   calls are prohibited", for dsh's own code, which should read projections), because it assumes the whole log is in
- *   memory; in 0.2.0-rc.2 it is, there is no other synchronous way to the prompt, and the turn-outline's prompt is a
- *   one-line preview. If it is missing or throws, the task is `''`: the judge then reads every command as not serving a task
- *   it can't see, and the gate asks you more often. A crew child's brief carries a trailing guidance block ("Your parent
- *   agent id is …"), and a compacted-away or image-only first message leaves nothing to read; both are accepted.
+ *   `data` is a `UserMessage` `{ id, role: 'user', content: ContentBlock[], source }`. `source.kind === 'user'` marks a prompt
+ *   that a human wrote (or, for a child, the brief its parent queued), and `source.kind === 'agent-message'` a message from
+ *   another agent, with the live sender's id in `senderSessionId` and dsh's `Agent <id> sent a message: ` as its first block
+ *   (`createAgentMessage` in `dsh-subagent`). Everything else is context dsh injected (`goal`, `runtime-context`,
+ *   `subagent-settled`, `tool-jobs`, tool results and so on), and never counts. Text blocks only; each message is cut to
+ *   `MAX_PART_CHARS` by taking out its middle (`clipMiddle`), so its head and its tail, where a brief's commit and report
+ *   instructions tend to be, both stay.
+ *   - **A top-level agent's** task is its prompts, oldest first, a resend (one equal to the one before it) counted once: the
+ *     first, then the newest that fit in `MAX_TASK_CHARS`, with `[… N earlier messages left out]` for the rest. The first and
+ *     the newest are always in. The first is often the request, and the newest what was said since ("site URL will be …").
+ *   - **A child's** task comes from its own events, which `session.inheritedEventCount` says where they start (a forked
+ *     child's log begins with its parent's). The brief is the first non-empty text block of its first prompt: crew's closing
+ *     note and dsh's return note ("Your parent agent id is …") are the blocks after it. Then the latest instruction after the
+ *     brief, if there is one: a prompt typed into the child, or an `agent-message` whose `senderSessionId` is the header's
+ *     `parentSession` (a `delegate` with `to`, or the parent's `send_message`), without dsh's first block. dsh lets only the
+ *     parent send to a child (`authorizeLineage`), and its own auto-review tells a parent's instruction the same way. A
+ *     message from any other agent, and a child whose header names no parent, add nothing.
+ *
+ *   `snapshotEvents` is marked deprecated in dsh ("new calls are prohibited", for dsh's own code, which should read
+ *   projections), because it assumes the whole log is in memory; in 0.2.0-rc.2 it is, there is no other synchronous way to
+ *   the prompt, and the turn-outline's prompt is a one-line preview. If it is missing or throws, the task is `''`: the judge
+ *   then reads every command as not serving a task it can't see, and the gate asks you more often. A prompt with no text is
+ *   passed over, and a compacted-away brief leaves nothing to read, which is accepted.
  *   The route dsh prefers, for a later follow-up: a `session/event` listener (emit mode, one per session) that keeps
- *   `WeakMap<Session, { brief, latest }>`, filled from each `user/message` event with `source.kind === 'user'` (the brief is
- *   the first one after `inheritedEventCount`). It needs no read of the log, but it also misses what was said before the
- *   plugin loaded or the session was resumed, which a projection registered with `ctx.sessionProjections` would not.
+ *   `WeakMap<Session, …>` of the messages above (the prompts, or the brief and the latest instruction), filled from each
+ *   `user/message` event as it comes. It needs no read of the log, but it also misses what was said before the plugin
+ *   loaded or the session was resumed, which a projection registered with `ctx.sessionProjections` would not.
  *
  * @module dish-judge/gate
  */
@@ -101,8 +114,14 @@ export const SERVES_TASK_QUESTION: Question = {
   instructions: 'Is running `command` a reasonable step toward `task`?',
 }
 
-/** The task is cut to this many characters. */
-export const MAX_TASK_CHARS = 4000
+/** One message is cut to this many characters, by taking out its middle. */
+export const MAX_PART_CHARS = 4000
+/**
+ * The task is kept within this many characters; the first and the newest message are always in. What it bounds is the
+ * messages between those two: the two alone can come to `2 * MAX_PART_CHARS`, plus a separator, and a gap line and its
+ * separator when some were left out.
+ */
+export const MAX_TASK_CHARS = 8000
 /** A justification is cut to this many characters. */
 const MAX_JUSTIFICATION_CHARS = 1000
 
@@ -275,7 +294,8 @@ function keyOf(owner: string, callId: string): string {
 export type GateAgent = JudgeAgent & {
   readonly session?: {
     readonly id?: unknown
-    readonly header?: { readonly cwd?: unknown }
+    /** `parentSession` is a child's parent's session id, as dsh-subagent writes it; a top-level session has none. */
+    readonly header?: { readonly cwd?: unknown, readonly parentSession?: unknown }
     readonly inheritedEventCount?: unknown
     snapshotEvents?(fromSeq?: number): readonly unknown[]
   }
@@ -307,6 +327,31 @@ function clip(text: string, max: number): string {
   const last = text.charCodeAt(end - 1)
   if (last >= 0xd800 && last <= 0xdbff) end -= 1
   return `${text.slice(0, end)}…`
+}
+
+/** What stands where `clipMiddle` took text out. */
+const CUT = '\n[…]\n'
+
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff
+
+/**
+ * `text` if it is within `max` characters, else its first and last halves joined by `\n[…]\n`, within `max`, with no half of a
+ * surrogate pair left at either cut. The head gets the odd character. A `max` too small for the mark gives the head alone.
+ */
+export function clipMiddle(text: string, max: number): string {
+  if (text.length <= max) return text
+  if (max <= CUT.length) {
+    let end = Math.max(0, max)
+    if (end > 0 && isHighSurrogate(text.charCodeAt(end - 1))) end -= 1
+    return text.slice(0, end)
+  }
+  const room = max - CUT.length
+  let headEnd = Math.ceil(room / 2)
+  let tailStart = text.length - (room - headEnd)
+  if (isHighSurrogate(text.charCodeAt(headEnd - 1))) headEnd -= 1
+  if (tailStart < text.length && isLowSurrogate(text.charCodeAt(tailStart))) tailStart += 1
+  return `${text.slice(0, headEnd)}${CUT}${text.slice(tailStart)}`
 }
 
 /** The tools whose `command` is the whole of what they run: the two shells. */
@@ -364,43 +409,113 @@ function directoryOf(args: unknown, sessionCwd: string | undefined): string | un
   return resolve(sessionCwd, workdir)
 }
 
-/** The text of a message a human wrote (`source.kind === 'user'`), or `undefined` for any other. */
-function promptText(data: unknown): string | undefined {
-  if (!isRecord(data) || data.role !== 'user') return undefined
-  const source = data.source
-  if (!isRecord(source) || source.kind !== 'user') return undefined
-  const content = data.content
-  if (!Array.isArray(content)) return undefined
-  const parts: string[] = []
-  for (const block of content) {
-    if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+/** What goes between the messages of a task. */
+const SEPARATOR = '\n\n'
+
+/** dsh's first block of a message from another agent (`createAgentMessage` in `dsh-subagent`): `Agent <id> sent a message: `. */
+const AGENT_MESSAGE_LEAD = /^Agent \S+ sent a message:\s*$/
+
+/** The line that stands for the messages a task leaves out. */
+function gapLine(count: number): string {
+  return count === 1 ? '[… 1 earlier message left out]' : `[… ${count} earlier messages left out]`
+}
+
+/** A user message (`role: 'user'`) with its source and the text of its text blocks, or `undefined` for anything else. */
+function userMessage(event: unknown): { source: Record<string, unknown>, texts: string[] } | undefined {
+  if (!isRecord(event) || event.type !== 'user/message') return undefined
+  const data = event.data
+  if (!isRecord(data) || data.role !== 'user' || !isRecord(data.source) || !Array.isArray(data.content)) return undefined
+  const texts: string[] = []
+  for (const block of data.content) {
+    if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') texts.push(block.text)
   }
-  const text = parts.join('\n').trim()
+  return { source: data.source, texts }
+}
+
+/** Text blocks joined by `\n` and trimmed, or `undefined` when nothing is left. */
+function joined(texts: readonly string[]): string | undefined {
+  const text = texts.join('\n').trim()
   return text === '' ? undefined : text
 }
 
+/** The text of a message a human wrote (`source.kind === 'user'`), or `undefined` for any other, or for one with no text. */
+function promptText(event: unknown): string | undefined {
+  const message = userMessage(event)
+  return message?.source.kind === 'user' ? joined(message.texts) : undefined
+}
+
 /**
- * The agent's task: a top-level agent's latest prompt, or a child's brief (its first). `''` when it can't be read, which
- * every way of failing comes to (see the file's notes). Never throws.
+ * A top-level agent's task: its prompts, oldest first, a resend (one equal to the one before it) once, each clipped. The first
+ * and the newest are always in; the ones between are added newest first while the whole stays within `MAX_TASK_CHARS`, and a
+ * gap line stands for those left out.
+ */
+function topLevelTask(events: Iterable<unknown>): string {
+  const prompts: string[] = []
+  let previous: string | undefined
+  for (const event of events) {
+    const text = promptText(event)
+    if (text === undefined || text === previous) continue
+    previous = text
+    prompts.push(clipMiddle(text, MAX_PART_CHARS))
+  }
+  if (prompts.length <= 2) return prompts.join(SEPARATOR)
+  const first = prompts[0]!
+  const newest = prompts.length - 1
+  // `from` is the oldest message kept after the first, and `kept` the length of those from it to the newest, joined.
+  let from = newest
+  let kept = prompts[newest]!.length
+  for (let index = newest - 1; index >= 1; index--) {
+    const withIt = prompts[index]!.length + SEPARATOR.length + kept
+    const gap = index > 1 ? gapLine(index - 1).length + SEPARATOR.length : 0
+    if (first.length + SEPARATOR.length + gap + withIt > MAX_TASK_CHARS) break
+    from = index
+    kept = withIt
+  }
+  return [first, ...from > 1 ? [gapLine(from - 1)] : [], ...prompts.slice(from)].join(SEPARATOR)
+}
+
+/**
+ * A child's task: its brief, and the latest instruction after it, each clipped. The brief is the first text block with
+ * something in it of its first prompt (`source.kind === 'user'`): crew's closing note and dsh's return note are the blocks
+ * after it. An instruction is a later prompt, or a message from its parent (`agent-message` whose `senderSessionId` is
+ * `parent`), without dsh's leading block. With no `parent`, no `agent-message` counts; nothing else ever does.
+ */
+function childTask(events: Iterable<unknown>, parent: string | undefined): string {
+  let brief: string | undefined
+  let latest: string | undefined
+  for (const event of events) {
+    const message = userMessage(event)
+    if (message === undefined) continue
+    const { source, texts } = message
+    if (brief === undefined) {
+      if (source.kind === 'user') brief = texts.map(text => text.trim()).find(text => text !== '')
+      continue
+    }
+    if (source.kind === 'user') {
+      latest = joined(texts) ?? latest
+    } else if (source.kind === 'agent-message' && parent !== undefined && source.senderSessionId === parent) {
+      const lead = texts[0]
+      latest = joined(lead !== undefined && AGENT_MESSAGE_LEAD.test(lead) ? texts.slice(1) : texts) ?? latest
+    }
+  }
+  if (brief === undefined) return ''
+  const task = clipMiddle(brief, MAX_PART_CHARS)
+  return latest === undefined ? task : `${task}${SEPARATOR}${clipMiddle(latest, MAX_PART_CHARS)}`
+}
+
+/**
+ * The agent's task: a top-level agent's first and latest prompts, or a child's brief and its latest instruction (see the
+ * file's notes, and `topLevelTask` and `childTask`). `''` when it can't be read, which every way of failing comes to. Never
+ * throws.
  */
 export function taskOf(agent: GateAgent, topLevel: boolean): string {
   try {
     const session = agent.session
     if (typeof session?.snapshotEvents !== 'function') return ''
-    if (topLevel) {
-      const events = session.snapshotEvents()
-      for (let index = events.length - 1; index >= 0; index--) {
-        const event = events[index]
-        const text = isRecord(event) && event.type === 'user/message' ? promptText(event.data) : undefined
-        if (text !== undefined) return clip(text, MAX_TASK_CHARS)
-      }
-      return ''
-    }
+    if (topLevel) return topLevelTask(session.snapshotEvents())
     const inherited = typeof session.inheritedEventCount === 'number' && session.inheritedEventCount > 0 ? session.inheritedEventCount : 0
-    for (const event of session.snapshotEvents(inherited)) {
-      const text = isRecord(event) && event.type === 'user/message' ? promptText(event.data) : undefined
-      if (text !== undefined) return clip(text, MAX_TASK_CHARS)
-    }
+    const parent = session.header?.parentSession
+    return childTask(session.snapshotEvents(inherited), typeof parent === 'string' && parent !== '' ? parent : undefined)
   } catch {
     // Not a session we can read.
   }
