@@ -1011,7 +1011,7 @@ export function createSkills(api: SkillsApi, config?: ConfigCalls, options: Skil
     if (name === undefined || saved === undefined) return
     const chosen = selection
     patch({ busy: 'delete', notice: undefined })
-    const result = await settle(() => api.remove(name, saved.commit, ''), 'delete')
+    const result = await settle(() => api.deleteSkill(name, saved.commit, ''), 'delete')
     patch({ busy: undefined, ...(chosen === selection ? { confirm: null } : {}) })
     if (!result.ok) {
       await refused(result, name, chosen, 'delete')

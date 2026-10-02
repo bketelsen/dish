@@ -67,6 +67,8 @@
     "@types/react": "~18.3.1"
   },
   "scripts": {
+    "build": "node ../../packages/dish-kit/scripts/build-client.mjs",
+    "dev": "node ../../packages/dish-kit/scripts/build-client.mjs --watch",
     "typecheck": "tsc -p tsconfig.client.json"
   }
 }

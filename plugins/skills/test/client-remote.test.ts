@@ -60,13 +60,13 @@ export type ApiMatchesTheSkillsRemote = [
   Check<Same<Parameters<SkillsApi['check']>, Parameters<SkillsRemote['check']>>>,
   Check<Same<Parameters<SkillsApi['save']>, Parameters<SkillsRemote['save']>>>,
   Check<Same<Parameters<SkillsApi['reset']>, Parameters<SkillsRemote['reset']>>>,
-  Check<Same<Parameters<SkillsApi['remove']>, Parameters<SkillsRemote['remove']>>>,
+  Check<Same<Parameters<SkillsApi['deleteSkill']>, Parameters<SkillsRemote['deleteSkill']>>>,
   Check<Same<CalledOn<'skills'>, ServedBy<'skills'>>>,
   Check<Same<CalledOn<'read'>, ServedBy<'read'>>>,
   Check<Same<CalledOn<'check'>, ServedBy<'check'>>>,
   Check<Same<CalledOn<'save'>, ServedBy<'save'>>>,
   Check<Same<CalledOn<'reset'>, ServedBy<'reset'>>>,
-  Check<Same<CalledOn<'remove'>, ServedBy<'remove'>>>,
+  Check<Same<CalledOn<'deleteSkill'>, ServedBy<'deleteSkill'>>>,
 ]
 
 /** The gateway's source-mode reading of a method's parameter names: the text between its first parentheses, split on commas. */
@@ -79,9 +79,29 @@ function parameterNames(method: (...args: never[]) => unknown): string[] {
 
 test('the descriptors list exactly the methods SkillsRemote marks, no more and no fewer', () => {
   const marked = remoteMethods(Object.create(SkillsRemote.prototype) as SkillsRemote).map(mark => mark.method).sort()
-  assert.deepEqual(marked, ['check', 'read', 'remove', 'reset', 'save', 'skills'])
+  assert.deepEqual(marked, ['check', 'deleteSkill', 'read', 'reset', 'save', 'skills'])
   assert.deepEqual(skillsRemote.descriptors.map(descriptor => descriptor.method).sort(), marked)
   assert.equal(skillsRemote.package, 'dish-skills')
+})
+
+/**
+ * What the browser's namespace service already has: the gateway mounts each descriptor as a method of one Cordis service
+ * per namespace (`RemoteNamespaceService` in `@deepseek-ai/dsh-api-gateway/client`, which isn't exported) and refuses, as
+ * "conflicts with its namespace service", a method named like one of its members, which fails the whole plugin's load. This
+ * is that class's fields and methods in 0.2.0-rc.2, copied; anything an object has (`toString`) is refused the same way.
+ * It was found live: the method that deletes a skill was first called `remove`, one of these, and the page never mounted.
+ */
+const NAMESPACE_SERVICE_MEMBERS = [
+  'ctx', 'empty', 'invokeRemote', 'methods', 'name', 'namespace',
+  'assertMethodAvailable', 'has', 'install', 'installDirect', 'installScoped', 'remove',
+]
+
+test('no method is named like a member of the browser\'s namespace service, which would not mount', () => {
+  for (const descriptor of skillsRemote.descriptors) {
+    const method = descriptor.method
+    assert.ok(!NAMESPACE_SERVICE_MEMBERS.includes(method), `${method} is a member of the gateway's namespace service`)
+    assert.ok(!(method in Object.prototype), `${method} is a member of every object`)
+  }
 })
 
 test('each descriptor is a direct, plain-JSON call in the dishSkills namespace, and sends the parameters the server reads, by name', () => {
@@ -91,7 +111,7 @@ test('each descriptor is a direct, plain-JSON call in the dishSkills namespace, 
     check: ['name', 'text'],
     save: ['name', 'text', 'base', 'note'],
     reset: ['name', 'base', 'note'],
-    remove: ['name', 'base', 'note'],
+    deleteSkill: ['name', 'base', 'note'],
   }
   for (const descriptor of skillsRemote.descriptors) {
     const method = descriptor.method

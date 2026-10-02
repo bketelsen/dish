@@ -21,6 +21,9 @@ export const NOTHING_TO_REVERT = 'Already reverted — nothing to do'
 /** A reset that came back `null`: the skill already is the shipped default. */
 export const ALREADY_DEFAULT = 'Already the default — nothing to do'
 
+/** The Default tab, when what is saved is the shipped default. */
+export const SAME_AS_DEFAULT = 'Same as the default.'
+
 /** Why a shipped skill has no Delete, and what to do instead. */
 export const SHIPPED_NOT_DELETABLE = 'A shipped skill can\'t be deleted: it comes back at the next start. Turn it off with `roles: []` instead.'
 

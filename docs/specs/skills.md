@@ -240,7 +240,7 @@ Remote: Cordis service `dishSkillsRemote`, wire namespace `dishSkills`. Results 
 | `check(name, text)` | `Outcome<{ problems: string[], warnings: string[], summary }>`. `summary` is `null` when there are problems. |
 | `save(name, text, base, note)` | `Outcome<CommitInfo \| null>`. It creates the skill when the path doesn't exist. `base` is the commit the page loaded. |
 | `reset(name, base, note)` | `Outcome<CommitInfo \| null>`. Writes the shipped default; the note defaults to "Reset to the default". `INVALID` for a skill you added. |
-| `remove(name, base, note)` | `Outcome<CommitInfo \| null>`. `INVALID` for a shipped skill: "turn it off with `roles: []` instead". |
+| `deleteSkill(name, base, note)` | `Outcome<CommitInfo \| null>`. `INVALID` for a shipped skill: "turn it off with `roles: []` instead". Not called `remove`: the browser mounts a namespace's methods on a service that already has a `remove`, and refuses the clash, which stops the whole plugin from loading. |
 
 ## Packaging
 

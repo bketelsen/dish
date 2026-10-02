@@ -102,7 +102,7 @@ function shippedInfo(name: string): SkillInfo {
 
 // --- the wire contract ---------------------------------------------------------------------------
 
-const METHODS = ['skills', 'read', 'check', 'save', 'reset', 'remove']
+const METHODS = ['skills', 'read', 'check', 'save', 'reset', 'deleteSkill']
 
 test('SkillsRemote is bound as dishSkillsRemote under the dishSkills namespace, and marks every method', async () => {
   await withRemote(async (remote, _store, ctx) => {
@@ -141,7 +141,7 @@ test('the gateway can read every method\'s parameter names from source, and they
     check: ['name', 'text'],
     save: ['name', 'text', 'base', 'note'],
     reset: ['name', 'base', 'note'],
-    remove: ['name', 'base', 'note'],
+    deleteSkill: ['name', 'base', 'note'],
   }
   for (const method of METHODS) {
     const names = parameterNames((SkillsRemote.prototype as unknown as Record<string, (...args: never[]) => unknown>)[method]!)
@@ -461,7 +461,7 @@ test('read of a skill the user added has no default (an empty string); one that 
     assert.deepEqual(ok(await remote.read('mine')), { text: MINE, commit: await store.head(), defaultText: '', missing: false })
     assert.match(failed(await remote.read('nobody'), 'NOT_FOUND'), /nobody/)
     // Once deleted, a skill the user added is gone for good.
-    ok(await remote.remove('mine', '', ''))
+    ok(await remote.deleteSkill('mine', '', ''))
     failed(await remote.read('mine'), 'NOT_FOUND')
   })
 })
@@ -698,7 +698,7 @@ test('remove deletes a skill the user added, as the user, with the note, and it 
   await withRemote(async (remote, store) => {
     await userWrite(store, 'mine', MINE)
     const { commit } = ok(await remote.read('mine'))
-    const removed = ok(await remote.remove('mine', commit, 'not needed'))
+    const removed = ok(await remote.deleteSkill('mine', commit, 'not needed'))
     plain(removed)
     assert.ok(removed)
     assert.deepEqual(removed.author, { kind: 'user' })
@@ -718,7 +718,7 @@ test('remove of a shipped skill is INVALID and says what to do instead; nothing 
   await withRemote(async (remote, store) => {
     const head = await store.head()
     for (const name of Object.keys(DEFAULTS)) {
-      assert.equal(failed(await remote.remove(name, '', ''), 'INVALID'), SHIPPED_ONLY, name)
+      assert.equal(failed(await remote.deleteSkill(name, '', ''), 'INVALID'), SHIPPED_ONLY, name)
     }
     assert.equal(await store.head(), head)
     assert.equal(await store.read('skills/brainstorming/SKILL.md'), DEFAULTS.brainstorming)
@@ -727,10 +727,10 @@ test('remove of a shipped skill is INVALID and says what to do instead; nothing 
 
 test('remove of a skill that is not in the store is NOT_FOUND', async () => {
   await withRemote(async (remote, store) => {
-    assert.match(failed(await remote.remove('nobody', '', ''), 'NOT_FOUND'), /nobody/)
+    assert.match(failed(await remote.deleteSkill('nobody', '', ''), 'NOT_FOUND'), /nobody/)
     // A shipped skill that was deleted is still shipped: it comes back, and so it can't be removed either.
     await store.write([{ path: pathFor('writing-skills'), delete: true }], { author: { kind: 'user' } })
-    assert.equal(failed(await remote.remove('writing-skills', '', ''), 'INVALID'), SHIPPED_ONLY)
+    assert.equal(failed(await remote.deleteSkill('writing-skills', '', ''), 'INVALID'), SHIPPED_ONLY)
   })
 })
 
@@ -739,9 +739,9 @@ test('remove with a base the document has changed since is CONFLICT, and the doc
     await userWrite(store, 'mine', MINE)
     const { commit } = ok(await remote.read('mine'))
     await userWrite(store, 'mine', MINE_TWO)
-    failed(await remote.remove('mine', commit, ''), 'CONFLICT')
+    failed(await remote.deleteSkill('mine', commit, ''), 'CONFLICT')
     assert.equal(await store.read('skills/mine/SKILL.md'), MINE_TWO)
-    assert.ok(ok(await remote.remove('mine', '', '')))
+    assert.ok(ok(await remote.deleteSkill('mine', '', '')))
     assert.equal(await store.read('skills/mine/SKILL.md'), undefined)
   })
 })
@@ -750,14 +750,14 @@ test('remove deletes a skill that is a problem, so a hand-broken document of the
   await withRemote(async (remote, store, _ctx, repository) => {
     await outsideCommit(repository, [{ path: 'skills/coding/SKILL.md', text: 'broken\n' }])
     assert.match(info(ok(await remote.skills()).skills, 'coding').problem, /frontmatter is missing/)
-    assert.ok(ok(await remote.remove('coding', '', '')))
+    assert.ok(ok(await remote.deleteSkill('coding', '', '')))
     assert.equal(await store.read('skills/coding/SKILL.md'), undefined)
   })
 })
 
 // --- no store ------------------------------------------------------------------------------------
 
-test('without dishConfig, read and skills give the shipped defaults, and save, reset and remove are UNAVAILABLE', async () => {
+test('without dishConfig, read and skills give the shipped defaults, and save, reset and deleteSkill are UNAVAILABLE', async () => {
   await withoutStore(async (remote, ctx) => {
     assert.equal(ctx.get('dishConfig'), undefined)
     const result = ok(await remote.skills())
@@ -775,9 +775,9 @@ test('without dishConfig, read and skills give the shipped defaults, and save, r
 
     assert.match(failed(await remote.save('mine', MINE, '', ''), 'UNAVAILABLE'), /config store/)
     failed(await remote.reset('brainstorming', '', ''), 'UNAVAILABLE')
-    failed(await remote.remove('mine', '', ''), 'UNAVAILABLE')
+    failed(await remote.deleteSkill('mine', '', ''), 'UNAVAILABLE')
     // A shipped skill is refused for its own reason, store or not.
-    assert.equal(failed(await remote.remove('brainstorming', '', ''), 'INVALID'), SHIPPED_ONLY)
+    assert.equal(failed(await remote.deleteSkill('brainstorming', '', ''), 'INVALID'), SHIPPED_ONLY)
     // A reset of a name that has no default is still INVALID, not UNAVAILABLE.
     failed(await remote.reset('mine', '', ''), 'INVALID')
   })
@@ -817,14 +817,14 @@ test('a name that is no skill name is INVALID in every method that takes one', a
       failed(await remote.check(name, MINE), 'INVALID')
       failed(await remote.save(name, MINE, '', ''), 'INVALID')
       failed(await remote.reset(name, '', ''), 'INVALID')
-      failed(await remote.remove(name, '', ''), 'INVALID')
+      failed(await remote.deleteSkill(name, '', ''), 'INVALID')
     }
     for (const name of [undefined, null, 7, {}, ['mine']] as unknown as string[]) {
       failed(await remote.read(name), 'INVALID')
       failed(await remote.check(name, MINE), 'INVALID')
       failed(await remote.save(name, MINE, '', ''), 'INVALID')
       failed(await remote.reset(name, '', ''), 'INVALID')
-      failed(await remote.remove(name, '', ''), 'INVALID')
+      failed(await remote.deleteSkill(name, '', ''), 'INVALID')
     }
   })
 })
@@ -839,7 +839,7 @@ test('the other parameters: a missing one is an empty one, and one that is not a
     assert.equal(await store.read('skills/brainstorming/SKILL.md'), DEFAULTS.brainstorming)
     assert.match(ok(await remote.check('mine', missing)).problems[0]!, /frontmatter is missing/)
     await userWrite(store, 'mine', MINE)
-    assert.ok(ok(await remote.remove('mine', missing, missing)))
+    assert.ok(ok(await remote.deleteSkill('mine', missing, missing)))
 
     failed(await remote.save('mine', 5 as unknown as string, '', ''), 'INVALID')
     failed(await remote.save('mine', MINE, 5 as unknown as string, ''), 'INVALID')
@@ -847,8 +847,8 @@ test('the other parameters: a missing one is an empty one, and one that is not a
     failed(await remote.check('mine', 5 as unknown as string), 'INVALID')
     failed(await remote.reset('brainstorming', null as unknown as string, ''), 'INVALID')
     failed(await remote.reset('brainstorming', '', {} as unknown as string), 'INVALID')
-    failed(await remote.remove('mine', 5 as unknown as string, ''), 'INVALID')
-    failed(await remote.remove('mine', '', ['x'] as unknown as string), 'INVALID')
+    failed(await remote.deleteSkill('mine', 5 as unknown as string, ''), 'INVALID')
+    failed(await remote.deleteSkill('mine', '', ['x'] as unknown as string), 'INVALID')
   })
 })
 
@@ -918,7 +918,7 @@ test('watchLogs sees nothing from a remote doing its work', async () => {
     ok(await remote.read('brainstorming'))
     ok(await remote.check('mine', MINE))
     ok(await remote.save('mine', MINE, '', ''))
-    ok(await remote.remove('mine', '', ''))
+    ok(await remote.deleteSkill('mine', '', ''))
     assert.deepEqual(logs, [])
   })
 })

@@ -30,7 +30,7 @@ export interface SkillsApi {
   check(name: string, text: string): Promise<RemoteResult<Outcome<CheckResult>>>
   save(name: string, text: string, base: string, note: string): Promise<RemoteResult<Outcome<CommitInfo | null>>>
   reset(name: string, base: string, note: string): Promise<RemoteResult<Outcome<CommitInfo | null>>>
-  remove(name: string, base: string, note: string): Promise<RemoteResult<Outcome<CommitInfo | null>>>
+  deleteSkill(name: string, base: string, note: string): Promise<RemoteResult<Outcome<CommitInfo | null>>>
 }
 
 /** Where dish-config's remote stands, as its `watch` reports it. */
@@ -80,5 +80,5 @@ export const skillsRemote: TypertRemoteContribution = remoteContribution('dish-s
   descriptor('check', ['name', 'text']),
   descriptor('save', ['name', 'text', 'base', 'note']),
   descriptor('reset', ['name', 'base', 'note']),
-  descriptor('remove', ['name', 'base', 'note']),
+  descriptor('deleteSkill', ['name', 'base', 'note']),
 ])

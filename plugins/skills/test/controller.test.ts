@@ -190,7 +190,7 @@ class FakeSkills {
       if (shipped === undefined) return refused('INVALID', `"${name}" has no shipped default to go back to`)
       return this.write(name, shipped, base, note)
     },
-    remove: async (name, base, note) => {
+    deleteSkill: async (name, base, note) => {
       this.calls.push(`remove ${name} ${base === '' ? '-' : base.slice(0, 7)} ${note === '' ? '-' : note}`)
       await this.wait('remove')
       if (!this.up) return refused('UNAVAILABLE', 'the config store isn\'t running, so skills can\'t be saved')

@@ -16,7 +16,7 @@
  *   `UNAVAILABLE` for a write with no store running. Anything else is a bug, and is thrown.
  *
  * The store is optional (`dishConfig`) and looked up on every call. Without it `skills`, `read` and `check` answer
- * with the shipped defaults, and `save`, `reset` and `remove` are `UNAVAILABLE`.
+ * with the shipped defaults, and `save`, `reset` and `deleteSkill` are `UNAVAILABLE`.
  *
  * The list is read straight from the store at one commit, not through the service's catalog, so that the commit it
  * reports, the documents it shows and the shipped skills it finds missing are one moment of the store. The catalog
@@ -356,7 +356,7 @@ export class SkillsRemote extends TypertRemoteService {
    * @param note - `''` for none; else why, in a line.
    * @returns the commit.
    */
-  async remove(name: string, base: string, note: string): Promise<Outcome<CommitInfo | null>> {
+  async deleteSkill(name: string, base: string, note: string): Promise<Outcome<CommitInfo | null>> {
     return outcome(async () => {
       const skill = skillName(name)
       const after = stringOf('base', base)
@@ -375,4 +375,4 @@ markRemote(SkillsRemote, 'read')
 markRemote(SkillsRemote, 'check')
 markRemote(SkillsRemote, 'save')
 markRemote(SkillsRemote, 'reset')
-markRemote(SkillsRemote, 'remove')
+markRemote(SkillsRemote, 'deleteSkill')
