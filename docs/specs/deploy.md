@@ -88,7 +88,7 @@ Ownership follows the nsl builder's split ([fleet's nsl builder doc](../../../fl
 ## Reaching it
 
 - **The address** is `https://dish.<tailnet>.ts.net`, from any device on your tailnet.
-- **Signing in.** dsh makes a new random access token each time it starts, and it can't be pinned; it prints the URL with the token on stdout. On the VM that line goes to the unit's journal: `ssh dish@… journalctl --user -u dish-web | grep 'dsh web:'`.
+- **Signing in.** dsh makes a new random access token each time it starts, and it can't be pinned; it prints the URL with the token on stdout. On the VM that line goes to the unit's journal, which you read as root through the guest's admin user `fleet` (the `dish` account has no SSH login): `sudo journalctl _UID="$(id -u dish)" _SYSTEMD_USER_UNIT=dish-web.service | grep 'dsh web:'`.
   - Open it once on the tailnet name, `https://dish.<tailnet>.ts.net/?token=…`. dsh then sets a browser cookie for that name, which lasts 30 days.
   - The cookie survives restarts: it is signed with a secret dsh keeps in its credential file, not with the token. A restart therefore doesn't sign you out, and the token is needed only for a new browser, or every 30 days.
   - The lifetime is `cookieMaxAgeDays` on the `connection` row, if 30 days proves short.

@@ -74,10 +74,10 @@ A restart makes a new access token, but your browser's sign-in carries over (see
 
 ## Signing in
 
-dsh makes a new random access token each time it starts, and prints the URL with it on stdout. On the VM that goes to the unit's journal. As `dish`:
+dsh makes a new random access token each time it starts, and prints the URL with it on stdout. On the VM that goes to the unit's journal. The `dish` account has no SSH login, so read it as root, through the guest's admin user `fleet` (fleet's `docs/dish.md` says how to reach it):
 
 ```sh
-journalctl --user -u dish-web | grep 'dsh web:'
+sudo journalctl _UID="$(id -u dish)" _SYSTEMD_USER_UNIT=dish-web.service | grep 'dsh web:'
 ```
 
 The last match is the current token. Open it once, on the tailnet name:
