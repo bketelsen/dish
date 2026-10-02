@@ -39,6 +39,7 @@ Status: implemented 2026-10-01 (branch `crew`). Implements roadmap step 4. Build
   - The standard preset's `send_message` tool does the same for the model, in both directions.
 - **Finish notices** are fixed text: "Background subagent <id> finished …", the stop reason and the closing message. They have no label, role, model or error.
   - A parent's `agent/pre-step` waterfall can rewrite them. They're user messages whose `source.kind` is `subagent-settled`.
+- **A note appended to a continuable child's task.** `startContinuable` adds a text block after `request.prompt`, only when the child's `send_message` is the standard one. It tells the child its parent's agent id, to send its result to the parent with `send_message` before it finishes, and to send earlier messages too when a finding changes what the parent should do. It lives in `withContinuableReturnGuidance` in `@deepseek-ai/dsh-subagent` (`lib/index.js`, used by the continuable start path), and a follow-up gets none. It is the opposite of how the crew reports, so crew puts a note of its own in front of it and refuses the send (both under [Report guard](#report-guard)). Re-check them when dsh is upgraded: if the note changes or goes, the crew's note and the guard's texts should change with it.
 - **`subagent/end`** gives `{ id, stopReason, lastAssistantMessage }` each time a child finishes a run. `agent/error` gives a live child error.
 - **Tool filters** throw if they name a tool the child can't see, and they're reapplied on reload.
 - **No custom session-log events.** dsh refuses to reload a session whose log contains an event type it doesn't know, so a plugin outside dsh can't journal into the session log the way agent-team does.
@@ -122,6 +123,7 @@ Empty strings are treated as absent. The checks run in this order, before anythi
 7. **Start or send.**
    - **Start:** `startContinuable` with:
      - `label`: `<role> · <model> · <title>`;
+     - `prompt`: the task, and, if the child has `send_message`, a second text block that says its closing message is its report (see [Report guard](#report-guard));
      - `persona`: `dishPrompts.persona(role).prefix`, so the child keeps that text for life; under the dish preset the persona row adds `common.md` and renders variables;
      - `toolFilter`: `{ allow }` (see [Tools](#tools));
      - `agentOptions`: the route;
@@ -130,7 +132,7 @@ Empty strings are treated as absent. The checks run in this order, before anythi
 
    Either way, the record is written.
 
-**`send_message`** stays available for quick questions in both directions: a child asking the main agent something, or the main agent nudging a child. A crew child's `send_message` is limited in length, so that it can't carry a report (see [Report guard](#report-guard)). The limits are enforced on `delegate` only. The main agent's prompt says fix rounds go through `delegate` with `to`, not `send_message`. While everything shares one directory, the writer rule depends on that prompt; step 6's worktrees make it moot.
+**`send_message`** stays available for quick questions in both directions: a child asking the main agent something, or the main agent nudging a child. A crew child can't use it to send its report: a long message is refused, and `send_message` is then closed to that child until its run ends (see [Report guard](#report-guard)). The limits are enforced on `delegate` only. The main agent's prompt says fix rounds go through `delegate` with `to`, not `send_message`. While everything shares one directory, the writer rule depends on that prompt; step 6's worktrees make it moot.
 
 ## Tools
 
@@ -146,14 +148,22 @@ The list is stored in the child's descriptor. So if a tool is later removed from
 
 ### Report guard
 
-A crew child reports once, in its closing message. The guard enforces it: crew registers a `tools/pre-execute` listener that refuses a crew child's `send_message` whose `message` is longer than `messageLimit` characters.
+A crew child reports once, in its closing message. Two things make it so: a note at the start of the child's task, and a guard that refuses the other way.
 
-- **Why.** `dsh web` shows only a turn's last message and folds everything before it. A child that sends its findings with `send_message` and then finishes gives the main agent two deliveries: the message, and the finish notice with the closing message. The main agent answers in two steps, and the fuller answer is the one that gets folded. The crew prompts say not to ("report once, in your closing message"), and some models do it anyway. dsh's own guidance, which it appends to a continuable child's task, tells the child to send its result to its parent with `send_message` before it finishes, so the prompt alone loses. The guard makes it structural.
-- **What it refuses.** A `send_message` from an agent that is not top-level (`isTopLevelAgent`) and that crew's record knows, whose `message` is a string longer than the limit (JS string length). The refusal is a tool error the child reads on its next step: the message reads like a report (its length and the limit), findings go in the closing message, and `send_message` is for a short question while it works. The call does not run, and no listener after the guard hears of it.
-- **What it leaves.** Every other tool; the main agent, which briefs and nudges its children as long as it likes; children that aren't crew's; a `message` that isn't a string (the tool refuses it). The checks go in that order, cheapest first, and the record is read only for a long message from a child, so nearly every tool call costs nothing.
-- **The limit.** `messageLimit` on the `dish-crew` row, a natural number, default 1200: a question is a few sentences, a report is not. `0` turns the guard off. It reads length only. A child could still split a report into short messages; the guard doesn't try to catch that.
-- **It fails open.** If the record can't be read, or takes more than 2 s, the message goes through, with one logged warning for each distinct problem. This is the opposite of the approval guard, which refuses in that case, and for the opposite reason: there the other outcome is a child hung on a prompt nobody sees; here it is a message delivered, which is harmless, while wrongly refusing a real question leaves a child unable to ask for what it is blocked on.
-- **Where it stands.** It is registered on the host, not prepended, before the plugin awaits anything. It only ever denies `send_message`, so its place among the other `tools/pre-execute` listeners makes no difference, and dish-judge's command gate does not gate `send_message`.
+- **Why.** `dsh web` shows only a turn's last message and folds everything before it. A child that sends its findings with `send_message` and then finishes gives the main agent two deliveries: the message, and the finish notice with the closing message. The main agent answers in two steps, and the fuller answer is the one that gets folded. The crew prompts say not to ("report once, in your closing message"), and some models do it anyway, because dsh appends a note to the child's task that says the opposite (see [What dsh gives us](#what-dsh-gives-us-checked-in-020-rc2)). Prompts alone lose, so the call is refused where it is made.
+- **The delegate note.** When `delegate` starts a child that has `send_message` in its allow list, the child's prompt is the task and then a second text block: its closing message is its report, the main agent receives it in full automatically, so it should not send its result with `send_message`, not even a summary or part of it, even though the note after this one says to; `send_message` is for a short question it is blocked on. dsh adds its note under the same condition, after ours. A follow-up (`to`) gets nothing added, as dsh adds nothing to it.
+- **The guard.** crew registers a `tools/pre-execute` listener on the host. The checks, in this order and cheapest first:
+  1. the tool is not `send_message`: `next()`;
+  2. the agent is top-level (`isTopLevelAgent`): `next()`. The main agent briefs and nudges its children as long as it likes;
+  3. the agent was refused earlier in this run: refused again (see below), whatever it sends;
+  4. `message` is not a string, or is at most `messageLimit` characters (JS string length): `next()`. `exec.arguments` is dsh's parsed object, and a message that isn't a string is the tool's to refuse;
+  5. the agent has no id: `next()`;
+  6. the record is asked, last, and only for a long message from a non-top-level agent: a child crew did not start is `next()`; a crew child is refused and held.
+- **What the child reads.** The first refusal is a tool error: the message is its result, its closing message is its report and reaches the main agent in full when it finishes, whatever its task says about `send_message`; resending it shorter or in parts is pointless, because `send_message` is closed to it until it finishes; finish and write the report as the closing message, and if it was a question, put that in the closing message and the main agent will follow up. **It names no length and no limit**: a budget invites the child to shorten or split the message and send it again, which satisfies dsh's note and brings the two deliveries back.
+- **The hold.** The refusal is sticky. Any later `send_message` of that child in the same run is refused, short or not, with a shorter text: closed because its report was refused once, put everything in the closing message, and finish. The guard can't tell a report in pieces from a question, so a child gets one refusal and then no sends. The ids are kept in a bounded set (256, oldest out) of children the record has vouched for, so the check costs no read. crew's `subagent/end` listener opens it for that child, so a follow-up run (`delegate` with `to`) can ask a question again. A restart, or an end that is never heard, loses the hold and not the refusal: the child's next long message is refused as before.
+- **The limit.** `messageLimit` on the `dish-crew` row, a natural number, default 1200: a question is a few sentences, a report is not. `0` turns the guard off.
+- **It fails open.** If the record can't be read, or takes more than 2 s, the message goes through, with one logged warning for each distinct problem. The approval guard refuses in that case, and for the opposite reason: there the other outcome is a child hung on a prompt nobody sees; here it is a message delivered, which is harmless. And the record is read for any long message from any non-top-level agent, so failing closed would refuse other plugins' children whenever crew's disk is broken, and a real question refused for a slow disk leaves a child unable to ask for what it is blocked on.
+- **Where it stands.** It is registered on the host, **prepended**, before the plugin awaits anything. A refusal does not call `next()`, so no later `tools/pre-execute` listener hears of the call: no `PreToolUse` hook, no dsh auto-review classifier (an LLM call) and no workspace-changes recorder, which is the rule dish-judge's own gate follows. The `tools/result` listeners still see the error. dish-judge's gate is prepended as well, and which of the two is first makes no difference for `send_message`: the judge doesn't gate it by default (`tools.gated` is `bash` and `pwsh`) and calls `next()` for what it doesn't gate; when it does gate it, it calls `next()` for an allow or an ask and keeps the stricter answer, which is our deny.
 
 ## The dish preset
 
@@ -210,7 +220,7 @@ Both changes are made to the shipped defaults. Seeding never overwrites, so your
 |---|---|---|---|
 | `dish-crew` | `dataDirectory` | `$XDG_DATA_HOME/dish/crew` | Where records and reports go. |
 | `dish-crew` | `subagentProvider` | `spawn` | The `ctx.subagents` provider for children. |
-| `dish-crew` | `messageLimit` | `1200` | The most characters a crew child's `send_message` may have; `0` turns the report guard off. |
+| `dish-crew` | `messageLimit` | `1200` | The most characters a crew child's `send_message` may have before it is taken for a report and refused, which closes `send_message` to that child until its run ends; `0` turns the report guard off. |
 | `dish-crew` | `terminal` | `true` | Print this plugin's messages. |
 | `dish-crew/delegate` | — | | The preset row: the tool, the notice rewriter. |
 
@@ -225,7 +235,8 @@ Roles, models and limits live in `crew.yaml`, not here.
 - **Follow-ups (`to`):** the role must match, the limits apply, and `sendMessage` is called.
 - **Tool lists:** intersection with visible tools, the pwsh swap, and the never-list.
 - **The record:** atomic writes, reports captured on `subagent/end`, errors from `agent/error`, and pruning.
-- **The report guard:** other tools, the main agent, short messages and non-crew children pass; a long message from a crew child is refused with its length and the limit, at the limit exactly and one over; an unreadable or slow record lets it through with one warning; `0` turns it off; and through the real tool registry, with the plugin's `messageLimit`.
+- **The report guard:** other tools, the main agent, short messages and non-crew children pass; a long message from a crew child is refused, with no number in the reason, at the limit exactly and one over; the child's later messages are refused too, until `subagent/end` for it, and other children are not; the set of held children is bounded; an unreadable or slow record lets a message through with one warning; `0` turns it off; and through the real tool registry, with the plugin's `messageLimit`, a refused call reaching no earlier-registered listener, and the plugin's `subagent/end` listener opening the child again.
+- **The delegate note:** a new child with `send_message` gets the task and then the closing-message note; one without it, or whose parent can't give it, gets the task alone; a follow-up sends the task alone.
 - **The notice rewrite:** a crew child finished, a crew child failed, and a non-crew child left untouched.
 - **The preset generator:** the drift test, and the removed delegation rows.
 

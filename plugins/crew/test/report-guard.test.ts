@@ -3,11 +3,12 @@ import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import { defineTool, ToolRuntime } from '@deepseek-ai/dsh-tools'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
+import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
 import * as plugin from '../src/index.ts'
 import type { DishCrew } from '../src/index.ts'
 import { CrewRecords } from '../src/record.ts'
 import { GUARD_LOOKUP_BUDGET_MS } from '../src/guard.ts'
-import { DEFAULT_MESSAGE_LIMIT, reportGuard } from '../src/report-guard.ts'
+import { DEFAULT_MESSAGE_LIMIT, MAX_REFUSED, reportGuard } from '../src/report-guard.ts'
 import type { ReportGuardDeps } from '../src/report-guard.ts'
 import { dirs, mountCrew, provideStub, watchLogs } from './helpers.ts'
 
@@ -68,10 +69,16 @@ function guardOf(more: Partial<ReportGuardDeps> = {}) {
   return { guard, asked, told }
 }
 
-const reasonFor = (n: number, limit = LIMIT): string =>
-  `That message reads like a report (${n} characters; a crew child's send_message is limited to ${limit} characters). `
-  + 'Don\'t send findings with send_message: finish the work and put your report in your closing message, which the main agent gets when you finish. '
-  + 'Use send_message only for a short question while you work.'
+/** What a child reads the first time: it frames the message as its result, and says nothing of lengths. */
+const REFUSED = 'Not sent: this is your result, and in this crew your closing message is your report. '
+  + 'It reaches the main agent in full, automatically, when you finish, whatever your task says about sending your result with send_message. '
+  + 'Don\'t resend it shorter or in parts: send_message is closed to you until you finish. '
+  + 'Finish the work and write the report as your closing message. '
+  + 'If this was a question you\'re blocked on, put it in your closing message instead; the main agent will follow up.'
+
+/** What it reads for every later send_message in the same run. */
+const CLOSED = 'Not sent: send_message is closed to you until you finish, because your report was refused here once already. '
+  + 'Put everything for the main agent in your closing message, and finish.'
 
 // --- the guard on its own ----------------------------------------------------------------------------
 
@@ -105,16 +112,19 @@ test('a short message from a crew child goes to next(), and the record is not as
   assert.deepEqual(asked, [], 'the cheap checks come first')
 })
 
-test('a long message from a crew child is denied with its length and the limit in the reason, and next() is not called', async () => {
+test('a long message from a crew child is denied, and next() is not called; the reason names no length or limit, so there is nothing to shorten it to', async () => {
   const { guard, asked, told } = guardOf()
   const { spy, next } = nextOf()
   const decision = await guard(execOf(text(2400), { agent: childOf('crew-7') }), next)
-  assert.deepEqual(decision, { kind: 'deny', reason: reasonFor(2400) })
+  assert.deepEqual(decision, { kind: 'deny', reason: REFUSED })
   assert.equal(spy.calls, 0, 'a refused call is not passed on')
   assert.deepEqual(asked, ['crew-7'])
   assert.deepEqual(told, [])
-  assert.match((decision as { reason: string }).reason, /2400 characters; .* limited to 1200 characters\)/)
-  assert.match((decision as { reason: string }).reason, /closing message/)
+  const reason = (decision as { reason: string }).reason
+  assert.doesNotMatch(reason, /\d/, 'no numbers: a limit in the reason is a budget to resend within')
+  assert.doesNotMatch(reason, /\blimit/i)
+  assert.match(reason, /closing message is your report/)
+  assert.match(reason, /Don't resend it shorter or in parts/)
 })
 
 test('exactly the limit goes to next(); one more character is denied', async () => {
@@ -123,7 +133,7 @@ test('exactly the limit goes to next(); one more character is denied', async () 
   assert.deepEqual(await guard(execOf(text(LIMIT)), exact.next), ALLOW)
   assert.equal(exact.spy.calls, 1)
   const over = nextOf()
-  assert.deepEqual(await guard(execOf(text(LIMIT + 1)), over.next), { kind: 'deny', reason: reasonFor(LIMIT + 1) })
+  assert.deepEqual(await guard(execOf(text(LIMIT + 1)), over.next), { kind: 'deny', reason: REFUSED })
   assert.equal(over.spy.calls, 0)
 })
 
@@ -133,7 +143,7 @@ test('the length is the string\'s JS length', async () => {
   const five = nextOf()
   assert.deepEqual(await guard(execOf('😀'.repeat(5)), five.next), ALLOW)
   const six = nextOf()
-  assert.deepEqual(await guard(execOf('😀'.repeat(6)), six.next), { kind: 'deny', reason: reasonFor(12, 10) })
+  assert.deepEqual(await guard(execOf('😀'.repeat(6)), six.next), { kind: 'deny', reason: REFUSED })
 })
 
 test('a child that is not crew\'s goes to next(), however long its message', async () => {
@@ -158,7 +168,7 @@ test('an agent that can not be read is looked up like any child', async () => {
   const { guard, asked } = guardOf()
   const unreadable = { id: 'crew-2', options: {}, get session(): never { throw new Error('the session is gone') } }
   const { spy, next } = nextOf()
-  assert.deepEqual(await guard(execOf(text(5000), { agent: unreadable }), next), { kind: 'deny', reason: reasonFor(5000) })
+  assert.deepEqual(await guard(execOf(text(5000), { agent: unreadable }), next), { kind: 'deny', reason: REFUSED })
   assert.equal(spy.calls, 0)
   assert.deepEqual(asked, ['crew-2'])
 })
@@ -243,6 +253,88 @@ test('the guard never throws for what it is given', async () => {
   for (const exec of [undefined, null, {}, { name: 'send_message' }, { name: 'send_message', arguments: { message: text(5000) } }]) {
     assert.deepEqual(await guard(exec as never, next), ALLOW)
   }
+  for (const id of ['nobody', '', undefined, null, 7, {}]) assert.doesNotThrow(() => { guard.runEnded(id as never) })
+})
+
+// --- a refusal closes send_message until the run ends ------------------------------------------------------
+
+test('after a refusal the same child\'s later send_message is refused too, short or not, without asking the record again; other crew children and other tools are not affected', async () => {
+  const { guard, asked } = guardOf()
+  const first = nextOf()
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-1') }), first.next), { kind: 'deny', reason: REFUSED })
+  assert.deepEqual(asked, ['crew-1'])
+
+  for (const message of ['Which file?', '', text(3), text(5000), undefined, 42]) {
+    assert.deepEqual(await guard(execOf(message, { agent: childOf('crew-1') }), first.next), { kind: 'deny', reason: CLOSED }, String(message))
+  }
+  assert.deepEqual(await guard(execOf(undefined, { agent: childOf('crew-1'), args: undefined }), first.next), { kind: 'deny', reason: CLOSED }, 'whatever the arguments are')
+  assert.equal(first.spy.calls, 0)
+  assert.deepEqual(asked, ['crew-1'], 'the record is not read again: only children it vouched for are held')
+
+  const others = nextOf()
+  assert.deepEqual(await guard(execOf('Which file?', { agent: childOf('crew-2') }), others.next), ALLOW, 'another crew child')
+  assert.deepEqual(await guard(execOf('Which file?', { agent: mainOf('crew-1') }), others.next), ALLOW, 'a top-level agent is checked before the set')
+  assert.deepEqual(await guard(execOf(text(5000), { name: 'bash', agent: childOf('crew-1') }), others.next), ALLOW, 'another tool of the same child')
+  assert.equal(others.spy.calls, 3)
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-2') }), nextOf().next), { kind: 'deny', reason: REFUSED }, 'and the other child is told the first time as well')
+})
+
+test('only a crew child that was refused is held: a child that is not crew\'s, one whose record could not be read, and one that sent a short message are not', async () => {
+  const told: string[] = []
+  let readable = true
+  const guard = reportGuard({
+    messageLimit: LIMIT,
+    isCrewChild: async (id) => { if (!readable) throw new Error('EIO'); return id.startsWith('crew-') },
+    tell: (message) => { told.push(message) },
+  })
+  const { spy, next } = nextOf()
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('stranger') }), next), ALLOW)
+  assert.deepEqual(await guard(execOf('Which file?', { agent: childOf('stranger') }), next), ALLOW)
+  readable = false
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-1') }), next), ALLOW, 'fail open')
+  readable = true
+  assert.deepEqual(await guard(execOf('Which file?', { agent: childOf('crew-1') }), next), ALLOW, 'and it was not held for it')
+  assert.deepEqual(await guard(execOf('Which file?', { agent: childOf('crew-2') }), next), ALLOW)
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-2') }), next), { kind: 'deny', reason: REFUSED }, 'a short message before it changed nothing')
+  assert.equal(spy.calls, 5)
+  assert.equal(told.length, 1)
+})
+
+test('runEnded opens send_message for that child only, and a report in its next run is refused afresh', async () => {
+  const { guard, asked } = guardOf()
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-1') }), nextOf().next), { kind: 'deny', reason: REFUSED })
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-2') }), nextOf().next), { kind: 'deny', reason: REFUSED })
+
+  guard.runEnded('crew-1')
+  const open = nextOf()
+  assert.deepEqual(await guard(execOf('Which file?', { agent: childOf('crew-1') }), open.next), ALLOW)
+  assert.equal(open.spy.calls, 1)
+  assert.deepEqual(await guard(execOf('Which file?', { agent: childOf('crew-2') }), nextOf().next), { kind: 'deny', reason: CLOSED }, 'the other child\'s run has not ended')
+
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-1') }), nextOf().next), { kind: 'deny', reason: REFUSED })
+  assert.deepEqual(await guard(execOf('Which file?', { agent: childOf('crew-1') }), nextOf().next), { kind: 'deny', reason: CLOSED })
+  assert.deepEqual(asked, ['crew-1', 'crew-2', 'crew-1'])
+})
+
+test('the set of refused children is bounded: past MAX_REFUSED the oldest is let go', async () => {
+  assert.ok(MAX_REFUSED >= 100 && MAX_REFUSED <= 1000, 'a few hundred: more than runs at once, and bounded')
+  const { guard } = guardOf({ messageLimit: 10 })
+  for (let i = 0; i < MAX_REFUSED; i++) {
+    assert.deepEqual(await guard(execOf(text(11), { agent: childOf(`crew-${i}`) }), nextOf().next), { kind: 'deny', reason: REFUSED })
+  }
+  assert.deepEqual(await guard(execOf('hi', { agent: childOf('crew-0') }), nextOf().next), { kind: 'deny', reason: CLOSED }, 'all of them are held')
+  // One more: crew-0, the oldest, goes.
+  assert.deepEqual(await guard(execOf(text(11), { agent: childOf('crew-extra') }), nextOf().next), { kind: 'deny', reason: REFUSED })
+  assert.deepEqual(await guard(execOf('hi', { agent: childOf('crew-0') }), nextOf().next), ALLOW, 'the oldest was let go')
+  assert.deepEqual(await guard(execOf('hi', { agent: childOf('crew-1') }), nextOf().next), { kind: 'deny', reason: CLOSED }, 'the rest are held')
+  assert.deepEqual(await guard(execOf('hi', { agent: childOf('crew-extra') }), nextOf().next), { kind: 'deny', reason: CLOSED })
+  assert.deepEqual(await guard(execOf('hi', { agent: childOf(`crew-${MAX_REFUSED - 1}`) }), nextOf().next), { kind: 'deny', reason: CLOSED })
+})
+
+test('with the guard off, a refusal can not have happened: a limit of 0 holds nobody', async () => {
+  const { guard } = guardOf({ messageLimit: 0 })
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-1') }), nextOf().next), ALLOW)
+  assert.deepEqual(await guard(execOf('hi', { agent: childOf('crew-1') }), nextOf().next), ALLOW)
 })
 
 // --- through the plugin and the real tool registry ----------------------------------------------------
@@ -265,6 +357,9 @@ async function mounted(t: { after(fn: () => unknown): void }, config: Partial<pl
     async execute(args) { sent.push({ ...args }); return 'delivered' },
   }))
   const logs = watchLogs(ctx)
+  // A listener from before crew was mounted, standing in for dsh's auto-review and the hooks: it hears every call that reaches it.
+  const heard: string[] = []
+  ctx.on('tools/pre-execute', (exec, next) => { heard.push(String(exec.callId)); return next() })
   const handle = mountCrew(ctx, where.data, config)
   t.after(async () => { await handle.dispose() })
   await handle
@@ -274,22 +369,60 @@ async function mounted(t: { after(fn: () => unknown): void }, config: Partial<pl
   let calls = 0
   const send = (agent: unknown, message: string): Promise<Result> =>
     ctx.tools.execute({ callId: `real-${++calls}` as never, name: 'send_message', arguments: { agent_id: 'main-1', message }, agent: agent as never, signal: new AbortController().signal }) as unknown as Promise<Result>
-  return { ctx, where, crew, sent, logs, handle, send }
+  return { ctx, where, crew, sent, logs, heard, handle, send }
 }
 
 test('the plugin refuses a crew child\'s long send_message in dsh\'s registry, and the tool does not run; a short one, the main agent and a child crew did not start are not touched', async (t) => {
   const w = await mounted(t)
-  const refused = await w.send(childOf('crew-child'), text(2400))
-  assert.equal(refused.isError, true)
-  assert.equal(textOf(refused), `Error: ${reasonFor(2400)}`)
-  assert.deepEqual(w.sent, [], 'it was not delivered')
-
+  // Everything that goes through first, since a refusal closes send_message to that child (see below).
   assert.equal((await w.send(childOf('crew-child'), 'Which of the two config files is the live one?')).isError, false)
   assert.equal((await w.send(childOf('crew-child'), text(LIMIT))).isError, false)
   assert.equal((await w.send(mainOf(), text(5000))).isError, false, 'the main agent')
   assert.equal((await w.send(childOf('stranger'), text(5000))).isError, false, 'a child of some other plugin')
   assert.equal(w.sent.length, 4)
+
+  const refused = await w.send(childOf('crew-child'), text(2400))
+  assert.equal(refused.isError, true)
+  assert.equal(textOf(refused), `Error: ${REFUSED}`)
+  assert.equal(w.sent.length, 4, 'it was not delivered')
   assert.deepEqual(w.logs.filter(line => line.startsWith('[dish-crew] warn:')), [])
+})
+
+/** dsh's `subagent/end` for `id`, as the plugin hears it. */
+function ended(ctx: Context, id: string): void {
+  ctx.emit('subagent/end', { runId: 'run-1', provider: 'spawn', id, local: true, stopReason: 'end_turn' } as unknown as SubagentRunEndInfo)
+}
+
+test('through the registry: after a refusal the child can not send_message until its run ends; another crew child is not affected; a follow-up run can ask again', async (t) => {
+  const w = await mounted(t)
+  await w.crew.records.addChild('main-1', { id: 'crew-other', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic' })
+  assert.equal(textOf(await w.send(childOf('crew-child'), text(2400))), `Error: ${REFUSED}`)
+  for (const message of ['Which file?', text(2400), '']) {
+    const closed = await w.send(childOf('crew-child'), message)
+    assert.equal(closed.isError, true)
+    assert.equal(textOf(closed), `Error: ${CLOSED}`)
+  }
+  assert.deepEqual(w.sent, [], 'nothing was delivered')
+  assert.equal((await w.send(childOf('crew-other'), 'Which file?')).isError, false, 'another crew child')
+  assert.equal((await w.send(mainOf(), 'Go on with the fix.')).isError, false, 'the main agent')
+
+  // The run ends: dsh says so with `subagent/end`, which crew's own listener hears.
+  ended(w.ctx, 'crew-other')
+  assert.equal((await w.send(childOf('crew-child'), 'Which file?')).isError, true, 'the end of another child\'s run does not open it')
+  ended(w.ctx, 'crew-child')
+  assert.equal((await w.send(childOf('crew-child'), 'Which file?')).isError, false, 'a follow-up run may ask again')
+  assert.equal(textOf(await w.send(childOf('crew-child'), text(2400))), `Error: ${REFUSED}`, 'and a report in it is refused afresh')
+})
+
+test('through the registry: the guard is the first to hear a call, so a refused call reaches no listener registered before it', async (t) => {
+  const w = await mounted(t)
+  assert.equal(w.heard.length, 0)
+  assert.equal((await w.send(childOf('crew-child'), 'Which file?')).isError, false)
+  assert.equal(w.heard.length, 1, 'a call that goes on is heard by the others')
+  assert.equal((await w.send(childOf('crew-child'), text(2400))).isError, true)
+  assert.equal(w.heard.length, 1, 'a refused call is not: no hook, auto-review or recorder after the guard hears of it')
+  assert.equal((await w.send(childOf('crew-child'), 'Which file?')).isError, true)
+  assert.equal(w.heard.length, 1, 'nor is one refused because send_message is closed')
 })
 
 test('the limit is the messageLimit setting; 0 turns the guard off', async (t) => {
@@ -297,7 +430,7 @@ test('the limit is the messageLimit setting; 0 turns the guard off', async (t) =
   assert.equal((await small.send(childOf('crew-child'), text(50))).isError, false)
   const refused = await small.send(childOf('crew-child'), text(51))
   assert.equal(refused.isError, true)
-  assert.equal(textOf(refused), `Error: ${reasonFor(51, 50)}`)
+  assert.equal(textOf(refused), `Error: ${REFUSED}`)
 
   const off = await mounted(t, { messageLimit: 0 })
   assert.equal((await off.send(childOf('crew-child'), text(100_000))).isError, false)
@@ -350,8 +483,10 @@ test('the guard is registered before the plugin awaits anything: a crew child is
   await records.flush()
   const loading = mountCrew(ctx, where.data)
   t.after(async () => { await loading.dispose() })
-  // cordis starts `apply` a few microtasks after `plugin()` returns. Microtasks only, so that no file read can finish in between:
-  // `apply` has run as far as its first `await` (the pruning of old records), and no further.
+  // cordis starts `apply` a few microtasks after `plugin()` returns. This loop is deterministic: only microtasks run in it, so no
+  // file read can finish, and `apply` has run as far as its first `await` (the pruning of old records) and no further. How many
+  // ticks cordis needs before `apply` starts is cordis's scheduling, not ours: if an upgrade needs more than 50, the call below
+  // goes through unguarded and this test fails loudly (the call is not refused) instead of flaking.
   for (let tick = 0; tick < 50; tick++) await Promise.resolve()
   assert.equal(ctx.get('dishCrew'), undefined, 'not provided yet: apply has not finished')
   const result = await ctx.tools.execute({
@@ -362,6 +497,6 @@ test('the guard is registered before the plugin awaits anything: a crew child is
     signal: new AbortController().signal,
   }) as unknown as Result
   assert.equal(result.isError, true)
-  assert.equal(textOf(result), `Error: ${reasonFor(5000)}`)
+  assert.equal(textOf(result), `Error: ${REFUSED}`)
   await loading
 })

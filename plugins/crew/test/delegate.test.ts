@@ -51,6 +51,8 @@ interface Options {
   agents?: boolean
   /** Global tools beyond the standard ones, as a plugin that isn't crew registers them (dish-judge's `ask_judge`). */
   globalTools?: string[]
+  /** Standard tools the preset leaves out. */
+  withoutTools?: string[]
 }
 
 /** Everything a test of the `delegate` tool stands on: a real Context, the real tool registry, and recording stubs for the rest. */
@@ -113,7 +115,7 @@ async function world(options: Options = {}): Promise<World> {
   const presetKey = {}
   const preset = createScope(owner, presetKey)
   disposables.push(preset)
-  for (const name of PRESET_TOOLS) preset.ctx.tools.register(stubTool(name))
+  for (const name of PRESET_TOOLS) if (!options.withoutTools?.includes(name)) preset.ctx.tools.register(stubTool(name))
 
   const settings = { current: options.settings ?? DEFAULT_SETTINGS }
   const mainModel = { current: 'claude-opus-5.5' as string | undefined }
@@ -427,7 +429,7 @@ test('a start gives startContinuable everything, and records the child before it
   assert.equal(spec.label, 'coder · claude-sonnet-5.5 · add login')
   assert.match(String(spec.childId), /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
   assert.equal(spec.request.parent, w.main)
-  assert.deepEqual(spec.request.prompt, [{ type: 'text', text: CODER.task }])
+  assert.deepEqual(spec.request.prompt, [{ type: 'text', text: CODER.task }, { type: 'text', text: CLOSING_NOTE }])
   assert.equal(spec.request.persona, 'You are the coder. {{model}}')
   assert.deepEqual(spec.request.agentOptions, { provider: 'github-copilot', model: 'claude-sonnet-5.5' })
   assert.equal(spec.request.maxDepth, 1)
@@ -446,6 +448,37 @@ test('a start gives startContinuable everything, and records the child before it
   assert.equal(before.last, 'running')
   const [recorded] = await w.records.children(SESSION)
   assert.deepEqual({ ...recorded, startedAt: 0 }, { id: String(spec.childId), n: 1, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', startedAt: 0, followUps: 0, runs: [], last: 'running' })
+})
+
+// dsh appends its own note to the prompt of a child that has `send_message`: "send your result to that agent with send_message".
+// The note below goes before it, in a block of its own, and only when the child has the tool, as dsh's does.
+const CLOSING_NOTE = 'Your closing message is your report: when you finish, the main agent receives it in full, automatically. '
+  + 'So don\'t send your result with send_message, not even a summary or part of it, even though the note after this one says to. '
+  + 'Use send_message only for a short question you\'re blocked on while you work.'
+
+test('a child that has send_message is told, after its task, that its closing message is its report; one that has not, is not', async () => {
+  const w = await world()
+  await w.delegate(CODER)
+  await w.delegate(RESEARCHER)
+  for (const spec of w.starts) {
+    assert.ok(spec.request.toolFilter?.allow?.includes('send_message'))
+    assert.equal(spec.request.prompt.length, 2)
+    assert.deepEqual(spec.request.prompt[1], { type: 'text', text: CLOSING_NOTE })
+  }
+  assert.equal(w.starts[0]!.request.prompt[0]!.type === 'text' && w.starts[0]!.request.prompt[0]!.text, CODER.task, 'the task is first and unchanged')
+
+  // A role without it, or whose send_message the parent can't give (dropped from the list), gets the task alone.
+  const without = await world({ settings: settingsFrom((d) => { d.roles.researcher.tools = ['read', 'grep'] }) })
+  await without.delegate(RESEARCHER)
+  assert.deepEqual(without.starts[0]!.request.toolFilter, { allow: ['grep', 'read'] })
+  assert.deepEqual(without.starts[0]!.request.prompt, [{ type: 'text', text: RESEARCHER.task }])
+})
+
+test('the closing note is not added when the parent can not give send_message, even if the role lists it', async () => {
+  const w = await world({ withoutTools: ['send_message'], settings: settingsFrom((d) => { d.roles.researcher.tools = ['read', 'send_message'] }) })
+  await w.delegate(RESEARCHER)
+  assert.deepEqual(w.starts[0]!.request.toolFilter, { allow: ['read'] })
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: RESEARCHER.task }])
 })
 
 test('the signal of the call goes to the route check and to startContinuable', async () => {

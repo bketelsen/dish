@@ -16,9 +16,10 @@
  * - guards its children's approvals (see `guard.ts`): an `approval/request` listener that refuses a crew child's request when
  *   dish-judge, whose answerer is the only one a child has, is not loaded. It is registered before anything is awaited, so there is
  *   no start-up window without it;
- * - guards its children's reports (see `report-guard.ts`): a `tools/pre-execute` listener that refuses a crew child's
- *   `send_message` longer than `messageLimit` characters, so that a child reports once, in its closing message, and the main
- *   agent gets one delivery. Registered with the approval guard, before anything is awaited;
+ * - guards its children's reports (see `report-guard.ts`): a prepended `tools/pre-execute` listener that refuses a crew child's
+ *   `send_message` longer than `messageLimit` characters and then closes `send_message` to that child until its run ends
+ *   (`subagent/end` opens it), so that a child reports once, in its closing message, and the main agent gets one delivery.
+ *   Registered with the approval guard, before anything is awaited;
  * - claims `crew.yaml` in the store and seeds it when `dishConfig` is there. `dishConfig` is optional, so there is no
  *   order to keep: with no store, every answer is the shipped default;
  * - logs as `dish-crew`.
@@ -84,7 +85,7 @@ export const Config: Schema<Config> = Schema.object({
   subagentProvider: Schema.string().default('spawn')
     .description('The ctx.subagents provider that creates the crew\'s children in-process.'),
   messageLimit: Schema.natural().default(DEFAULT_MESSAGE_LIMIT)
-    .description('The most characters a crew child\'s send_message may have. A longer one is refused with a note to put its report in its closing message, which is how the main agent gets one delivery and not two. 0 turns this off.'),
+    .description('The most characters a crew child\'s send_message may have. A longer one is taken for the child\'s report: it is refused, and send_message stays closed to that child until it finishes, so that its closing message is its report and the main agent gets one delivery, not two. 0 turns this off.'),
   terminal: Schema.boolean().default(true)
     .description('Print this plugin\'s messages to the terminal.'),
 })
@@ -245,16 +246,20 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     },
   }), { prepend: true })
 
-  // A crew child reports once, in its closing message: a `send_message` longer than `messageLimit` is refused with a note that says
-  // so (see `report-guard.ts`). Not prepended, unlike the guard above: this one only ever denies `send_message`, so where it stands
-  // among the other `tools/pre-execute` listeners changes nothing (dish-judge's command gate does not gate `send_message`, and
-  // whatever else listens would see the call, or not, the same either way). It says each distinct problem once itself. Before the
-  // first `await`, like the listeners above and below.
-  ctx.on('tools/pre-execute', reportGuard({
+  // A crew child reports once, in its closing message: a `send_message` longer than `messageLimit` is refused, and the child may not
+  // send another until its run ends (see `report-guard.ts`; `subagent/end` below opens it). Prepended, like the guard above, so
+  // that a call it refuses reaches nothing after it: no PreToolUse hook, no auto-review classifier (an LLM call) and no
+  // workspace-changes recorder, which is the judge's own rule for its gate (`plugins/judge/src/gate.ts`). The judge's gate is
+  // prepended as well, so which of the two is first is up to the load order, and it makes no difference for `send_message`: the gate
+  // doesn't gate `send_message` by default (`tools.gated`) and calls `next()` for any call it doesn't gate, and when it does gate
+  // one it calls `next()` for an allow or an ask and keeps the stricter answer, which is our deny. It says each distinct problem
+  // once itself. Before the first `await`, like the listeners above and below.
+  const report = reportGuard({
     messageLimit: config.messageLimit,
     isCrewChild,
     tell: (message) => { warn('%s', message) },
-  }))
+  })
+  ctx.on('tools/pre-execute', report, { prepend: true })
 
   // The error each crew child's agent last reported, until its `subagent/end`. The promise answers whether the agent is a
   // crew child (the record has to be asked), and an agent that isn't takes its entry out, so what is kept is the
@@ -335,6 +340,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const event: unknown = info
       const id = idOf(event)
       if (id === undefined) return
+      // The run is over: the child may send_message again in its next one (a follow-up, `delegate` with `to`).
+      report.runEnded(id)
       const { stopReason, lastAssistantMessage } = event as { stopReason?: unknown, lastAssistantMessage?: unknown }
       const error = remembered.get(id)
       remembered.delete(id)
