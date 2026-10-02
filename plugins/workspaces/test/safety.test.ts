@@ -83,7 +83,7 @@ test('every allowed key passes, as git writes it', async () => {
 test('ALLOWED lists exactly the plan\'s keys', () => {
   const strings = ALLOWED.filter((entry): entry is string => typeof entry === 'string').sort()
   assert.deepEqual(strings, [
-    'core.bare', 'core.filemode', 'core.ignorecase', 'core.logallrefupdates', 'core.precomposeunicode', 'core.repositoryformatversion',
+    'core.bare', 'core.filemode', 'core.hookspath', 'core.ignorecase', 'core.logallrefupdates', 'core.precomposeunicode', 'core.repositoryformatversion',
     'core.symlinks', 'credential.interactive', 'extensions.objectformat', 'extensions.refstorage', 'fetch.prune', 'init.defaultbranch',
     'pull.ff', 'pull.rebase', 'push.autosetupremote', 'push.default', 'user.email', 'user.name',
   ])
@@ -93,17 +93,29 @@ test('ALLOWED lists exactly the plan\'s keys', () => {
     'remote.origin.url', 'remote.origin.fetch', 'remote.origin.pushurl', 'remote.origin.prune', 'remote.origin.tagopt',
     'branch.main.remote', 'branch.main.merge', 'branch.main.rebase', 'branch.main.pushremote', 'branch.main.description',
     'credential.https://github.com.helper', 'credential.https://github.com.usehttppath',
+    'submodule.vendor/sub.url', 'submodule.vendor/sub.active',
   ]) assert.equal(matches(key), true, key)
   for (const key of [
     'remote.origin.uploadpack', 'remote.origin.receivepack', 'remote.origin.vcs', 'remote.origin.proxy', 'branch.main.vscode',
     'credential.helper', 'credential.https://github.com.username', 'filter.lfs.smudge', 'url.x.insteadof', 'remote..url',
+    'submodule.vendor.update', 'submodule.vendor.branch', 'submodule.recurse',
   ]) assert.equal(matches(key), false, key)
 })
 
 test('configProblem: section and variable names are compared as git does, without case; subsections keep theirs', () => {
   assert.equal(configProblem([['Core.Bare', 'false'], ['REMOTE.origin.URL', 'https://x.invalid/r.git']]), undefined)
-  assert.match(configProblem([['Core.HooksPath', '/x']]) ?? '', /core\.hookspath/)
+  assert.match(configProblem([['Core.SshCommand', '/x']]) ?? '', /core\.sshcommand/)
   assert.match(configProblem([[`credential.HTTPS://GITHUB.COM.helper`, HELPER]], EXPECT) ?? '', /another origin/)
+})
+
+test('configProblem: what a JS or submodule setup writes is allowed: dish overrides hooksPath, and never recurses', () => {
+  // husky's `prepare` sets core.hooksPath; dish's git (-c) and setup's (GIT_CONFIG_COUNT) set it to /dev/null over it.
+  assert.equal(configProblem([['core.hooksPath', '.husky/_']]), undefined)
+  // `git submodule update --init` writes url and active; a helper-transport URL or a leading dash is still refused.
+  assert.equal(configProblem([['submodule.vendor/sub.url', 'https://github.com/acme/sub.git'], ['submodule.vendor/sub.active', 'true']]), undefined)
+  assert.match(configProblem([['submodule.vendor.url', 'ext::sh -c x']]) ?? '', /submodule\.vendor\.url/)
+  assert.match(configProblem([['submodule.vendor.url', '-u/x']]) ?? '', /submodule\.vendor\.url/)
+  assert.match(configProblem([['submodule.vendor.update', '!sh -c x']]) ?? '', /submodule\.vendor\.update/)
 })
 
 test('configProblem: a key with no value counts as true, as in git', () => {
@@ -114,8 +126,7 @@ test('configProblem: a key with no value counts as true, as in git', () => {
 
 /** What an agent might write into `.git/config` of a clone dish set up, the key the refusal must name, and the expectations (EXPECT if none). */
 const PLANTS: ReadonlyArray<readonly [string, string, CloneExpectations | undefined]> = [
-  ['[core]\n\thooksPath = /x\n', 'core.hookspath', undefined],
-  ['[Core]\n\tHooksPath = /x\n', 'core.hookspath', undefined],
+  ['[Core]\n\tSshCommand = /x\n', 'core.sshcommand', undefined],
   ['[core]\n\tfsmonitor = /x\n', 'core.fsmonitor', undefined],
   ['[core]\n\tsshCommand = /x\n', 'core.sshcommand', undefined],
   ['[core]\n\tpager = /x\n', 'core.pager', undefined],
@@ -147,6 +158,8 @@ const PLANTS: ReadonlyArray<readonly [string, string, CloneExpectations | undefi
   ['[gpg]\n\tprogram = /x\n', 'gpg.program', undefined],
   ['[sequence]\n\teditor = /x\n', 'sequence.editor', undefined],
   ['[submodule]\n\trecurse = true\n', 'submodule.recurse', undefined],
+  ['[submodule "vendor"]\n\tupdate = !sh -c x\n', 'submodule.vendor.update', undefined],
+  ['[submodule "vendor"]\n\turl = ext::sh -c x\n', 'submodule.vendor.url', undefined],
   ['[credential "https://github.com"]\n\thelper = !evil\n', 'credential.https://github.com.helper', EXPECT],
   ['[credential "https://github.com"]\n\tuseHttpPath = false\n', 'credential.https://github.com.usehttppath', EXPECT],
   ['[credential "https://evil.example"]\n\thelper =\n', 'credential.https://evil.example.helper', EXPECT],

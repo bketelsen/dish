@@ -43,7 +43,11 @@ export type SafetyResult = { ok: true } | { ok: false, problem: string }
 export const ALLOWED: readonly (string | RegExp)[] = Object.freeze([
   'core.repositoryformatversion', 'core.filemode', 'core.bare', 'core.logallrefupdates', 'core.ignorecase',
   'core.precomposeunicode', 'core.symlinks',
+  // A JS project's setup (husky's `prepare`) sets it; dish's git and setup's override it with core.hooksPath=/dev/null.
+  'core.hookspath',
   /^remote\.(?<name>.+)\.(?:url|fetch|pushurl|prune|tagopt)$/,
+  // `git submodule update --init` (a setup's, or an agent's) writes these; dish's git never recurses into submodules.
+  /^submodule\.(?<name>.+)\.(?:url|active)$/,
   /^branch\.(?<name>.+)\.(?:remote|merge|rebase|pushremote|description)$/,
   'user.name', 'user.email',
   'credential.interactive',
@@ -103,7 +107,7 @@ function valueProblem(key: string, value: string, expect: CloneExpectations): st
   if (key === 'pull.rebase' || /^branch\..+\.rebase$/.test(key)) {
     return ['true', 'false', 'merges'].includes(value) ? undefined : `${shown} must be true, false or merges`
   }
-  if (/^remote\..+\.(?:url|pushurl)$/.test(key) || /^branch\..+\.(?:remote|pushremote)$/.test(key)) {
+  if (/^remote\..+\.(?:url|pushurl)$/.test(key) || /^branch\..+\.(?:remote|pushremote)$/.test(key) || /^submodule\..+\.url$/.test(key)) {
     const problem = urlProblem(value)
     if (problem !== undefined) return `${shown} ${problem}`
     if (key === 'remote.origin.url' && expect.url !== undefined && value !== expect.url) return `remote.origin.url is not ${expect.url}`

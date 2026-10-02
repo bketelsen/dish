@@ -61,19 +61,10 @@ const GROUP_POLL_MS = 50
 const PIPE_GRACE_MS = 1_000
 /** The longest delay `setTimeout` takes. */
 const MAX_TIMER_MS = 2 ** 31 - 1
-/** Turns off the commit-graph file for one git call: a forged one lies about parents. */
-// SAFE_FLAGS carries core.commitGraph=false too (on `projects`, after this module was written); this stays as a belt.
-const NO_COMMIT_GRAPH: readonly string[] = ['-c', 'core.commitGraph=false']
 /** The start of every reason that comes from not hearing GitHub's word. */
 const UNCONFIRMED = "couldn't confirm the default branch with GitHub"
 
-/**
- * Settings `projects`' SAFE_FLAGS has (Tasks 3a's and 3b's reviews) that this branch's copy may lack. Each is added to
- * setup's git config unless SAFE_FLAGS already sets its key; once SAFE_FLAGS carries both, this list can go.
- */
-const SAFE_SETTINGS_TO_COME: ReadonlyArray<readonly [string, string]> = [['credential.interactive', 'false'], ['core.commitGraph', 'false']]
-
-/** What SAFE_FLAGS sets, as `[key, value]` pairs (the one list both dish's git and setup's draw from), and the settings to come. */
+/** What SAFE_FLAGS sets, as `[key, value]` pairs: the one list both dish's git and setup's draw from. */
 function safeSettings(): Array<[string, string]> {
   const pairs: Array<[string, string]> = []
   for (let index = 0; index < SAFE_FLAGS.length; index += 2) {
@@ -81,9 +72,6 @@ function safeSettings(): Array<[string, string]> {
     const equals = setting?.indexOf('=') ?? -1
     if (SAFE_FLAGS[index] !== '-c' || setting === undefined || equals <= 0) throw new Error('SAFE_FLAGS must be -c key=value pairs')
     pairs.push([setting.slice(0, equals), setting.slice(equals + 1)])
-  }
-  for (const [key, value] of SAFE_SETTINGS_TO_COME) {
-    if (!pairs.some(([known]) => known.toLowerCase() === key.toLowerCase())) pairs.push([key, value])
   }
   return pairs
 }
@@ -497,7 +485,7 @@ function aborted(): MergedCheck {
 
 /** Run dish's git in `dir`, the commit-graph file off. */
 function gitIn(dir: string, args: readonly string[], signal?: AbortSignal): Promise<GitResult> {
-  return git([...NO_COMMIT_GRAPH, '-C', dir, ...args], { signal, env: { ...internals.gitEnv } })
+  return git(['-C', dir, ...args], { signal, env: { ...internals.gitEnv } })
 }
 
 /** GitHub's default branch tip: `ls-remote --symref origin HEAD`, which must name `refs/heads/<defaultBranch>`, and whose sha must be in the clone. */
