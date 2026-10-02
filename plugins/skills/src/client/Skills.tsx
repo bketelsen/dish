@@ -62,7 +62,7 @@ export function Skills(props: Props) {
       {listed && (
         <div className="dish-skills-layout">
           <div className="dish-skills-side">
-            <NewSkill disabled={storeless} startNew={props.startNew} />
+            <NewSkill disabled={storeless} opened={state.creating ? selected : undefined} startNew={props.startNew} />
             {storeless && <p className="dish-skills-muted">The config store isn't running, so skills are read-only.</p>}
             <SkillList state={state} select={(name) => { void props.select(name) }} />
           </div>
@@ -79,13 +79,20 @@ export function Skills(props: Props) {
   )
 }
 
-/** The name of a new skill, and the button that opens the editor on it. Nothing is stored until the editor's Save. */
-function NewSkill({ disabled, startNew }: { disabled: boolean, startNew: (name: string) => Promise<boolean> }) {
+/**
+ * The name of a new skill, and the button that opens the editor on it. Nothing is stored until the editor's Save.
+ * @param opened - the new skill the editor is open on, if any. The field is emptied when the editor opens on the name in it, and
+ *   not before: a refused name stays to be fixed, and so does one that only asked about unsaved changes first ("Keep editing").
+ */
+function NewSkill({ disabled, opened, startNew }: { disabled: boolean, opened: string | undefined, startNew: (name: string) => Promise<boolean> }) {
   const [name, setName] = useState('')
+  useEffect(() => {
+    // Runs when the editor opens on a new skill, with the field as it is now.
+    if (opened !== undefined && opened === name.trim()) setName('')
+  }, [opened]) // eslint-disable-line react-hooks/exhaustive-deps
   const submit = (event: FormEvent): void => {
     event.preventDefault()
-    // A refused name stays in the field to be fixed; the page's notice says why.
-    void startNew(name).then((accepted) => { if (accepted) setName('') })
+    void startNew(name)
   }
   return (
     <form className="dish-skills-new" onSubmit={submit} aria-label="New skill">

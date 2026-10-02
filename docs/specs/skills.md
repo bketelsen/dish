@@ -240,7 +240,7 @@ Remote: Cordis service `dishSkillsRemote`, wire namespace `dishSkills`. Results 
 | `check(name, text)` | `Outcome<{ problems: string[], warnings: string[], summary }>`. `summary` is `null` when there are problems. |
 | `save(name, text, base, note)` | `Outcome<CommitInfo \| null>`. It creates the skill when the path doesn't exist. `base` is the commit the page loaded. |
 | `reset(name, base, note)` | `Outcome<CommitInfo \| null>`. Writes the shipped default; the note defaults to "Reset to the default". `INVALID` for a skill you added. |
-| `deleteSkill(name, base, note)` | `Outcome<CommitInfo \| null>`. `INVALID` for a shipped skill: "turn it off with `roles: []` instead". Not called `remove`: the browser mounts a namespace's methods on a service that already has a `remove`, and refuses the clash, which stops the whole plugin from loading. |
+| `deleteSkill(name, base, note)` | `Outcome<CommitInfo \| null>`. `INVALID` for a shipped skill: "turn it off with `roles: []` instead". |
 
 ## Packaging
 
@@ -313,6 +313,7 @@ Live (needs you):
 - **Ruling: a store with no skill documents (and no problems) serves the shipped defaults,** at commit `null` — so agents are never left without skills for want of a seed, which covers a store before its first seed and one whose seed failed. A store whose documents are all problems doesn't: that is an answer, and the page shows the problems. The cost if wrong is low: agents see the shipped skills where the store would show none.
 - **Seeding.** `seed(..., { replace })` and `defaults/previous.json` are as above. The content commits were squashed before `previous.json` was generated, so it lists only texts that shipped, not drafts. Prompts' `previous.json` lists the earlier shipped prompt texts, so the VM's unedited prompts move to the new ones at its next start.
 - **`dish-skills/skill` is exported** (`package.json` exports `./skill`) for dish-prompts' test of skill mentions. It parses the shipped skills, checks their roles, and finds their directory through this export, without loading the plugin.
+- **The delete method is `deleteSkill`, not `remove`.** dsh's `RemoteNamespaceService` (the browser's service for a namespace's methods) has a `remove` of its own, so `$mount` refused the namespace and the page failed to activate. The mocked tests couldn't see it; running the page in a scratch dsh profile did. `remoteContribution` in dish-kit now refuses any method named like one of that service's members, for every plugin's descriptors, when the page module loads. The controller's action is still `remove`.
 - **The prompts reset note** now defaults to "Reset to the default", and the backlog item is closed.
 - **The ledger lives in the working directory.** `subagent-driven-development` and `executing-plans` keep it at a git-ignored `.worktrees/<plan file name>-ledger.md`. Under dsh's sandbox a write outside the workspace asks for approval every time, so a ledger kept elsewhere would interrupt every task.
 - **`common.md`'s skill rule yields to the brief:** "load it … unless your brief says not to". A pressure-test child, as `writing-skills` runs them, can then be told not to load the skill under test.

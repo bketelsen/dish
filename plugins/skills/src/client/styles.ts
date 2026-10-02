@@ -432,11 +432,8 @@ div.dish-skills-item:hover {
   color: var(--dsw-alias-label-primary);
 }
 
-/* What the last thing did. It stays at the top of the view: a save is made at the bottom of a long document, far from the page's head. */
+/* What the last thing did. The notice bar stays at the top of the view: a save is made at the bottom of a long document, far from the page's head. A load error is part of its view and does not. */
 .dish-skills-notice {
-  position: sticky;
-  top: 0;
-  z-index: 1;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -445,6 +442,11 @@ div.dish-skills-item:hover {
   border: 0.5px solid var(--dsw-alias-border-l3);
   border-radius: var(--dsw-radius-md);
   background: var(--dsw-alias-settings-card-fill);
+}
+.dish-skills-notice-bar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 .dish-skills-notice-body {
   display: flex;

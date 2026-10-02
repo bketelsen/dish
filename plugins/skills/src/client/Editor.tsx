@@ -132,12 +132,12 @@ function CheckPanel({ state }: { state: PageState }) {
 
 /** The button, and when it is pressed a question first: a delete is a commit, and the skill closes after it. */
 function DeleteControl({ name, state, actions }: { name: string, state: PageState, actions: Actions }) {
-  const { confirm, busy, dirty, hasHistory } = state
+  const { confirm, busy, dirty, hasHistory, readOnly } = state
   const working = busy === 'delete'
   if (confirm !== 'delete' && !working) {
     return (
       <div className="dish-skills-actions">
-        <Button className="dish-skills-danger" variant="outline" size="sm" disabled={busy !== undefined} onClick={actions.askDelete}>
+        <Button className="dish-skills-danger" variant="outline" size="sm" disabled={readOnly || busy !== undefined} onClick={actions.askDelete}>
           Delete
         </Button>
       </div>
@@ -151,7 +151,7 @@ function DeleteControl({ name, state, actions }: { name: string, state: PageStat
         {dirty ? ' Your unsaved edit is dropped too.' : ''}
       </p>
       <div className="dish-skills-actions">
-        <Button variant="primary" size="sm" disabled={busy !== undefined} onClick={() => { void actions.remove() }}>
+        <Button variant="primary" size="sm" disabled={readOnly || busy !== undefined} onClick={() => { void actions.remove() }}>
           {working ? 'Deleting…' : 'Delete'}
         </Button>
         <Button variant="ghost" size="sm" disabled={working} onClick={actions.cancelConfirm}>Cancel</Button>

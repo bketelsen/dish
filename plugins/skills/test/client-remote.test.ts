@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
-import { jsonCodec } from 'dish-kit/client'
+import { RESERVED_REMOTE_METHODS, jsonCodec } from 'dish-kit/client'
 import type { FileDiff } from 'dish-kit/ui/diff'
 import type { CommitInfo as StoreCommit, ConfigEvent as StoreEvent, FileDiff as StoreDiff } from '../../config/src/protocol.ts'
 import type { ConfigRemote } from '../../config/src/remote.ts'
@@ -84,22 +84,14 @@ test('the descriptors list exactly the methods SkillsRemote marks, no more and n
   assert.equal(skillsRemote.package, 'dish-skills')
 })
 
-/**
- * What the browser's namespace service already has: the gateway mounts each descriptor as a method of one Cordis service
- * per namespace (`RemoteNamespaceService` in `@deepseek-ai/dsh-api-gateway/client`, which isn't exported) and refuses, as
- * "conflicts with its namespace service", a method named like one of its members, which fails the whole plugin's load. This
- * is that class's fields and methods in 0.2.0-rc.2, copied; anything an object has (`toString`) is refused the same way.
- * It was found live: the method that deletes a skill was first called `remove`, one of these, and the page never mounted.
- */
-const NAMESPACE_SERVICE_MEMBERS = [
-  'ctx', 'empty', 'invokeRemote', 'methods', 'name', 'namespace',
-  'assertMethodAvailable', 'has', 'install', 'installDirect', 'installScoped', 'remove',
-]
-
+// dish-kit's `remoteContribution` refuses these names when the descriptors are built (the gateway's namespace service has
+// them as members and would not mount the method, which fails the whole plugin's load). It was found live: the method that
+// deletes a skill was first called `remove`. This keeps the guard from being loosened.
 test('no method is named like a member of the browser\'s namespace service, which would not mount', () => {
+  assert.ok(RESERVED_REMOTE_METHODS.includes('remove'))
   for (const descriptor of skillsRemote.descriptors) {
     const method = descriptor.method
-    assert.ok(!NAMESPACE_SERVICE_MEMBERS.includes(method), `${method} is a member of the gateway's namespace service`)
+    assert.ok(!RESERVED_REMOTE_METHODS.includes(method), `${method} is a member of the gateway's namespace service`)
     assert.ok(!(method in Object.prototype), `${method} is a member of every object`)
   }
 })

@@ -692,9 +692,9 @@ test('reset with a stale base is CONFLICT; a skill with no shipped default can\'
   })
 })
 
-// --- remove --------------------------------------------------------------------------------------
+// --- deleteSkill --------------------------------------------------------------------------------------
 
-test('remove deletes a skill the user added, as the user, with the note, and it is gone from the list', async () => {
+test('deleteSkill deletes a skill the user added, as the user, with the note, and it is gone from the list', async () => {
   await withRemote(async (remote, store) => {
     await userWrite(store, 'mine', MINE)
     const { commit } = ok(await remote.read('mine'))
@@ -714,7 +714,7 @@ test('remove deletes a skill the user added, as the user, with the note, and it 
   })
 })
 
-test('remove of a shipped skill is INVALID and says what to do instead; nothing is written', async () => {
+test('deleteSkill of a shipped skill is INVALID and says what to do instead; nothing is written', async () => {
   await withRemote(async (remote, store) => {
     const head = await store.head()
     for (const name of Object.keys(DEFAULTS)) {
@@ -725,7 +725,7 @@ test('remove of a shipped skill is INVALID and says what to do instead; nothing 
   })
 })
 
-test('remove of a skill that is not in the store is NOT_FOUND', async () => {
+test('deleteSkill of a skill that is not in the store is NOT_FOUND', async () => {
   await withRemote(async (remote, store) => {
     assert.match(failed(await remote.deleteSkill('nobody', '', ''), 'NOT_FOUND'), /nobody/)
     // A shipped skill that was deleted is still shipped: it comes back, and so it can't be removed either.
@@ -734,7 +734,7 @@ test('remove of a skill that is not in the store is NOT_FOUND', async () => {
   })
 })
 
-test('remove with a base the document has changed since is CONFLICT, and the document stays', async () => {
+test('deleteSkill with a base the document has changed since is CONFLICT, and the document stays', async () => {
   await withRemote(async (remote, store) => {
     await userWrite(store, 'mine', MINE)
     const { commit } = ok(await remote.read('mine'))
@@ -746,7 +746,7 @@ test('remove with a base the document has changed since is CONFLICT, and the doc
   })
 })
 
-test('remove deletes a skill that is a problem, so a hand-broken document of the user\'s can be cleared away', async () => {
+test('deleteSkill deletes a skill that is a problem, so a hand-broken document of the user\'s can be cleared away', async () => {
   await withRemote(async (remote, store, _ctx, repository) => {
     await outsideCommit(repository, [{ path: 'skills/coding/SKILL.md', text: 'broken\n' }])
     assert.match(info(ok(await remote.skills()).skills, 'coding').problem, /frontmatter is missing/)

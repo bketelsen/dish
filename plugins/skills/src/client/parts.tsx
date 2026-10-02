@@ -10,7 +10,7 @@ import type { Notice } from './outcome.ts'
 /** The result of the last thing the person did, with what the store itself said beneath it. */
 export function NoticeBar({ notice, dismiss }: { notice: PageNotice, dismiss: () => void }) {
   return (
-    <div className={`dish-skills-notice dish-skills-notice-${notice.tone}`} role={notice.tone === 'error' ? 'alert' : 'status'}>
+    <div className={`dish-skills-notice dish-skills-notice-bar dish-skills-notice-${notice.tone}`} role={notice.tone === 'error' ? 'alert' : 'status'}>
       <div className="dish-skills-notice-body">
         <span>{notice.text}</span>
         {notice.detail !== undefined && notice.detail !== '' && <span className="dish-skills-muted">{notice.detail}</span>}
