@@ -23,6 +23,7 @@ dish runs like any web app: a **prod** configuration, which only the VM's servic
 | 7 | Installs with approval | `apt` through a narrow sudo rule (fleet), which allows one root-owned wrapper and nothing else. User-level tools through mise. Both are agent commands that write outside the workspace, so they go through dsh's escalation: the main agent asks you, and a child is refused unless the judge approves. |
 | 8 | `update.sh` default | A dry run that shows what would change. `--apply` acts. A ref argument checks out that commit, as a rollback. |
 | 9 | Sign-in link | `deploy/url.sh` prints `https://<tailnet name>/?token=…` from the service's journal. |
+| 10 | Settings over the tailnet | A small host plugin, `dish-web`, marks pages on your trusted host (`--trusted-host`) as the operator's own machine, so Settings, durable UI preferences and the Models page work over `https://<tailnet name>` as on loopback. (Added 2026-10-02 at your request; see below.) |
 
 ## Non-goals
 
@@ -94,6 +95,32 @@ dsh uses its working directory for three things:
 - new chats with no workspace;
 - the sandbox's fallback root;
 - a `.env` file there, which it loads. dsh refuses `PATH`, `DSH_*`, `XDG_*` and the other launch variables from it, but other names reach the service. So keep `~/work` free of a `.env`.
+
+## Settings over the tailnet (`dish-web`)
+
+dsh treats only loopback pages as "the operator's own machine". On any other page:
+- **Host settings** are unavailable, so the Models page fails with "settings are unavailable in this browser".
+- **UI preferences**, such as Work details, are kept in memory only.
+
+**Where the check lives.** It's made only in the browser, from `location.hostname`, or from a transport global, `__DSH_TRANSPORT__.ownsHost`, that dsh's desktop shell sets. The server never checks it. Any request that passes the Host check (`--trusted-host`) and carries the sign-in cookie can already write settings and credentials.
+
+**What the plugin does.** `dish-web` adds one classic script row to the served page through dsh's documented `webserver/index-inject` hook. The script sets `globalThis.__DSH_TRANSPORT__ = { ownsHost: true }` only when:
+- the page's hostname is one of the trusted hosts, which are the non-IP entries of `webRuntime.trustedHosts`, lower-cased and without port;
+- and no transport global is already set.
+
+**What it changes.** Only `isLoopback` changes, to true. The connection, the stream URL and module loading all stay on their defaults.
+
+**What it gains you,** over the tailnet:
+- durable Work details and other preferences;
+- a working Models page, so Task 7's Copilot card is reachable;
+- every settings page saving;
+- "Open configuration file" appears. On the headless VM it does nothing useful, but it's harmless.
+
+**The risk is a dependency on a shell-only field.** dsh documents the transport global as set by its desktop shell, saying "served pages never carry the global". A later dsh could give `ownsHost` other meanings. A pin test reads the installed `dsh-client-connection` and fails when its `isLoopback` computation no longer reads `transport?.ownsHost === true`, so a dsh upgrade has to re-check this.
+
+**Security.** It adds no server capability: anyone holding the cookie for the trusted host can already call these methods. One thing does change: every browser on that host now writes the one shared settings document. With one user that's the intent.
+
+**Config:** `dish-web` takes `hosts`, which overrides the derived list, and `enabled`, default true.
 
 ## `deploy/update.sh`
 
@@ -202,6 +229,7 @@ The order matters. A dish whose `pnpm dsh` goes through the launcher, started by
 3. Fast-forward the VM's checkout once by hand. It predates `update.sh`: `incus exec dish --project dish -- su - dish -c 'git -C ~/dish pull --ff-only origin main'`. This changes no running code.
 4. Run `update.sh`, then `update.sh --apply`. It installs, copies the new unit, restarts once (there is no stamp yet), and writes its stamp.
 5. Check:
+   - over `https://<tailnet name>`, Settings → General → Work details survives a reload, and Settings → Models loads (`dish-web`);
    - a new chat opened with no workspace starts in `~/work`;
    - `url.sh` prints a link that signs you in;
    - Settings shows prod's data;
