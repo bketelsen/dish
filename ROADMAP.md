@@ -18,3 +18,14 @@ The proposed build order for the system in [docs/design.md](docs/design.md). Eac
 | 9 | `triggers`: schedules and GitHub events through Funnel | Unattended work on approved initiatives. | |
 | 10 | `memory`: the vault | Durable personal and project context. | |
 | later | `copilot-usage`, `infra` (tiered approvals), `web-research` | | |
+
+## Backlog
+
+Small follow-ups that don't need a step of their own.
+
+| Item | Why | Noted |
+|---|---|---|
+| `copilot`: show the sign-in card on a fresh install. Today it sits on the `github-copilot` route's provider card, and that route exists only after a first sign-in. So a fresh profile has no card, and the first sign-in needs `terminalSignIn` (see [`deploy/README.md`](deploy/README.md#one-time-steps-on-the-vm)). | The first Copilot sign-in on a new machine, such as the VM, should be one click on Settings → Models. | 2026-10-01, VM rollout |
+| `prompts`: the remote's `reset` should default its note to "Reset to the default". | Resets made through the remote show "edited in web UI" in History. | 2026-10-01 |
+| `judge`: read the agent's task from a projection kept up to date by `session/event`, not from `session.snapshotEvents()`. | dsh marks `snapshotEvents` deprecated. If it goes away, the gate judges commands against an empty task and asks more. | 2026-10-01, judge build |
+| `judge`: weight dense text (hex, base64, minified code) more in the screen's rate budget. | The budget counts characters, which under-counts tokens for dense text. | 2026-10-01, judge build |
