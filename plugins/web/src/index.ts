@@ -15,8 +15,9 @@
  * It does nothing, and registers nothing, unless `enabled` is true, `webRuntime` is there (a profile other than the web
  * one has none) and there is at least one host.
  *
- * The risk is a dependency on a field that only dsh's shell is meant to set: `test/pin.test.ts` reads the installed
- * `dsh-client-connection` and fails when it no longer decides `isLoopback` that way.
+ * The risk is a dependency on a field that only dsh's shell is meant to set: `test/pin.test.ts` reads the installed dsh
+ * and fails when `dsh-client-connection` no longer decides `isLoopback` that way, when dsh's web server no longer puts
+ * this row at the top of the head, or when anything else dsh serves starts reading the flag.
  *
  * @module dish-web
  */
