@@ -8,7 +8,7 @@ The design is in the [deploy spec](../docs/specs/deploy.md) and the [ops spec](.
 
 - **The service.** `dsh web`, as `dish-web.service`: a systemd user unit of the unprivileged `dish` account, which has linger on. Its one sudo right is fleet's apt wrapper (see [Security notes](#security-notes)).
 - **The binary.** The unit runs the checkout's own dsh, `~/dish/node_modules/.bin/dsh`, not `pnpm dsh`. Only `pnpm dsh` goes through the launcher, which defaults to dev (see [Prod and dev](#prod-and-dev)). `pnpm dev` runs `scripts/dev.ts`, which is dev only, and `pnpm test`, `build` and `typecheck` use neither. The service is prod because it never goes through the launcher.
-- **The working directory** is `~/work`. A chat opened with no workspace starts there, not in the live checkout.
+- **The working directory** is `~/work`, not the live checkout: dsh's fallback root for the sandbox, and where it reads a `.env`. dsh's web UI starts every chat in a workspace, so chats stay out of the checkout as long as no workspace points at it. General chats use a scratch workspace inside `~/work` (see [One-time steps on the VM](#one-time-steps-on-the-vm)).
 - **The port.** It listens on `127.0.0.1:3080` only. Nothing listens on the VM's own address.
 - **The address.** `tailscale serve` puts it at `https://dish.<tailnet>.ts.net`, with a tailnet certificate. The tailnet needs HTTPS certificates enabled in the admin console first.
 - **The code.** A checkout of `bketelsen/dish` at `~dish/dish`, with the profile at `~dish/.dsh/profiles/web`.
@@ -156,7 +156,7 @@ Until 6a, fleet's guest play updated the checkout, ran `install.sh` and restarte
 
 1. **`ops` reaches `main`, as one merge.** The unit that runs dsh directly must land with the launcher that `pnpm dsh` now goes through. With the old unit's `pnpm dsh web`, the VM would come up on an empty dev store.
 2. **The fleet PR, [bketelsen/fleet#38](https://github.com/bketelsen/fleet/pull/38) (merged, fleet c5bb7f6).** Its docs follow-up is [bketelsen/fleet#39](https://github.com/bketelsen/fleet/pull/39). Run the guest play one last time: preview, apply and rerun, with the secrets left out. Expect `install.env`, `~dish/work`, `/usr/local/sbin/dish-apt-get` with its sudoers file, `/usr/local/sbin/dish-update` and `/usr/local/sbin/dish-url`, and `/usr/local/bin/mise`. Expect no change to `~dish/dish`, the profile or the unit. The rerun reports no changes.
-3. **Fast-forward the checkout once by hand,** so that `update.sh` is there. This changes no running code. It must be a clean checkout first: before 6a, chats with no workspace started in `~dish/dish`, so agents may have left files there. Then `dish-update` would refuse with "local changes", and the old unit would keep running against the new launcher, the very window step 4 avoids. So the command pulls only when `git status` lists nothing:
+3. **Fast-forward the checkout once by hand,** so that `update.sh` is there. This changes no running code. It must be a clean checkout first: before 6a, chats in the `/home/dish/dish` workspace ran in the live checkout, so agents may have left files there. Then `dish-update` would refuse with "local changes", and the old unit would keep running against the new launcher, the very window step 4 avoids. So the command pulls only when `git status` lists nothing:
 
    ```sh
    incus exec minideb:dish --project dish -- su - dish -c 'test -z "$(git -C ~/dish status --porcelain)" && git -C ~/dish pull --ff-only origin main'
@@ -176,7 +176,7 @@ Until 6a, fleet's guest play updated the checkout, ran `install.sh` and restarte
 5. **Check:**
    - `dish-url` prints a link that signs you in.
    - Over `https://dish.<tailnet>.ts.net`: Settings → General → Work details survives a reload, Settings → Models loads, and while Copilot has no route the footer card shows.
-   - A new chat with no workspace starts in `/home/dish/work`.
+   - A new chat in the scratch workspace (see [One-time steps on the VM](#one-time-steps-on-the-vm)) has `/home/dish/work/scratch` as its `pwd`, and no workspace points at `/home/dish/dish`.
    - Settings → Prompts, Skills and History show the VM's store.
    - An agent's `printenv DISH_REMOTE DISH_ENV DSH_DISH_HOME` prints nothing.
 6. **Clean up** when it has proved itself: the play's old record of the last start, `~dish/.local/state/fleet-dish`. Nothing reads it any more. Remove it as `dish`, not as root, since the account can write that tree:
@@ -230,6 +230,8 @@ Then open `http://127.0.0.1:3081/?token=…`, with the token from `dish-url`'s l
 Each is entered on `https://dish.<tailnet>.ts.net`, or through the tunnel if `dish-web` isn't working, so nothing passes through fleet or Git. dsh keeps the sign-ins in `~dish/.dsh/.credentials.yaml`, and they survive restarts and updates.
 - **Copilot, the first sign-in.** On a fresh install Settings → Models has no Copilot provider yet: dish-copilot adds the `github-copilot` route only after a first sign-in. Until then its sign-in card sits in the Models page's footer, titled "GitHub Copilot". Sign in there and approve the device code at <https://github.com/login/device>. The route and its models appear, and the footer card goes. Later sign-ins, after a sign-out, use the card on the Copilot provider.
 - **TypeSafe.** Paste the key on **Settings → Judge**. Without it the judge fails closed: the main agent asks you for every shell command, and a crew child's is refused.
+- **A workspace for general chats.** dsh's web UI starts every chat in a workspace. It has no chat without one, and no default setting: a new chat goes to the current chat's workspace, else the one used last. Add one for general work at `/home/dish/work/scratch`: "Add workspace…" (in the workspace chip, or the sidebar's "+"), "Edit path" to `/home/dish/work`, "New folder" `scratch`, then Open. Not `~/work` itself: a workspace's folder is where agents write without asking, dsh reads `~/work/.env` when the service starts, and step 6b's clones live under `~/work`. Step 6b's onboarding registers the scratch workspace itself.
+- **No workspace for the live checkout.** Remove any workspace for `/home/dish/dish` (its row's menu in the sidebar). That removes only the record: the checkout stays, and its chats move to "Ungrouped". Don't continue those chats; they still run in the checkout, where agents could write the deployed code without asking.
 - **The model.** A new chat may start on DeepSeek's own model, which has no key here. Pick a Copilot model (e.g. GPT-6.1 Sol) from the model menu.
 
 ## Prod and dev
