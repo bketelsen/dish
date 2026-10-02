@@ -69,7 +69,7 @@ Ownership follows the nsl builder's split ([fleet's nsl builder doc](../../../fl
 
 - **`deploy/install.sh`** is idempotent, and is run as `dish` from the checkout. It:
   1. runs `pnpm install --frozen-lockfile` and `pnpm build`;
-  2. creates the `web` profile from dsh's default one if it isn't there, and adds each dish bundle with `pnpm dsh plugin --profile web add ./plugins/<name>` for copilot, config, prompts, crew and judge, in that order;
+  2. creates the `web` profile from dsh's default one if it isn't there, and adds each dish bundle with `pnpm dsh plugin --profile web add ./plugins/<name>` for copilot, config, prompts, skills, crew and judge, in that order;
   3. writes the dish rows of the profile's patch layer.
      - **The `dish-config` row** gets:
        - `remote: git@github-dish-config:bketelsen/dish-config.git`;
@@ -118,7 +118,7 @@ Once the VM is up and its first fleet run has passed, in this order:
 ## Testing and verification
 
 - **dish side:** `deploy/install.sh` runs against a scratch `DSH_HOME` and scratch `XDG_*` (the live6 pattern), twice. The second run changes nothing.
-  - After it, `--dump-config` shows the five dish bundles and the `dish-config` row's remote.
+  - After it, `--dump-config` shows the six dish bundles and the `dish-config` row's remote.
   - The unit file passes `systemd-analyze verify --user`.
 - **fleet side:** `ansible-lint` and syntax checks, a check-and-diff run, `tofu plan`, then the apply under your authorization, and a rerun for idempotence, as fleet's `AGENTS.md` asks.
 - **Live, once:**

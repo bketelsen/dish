@@ -9,7 +9,8 @@
     "./client": "./src/client.ts",
     "./ui": "./src/ui/index.ts",
     "./ui/diff": "./src/ui/diff.ts",
-    "./build-client": "./scripts/build-client.mjs"
+    "./build-client": "./scripts/build-client.mjs",
+    "./previous-defaults": "./scripts/previous-defaults.mjs"
   },
   "dependencies": {
     "esbuild": "^0.25.0"

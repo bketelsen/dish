@@ -1,5 +1,5 @@
 /**
- * The wire shapes shared by the server remote (`remote.ts`) and the Prompts page (`client/`). Types and one constant,
+ * The wire shapes shared by the server remote (`remote.ts`) and the Prompts page (`client/`). Types and constants,
  * so both halves can import it, and it imports nothing: the browser build must not reach into the store (or, through
  * it, into Node's modules). `CommitInfo` is therefore declared here, as `dish-config`'s own `protocol.ts` declares it,
  * and `remote.ts` checks at compile time that the store's type fits it, so a change to either side is a type error.
@@ -11,6 +11,9 @@
 
 /** The remote's wire namespace: the page calls `ctx.remote.dishPrompts`. (Its Cordis service key is `dishPromptsRemote`.) */
 export const NAMESPACE = 'dishPrompts'
+
+/** The note a reset carries when the caller gives none, so that its commit says what it was in the history. */
+export const RESET_NOTE = 'Reset to the default'
 
 /**
  * The failures a call reports as a result: the store's own stable codes, as `dish-config`'s remote has them, and

@@ -1,11 +1,16 @@
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, stat, utimes, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
+import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
+import { computePrevious } from 'dish-kit'
 import * as plugin from '../src/index.ts'
 import type { DishPrompts } from '../src/index.ts'
-import { DEFAULTS } from '../src/defaults.ts'
+import { DEFAULTS, PREVIOUS, replaceMap } from '../src/defaults.ts'
 import { CREW_ROLES, pathFor } from '../src/roles.ts'
 import { SnapshotFiles } from '../src/snapshots.ts'
 import {
@@ -91,6 +96,84 @@ test('a person\'s edit survives a restart: the defaults are only seeded where no
   await withBoth(where, async (ctx) => {
     assert.equal(await ctx.dishConfig.read(pathFor('main')), MAIN_ONE)
     assert.equal(await ctx.dishConfig.read(pathFor('coder')), DEFAULTS.coder)
+  })
+})
+
+// --- earlier defaults ---------------------------------------------------------------------------
+
+const DEFAULTS_DIRECTORY = fileURLToPath(new URL('../defaults/', import.meta.url))
+
+/** The text of `file` (under `defaults/`) in git history whose sha256 is `hash`. */
+function earlierText(file: string, hash: string): string {
+  const git = (...args: string[]): string => execFileSync('git', ['-C', DEFAULTS_DIRECTORY, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  // `--full-history`, as `computePrevious` reads it: a version that only a side branch had is listed too.
+  for (const commit of git('log', '--full-history', '--format=%H', '--', file).split('\n').filter(Boolean)) {
+    let text: string
+    try {
+      text = git('show', `${commit}:./${file}`)
+    } catch {
+      continue
+    }
+    if (createHash('sha256').update(text, 'utf8').digest('hex') === hash) return text
+  }
+  throw new Error(`no earlier version of ${file} has the hash ${hash}`)
+}
+
+/** Whether git history can be read here; if not, `t` is skipped, so that a test needing the earlier texts returns. */
+async function historyOrSkip(t: TestContext): Promise<boolean> {
+  try {
+    await computePrevious(DEFAULTS_DIRECTORY, 'prompts/')
+    return true
+  } catch (error) {
+    if ((error as { code?: unknown }).code !== 'NO_HISTORY') throw error
+    t.skip((error as Error).message)
+    return false
+  }
+}
+
+test('at start, a document that is an earlier default becomes the current one, with the note; an edited one stays', async (t) => {
+  if (!await historyOrSkip(t)) return
+  const where = await dirs()
+  const MAIN = 'prompts/main.md'
+  const ARCHITECT = 'prompts/crew/architect.md'
+  const CODER = 'prompts/crew/coder.md'
+  const earlierMain = earlierText('main.md', PREVIOUS[MAIN]![0]!)
+  const earlierArchitect = earlierText('crew/architect.md', PREVIOUS[ARCHITECT]![0]!)
+  const editedCoder = `${earlierText('crew/coder.md', PREVIOUS[CODER]![0]!)}\nAnd be kind.\n`
+  assert.notEqual(earlierMain, DEFAULTS.main)
+
+  // First life: the person's store holds two earlier defaults (as an older dish seeded them) and an edit of a third.
+  await withBoth(where, async (ctx) => {
+    await userWrite(ctx.dishConfig, 'main', earlierMain)
+    await userWrite(ctx.dishConfig, 'architect', earlierArchitect)
+    await userWrite(ctx.dishConfig, 'coder', editedCoder)
+  })
+
+  let upgraded: string
+  await withBoth(where, async (ctx) => {
+    const store = ctx.dishConfig
+    // The seed isn't awaited by start-up, so the upgrade lands a moment after the plugin is up.
+    await waitFor('the earlier defaults to be replaced', async () => await store.read(MAIN) === DEFAULTS.main)
+    assert.equal(await store.read(ARCHITECT), DEFAULTS.architect)
+    assert.equal(await store.read(CODER), editedCoder)
+    // Every other document is as it was seeded.
+    assert.equal(await store.read(pathFor('reviewer')), DEFAULTS.reviewer)
+    assert.equal(await store.read(pathFor('common')), DEFAULTS.common)
+
+    const [latest] = await store.history({ prefix: 'prompts/', limit: 1 })
+    assert.deepEqual(latest!.author, { kind: 'system' })
+    assert.equal(latest!.note, 'updated to the new defaults')
+    assert.deepEqual(latest!.paths, [ARCHITECT, MAIN])
+    upgraded = latest!.id
+  })
+
+  // Once replaced, a document is the current default: a further start has nothing to do. The plugin's own seed isn't
+  // awaited, so the no-op is shown by asking the store to seed again: it has nothing to write or replace.
+  await withBoth(where, async (ctx) => {
+    const store = ctx.dishConfig
+    assert.equal(await store.seed(DEFAULTS_BY_PATH, plugin.name, { replace: replaceMap() }), undefined)
+    assert.equal((await store.history({ prefix: 'prompts/', limit: 1 }))[0]!.id, upgraded)
+    assert.equal(await store.read(CODER), editedCoder)
   })
 })
 

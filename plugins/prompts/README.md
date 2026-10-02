@@ -17,7 +17,7 @@ pnpm --filter dish-prompts build    # src/client → lib/client.js (the Prompts 
 pnpm dsh plugin --profile web add ./plugins/prompts
 ```
 
-It needs `dish-config` in the same profile, installed first. On its first start with the store, it seeds the eight default prompts as one commit, and the store pushes it like any other.
+It needs `dish-config` in the same profile, installed first. On its first start with the store, it seeds the eight default prompts as one commit, and the store pushes it like any other. On later starts, a prompt that is still an earlier shipped default moves to the current one (one commit, note "updated to the new defaults"); an edited one stays. After changing a file in `defaults/`, run `node packages/dish-kit/scripts/previous-defaults.mjs plugins/prompts/defaults prompts/`.
 
 **Choose the preset:** the **dish** preset comes with `dish-crew`, not with this plugin, so install that too (see [dish-crew](../crew)). Then, on **Settings → Agent presets**, use **Set as new task default** on **dish** (under Custom). dsh's own presets stay available, and the mode picker on a new chat switches per chat. On its own, this plugin gives you the persona row for a preset of your own.
 

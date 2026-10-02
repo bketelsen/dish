@@ -46,10 +46,32 @@ export function remoteDescriptor(
 }
 
 /**
+ * The names the browser's namespace service already has: the gateway (`@deepseek-ai/dsh-api-gateway/client`) mounts each
+ * namespace's methods on one Cordis service (`RemoteNamespaceService`, not exported) and refuses a method named like one of
+ * its members, as "conflicts with its namespace service", which fails the whole plugin's load. These are that class's fields
+ * and methods in 0.2.0-rc.2, copied; anything every object has (`toString`) is refused the same way. A method with one of
+ * these names can't be exposed to the browser: call it something else.
+ */
+export const RESERVED_REMOTE_METHODS: readonly string[] = [
+  'ctx', 'empty', 'invokeRemote', 'methods', 'name', 'namespace',
+  'assertMethodAvailable', 'has', 'install', 'installDirect', 'installScoped', 'remove',
+]
+
+/**
  * Bundle descriptors for `ctx.remote.$mount`.
  * @param pkg - the package name.
  * @param descriptors - the package's remote methods.
+ * @throws if a method is named like a member of the browser's namespace service (`RESERVED_REMOTE_METHODS`): that would not
+ *   mount, and the failure it causes in the browser says nothing of the cause.
  */
 export function remoteContribution(pkg: string, descriptors: InvocationDescriptor[]): TypertRemoteContribution {
+  for (const { namespace, method } of descriptors) {
+    if (RESERVED_REMOTE_METHODS.includes(method) || method in Object.prototype) {
+      throw new Error(
+        `${pkg}: the remote method "${method}" (${namespace}/${method}) clashes with a member of the browser's namespace service, ` +
+        'which refuses to mount it; give the method another name',
+      )
+    }
+  }
   return { package: pkg, descriptors }
 }

@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { ConfigStoreError } from './errors.ts'
@@ -52,6 +52,12 @@ export interface WriteMeta {
 
 /** The arguments of `revert`: those of `write`, without `base` (a revert's base is the commit it reverts). */
 export type RevertMeta = Omit<WriteMeta, 'base'>
+
+/** What `seed` takes beyond the defaults and the owner. */
+export interface SeedOptions {
+  /** Per path: lowercase hex sha256 of earlier shipped texts. A stored document with one of these hashes is replaced. */
+  replace?: Readonly<Record<string, readonly string[]>>
+}
 
 /** What `history` asks for. */
 export interface HistoryQuery {
@@ -113,6 +119,10 @@ const FULL_COMMIT_ID = /^[0-9a-f]{40}$/
 const IDENTIFIER = /^[A-Za-z0-9._:-]{1,128}$/
 const DEFAULT_ROLE = 'main'
 const NOTE_MAX_CHARS = 200
+/** The note on a `seed` commit that replaced at least one stored default. */
+const REPLACED_NOTE = 'updated to the new defaults'
+/** What a hash in `SeedOptions.replace` looks like: sha256, lowercase hex. */
+const SHA256_HEX = /^[0-9a-f]{64}$/
 const SUBJECT_PATHS = 3
 const SHORT_ID_CHARS = 7
 const DEFAULT_HISTORY_LIMIT = 50
@@ -209,6 +219,44 @@ function checkPaths(changes: Change[]): void {
     const problem = pathProblem(path)
     if (problem !== undefined) throw invalid(`invalid path ${label(path)}: ${problem}`)
   }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const prototype: unknown = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+/**
+ * `seed`'s options, checked before anything else: a plain object whose `replace` is a plain object,
+ * every key a path of `defaults` and every value an array of lowercase hex sha256 strings.
+ * Returned as copies, so the caller can't change what was checked.
+ */
+function checkSeedOptions(options: unknown, defaults: Record<string, string>): Map<string, Set<string>> {
+  const replace = new Map<string, Set<string>>()
+  if (options === undefined) return replace
+  if (!isPlainObject(options)) throw invalid('seed options must be an object')
+  const given = options.replace
+  if (given === undefined) return replace
+  if (!isPlainObject(given)) throw invalid('seed replace must be an object of path to hashes')
+  for (const path of Object.keys(given)) {
+    if (!Object.hasOwn(defaults, path)) throw invalid(`seed replace: ${label(path)} is not a path in the defaults`)
+    const hashes = given[path]
+    if (!Array.isArray(hashes)) throw invalid(`seed replace: ${label(path)} must be an array of hashes`)
+    const checked = new Set<string>()
+    for (const hash of hashes as unknown[]) {
+      if (typeof hash !== 'string' || !SHA256_HEX.test(hash)) {
+        throw invalid(`seed replace: ${label(path)} holds a hash that is not 64 lowercase hex characters`)
+      }
+      checked.add(hash)
+    }
+    replace.set(path, checked)
+  }
+  return replace
+}
+
+function sha256(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
 function checkAuthorKind(meta: unknown): EditAuthor {
@@ -570,14 +618,24 @@ export class ConfigStore {
   /**
    * Write the documents in `defaults` that don't exist yet, as one commit by the
    * `system` author with the subject `<paths>: <owner> defaults`.
-   * Existing documents are never touched. Every path must belong to a namespace
-   * owned by `owner` (`UNOWNED`); the guard and validators run as for `write`,
-   * but the agent policy doesn't apply.
-   * @returns the commit, or `undefined` when nothing was missing.
+   * An existing document is never touched, with one exception: `options.replace`
+   * lists, per path, the sha256 (lowercase hex, of the text as UTF-8) of earlier
+   * shipped texts, and a stored document that still has one of those hashes is
+   * overwritten with the new default. That is how an upgrade moves unedited
+   * defaults along while leaving the edited ones alone. A commit that replaced
+   * something carries the note "updated to the new defaults".
+   * Every path must belong to a namespace owned by `owner` (`UNOWNED`); the
+   * guard and validators run as for `write`, but the agent policy doesn't apply.
+   * A malformed `options` (`replace` keys that aren't paths of `defaults`, hashes
+   * that aren't lowercase hex sha256) is `INVALID`, before anything is read.
+   * The commit is built on the head that was read, so a document changed in the
+   * meantime is `CONFLICT`, never overwritten.
+   * @returns the commit, or `undefined` when there was nothing to write or replace.
    */
-  seed(defaults: Record<string, string>, owner: string): Promise<CommitInfo | undefined> {
+  seed(defaults: Record<string, string>, owner: string, options?: SeedOptions): Promise<CommitInfo | undefined> {
     return this.run(async () => {
       if (typeof owner !== 'string' || owner === '' || CONTROL.test(owner)) throw invalid('seed owner must be a one-line string')
+      const replace = checkSeedOptions(options, defaults)
       const entries = Object.entries(defaults)
       if (entries.length === 0) return undefined
       const all = checkChanges(entries.map(([path, text]) => ({ path, text })))
@@ -586,18 +644,30 @@ export class ConfigStore {
       for (const [path, spec] of owners) {
         if (spec.owner !== owner) throw new ConfigStoreError('UNOWNED', `${label(path)} belongs to ${JSON.stringify(spec.owner)}, not ${JSON.stringify(owner)}`)
       }
-      // Every path is scanned before git sees any of them, not only the ones that turn out to be missing.
+      // Every path is scanned before git sees any of them, not only the ones that turn out to be written.
       for (const { path } of all) checkContent(path, '', this.maxBytes)
       const head = await this.mainCommit()
-      const missing: Change[] = []
+      const writes: Change[] = []
+      let replaced = 0
       for (const change of all) {
-        if (!(await this.hasFile(head, change.path))) missing.push(change)
+        if (!(await this.hasFile(head, change.path))) {
+          writes.push(change)
+          continue
+        }
+        const earlier = replace.get(change.path)
+        if (earlier === undefined || earlier.size === 0 || !('text' in change)) continue
+        const stored = await this.git.readBlob(head, change.path)
+        if (stored === undefined || stored === change.text || !earlier.has(sha256(stored))) continue
+        writes.push(change)
+        replaced++
       }
-      if (missing.length === 0) return undefined
-      this.checkGuard(missing)
-      this.checkValid(missing, owners)
-      // `base` makes the retry notice a document that appeared in the meantime, instead of overwriting it.
-      return this.commitPrepared({ changes: missing, author: SYSTEM, base: head, summary: `${owner} defaults` })
+      if (writes.length === 0) return undefined
+      this.checkGuard(writes)
+      this.checkValid(writes, owners)
+      // `base` makes the retry notice a document that appeared, or was edited, in the meantime, instead of overwriting it.
+      const prepared: Prepared = { changes: writes, author: SYSTEM, base: head, summary: `${owner} defaults` }
+      if (replaced > 0) prepared.note = REPLACED_NOTE
+      return this.commitPrepared(prepared)
     })
   }
 

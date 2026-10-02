@@ -43,7 +43,7 @@ Its steps, in order:
    - **The `dish-config` row** gets `remote`, `userName` and `userEmail`, and nothing else.
    - **The `agent-preset-registry` row** makes the `dish` preset the default for new tasks, when no default is chosen yet.
    - Other rows, comments and key order stay as they are. A file that is already right is not rewritten.
-4. **The bundles.** For copilot, config, prompts, crew and judge, in that order, `pnpm dsh plugin --profile <profile> add ./plugins/<name>`, only when the profile doesn't link it yet.
+4. **The bundles.** For copilot, config, prompts, skills, crew and judge, in that order, `pnpm dsh plugin --profile <profile> add ./plugins/<name>`, only when the profile doesn't link it yet.
 
 It prints what it did, and its last line is `install: no changes to the profile` or `install: profile changed`. On a failure it stops and names the step on stderr, as `install: FAILED at step: …`. It prints nothing secret.
 
@@ -72,6 +72,8 @@ The play:
 
 A restart makes a new access token, but your browser's sign-in carries over (see below).
 
+At the restart, `dish-prompts` and `dish-skills` look at their documents in the config store. One that is still an earlier shipped default moves to the new text, in one commit with the note "updated to the new defaults" (Settings → History shows it). One you edited stays as it is. Skills are edited on Settings → Skills, which works over the tailnet name, like Prompts.
+
 ## Signing in
 
 dsh makes a new random access token each time it starts, and prints the URL with it on stdout. On the VM that goes to the unit's journal. The `dish` account has no SSH login, so read it as root, through the guest's admin user `fleet` (fleet's `docs/dish.md` says how to reach it):
@@ -92,7 +94,7 @@ Use the tailnet name, not the VM's tailnet IP or short name. dsh answers `/api` 
 
 ## Changing host settings: through a tunnel
 
-dsh lets a browser change the host's own settings only when the page was opened on a loopback name (`localhost`, `127.x` or `[::1]`). It decides from the address in your browser. On `https://dish.<tailnet>.ts.net`, the chat, Prompts, History and the Judge page's thresholds all work. **Settings → Models**, provider sign-ins and the other host settings fail with "settings are unavailable in this browser".
+dsh lets a browser change the host's own settings only when the page was opened on a loopback name (`localhost`, `127.x` or `[::1]`). It decides from the address in your browser. On `https://dish.<tailnet>.ts.net`, the chat, Prompts, Skills, History and the Judge page's thresholds all work. **Settings → Models**, provider sign-ins and the other host settings fail with "settings are unavailable in this browser".
 
 For those, open a tunnel from your desktop to the VM's `127.0.0.1:3080`, through Minideb, as fleet's `docs/dish.md` reaches the guest:
 

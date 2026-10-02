@@ -294,6 +294,29 @@ test('reset writes the shipped default as the user, and the role stops differing
   })
 })
 
+test('reset with no note commits with the note "Reset to the default"; a note given stays', async () => {
+  await withRemote(async (remote, store) => {
+    await userWrite(store, 'coder', 'Something else.\n')
+    const bare = ok(await remote.reset('coder', '', ''))
+    plain(bare)
+    assert.ok(bare)
+    assert.equal(bare.note, 'Reset to the default')
+    assert.equal(await store.read('prompts/crew/coder.md'), DEFAULTS.coder)
+    // The note is in History too, not only in what the call returned.
+    const [latest] = await store.history({ path: 'prompts/crew/coder.md', limit: 1 })
+    assert.equal(latest!.id, bare.id)
+    assert.equal(latest!.note, 'Reset to the default')
+
+    // A missing note (the client leaves out an `undefined` positional) is an empty one.
+    await userWrite(store, 'main', MAIN_ONE)
+    const missing = ok(await remote.reset('main', '', undefined as unknown as string))
+    assert.equal(missing?.note, 'Reset to the default')
+
+    await userWrite(store, 'coder', 'Something else again.\n')
+    assert.equal(ok(await remote.reset('coder', '', 'back to normal'))?.note, 'back to normal')
+  })
+})
+
 test('reset when the document already is the default changes nothing (null)', async () => {
   await withRemote(async (remote, store) => {
     const head = await store.head()

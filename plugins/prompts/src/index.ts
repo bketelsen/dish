@@ -7,7 +7,8 @@
  *
  * - `dishConfig` is optional. When the store is there, the plugin claims its three namespaces (an agent may only
  *   propose changes to `common` and `main`, and write crew roles) and seeds the shipped defaults, which never
- *   overwrites an edit. While it isn't, every answer is the shipped default;
+ *   overwrites an edit: a stored document that is still an earlier shipped text (`defaults/previous.json`) moves to
+ *   the current one, and an edited one stays. While the store isn't there, every answer is the shipped default;
  * - each agent's prompt is pinned to the store commit it was first asked for, in a file under `stateDirectory`, so
  *   it doesn't change for the agent's life, across a restart. Files not read for 180 days are pruned at start;
  * - the Prompts page's server half is the `dishPromptsRemote` Typert remote (see `remote.ts`), served by the
@@ -21,7 +22,7 @@ import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
-import { DEFAULTS } from './defaults.ts'
+import { DEFAULTS, replaceMap } from './defaults.ts'
 import { namespaceSpecs, pathFor } from './roles.ts'
 import { PromptsRemote } from './remote.ts'
 import { createDishPrompts } from './service.ts'
@@ -123,7 +124,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       child.effect(() => () => { present = false })
       for (const spec of namespaceSpecs(name)) child.effect(() => child.dishConfig.claim(spec))
       try {
-        await store.seed(defaultsByPath(), name)
+        await store.seed(defaultsByPath(), name, { replace: replaceMap() })
       } catch (error) {
         // Unless the store is going away, which closed it under the seed.
         if (present) logger.warn('could not seed the default prompts: %s', describe(error))

@@ -1,0 +1,8 @@
+# The skills (the dishSkills service). It works without dish-config, on the
+# shipped defaults, and claims its documents and seeds them when the store is
+# there, so there is no order to keep. Config is optional: `presets` (preset id
+# to the role of its top-level agents; only agents on these presets are offered
+# role skills; { dish: main } by default) and `terminal`.
+- insert:
+    - id: dish-skills
+      name: dish-skills

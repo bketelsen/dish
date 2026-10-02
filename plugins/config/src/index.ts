@@ -42,7 +42,7 @@ export type { ErrorCode } from './store/errors.ts'
 export type { NamespaceSpec } from './store/namespaces.ts'
 export type {
   AcceptMeta, Author, Change, CommitInfo, EditAuthor, FileDiff, GitIdentity, HistoryQuery, ProposalEvent, ProposalInfo,
-  ProposalStatus, ProposeMeta, RejectMeta, RemoteStatus, RevertMeta, WriteMeta,
+  ProposalStatus, ProposeMeta, RejectMeta, RemoteStatus, RevertMeta, SeedOptions, WriteMeta,
 } from './store/store.ts'
 
 export const name = 'dish-config'
@@ -294,7 +294,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     read: (path, ref) => store.read(path, ref),
     list: (prefix, ref) => store.list(prefix, ref),
     write: (changes, meta) => store.write(changes, meta),
-    seed: (defaults, owner) => store.seed(defaults, owner),
+    seed: (defaults, owner, options) => store.seed(defaults, owner, options),
     history: query => store.history(query),
     diff: (from, to, path) => store.diff(from, to, path),
     commit: id => store.commit(id),

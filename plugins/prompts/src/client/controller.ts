@@ -25,6 +25,7 @@ import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import { unifiedDiff } from 'dish-kit/ui/diff'
 import type { FileDiff } from 'dish-kit/ui/diff'
 import { interpolate } from '../interpolate.ts'
+import { RESET_NOTE } from '../protocol.ts'
 import type { CommitInfo, ErrorCode, Outcome, PreviewResult, ReadResult, RoleInfo, VariableInfo } from '../protocol.ts'
 import { roleLabel, shortId } from './format.ts'
 import { ALREADY_DEFAULT, NOTHING_TO_REVERT, failureNotice, unexpectedNotice } from './outcome.ts'
@@ -33,9 +34,6 @@ import type { ConfigCalls, ConfigEvent, PromptsApi } from './remote.ts'
 
 /** How many commits the History tab asks for. */
 export const HISTORY_PAGE = 20
-
-/** The note a reset carries, so that its commit says what it was in the history. */
-export const RESET_NOTE = 'Reset to the default'
 
 /** What the page calls its two remotes when a call fails before the store is reached. */
 const PROMPTS = 'dish-prompts'
