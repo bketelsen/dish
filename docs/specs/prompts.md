@@ -43,7 +43,7 @@ Three claims, because the store's agent policy is per namespace and namespaces c
 - A prompt may not be empty or only whitespace. To go back to the default, use **Reset**.
 - Under `prompts/crew/`, only `<role>.md` directly, no subdirectories.
 
-**Variables.** A prompt may use dsh's prompt variables, `{{model}}`, `{{cwd}}` and any a plugin registers. dsh renders them strictly: an unknown name, or one with no value, fails the agent's step. A prompt is edited text that outlives the plugins it mentions, so dish-prompts renders its own sections itself, leniently:
+**Variables.** A prompt may use dsh's prompt variables, `{{model}}`, `{{cwd}}` and any a plugin registers. `{{model}}` and `{{provider}}` are the session's selected model and provider, as they stand when the step's prompt is assembled: the persona row reads them after dsh's model selection has set them, so a model switched in the chat shows from the next step (see [the persona row](#the-persona-row-dish-promptspersona)). A delegated child has no selection of its own; its `{{model}}` is its route's. dsh renders them strictly: an unknown name, or one with no value, fails the agent's step. A prompt is edited text that outlives the plugins it mentions, so dish-prompts renders its own sections itself, leniently:
 - each known name with a value is replaced;
 - anything else is left as written and logged once per agent;
 - the section is then handed to dsh with `interpolate: false`.
@@ -86,18 +86,21 @@ The `dishPrompts` service takes a **snapshot** the first time it's asked for an 
 
 ### The persona row: `dish-prompts/persona`
 
-A plugin row for preset compositions, the counterpart of `@deepseek-ai/dsh-persona`, configured with `{ role }` (`main` in the dish preset). It registers no sections. It registers one `system-prompt/assemble` listener that, for each agent under the preset:
+A plugin row for preset compositions, the counterpart of `@deepseek-ai/dsh-persona`, configured with `{ role }` (`main` in the dish preset). It registers no sections. It registers one `system-prompt/assemble` listener, with `prepend: true`, that, for each agent under the preset:
 
 1. awaits the agent's snapshot (instant after the first step). For a delegated child, only `common` is used from it;
-2. finds the assembled `deployment:persona-prefix` and `deployment:persona-suffix` sections by name, and sets their text, interpolated leniently, with `interpolate: false`:
+2. calls `next()`, once, whatever else happens;
+3. finds the `deployment:persona-prefix` and `deployment:persona-suffix` sections by name in **what `next()` returned**, and sets their text, interpolated leniently from that assembly's variables, with `interpolate: false`:
    - **a top-level agent:** the prefix is the row's role document, the suffix is `common.md`;
    - **a delegated child** (`delegationDepth` above zero): the prefix is left as the child's own persona (crew's role text) and only interpolated leniently; the suffix is `common.md`.
 
    The global persona sections always exist (`dsh-system-prompt` registers them unconditionally), so there's always something to set.
 
+**Why after `next()`, and prepended.** dsh-agent's model-selection listener returns the assembly with `provider` and `model` replaced by the session's selection, **after** its own `next()`. The variables the waterfall starts with hold only the global default model the agent was created or resumed with (`agent.options.model`). A row that interpolated before `next()` therefore said the default: a qwen session was told it was `gpt-6.1-sol`. With `prepend: true` the row is the outermost listener, so its `next()` returns after the selection's listener has run, whatever order the preset and the agent registered theirs in (`dsh-session-reference` reads the selected model the same way). The cost is that a listener inside the waterfall that reads the persona sections' text sees the preset's text; none in dsh 0.2.0-rc.2 or dish does, and the preview calls `applyPersona` directly.
+
 A `complete` section isn't marked in the assembly, and dsh restores it after the waterfall anyway, so a preset that uses one gets exactly that section, as dsh intends.
 
-The row needs the `dishPrompts` service. If the `dish-prompts` plugin isn't loaded, the row logs once and leaves the assembly unchanged, so the agent still works, on dsh's empty global persona.
+The row needs the `dishPrompts` service. If the `dish-prompts` plugin isn't loaded, the row logs once and leaves the assembly unchanged, so the agent still works, on dsh's empty global persona. Every path through the listener (no agent, no service, a snapshot that fails, a section it can't patch) calls `next()` exactly once; an error from `next()` is the caller's, and not the row's trouble.
 
 ### The dish preset
 
@@ -210,4 +213,5 @@ By hand in the browser: the preview path first (see the open items), then the ed
 - **A bad `role` on the persona row** fails the preset's row audit, so the whole dish preset won't mount (dsh reports it broken).
 - **`variables()`** returns `{ variables, fallback }`, and the page doesn't warn about unknown names when `fallback` is true.
 - **The Prompts page shows a role's history itself.** A settings section can only `close`, so it can't link to the History page. The diff view moved to `dish-kit/ui`, so both pages share it.
+- **`{{model}}` is read after dsh's model selection** (2026-10-02, friction). The row used to interpolate before `next()` and so always said the agent's creation-time default model; it now patches what `next()` returns, and is registered with `prepend: true`.
 - **The dish preset is generated** from the installed dsh's `standard` preset (`pnpm --filter dish-crew sync-preset`, since the crew step moved it). The drift test reads the standard preset through `@deepseek-ai/dsh` itself, not a pinned copy.
