@@ -15,17 +15,19 @@ export const SENSITIVE_NAME = /KEY|PASSWORD|SECRET|TOKEN/i
 export const DSH_PREFIX = 'DSH_'
 /** git's own names; compared without case too. */
 const GIT_PREFIX = 'GIT_'
+/** ssh's GUI password prompt: `GIT_TERMINAL_PROMPT=0` doesn't stop git from running it (Task 3b's review). */
+const ASKPASS = new Set(['SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE'])
 
 /**
  * `env` (default `process.env`) minus credential-shaped names, DSH_* names (case-insensitive, as dsh's
- * scrubbedParentEnv) and every GIT_* name, plus GIT_TERMINAL_PROMPT=0. Undefined values dropped. A new object.
+ * scrubbedParentEnv), every GIT_* name and SSH_ASKPASS(_REQUIRE), plus GIT_TERMINAL_PROMPT=0. Undefined values dropped. A new object.
  */
 export function childEnvironment(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const child: Record<string, string> = {}
   for (const [name, value] of Object.entries(env)) {
     if (value === undefined || SENSITIVE_NAME.test(name)) continue
     const upper = name.toUpperCase()
-    if (upper.startsWith(DSH_PREFIX) || upper.startsWith(GIT_PREFIX)) continue
+    if (upper.startsWith(DSH_PREFIX) || upper.startsWith(GIT_PREFIX) || ASKPASS.has(upper)) continue
     child[name] = value
   }
   child.GIT_TERMINAL_PROMPT = '0'

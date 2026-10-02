@@ -28,6 +28,11 @@ test('childEnvironment returns a new object, and reads process.env by default', 
   })
 })
 
+test('childEnvironment drops ssh\'s GUI password prompt too', () => {
+  const env = childEnvironment({ PATH: '/bin', SSH_ASKPASS: '/usr/bin/ksshaskpass', ssh_askpass_require: 'force', DISPLAY: ':0' })
+  assert.deepEqual(env, { PATH: '/bin', DISPLAY: ':0', GIT_TERMINAL_PROMPT: '0' })
+})
+
 test("the scrub is pinned to dsh's own: same pattern, same prefix", () => {
   assert.equal(SENSITIVE_NAME.source, SENSITIVE_ENV_PATTERN.source, PINNED)
   assert.equal(SENSITIVE_NAME.flags, SENSITIVE_ENV_PATTERN.flags, PINNED)
