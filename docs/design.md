@@ -33,7 +33,9 @@ Status: draft, from the brainstorm on 2026-09-30. It records what we decided and
 | State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs | no |
 | Cache | `$XDG_CACHE_HOME/dish/` | Copilot model catalog cache (currently in `~/.dsh`; it will move), fetched pages | no |
 
-dsh keeps its own home, `~/.dsh`, for sessions, profiles and credentials. dish doesn't write there except through dsh services.
+One instance's dish directories move together: when `DSH_DISH_HOME` is set to an absolute path, dish-kit's `xdgPaths` puts all four at `$DSH_DISH_HOME/{config,state,data,cache}/dish`, ahead of the XDG variables. Dev, the default for everything but the VM's service, sets it to `<checkout>/.dev`; prod uses the defaults above. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands. See the [ops spec](specs/ops.md).
+
+dsh keeps its own home, `~/.dsh` (dev's is `<checkout>/.dev/dsh`), for sessions, profiles and credentials. dish doesn't write there except through dsh services.
 
 ## The crew
 
@@ -136,6 +138,7 @@ Each is its own bundle. "Provides" names its Cordis service; plugins depend only
 | `triggers` | — | `families`, `inbox` | schedules and GitHub events → main-agent wake-ups |
 | `memory` | `memory` | — | the vault: notes, search and agent tools |
 | `judge` | `judge` | `dishConfig` (thresholds) | the TypeSafe Jev client, the key settings card, guardrails (approval answerer and result screen), `ask_judge` |
+| `web` | — | dsh's `webRuntime` | settings over the tailnet: pages on the trusted host count as the operator's own machine. See the [ops spec](specs/ops.md#settings-over-the-tailnet-dish-web) |
 | `copilot` (done) | `copilotCatalog` | — | Copilot sign-in and the live model catalog |
 | later: `copilot-usage`, `infra` (with a tiered approval answerer), `web-research` | | | |
 

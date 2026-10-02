@@ -16,6 +16,22 @@ const css = `
   line-height: 20px;
   color: var(--dsw-alias-label-primary);
 }
+.dish-copilot-first {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 24px;
+}
+.dish-copilot-first-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+  color: var(--dsw-alias-label-primary);
+}
+.dish-copilot-first > .dish-copilot {
+  margin-top: 8px;
+}
 .dish-copilot-row {
   display: flex;
   align-items: center;

@@ -10,6 +10,7 @@ import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SubagentRunEndInfo, SubagentRunInfo } from '@deepseek-ai/dsh-subagent'
 import type { DishConfigService } from 'dish-config'
+import { xdgPaths } from 'dish-kit'
 import * as plugin from '../src/index.ts'
 import type { DishCrew } from '../src/index.ts'
 import { CrewRecords } from '../src/record.ts'
@@ -938,5 +939,28 @@ test('a children.json that is not valid is logged with where it went and what ha
     assert.ok(lines[0]!.includes(join(sessionPath(where, 's1'), moved[0]!)))
   } finally {
     await handle.dispose()
+  }
+})
+
+// DSH_DISH_HOME moves every dish directory ahead of XDG_*. A parent environment that has it (a `pnpm dev` shell) must not
+// leak into the tests that steer dish's directories with XDG_*: withEnv hides it for its body and puts it back.
+test('withEnv hides an inherited DSH_DISH_HOME, so XDG_* steer dish in its body, and puts it back', async () => {
+  const root = await tempDir()
+  const instance = join(root, 'instance')
+  const inherited = process.env.DSH_DISH_HOME
+  process.env.DSH_DISH_HOME = instance
+  try {
+    await withEnv({ XDG_DATA_HOME: join(root, 'xdg') }, async () => {
+      assert.equal(process.env.DSH_DISH_HOME, undefined)
+      assert.equal(xdgPaths('dish').data, join(root, 'xdg', 'dish'))
+      assert.equal(plugin.dataDirectoryPath(undefined), join(root, 'xdg', 'dish', 'crew'))
+    })
+    assert.equal(process.env.DSH_DISH_HOME, instance, 'put back after the body')
+    await assert.rejects(withEnv({ XDG_DATA_HOME: join(root, 'xdg') }, async () => { throw new Error('boom') }), /boom/)
+    assert.equal(process.env.DSH_DISH_HOME, instance, 'put back after a failing body too')
+    assert.equal(existsSync(instance), false, 'nothing was written under DSH_DISH_HOME')
+  } finally {
+    if (inherited === undefined) delete process.env.DSH_DISH_HOME
+    else process.env.DSH_DISH_HOME = inherited
   }
 })

@@ -4,9 +4,9 @@
   "type": "module",
   "description": "Personal DeepSeek Harness plugin workspace",
   "scripts": {
-    "dsh": "dsh",
-    "web": "dsh web",
-    "test": "node --test --test-timeout=60000 'packages/*/test/*.test.ts' 'plugins/*/test/*.test.ts' 'deploy/test/*.test.ts'",
+    "dev": "node scripts/dev.ts",
+    "dsh": "node scripts/env.ts dsh",
+    "test": "node --test --test-timeout=60000 'packages/*/test/*.test.ts' 'plugins/*/test/*.test.ts' 'deploy/test/*.test.ts' 'scripts/test/*.test.ts'",
     "typecheck": "tsc -p tsconfig.json --noEmit && pnpm -r --if-present typecheck",
     "build": "pnpm -r --if-present build"
   },

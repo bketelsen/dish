@@ -104,9 +104,15 @@ export function captureStderr(): { lines: () => string[], restore: () => void } 
   }
 }
 
-/** Run `body` with `env` set in this process, and put the variables back as they were. */
+/**
+ * Run `body` with `env` set in this process, and put the variables back as they were. DSH_DISH_HOME is unset for the
+ * body too: it moves every dish directory ahead of XDG_* and HOME, so one inherited from a `pnpm dev` shell would send
+ * the tests that steer dish's directories with those variables to the real instance.
+ */
 export async function withEnv<T>(env: Record<string, string>, body: () => Promise<T>): Promise<T> {
-  const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]))
+  const names = [...new Set([...Object.keys(env), 'DSH_DISH_HOME'])]
+  const saved = Object.fromEntries(names.map(key => [key, process.env[key]]))
+  delete process.env.DSH_DISH_HOME
   Object.assign(process.env, env)
   try {
     return await body()

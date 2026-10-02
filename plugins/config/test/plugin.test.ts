@@ -1,6 +1,7 @@
 import { execFile, spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -8,6 +9,7 @@ import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
 import { format, promisify } from 'node:util'
 import { Context } from '@deepseek-ai/cordis'
+import { xdgPaths } from 'dish-kit'
 import * as plugin from '../src/index.ts'
 import type { DishConfigService } from '../src/index.ts'
 import { Git } from '../src/store/git.ts'
@@ -87,9 +89,15 @@ function captureStderr(): { lines: () => string[], restore: () => void } {
   }
 }
 
-/** Run `body` with `env` set in this process, and put the variables back as they were. */
+/**
+ * Run `body` with `env` set in this process, and put the variables back as they were. DSH_DISH_HOME is unset for the
+ * body too: it moves every dish directory ahead of XDG_* and HOME, so one inherited from a `pnpm dev` shell would send
+ * the tests that steer dish's directories with those variables to the real instance.
+ */
 async function withEnv<T>(env: Record<string, string>, body: () => Promise<T>): Promise<T> {
-  const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]))
+  const names = [...new Set([...Object.keys(env), 'DSH_DISH_HOME'])]
+  const saved = Object.fromEntries(names.map(key => [key, process.env[key]]))
+  delete process.env.DSH_DISH_HOME
   Object.assign(process.env, env)
   try {
     return await body()
@@ -609,4 +617,26 @@ test('terminal: false prints nothing', async () => {
     out.restore()
   }
   assert.deepEqual(out.lines().filter(line => line.startsWith('[dish-config]')), [])
+})
+
+// DSH_DISH_HOME moves every dish directory ahead of XDG_*. A parent environment that has it (a `pnpm dev` shell) must not
+// leak into the tests that steer dish's directories with XDG_*: withEnv hides it for its body and puts it back.
+test('withEnv hides an inherited DSH_DISH_HOME, so XDG_* steer dish in its body, and puts it back', async () => {
+  const root = await tempDir()
+  const instance = join(root, 'instance')
+  const inherited = process.env.DSH_DISH_HOME
+  process.env.DSH_DISH_HOME = instance
+  try {
+    await withEnv({ XDG_CONFIG_HOME: join(root, 'xdg') }, async () => {
+      assert.equal(process.env.DSH_DISH_HOME, undefined)
+      assert.equal(xdgPaths('dish').config, join(root, 'xdg', 'dish'))
+    })
+    assert.equal(process.env.DSH_DISH_HOME, instance, 'put back after the body')
+    await assert.rejects(withEnv({ XDG_CONFIG_HOME: join(root, 'xdg') }, async () => { throw new Error('boom') }), /boom/)
+    assert.equal(process.env.DSH_DISH_HOME, instance, 'put back after a failing body too')
+    assert.equal(existsSync(instance), false, 'nothing was written under DSH_DISH_HOME')
+  } finally {
+    if (inherited === undefined) delete process.env.DSH_DISH_HOME
+    else process.env.DSH_DISH_HOME = inherited
+  }
 })

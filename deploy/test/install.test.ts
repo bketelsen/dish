@@ -9,8 +9,10 @@
  * The property that matters most is that the install never opens the real config store, and the checks on it are:
  * every dsh process the install starts has its four XDG directories pointed at a throwaway directory (a spy loaded
  * through NODE_OPTIONS records each one), the throwaway directory is gone afterwards, and the scratch "real"
- * XDG directories hold no `dish` directory, so no `config.git`. The throwaway directories must not take pnpm's store
- * with them, which is the other check: the profile records the account's own store, so a later install can add to it.
+ * XDG directories hold no `dish` directory, so no `config.git`. Under `pnpm dev` the launcher sets DSH_DISH_HOME, which
+ * moves dish's directories ahead of XDG_*: the scratch sets it too, and the spy checks that no dsh process sees it.
+ * The throwaway directories must not take pnpm's store with them, which is the other check: the profile records the
+ * account's own store, so a later install can add to it.
  */
 
 import assert from 'node:assert/strict'
@@ -32,13 +34,13 @@ const SKIP = INTEGRATION ? false : 'set DISH_INSTALL_TEST=1 to run the install a
 const REMOTE = 'git@github-dish-config.invalid:example/store.git'
 const USER_NAME = 'Dish Test'
 const USER_EMAIL = 'dish-test@example.invalid'
-const BUNDLES = ['dish-copilot', 'dish-config', 'dish-prompts', 'dish-skills', 'dish-crew', 'dish-judge']
+const BUNDLES = ['dish-copilot', 'dish-config', 'dish-prompts', 'dish-skills', 'dish-crew', 'dish-judge', 'dish-web']
 
 const execFileAsync = promisify(execFile)
 
 /**
- * Loaded into every node process the install starts: it records each dsh process's argument list and XDG directories,
- * and, for a `plugin ... add`, whether the profile's patch file already has the dish-config row.
+ * Loaded into every node process the install starts: it records each dsh process's argument list, XDG directories and
+ * DSH_DISH_HOME, and, for a `plugin ... add`, whether the profile's patch file already has the dish-config row.
  */
 const SPY = `
 const { appendFileSync, readFileSync } = require('node:fs')
@@ -56,7 +58,7 @@ if (/@deepseek-ai[\\\\/]dsh[\\\\/]lib[\\\\/]bin\\.js$/.test(process.argv[1] ?? '
       patchHasRow = false
     }
   }
-  appendFileSync(env.DISH_TEST_SPY, JSON.stringify({ args, xdg, patchHasRow }) + '\\n')
+  appendFileSync(env.DISH_TEST_SPY, JSON.stringify({ args, xdg, instanceHome: env.DSH_DISH_HOME, patchHasRow }) + '\\n')
 }
 `
 
@@ -66,6 +68,8 @@ interface Scratch {
   dshHome: string
   /** The "real" XDG directories of the scratch account: what dsh would use without the install's throwaway ones. */
   xdg: { config: string; state: string; data: string; cache: string }
+  /** What DSH_DISH_HOME is set to for the install: dsh must never see it, so this directory must never be made. */
+  instance: string
   /** TMPDIR for the install, so the throwaway directory it makes can be checked for afterwards. */
   tmp: string
   spyLog: string
@@ -100,6 +104,8 @@ async function makeScratch(extra: Record<string, string | undefined> = {}): Prom
   Object.assign(env, {
     HOME: home,
     DSH_HOME: join(dir, 'dsh'),
+    // As `pnpm dev` has it. It moves dish's directories ahead of XDG_*, so the install has to take it away from dsh.
+    DSH_DISH_HOME: join(dir, 'instance'),
     XDG_CONFIG_HOME: xdg.config,
     XDG_STATE_HOME: xdg.state,
     XDG_DATA_HOME: xdg.data,
@@ -115,7 +121,7 @@ async function makeScratch(extra: Record<string, string | undefined> = {}): Prom
     if (value === undefined) delete env[name]
     else env[name] = value
   }
-  return { dir, home, dshHome: join(dir, 'dsh'), xdg, tmp, spyLog, env }
+  return { dir, home, dshHome: join(dir, 'dsh'), xdg, instance: join(dir, 'instance'), tmp, spyLog, env }
 }
 
 interface Result {
@@ -138,6 +144,8 @@ async function run(command: string, args: string[], scratch: Scratch, env: NodeJ
 interface DshCall {
   args: string[]
   xdg: string[]
+  /** DSH_DISH_HOME as that dsh process saw it. */
+  instanceHome?: string
   /** For a `plugin ... add`: whether the patch file had the dish-config row at that moment. */
   patchHasRow?: boolean
 }
@@ -148,10 +156,11 @@ function dshCalls(scratch: Scratch): DshCall[] {
   return readFileSync(scratch.spyLog, 'utf8').split('\n').filter((line) => line !== '').map((line) => JSON.parse(line) as DshCall)
 }
 
-/** Fail unless every dsh process ran with all four XDG directories somewhere other than the scratch account's own. */
+/** Fail unless every dsh process ran with all four XDG directories somewhere other than the scratch account's own, and without DSH_DISH_HOME. */
 function assertIsolated(scratch: Scratch, calls: DshCall[]): void {
   const real = [scratch.xdg.config, scratch.xdg.state, scratch.xdg.data, scratch.xdg.cache]
   for (const call of calls) {
+    assert.equal(call.instanceHome, undefined, `dsh ${call.args.join(' ')}: DSH_DISH_HOME reached dsh`)
     assert.equal(call.xdg.length, 4)
     call.xdg.forEach((path, index) => {
       assert.ok(path !== undefined && path !== '', `dsh ${call.args.join(' ')}: XDG directory ${index} is unset`)
@@ -174,6 +183,7 @@ async function assertNoStore(scratch: Scratch): Promise<void> {
     assert.ok(!(await readdir(path)).includes('dish'), `${name} directory has a dish directory`)
   }
   assert.ok(!existsSync(join(scratch.xdg.config, 'dish', 'config.git')))
+  assert.ok(!existsSync(scratch.instance), `${scratch.instance} was made: DSH_DISH_HOME reached dish`)
 }
 
 for (const name of ['DISH_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL']) {
@@ -204,10 +214,10 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(first.code, 0, first.stderr)
   assert.match(first.stdout, /install: profile web at .*: created/)
   assert.match(first.stdout, /install: dish rows \(.*\): updated/)
-  assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge; already linked: none/)
+  assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge web; already linked: none/)
   assert.match(first.stdout, /install: profile changed/)
   const firstCalls = dshCalls(scratch)
-  assert.equal(firstCalls.length, 7, 'one dsh command makes the profile, one links each bundle')
+  assert.equal(firstCalls.length, 8, 'one dsh command makes the profile, one links each bundle')
   assertIsolated(scratch, firstCalls)
   assertRowsFirst(firstCalls)
   assert.deepEqual(await readdir(scratch.tmp), [], "the install's throwaway directory is removed")
@@ -220,9 +230,9 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(second.code, 0, second.stderr)
   assert.match(second.stdout, /install: profile web at .*: existing/)
   assert.match(second.stdout, /install: dish rows \(.*\): unchanged/)
-  assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge/)
+  assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge web/)
   assert.match(second.stdout, /install: no changes to the profile/)
-  assert.equal(dshCalls(scratch).length, 7, 'the second run starts no dsh command')
+  assert.equal(dshCalls(scratch).length, 8, 'the second run starts no dsh command')
   assert.equal(statSync(patch).mtimeMs, patchBefore, 'the patch file was not rewritten')
   assert.equal(statSync(manifest).mtimeMs, manifestBefore, "the profile's package.json was not rewritten")
   assert.equal(await readFile(patch, 'utf8'), patchText)
@@ -247,14 +257,16 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal((JSON.parse(modules) as { storeDir: string }).storeDir, store, "the profile records the account's store")
 
   // A bundle that goes missing (a failed first run, or a removal) is linked again, and only that one.
-  const removal = await run('pnpm', ['exec', 'dsh', 'plugin', '--profile', 'web', 'remove', 'dish-judge'], scratch)
+  // Run directly, not through the install, so DSH_DISH_HOME (which the scratch has, like `pnpm dev`) is taken away here.
+  const removal = await run('pnpm', ['exec', 'dsh', 'plugin', '--profile', 'web', 'remove', 'dish-judge'], scratch, { ...scratch.env, DSH_DISH_HOME: undefined })
   assert.equal(removal.code, 0, removal.stderr)
   const repair = await run(INSTALL, [], scratch)
   assert.equal(repair.code, 0, repair.stderr)
-  assert.match(repair.stdout, /bundles added: judge; already linked: copilot config prompts skills crew\n/)
+  assert.match(repair.stdout, /bundles added: judge; already linked: copilot config prompts skills crew web\n/)
   assert.match(repair.stdout, /install: dish rows \(.*\): unchanged/)
-  const repairCalls = dshCalls(scratch).slice(7)
+  const repairCalls = dshCalls(scratch).slice(8)
   assert.equal(repairCalls.length, 2, 'the removal, and one `plugin add`')
+  assert.equal(repairCalls[0].instanceHome, undefined, 'the removal ran without DSH_DISH_HOME')
   assertIsolated(scratch, repairCalls.slice(1))
   assertRowsFirst(repairCalls)
 
@@ -262,6 +274,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   const throwaway = join(scratch.dir, 'throwaway')
   const dump = await run('pnpm', ['exec', 'dsh', '--profile', 'web', '--dump-config'], scratch, {
     ...scratch.env,
+    DSH_DISH_HOME: undefined,
     XDG_CONFIG_HOME: join(throwaway, 'config'),
     XDG_STATE_HOME: join(throwaway, 'state'),
     XDG_DATA_HOME: join(throwaway, 'data'),

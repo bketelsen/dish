@@ -20,7 +20,7 @@ The design is in the [spec](../../docs/specs/judge.md), and what we measured abo
 pnpm dsh plugin --profile web add ./plugins/judge
 ```
 
-- **The key.** Paste your TypeSafe key on **Settings → Judge**. dsh keeps it in its own credential file (`~/.dsh/.credentials.yaml`), or reads `TYPESAFE_API_KEY` from the environment. It never goes in the config store, and the page can't read it back.
+- **The key.** Paste your TypeSafe key on **Settings → Judge**. dsh keeps it in its own credential file, `$DSH_HOME/.credentials.yaml` (`.dev/dsh` in dev, `~/.dsh` on the VM), or reads `TYPESAFE_API_KEY` from the environment. It never goes in the config store, and the page can't read it back.
 - **With `dish-config`,** the plugin seeds `judge.yaml` on its first start. Without it, the shipped values are used.
 - **With `dish-crew`,** add `ask_judge` to your stored `crew.yaml` roles (the shipped file has it). Crew also refuses its children's approval requests whenever dish-judge isn't loaded, so a child never waits on a prompt nobody sees.
 

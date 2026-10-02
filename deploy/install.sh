@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install dish into a dsh profile: build, create the profile, write dish's rows, link the six bundles.
+# Install dish into a dsh profile: build, create the profile, write dish's rows, link its bundles.
 #
 # Run it from anywhere as the account that runs `dsh web` (it moves to the checkout's root itself). It is idempotent: a
 # second run changes nothing, and says so on its last line.
@@ -28,7 +28,9 @@
 # that did that on a fresh machine would leave an empty local store, and the first start with a remote would then push
 # that store over the one on GitHub instead of restoring it. In dsh 0.2.0-rc.2 `--dump-config` and `plugin ... add` do
 # not boot anything (the first composes patch files, the second runs pnpm), so this is a guard against a later dsh, not
-# a fix. HOME and DSH_HOME stay real, so the profile lands where `dsh web` reads it.
+# a fix. HOME and DSH_HOME stay real, so the profile lands where `dsh web` reads it. Under `pnpm dev` the launcher sets
+# DSH_DISH_HOME, which moves dish's directories ahead of XDG_*, so run_dsh removes it: otherwise the throwaway
+# directories would do nothing there.
 #
 # One thing in those directories has to stay put: pnpm's store. pnpm finds it under $PNPM_HOME, else $XDG_DATA_HOME,
 # records it in the profile's node_modules/.modules.yaml, and refuses (ERR_PNPM_UNEXPECTED_STORE) to work on that
@@ -85,15 +87,17 @@ fi
 step="making the throwaway directory in ${TMPDIR:-/tmp}"
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/dish-install.XXXXXX")
 
-# dsh, from this checkout, with its XDG directories in the throwaway one and pnpm's store where it always is.
+# dsh, from this checkout, with its XDG directories in the throwaway one, DSH_DISH_HOME removed, and pnpm's store where
+# it always is.
 run_dsh() {
-  XDG_CONFIG_HOME="$scratch/config" XDG_STATE_HOME="$scratch/state" \
+  env -u DSH_DISH_HOME \
+    XDG_CONFIG_HOME="$scratch/config" XDG_STATE_HOME="$scratch/state" \
     XDG_DATA_HOME="$scratch/data" XDG_CACHE_HOME="$scratch/cache" \
     pnpm_config_store_dir="$pnpm_store" \
     pnpm exec dsh "$@"
 }
 
-bundles=(copilot config prompts skills crew judge)
+bundles=(copilot config prompts skills crew judge web)
 profile_dir="${DSH_HOME:-$HOME/.dsh}/profiles/$profile"
 patch="$profile_dir/cordis.patch.yml"
 changed=0

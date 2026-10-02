@@ -1,6 +1,6 @@
 # Spec: dish on its own VM (`deploy`)
 
-Status: implemented and rolled out, 2026-10-01 (see [notes from the rollout](#notes-from-the-rollout)). Implements roadmap step 5. Builds on:
+Status: implemented and rolled out, 2026-10-01 (see [notes from the rollout](#notes-from-the-rollout)). Implements roadmap step 5. Since step 6a, the [ops spec](ops.md) supersedes what this one says about updating (fleet's fast-forward, install and restart, and the unit's `pnpm dsh web` in `~/dish`), signing in (`sudo journalctl`), the first Copilot sign-in (`terminalSignIn`) and the tunnel for host settings. Builds on:
 - the [design](../design.md), "Hosting" and open question 6;
 - the [config store](config-store.md) spec, for the store's remote and its single pusher;
 - the [judge](judge.md) spec, which is the guardrail that makes an always-on agent host acceptable.
