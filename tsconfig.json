@@ -19,7 +19,8 @@
     "packages/*/test",
     "plugins/*/test",
     "plugins/*/test-live",
-    "deploy"
+    "deploy",
+    "scripts"
   ],
   "exclude": [
     "plugins/*/src/client",
