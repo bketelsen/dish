@@ -182,9 +182,9 @@ test('DEFAULTS inherits nothing: "constructor" is a legal crew role, and has no 
   assert.equal(validate('prompts/crew/constructor.md', 'text'), undefined)
 })
 
-test('the shipped files are laid out like the store, one per role', () => {
+test('the shipped files are laid out like the store, one per role, with previous.json beside them', () => {
   const dir = new URL('../defaults/', import.meta.url)
-  assert.deepEqual(readdirSync(dir).sort(), ['common.md', 'crew', 'main.md'])
+  assert.deepEqual(readdirSync(dir).sort(), ['common.md', 'crew', 'main.md', 'previous.json'])
   assert.deepEqual(readdirSync(new URL('crew/', dir)).sort(), CREW_ROLES.map(role => `${role}.md`).sort())
 })
 

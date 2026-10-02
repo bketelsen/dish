@@ -1,0 +1,23 @@
+{
+  "prompts/crew/architect.md": [
+    "02da00b176e54aed60f5fc06f43d0bd60f663e52148bf944189766cd7bdfaf9d"
+  ],
+  "prompts/crew/coder.md": [
+    "2fb670f5b6f4211ef11393299f1761265be845ad4379de2d131683e34a3e2a38"
+  ],
+  "prompts/crew/ops.md": [
+    "0d4201e61b5f79d000265db405f59db3c27810187ff7f7500fc6b60637fc3ede"
+  ],
+  "prompts/crew/researcher.md": [
+    "e7abc4a233c83dc0f06e7f1daea941ff5b832691729b268be578a6f9953a2e81"
+  ],
+  "prompts/crew/reviewer.md": [
+    "8ee73fa5ed74e329448a66e868bddd4cdbe3a7babe923204cce308f1195b524a"
+  ],
+  "prompts/crew/writer.md": [
+    "5af6b10eadc5b58c348b9990043907f80299dd2a2d751de7be662656c389f240"
+  ],
+  "prompts/main.md": [
+    "75e7543fd117bad20a9c089254ff9b073911988efdbb9dfa37ecfba171d795b6"
+  ]
+}

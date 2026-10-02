@@ -7,7 +7,7 @@
  * - the gateway serves any root service that carries a `typertRemote` binding and `@Remote` markers, reading wire
  *   parameter names from the method source (so every parameter is a plain identifier). This package runs as
  *   type-stripped `.ts`, which has no decorator syntax, so the markers are applied by `markRemote`;
- * - every parameter is plain JSON, and `''` means absent: no base, no note;
+ * - every parameter is plain JSON, and `''` means absent: no base, no note (`reset`'s note then defaults to `RESET_NOTE`);
  * - every write is made as the user, a person at the keyboard;
  * - a refusal the person can act on comes back as `{ ok: false, code, message }`, not as a throw: Typert has a
  *   closed set of failure codes, and its gateway folds anything thrown into `gateway/internal`. That covers the
@@ -26,7 +26,7 @@ import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { CommitInfo as StoreCommitInfo, DishConfigService, ErrorCode as StoreErrorCode, WriteMeta } from 'dish-config'
 import { markRemote } from 'dish-kit'
 import { buildPreview, buildVariables } from './preview.ts'
-import { NAMESPACE } from './protocol.ts'
+import { NAMESPACE, RESET_NOTE } from './protocol.ts'
 import type { CommitInfo, ErrorCode, Outcome, PreviewResult, ReadResult, RoleInfo, VariablesResult } from './protocol.ts'
 import { namespaceSpecs, pathFor } from './roles.ts'
 import type { DishPrompts } from './service.ts'
@@ -248,6 +248,7 @@ export class PromptsRemote extends TypertRemoteService {
   /**
    * Save the shipped default as `role`'s document, as the user (`save` with the default text): an ordinary commit, so it can be reverted.
    * A role dish ships no default for is `INVALID`.
+   * @param note - `''` for the default note, `RESET_NOTE`; else why, in a line.
    * @returns the commit, or `null` when the document already is the default.
    */
   async reset(role: string, base: string, note: string): Promise<Outcome<CommitInfo | null>> {
@@ -255,7 +256,7 @@ export class PromptsRemote extends TypertRemoteService {
       const name = roleName(role)
       const shipped = this.ctx.dishPrompts.defaultText(name)
       if (shipped === undefined) throw new Refusal('INVALID', `${JSON.stringify(name)} has no shipped default to go back to`)
-      return put(this.ctx, name, shipped, stringOf('base', base), stringOf('note', note))
+      return put(this.ctx, name, shipped, stringOf('base', base), stringOf('note', note) || RESET_NOTE)
     })
   }
 

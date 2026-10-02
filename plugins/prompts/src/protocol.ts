@@ -12,6 +12,9 @@
 /** The remote's wire namespace: the page calls `ctx.remote.dishPrompts`. (Its Cordis service key is `dishPromptsRemote`.) */
 export const NAMESPACE = 'dishPrompts'
 
+/** The note a reset carries when the caller gives none, so that its commit says what it was in the history. */
+export const RESET_NOTE = 'Reset to the default'
+
 /**
  * The failures a call reports as a result: the store's own stable codes, as `dish-config`'s remote has them, and
  * `UNAVAILABLE` for a write while there is no store.
