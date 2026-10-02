@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -180,6 +181,26 @@ test('a claim, then a write, emits dish-config/changed with the path, the commit
     await release()
     await assert.rejects(service.write([{ path: 't/c.md', text: 'x' }], { author: USERA }), isStoreError('UNOWNED'))
     assert.equal(await service.read('t/a.md'), 'hello')
+  })
+})
+
+test('seed through the service takes its options: a stored default with a listed hash is replaced, with the note', async () => {
+  await withPlugin({ repository: await repoPath() }, async (ctx, service) => {
+    ctx.effect(() => service.claim(ns('t/', 'write', 't')))
+    const hash = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex')
+    await service.seed({ 't/a.md': 'v1', 't/b.md': 'b1' }, 't')
+    await service.write([{ path: 't/b.md', text: 'edited' }], { author: USERA })
+    const info = await service.seed(
+      { 't/a.md': 'v2', 't/b.md': 'b2' },
+      't',
+      { replace: { 't/a.md': [hash('v1')], 't/b.md': [hash('b1')] } },
+    )
+    assert.ok(info)
+    assert.deepEqual(info.paths, ['t/a.md'])
+    assert.equal(info.note, 'updated to the new defaults')
+    assert.equal(await service.read('t/a.md'), 'v2')
+    assert.equal(await service.read('t/b.md'), 'edited')
+    await assert.rejects(service.seed({ 't/a.md': 'v3' }, 't', { replace: { 't/zzz.md': [hash('v2')] } }), isStoreError('INVALID'))
   })
 })
 

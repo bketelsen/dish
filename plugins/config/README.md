@@ -53,6 +53,7 @@ export function apply(ctx: Context) {
 }
 ```
 
+- **`seed` can move unedited defaults along.** By default it writes only what is missing. Pass `{ replace: { [path]: [hashes] } }` as the third argument and a stored document whose text still hashes (sha256, lowercase hex, of the UTF-8 text) to one of an earlier default's hashes is overwritten with the new default. A document that doesn't match is an edit, and stays. The commit carries the note "updated to the new defaults", so History shows it. If the document changed in the meantime the seed fails with `CONFLICT` and overwrites nothing.
 - **Read at use**, not at load. Agents started after a commit see it, and running ones keep what they started with. Re-read on `dish-config/changed(paths, commit, author)` instead of caching.
 - **Editors write with `base`**, the `head()` they loaded, as `{ kind: 'user' }`. A path someone else changed since then is `CONFLICT` (reload), and changes to other paths go through.
 - Namespaces may not overlap, and a path no namespace claims can't be written.

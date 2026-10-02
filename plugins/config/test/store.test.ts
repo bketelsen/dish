@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { test } from 'node:test'
+import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -286,6 +287,228 @@ test('seed runs the guard and the validators; the agent policy does not apply to
   await assert.rejects(store.seed({ 'prompts/a.md': 'ok' }, 'bad\nowner'), isStoreError('INVALID'))
   assert.equal(await objects(git), before)
   assert.ok(await store.seed({ 'prompts/a.md': 'fine' }, 'prompts'), 'agent: none still lets the store seed its own namespace')
+})
+
+// --- seed with replace ---------------------------------------------------------------------------
+
+/** Lowercase hex sha256 of `text` as UTF-8 bytes: what `SeedOptions.replace` lists. */
+function sha256(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
+const UPDATED_NOTE = 'updated to the new defaults'
+
+describe('seed replace', () => {
+  test('a missing path is written and a stored path with a listed hash replaced, in one commit carrying the note', async () => {
+    const { seen, onCommit } = recorder()
+    const { store, git } = await openAt({ claims: [ns('prompts/', 'write', 'prompts')], onCommit })
+    await store.seed({ 'prompts/a.md': 'A v1' }, 'prompts')
+    seen.length = 0
+    const before = (await git.run(['rev-list', '--count', MAIN])).stdout.trim()
+
+    const info = await store.seed(
+      { 'prompts/a.md': 'A v2', 'prompts/b.md': 'B v1' },
+      'prompts',
+      { replace: { 'prompts/a.md': [sha256('A v0'), sha256('A v1')] } },
+    )
+    assert.ok(info)
+    assert.deepEqual(info.paths, ['prompts/a.md', 'prompts/b.md'])
+    assert.deepEqual(info.author, { kind: 'system' })
+    assert.equal(info.note, UPDATED_NOTE)
+    assert.equal(info.message, `prompts/a.md, prompts/b.md: prompts defaults\n\nDish-Author-Kind: system\nDish-Note: ${UPDATED_NOTE}\n`)
+    assert.equal(await storedMessage(git, info.id), info.message)
+    assert.equal(await store.read('prompts/a.md'), 'A v2')
+    assert.equal(await store.read('prompts/b.md'), 'B v1')
+    assert.equal((await git.run(['rev-list', '--count', MAIN])).stdout.trim(), String(Number(before) + 1), 'one commit')
+    assert.deepEqual(seen, [info], 'announced once')
+  })
+
+  test('history shows the note, and the subject keeps its "<paths>: <owner> defaults" shape', async () => {
+    const store = await openStore({ claims: [ns('prompts/', 'write', 'prompts')] })
+    await store.seed({ 'prompts/a.md': 'A v1' }, 'prompts')
+    const info = await store.seed({ 'prompts/a.md': 'A v2' }, 'prompts', { replace: { 'prompts/a.md': [sha256('A v1')] } })
+    assert.ok(info)
+    const log = await store.history({ path: 'prompts/a.md' })
+    assert.deepEqual(log.map(commit => commit.id), [info.id, log[1]!.id])
+    assert.equal(log[0]!.note, UPDATED_NOTE)
+    assert.deepEqual(log[0]!.author, { kind: 'system' })
+    assert.match(log[0]!.message, /^prompts\/a\.md: prompts defaults\n/)
+    assert.equal(log[1]!.note, undefined, 'the first seed had nothing replaced, so no note')
+  })
+
+  test('a document whose hash is not listed is edited, and left alone, even when others are replaced', async () => {
+    const store = await openStore({ claims: [ns('prompts/', 'write', 'prompts')] })
+    await store.seed({ 'prompts/a.md': 'A v1', 'prompts/b.md': 'B v1' }, 'prompts')
+    await store.write([{ path: 'prompts/a.md', text: 'A edited by the user' }], { author: USERA })
+
+    const info = await store.seed(
+      { 'prompts/a.md': 'A v2', 'prompts/b.md': 'B v2' },
+      'prompts',
+      { replace: { 'prompts/a.md': [sha256('A v1')], 'prompts/b.md': [sha256('B v1')] } },
+    )
+    assert.ok(info)
+    assert.deepEqual(info.paths, ['prompts/b.md'])
+    assert.equal(await store.read('prompts/a.md'), 'A edited by the user')
+    assert.equal(await store.read('prompts/b.md'), 'B v2')
+  })
+
+  test('nothing to do returns undefined and makes no commit: edited, current, or no hash listed', async () => {
+    const { store, git } = await openAt({ claims: [ns('prompts/', 'write', 'prompts')] })
+    await store.seed({ 'prompts/a.md': 'A v1', 'prompts/b.md': 'B v1' }, 'prompts')
+    await store.write([{ path: 'prompts/a.md', text: 'edited' }], { author: USERA })
+    const head = await store.head()
+    const before = await objects(git)
+
+    assert.equal(await store.seed(
+      { 'prompts/a.md': 'A v2', 'prompts/b.md': 'B v1' },
+      'prompts',
+      { replace: { 'prompts/a.md': [sha256('A v1')], 'prompts/b.md': [sha256('B v0')] } },
+    ), undefined)
+    assert.equal(await store.seed({ 'prompts/a.md': 'A v2' }, 'prompts', { replace: {} }), undefined)
+    assert.equal(await store.seed({ 'prompts/a.md': 'A v2' }, 'prompts', { replace: { 'prompts/a.md': [] } }), undefined)
+    assert.equal(await store.seed({ 'prompts/a.md': 'A v2' }, 'prompts', {}), undefined)
+    assert.equal(await store.seed({}, 'prompts', { replace: {} }), undefined)
+    assert.equal(await store.head(), head)
+    assert.equal(await objects(git), before)
+  })
+
+  test('running the same upgrade twice replaces once: the second run finds the new text and is a no-op', async () => {
+    const store = await openStore({ claims: [ns('prompts/', 'write', 'prompts')] })
+    await store.seed({ 'prompts/a.md': 'A v1' }, 'prompts')
+    const options = { replace: { 'prompts/a.md': [sha256('A v1')] } }
+    assert.ok(await store.seed({ 'prompts/a.md': 'A v2' }, 'prompts', options))
+    assert.equal(await store.seed({ 'prompts/a.md': 'A v2' }, 'prompts', options), undefined)
+  })
+
+  test('without a replacement there is no note, as before (a seed of missing paths only)', async () => {
+    const store = await openStore({ claims: [ns('prompts/', 'write', 'prompts')] })
+    const info = await store.seed({ 'prompts/a.md': 'A' }, 'prompts', { replace: { 'prompts/a.md': [sha256('old')] } })
+    assert.ok(info)
+    assert.equal(info.message, 'prompts/a.md: prompts defaults\n\nDish-Author-Kind: system\n')
+    assert.equal('note' in info, false)
+  })
+
+  test('a hash replaces only its own path, and the stored text is hashed as UTF-8, byte for byte', async () => {
+    const store = await openStore({ claims: [ns('prompts/', 'write', 'prompts')] })
+    const odd = 'caf\u00e9 \u{1F600}\r\n  trailing space \n\n'
+    await store.seed({ 'prompts/a.md': 'same', 'prompts/b.md': 'same', 'prompts/c.md': odd }, 'prompts')
+    const info = await store.seed(
+      { 'prompts/a.md': 'new a', 'prompts/b.md': 'new b', 'prompts/c.md': 'new c' },
+      'prompts',
+      { replace: { 'prompts/a.md': [sha256('same')], 'prompts/c.md': [sha256(odd)] } },
+    )
+    assert.ok(info)
+    assert.deepEqual(info.paths, ['prompts/a.md', 'prompts/c.md'])
+    assert.equal(await store.read('prompts/a.md'), 'new a')
+    assert.equal(await store.read('prompts/b.md'), 'same', 'b has no listed hash, though its text equals a hash listed for a')
+    assert.equal(await store.read('prompts/c.md'), 'new c')
+
+    // One byte off is an edit: the trimmed text does not match the stored one.
+    const again = await store.seed({ 'prompts/d.md': 'x' }, 'prompts')
+    assert.ok(again)
+    assert.equal(await store.seed({ 'prompts/d.md': 'y' }, 'prompts', { replace: { 'prompts/d.md': [sha256('x\n')] } }), undefined)
+    assert.equal(await store.read('prompts/d.md'), 'x')
+  })
+
+  test('a replace key that is not in defaults, or a malformed value, is INVALID and writes nothing at all', async () => {
+    const { store, git } = await openAt({ claims: [ns('prompts/', 'write', 'prompts')] })
+    await store.seed({ 'prompts/a.md': 'A v1' }, 'prompts')
+    const head = await store.head()
+    const before = await objects(git)
+    const runner = gitOf(store)
+    const original = runner.run.bind(runner)
+    let gitCalls = 0
+    runner.run = async (...args) => { gitCalls++; return original(...args) }
+    const good = sha256('A v1')
+    const defaults = { 'prompts/a.md': 'A v2', 'prompts/b.md': 'B' }
+    const refuse = (replace: unknown, ...mentions: string[]) =>
+      assert.rejects(store.seed(defaults, 'prompts', { replace } as never), isStoreError('INVALID', ...mentions))
+
+    // A key that is no path of the defaults (even a real document of the store, or a made-up one).
+    await refuse({ 'prompts/other.md': [good] }, 'prompts/other.md')
+    await refuse({ 'prompts/a.md': [good], 'prompts/zzz.md': [good] }, 'prompts/zzz.md')
+    await refuse({ 'nowhere/x.md': [good] })
+    await refuse(JSON.parse('{"__proto__": []}'), '__proto__')
+    await refuse({ constructor: [good] }, 'constructor')
+    // A malformed hash: wrong length, uppercase, non-hex, non-string, not an array.
+    await refuse({ 'prompts/a.md': [good.slice(1)] }, 'prompts/a.md')
+    await refuse({ 'prompts/a.md': [good + '0'] }, 'prompts/a.md')
+    await refuse({ 'prompts/a.md': [good.toUpperCase()] }, 'prompts/a.md')
+    await refuse({ 'prompts/a.md': ['g'.repeat(64)] }, 'prompts/a.md')
+    await refuse({ 'prompts/a.md': [good, 5] }, 'prompts/a.md')
+    await refuse({ 'prompts/a.md': [` ${good.slice(1)}`] }, 'prompts/a.md')
+    await refuse({ 'prompts/a.md': [`${good}\n`] }, 'prompts/a.md')
+    await refuse({ 'prompts/a.md': good }, 'prompts/a.md')
+    await refuse({ 'prompts/a.md': null }, 'prompts/a.md')
+    await refuse({ 'prompts/a.md': { 0: good } }, 'prompts/a.md')
+    // The whole `replace` is not an object.
+    await refuse([good])
+    await refuse(null)
+    await refuse('prompts/a.md')
+    await refuse(5)
+    // `options` itself is not an object.
+    for (const options of [null, 'replace', 5, [], () => undefined]) {
+      await assert.rejects(store.seed(defaults, 'prompts', options as never), isStoreError('INVALID'))
+    }
+    // An invalid `replace` is refused even when there is nothing else to do.
+    await assert.rejects(store.seed({}, 'prompts', { replace: { 'prompts/a.md': [good] } }), isStoreError('INVALID'))
+
+    assert.equal(gitCalls, 0, 'refused before git was asked anything')
+    assert.equal(await objects(git), before)
+    assert.equal(await store.head(), head)
+    assert.equal(await store.read('prompts/a.md'), 'A v1')
+    assert.equal(await store.read('prompts/b.md'), undefined)
+  })
+
+  test('the owner, the paths, the guard and the validators apply to a replaced document as to a new one', async () => {
+    const validate = (_path: string, text: string) => (text === 'bad' ? 'bad document' : undefined)
+    const { store, git } = await openAt({ claims: [ns('prompts/', 'none', 'prompts', validate), ns('crew.yaml', 'write', 'crew')] })
+    await store.seed({ 'prompts/a.md': 'A v1' }, 'prompts')
+    const head = await store.head()
+    const before = await objects(git)
+    const replace = { 'prompts/a.md': [sha256('A v1')] }
+
+    await assert.rejects(store.seed({ 'prompts/a.md': 'bad' }, 'prompts', { replace }), isStoreError('INVALID', 'prompts/a.md: bad document'))
+    await assert.rejects(store.seed({ 'prompts/a.md': `x ${TOKEN}` }, 'prompts', { replace }), (error: unknown) => {
+      assert.ok(error instanceof ConfigStoreError)
+      assert.equal(error.code, 'SECRET')
+      assert.ok(!error.message.includes(TOKEN), error.message)
+      return true
+    })
+    await assert.rejects(store.seed({ 'prompts/a.md': 'A v2' }, 'someone-else', { replace }), isStoreError('UNOWNED'))
+    await assert.rejects(store.seed({ 'prompts/a.md': 'A v2', 'crew.yaml': 'c' }, 'prompts', { replace }), isStoreError('UNOWNED', 'crew'))
+    await assert.rejects(store.seed({ 'prompts/a.md': 5 as unknown as string }, 'prompts', { replace }), isStoreError('INVALID'))
+    assert.equal(await objects(git), before)
+    assert.equal(await store.head(), head)
+    assert.equal(await store.read('prompts/a.md'), 'A v1')
+
+    assert.ok(await store.seed({ 'prompts/a.md': 'A v2' }, 'prompts', { replace }), 'agent: none still lets the store replace its own defaults')
+    assert.equal(await store.read('prompts/a.md'), 'A v2')
+  })
+
+  test('a document an outside writer changed in the meantime is CONFLICT, never overwritten', async () => {
+    const { store, git } = await openAt({ claims: [ns('prompts/', 'write', 'prompts')] })
+    await store.seed({ 'prompts/a.md': 'A v1' }, 'prompts')
+    const { externalIds } = interfere(store, git, 1, 'prompts/a.md')
+    await assert.rejects(
+      store.seed({ 'prompts/a.md': 'A v2' }, 'prompts', { replace: { 'prompts/a.md': [sha256('A v1')] } }),
+      isStoreError('CONFLICT', 'prompts/a.md'),
+    )
+    assert.equal(await mainOf(git), externalIds[0])
+    assert.equal(await store.read('prompts/a.md'), 'external 0', 'the outside edit stands')
+  })
+
+  test('an outside change to another path only makes the replacement retry on the new head', async () => {
+    const { store, git } = await openAt({ claims: [ns('prompts/', 'write', 'prompts')] })
+    await store.seed({ 'prompts/a.md': 'A v1' }, 'prompts')
+    const { externalIds } = interfere(store, git, 1, 'prompts/ext.md')
+    const info = await store.seed({ 'prompts/a.md': 'A v2' }, 'prompts', { replace: { 'prompts/a.md': [sha256('A v1')] } })
+    assert.ok(info)
+    assert.equal((await git.run(['rev-parse', `${info.id}^`])).stdout.trim(), externalIds[0], 'built on top of the outside commit')
+    assert.deepEqual(info.paths, ['prompts/a.md'])
+    assert.equal(await store.read('prompts/a.md'), 'A v2')
+    assert.equal(await store.read('prompts/ext.md'), 'external 0')
+  })
 })
 
 // --- open and the repository ---------------------------------------------------------------------
