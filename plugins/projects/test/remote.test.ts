@@ -160,7 +160,7 @@ async function stored(store: DishConfigService): Promise<Record<string, ProjectF
 
 // --- the wire contract ---------------------------------------------------------------------------
 
-const METHODS = ['projects', 'check', 'save', 'remove', 'retry']
+const METHODS = ['projects', 'check', 'save', 'removeProject', 'retry']
 
 test('ProjectsRemote is bound as dishProjectsRemote under the dishProjects namespace, and marks every method', async () => {
   await withRemote(async ({ remote, ctx }) => {
@@ -197,7 +197,7 @@ test('the gateway can read every method\'s parameter names from source, and they
     projects: [],
     check: ['name', 'fields', 'adding'],
     save: ['name', 'fields', 'base', 'note', 'adding'],
-    remove: ['name', 'base', 'note'],
+    removeProject: ['name', 'base', 'note'],
     retry: ['name'],
   }
   for (const method of METHODS) {
@@ -654,7 +654,7 @@ test('with no base, a change to the registry made after the read is a CONFLICT, 
       () => remote.save('acme/mine', wireFields(), '', '', true),
       () => remote.save('acme/base', wireFields({ gate: 'mine' }), '', '', false),
       () => remote.save('acme/mine', wireFields(), undefined as unknown as string, '', true),
-      () => remote.remove('acme/base', '', ''),
+      () => remote.removeProject('acme/base', '', ''),
     ]) {
       await store.write([{ path: PROJECTS_PATH, text: serializeProjects({ 'acme/base': fileFields() }) }], { author: USER })
       const restore = interleave(store, PROJECTS_PATH, theirs)
@@ -710,7 +710,7 @@ test('save with a base the registry has changed since is CONFLICT, and nothing i
     const message = failed(await remote.save('acme/widget', wireFields({ gate: 'mine' }), commit, '', false), 'CONFLICT')
     assert.match(message, /projects\.yaml/)
     failed(await remote.save('acme/new', wireFields(), commit, '', true), 'CONFLICT')
-    failed(await remote.remove('acme/widget', commit, ''), 'CONFLICT')
+    failed(await remote.removeProject('acme/widget', commit, ''), 'CONFLICT')
     assert.equal(await store.head(), head)
     assert.equal((await stored(store))['acme/widget']!.gate, 'theirs')
 
@@ -728,7 +728,7 @@ test('the base is per document: a commit elsewhere in the store is not a conflic
     assert.notEqual(await store.head(), commit)
     assert.ok(ok(await remote.save('acme/widget', wireFields(), commit, '', true)))
     failed(await remote.save('acme/other', wireFields(), '0'.repeat(40), '', true), 'NOT_FOUND')
-    failed(await remote.remove('acme/widget', 'main~1', ''), 'NOT_FOUND')
+    failed(await remote.removeProject('acme/widget', 'main~1', ''), 'NOT_FOUND')
     assert.deepEqual(Object.keys(await stored(store)), ['acme/widget'])
   })
 })
@@ -767,7 +767,7 @@ test('save into a registry that does not parse is INVALID with the problem and a
     const message = failed(await remote.save('acme/other', wireFields(), '', '', true), 'INVALID')
     assert.match(message, /^projects\.yaml: acme\/widget: role is missing/)
     assert.match(message, /History/)
-    assert.match(failed(await remote.remove('acme/widget', '', ''), 'INVALID'), /History/)
+    assert.match(failed(await remote.removeProject('acme/widget', '', ''), 'INVALID'), /History/)
     assert.equal(await store.head(), broken)
   })
 })
@@ -778,7 +778,7 @@ test('remove deletes the entry, as the user, with the default note that says the
   await withRemote(async ({ remote, store, write }) => {
     await write({ 'acme/widget': fileFields(), 'acme/gadget': fileFields({ role: 'stays' }) })
     const { commit } = ok(await remote.projects())
-    const result = await remote.remove('acme/widget', commit, '')
+    const result = await remote.removeProject('acme/widget', commit, '')
     plain(result)
     const removed = ok(result)
     assert.ok(removed)
@@ -797,11 +797,11 @@ test('remove deletes the entry, as the user, with the default note that says the
 test('remove with a note keeps it; the last project leaves an empty registry; a missing note is an empty one', async () => {
   await withRemote(async ({ remote, store, write }) => {
     await write({ 'acme/widget': fileFields() })
-    const removed = ok(await remote.remove('acme/widget', '', 'archived upstream'))
+    const removed = ok(await remote.removeProject('acme/widget', '', 'archived upstream'))
     assert.equal(removed?.note, 'archived upstream')
     assert.equal(await store.read(PROJECTS_PATH), SEED_TEXT)
     await write({ 'acme/widget': fileFields() })
-    assert.equal(ok(await remote.remove('acme/widget', undefined as unknown as string, undefined as unknown as string))?.note, 'Removed acme/widget; its clone and workspace stay')
+    assert.equal(ok(await remote.removeProject('acme/widget', undefined as unknown as string, undefined as unknown as string))?.note, 'Removed acme/widget; its clone and workspace stay')
   })
 })
 
@@ -809,11 +809,11 @@ test('remove of a project the registry lacks is NOT_FOUND; only the exact spelli
   await withRemote(async ({ remote, store, write }) => {
     await write({ 'acme/widget': fileFields() })
     const head = await store.head()
-    assert.match(failed(await remote.remove('acme/gadget', '', ''), 'NOT_FOUND'), /acme\/gadget/)
-    failed(await remote.remove('ACME/widget', '', ''), 'NOT_FOUND')
-    failed(await remote.remove('__proto__', '', ''), 'NOT_FOUND')
-    failed(await remote.remove('constructor', '', ''), 'NOT_FOUND')
-    failed(await remote.remove('', '', ''), 'NOT_FOUND')
+    assert.match(failed(await remote.removeProject('acme/gadget', '', ''), 'NOT_FOUND'), /acme\/gadget/)
+    failed(await remote.removeProject('ACME/widget', '', ''), 'NOT_FOUND')
+    failed(await remote.removeProject('__proto__', '', ''), 'NOT_FOUND')
+    failed(await remote.removeProject('constructor', '', ''), 'NOT_FOUND')
+    failed(await remote.removeProject('', '', ''), 'NOT_FOUND')
     assert.equal(await store.head(), head)
   })
 })
@@ -822,7 +822,7 @@ test('removing a project stops its onboarding and forgets its status', async () 
   await withRemote(async ({ remote, write, fake, service }) => {
     await write({ 'acme/widget': fileFields() })
     const call = await fake.next('onboard', 'acme/widget')
-    assert.ok(ok(await remote.remove('acme/widget', '', '')))
+    assert.ok(ok(await remote.removeProject('acme/widget', '', '')))
     await waitFor('the onboarding to be aborted', () => call.signal?.aborted)
     await waitFor('the status to be forgotten', () => service().status('acme/widget').at === 0)
     assert.deepEqual(service().status('acme/widget'), { state: 'pending', at: 0 })
@@ -885,7 +885,7 @@ test('without dishConfig, projects is empty at commit "", and save, remove and r
     assert.deepEqual(ok(result), { commit: '', projects: [], problem: null, pendingProposals: 0 })
     assert.match(failed(await remote.save('acme/widget', wireFields(), '', '', true), 'UNAVAILABLE'), /config store/)
     failed(await remote.save('acme/widget', wireFields(), '', '', false), 'UNAVAILABLE')
-    failed(await remote.remove('acme/widget', '', ''), 'UNAVAILABLE')
+    failed(await remote.removeProject('acme/widget', '', ''), 'UNAVAILABLE')
     assert.match(failed(await remote.retry('acme/widget'), 'UNAVAILABLE'), /config store/)
   })
 })
@@ -921,7 +921,7 @@ test('a name that is not a string is INVALID in every method that takes one', as
     for (const name of [undefined, null, 7, {}, ['acme/widget']] as unknown as string[]) {
       failed(await remote.check(name, wireFields(), true), 'INVALID')
       failed(await remote.save(name, wireFields(), '', '', true), 'INVALID')
-      failed(await remote.remove(name, '', ''), 'INVALID')
+      failed(await remote.removeProject(name, '', ''), 'INVALID')
       failed(await remote.retry(name), 'INVALID')
     }
   })
@@ -968,8 +968,8 @@ test('the other parameters: one that is not a string is INVALID', async () => {
   await withRemote(async ({ remote }) => {
     failed(await remote.save('acme/widget', wireFields(), 5 as unknown as string, '', true), 'INVALID')
     failed(await remote.save('acme/widget', wireFields(), '', {} as unknown as string, true), 'INVALID')
-    failed(await remote.remove('acme/widget', null as unknown as string, ''), 'INVALID')
-    failed(await remote.remove('acme/widget', '', ['x'] as unknown as string), 'INVALID')
+    failed(await remote.removeProject('acme/widget', null as unknown as string, ''), 'INVALID')
+    failed(await remote.removeProject('acme/widget', '', ['x'] as unknown as string), 'INVALID')
   })
 })
 
@@ -1031,7 +1031,7 @@ test('a refusal is recognised by its code, whichever package\'s error it is; any
   // A store that is locked answers with its own code, from the first read.
   await withStubs({ head: async () => { throw coded('LOCKED') } }, async (remote) => {
     assert.equal(failed(await remote.projects(), 'LOCKED'), 'refused: LOCKED')
-    failed(await remote.remove('acme/widget', '', ''), 'LOCKED')
+    failed(await remote.removeProject('acme/widget', '', ''), 'LOCKED')
   })
 })
 
@@ -1076,7 +1076,7 @@ test('the wire carries JSON: a commit with nothing undefined in it', async () =>
     assert.ok(saved && !('note' in saved))
   })
   await withStubs({ write: async () => commit as never, read: async () => serializeProjects({ 'acme/widget': fileFields() }) }, async (remote) => {
-    const removed = ok(await remote.remove('acme/widget', '', ''))
+    const removed = ok(await remote.removeProject('acme/widget', '', ''))
     plain(removed)
     assert.ok(removed && !('note' in removed))
   })
@@ -1087,7 +1087,7 @@ test('a remote doing its work logs nothing', async () => {
     ok(await remote.projects())
     ok(await remote.check('acme/widget', wireFields(), true))
     ok(await remote.save('acme/widget', wireFields(), '', '', true))
-    ok(await remote.remove('acme/widget', '', ''))
+    ok(await remote.removeProject('acme/widget', '', ''))
     assert.deepEqual(logs, [])
   }, { workspaces: false })
 })

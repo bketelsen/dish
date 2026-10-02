@@ -18,9 +18,9 @@
  *
  * The store is optional (`dishConfig`) and looked up on every call, and so is `dishWorkspaces` (read with `ctx.get`:
  * a sibling, never an ancestor). Without a store `projects` answers with no projects and `check` judges the fields
- * alone; `save`, `remove` and `retry` are `UNAVAILABLE`.
+ * alone; `save`, `removeProject` and `retry` are `UNAVAILABLE`.
  *
- * **How a change is made.** `save` and `remove` read `projects.yaml` at the commit the page loaded (`base`, or the
+ * **How a change is made.** `save` and `removeProject` read `projects.yaml` at the commit the page loaded (`base`, or the
  * head for `''`), change the one entry, and write the whole document back through `serializeProjects` with that
  * `base` (the commit it read, when the caller gave none). The store refuses the write as `CONFLICT` when the file changed after `base` (the check is per document:
  * a commit elsewhere in the store is no conflict), so what is edited is the very file the page showed. A save is
@@ -409,14 +409,16 @@ export class ProjectsRemote extends TypertRemoteService {
   }
 
   /**
-   * Remove a project from `projects.yaml`, as the user: a commit, so it can be reverted. Nothing on disk goes: the
+   * Remove a project from `projects.yaml`, as the user: a commit, so it can be reverted. (Not called `remove`: the
+   * browser's namespace service has a member of that name and refuses to mount a method called so, which would fail the
+   * page's whole plugin to load. `dish-skills` has the same, as `deleteSkill`.) Nothing on disk goes: the
    * clone and the workspace stay, and dish stops fetching, sweeping and gating it; its onboarding is stopped. A
    * name the file doesn't have (only the spelling it has is there) is `NOT_FOUND`.
    * @param base - `''` for the head as this call reads it; else the commit the page loaded. Either way, a registry that has changed since is `CONFLICT`.
    * @param note - `''` for "Removed <name>; its clone and workspace stay"; else why, in a line.
    * @returns the commit.
    */
-  async remove(name: string, base: string, note: string): Promise<Outcome<CommitInfo | null>> {
+  async removeProject(name: string, base: string, note: string): Promise<Outcome<CommitInfo | null>> {
     return outcome(async () => {
       const project = nameOf(name)
       const after = stringOf('base', base)
@@ -458,5 +460,5 @@ export class ProjectsRemote extends TypertRemoteService {
 markRemote(ProjectsRemote, 'projects')
 markRemote(ProjectsRemote, 'check')
 markRemote(ProjectsRemote, 'save')
-markRemote(ProjectsRemote, 'remove')
+markRemote(ProjectsRemote, 'removeProject')
 markRemote(ProjectsRemote, 'retry')
