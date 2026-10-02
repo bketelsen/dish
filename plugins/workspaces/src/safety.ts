@@ -18,7 +18,7 @@
 import { constants } from 'node:fs'
 import { lstat, open, readdir, realpath } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
-import { basename, isAbsolute, join } from 'node:path'
+import { basename, isAbsolute, join, resolve } from 'node:path'
 import { maskSecrets } from 'dish-kit'
 import { GitError, gitOk, maskUrlPasswords } from './git.ts'
 
@@ -275,16 +275,18 @@ async function worktreeProblem(clone: string, path: string): Promise<string | un
   }
   // The worktree path's own last component must not be a symbolic link: `git worktree remove` on a link that an agent
   // swapped in would delete whatever it points at (`<clone>/src`). An intermediate link (a clone reached through one)
-  // is fine, so lstat the path itself, which follows every component but the last.
+  // is fine, so lstat the path itself, which follows every component but the last. Normalized first: lstat follows the
+  // link for a trailing `/` or `/.` (`…/one/`, `…/one/.`), which would let those spellings through.
+  const worktree = resolve(path)
   try {
-    if ((await lstat(path)).isSymbolicLink()) return `${path} is a symbolic link`
+    if ((await lstat(worktree)).isSymbolicLink()) return `${worktree} is a symbolic link`
   } catch {
-    return `${path} can't be read`
+    return `${worktree} can't be read`
   }
   try {
-    realPath = await realpath(path)
+    realPath = await realpath(worktree)
   } catch {
-    return `${path} can't be resolved`
+    return `${worktree} can't be resolved`
   }
   const dotGit = await readSmall(join(realPath, '.git'))
   if (!dotGit.ok) return `${path}: .git ${dotGit.reason}`

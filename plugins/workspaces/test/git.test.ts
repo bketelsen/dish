@@ -59,6 +59,7 @@ test('SAFE_FLAGS turn hooks, fsmonitor, submodule recursion, replace refs and ba
     '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
     '-c', 'fetch.recurseSubmodules=false', '-c', 'submodule.recurse=false',
     '-c', 'core.useReplaceRefs=false', '-c', 'safe.bareRepository=explicit',
+    '-c', 'advice.graftFileDeprecated=false',
   ])
   assert.equal(Object.isFrozen(SAFE_FLAGS), true)
   assert.equal(DEFAULT_GIT_TIMEOUT_MS, 120_000)
@@ -68,7 +69,7 @@ test('SAFE_FLAGS turn hooks, fsmonitor, submodule recursion, replace refs and ba
     for (const [key, value] of [
       ['core.hooksPath', '/dev/null'], ['core.fsmonitor', 'false'],
       ['fetch.recurseSubmodules', 'false'], ['submodule.recurse', 'false'],
-      ['core.useReplaceRefs', 'false'], ['safe.bareRepository', 'explicit'],
+      ['core.useReplaceRefs', 'false'], ['safe.bareRepository', 'explicit'], ['advice.graftFileDeprecated', 'false'],
     ]) assert.equal(await gitOk(['config', '--get', key], { cwd: dir, env: NOSYSTEM }), `${value}\n`, key)
   })
 })
@@ -453,6 +454,34 @@ test("a planted .git/info/grafts doesn't rewrite history for dish's git (and doe
     '-c', 'advice.graftFileDeprecated=false', '-C', clone, 'merge-base', '--is-ancestor', evil, 'origin/main',
   ], { env: { ...env, GIT_GRAFT_FILE: join(clone, '.git', 'info', 'grafts') } }).then(() => 0).catch(() => 1)
   assert.equal(leaked, 0, 'the fixture proved itself: the graft makes the false ancestry true')
+})
+
+test("a failing merge-base or worktree remove reports git's fatal: line, not the grafts deprecation hint", async () => {
+  const dir = await tempDir()
+  const { clone } = await makeClone(dir)
+  await asDish(dir, async () => {
+    const mergeBase = await gitOk(['-C', clone, 'merge-base', '--is-ancestor', 'HEAD', 'nope'], { env: NOSYSTEM }).catch((e: unknown) => e)
+    assert.ok(mergeBase instanceof GitError)
+    assert.match(mergeBase.message, /^git merge-base failed \(exit 128\): fatal: /)
+    assert.equal(mergeBase.message.includes('hint:'), false)
+    const remove = await gitOk(['-C', clone, 'worktree', 'remove', join(clone, '.worktrees', 'nope')], { env: NOSYSTEM }).catch((e: unknown) => e)
+    assert.ok(remove instanceof GitError)
+    assert.match(remove.message, /^git worktree failed \(exit 128\): fatal: /)
+    assert.equal(remove.message.includes('hint:'), false)
+  })
+})
+
+test("no caller's env can turn grafts back on", async () => {
+  const dir = await tempDir()
+  const made = await makeClone(dir, { a: 'real\n' })
+  const { clone } = made
+  const { base, evil } = await baseAndEvil(made)
+  const grafts = join(clone, '.git', 'info', 'grafts')
+  await writeFile(grafts, `${base} ${evil}\n`)
+  await asDish(dir, async () => {
+    const result = await git(['-C', clone, 'merge-base', '--is-ancestor', evil, 'origin/main'], { env: { ...NOSYSTEM, GIT_GRAFT_FILE: grafts } })
+    assert.equal(result.code, 1, 'options.env re-enabled the planted graft')
+  })
 })
 
 test('safe.bareRepository=explicit refuses a -C into a bare repository, but --git-dir still works', async () => {

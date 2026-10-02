@@ -341,9 +341,11 @@ test('checkWorktree refuses a worktree path that is itself a symbolic link, so w
   await mkdir(join(clone, 'src'))
   await rm(path, { recursive: true })
   await symlink(join(clone, 'src'), path)
-  const result = await checkWorktree(clone, path)
-  assert.equal(result.ok, false)
-  assert.match(problemOf(result), /is a symbolic link/)
+  for (const spelling of [path, `${path}/`, `${path}/.`, join(clone, '.worktrees', '.', 'one')]) {
+    const result = await checkWorktree(clone, spelling)
+    assert.equal(result.ok, false, spelling)
+    assert.match(problemOf(result), /is a symbolic link/, spelling)
+  }
 })
 
 test('checkWorktree refuses a rewritten .git file, commondir or gitdir, a config.worktree, and a .git directory', async () => {

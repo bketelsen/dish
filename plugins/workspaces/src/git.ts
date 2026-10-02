@@ -37,12 +37,15 @@ import { childEnvironment } from './env.ts'
 /**
  * Passed before every git command dish runs, whatever the clone's own files say (`-c` beats every config file): no
  * hooks, no fsmonitor, no recursion into submodules, no replace refs, and a bare repository only when named.
- * Grafts are switched off through `GIT_GRAFT_FILE` in the environment, since no `-c` key does it.
+ * Grafts are switched off through `GIT_GRAFT_FILE` in the environment, since no `-c` key does it; setting that var
+ * makes git print a deprecation hint on every command that parses commits, which would push the real `fatal:` line
+ * out of `GitError`'s first-line message, so the hint is silenced here.
  */
 export const SAFE_FLAGS: readonly string[] = Object.freeze([
   '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
   '-c', 'fetch.recurseSubmodules=false', '-c', 'submodule.recurse=false',
   '-c', 'core.useReplaceRefs=false', '-c', 'safe.bareRepository=explicit',
+  '-c', 'advice.graftFileDeprecated=false',
 ])
 /** How long one git command may run before its process group is killed. */
 export const DEFAULT_GIT_TIMEOUT_MS = 120_000
@@ -160,9 +163,9 @@ export function git(args: readonly string[], options: GitOptions = {}): Promise<
   return new Promise((resolve, reject) => {
     const child: ChildProcess = spawn('git', [...SAFE_FLAGS, ...args], {
       cwd: options.cwd,
-      // GIT_GRAFT_FILE after the scrub (which dropped every inherited GIT_*): only it switches a planted grafts file off.
-      // A caller's options.env still wins, for a test that must point it elsewhere.
-      env: { ...childEnvironment(), GIT_GRAFT_FILE: '/dev/null', ...options.env },
+      // GIT_GRAFT_FILE last: after the scrub (which dropped every inherited GIT_*) and after options.env, so no caller can
+      // turn a planted grafts file back on. Only this var switches grafts off.
+      env: { ...childEnvironment(), ...options.env, GIT_GRAFT_FILE: '/dev/null' },
       detached: true,
       stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     })
