@@ -14,8 +14,8 @@ import type { DishWorkspaces } from '../src/service.ts'
 import { exists, filesHolding } from './onboard-helpers.ts'
 import { runOk, tempDir } from './helpers.ts'
 import {
-  APP_ID_NAME, HELPER, PRIVATE_KEY_NAME, credentialsStub, crewStub, mountRegistryOn, provideStub, startServiceWorld, useScratchProcess,
-  waitFor, watchLogs,
+  APP_ID_NAME, HELPER, PRIVATE_KEY_NAME, credentialsStub, crewStub, mountRegistryOn, projectOf, projectsStub, provideStub, startServiceWorld,
+  useScratchProcess, waitFor, watchLogs,
 } from './service-helpers.ts'
 import type { MountedRegistry, ServiceWorld } from './service-helpers.ts'
 import { mergedPull } from './worktree-helpers.ts'
@@ -277,5 +277,43 @@ test('dish-workspaces stopping mid-onboarding kills its setup and leaves the pro
     assert.equal(await exists(go), false)
   } finally {
     await run.stop()
+  }
+})
+
+test('dish-projects recording a project ready registers its workspace when a registry came after its onboarding\'s last step', async () => {
+  const world = await startServiceWorld()
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  const projects = projectsStub()
+  const widget = projectOf('acme/widget')
+  projects.add(widget)
+  const fibers = [provideStub(ctx, 'dishProjects', projects.service), provideStub(ctx, 'credentials', credentialsStub(world.credentials))]
+  for (const fiber of fibers) await fiber
+  let started: plugin.WorkspacesService | undefined
+  const workspaces = ctx.plugin({
+    name: plugin.name,
+    apply: (inner: Context, config: plugin.Config) => { started = plugin.start(inner, config, world.internals()) },
+  } as never, { appIdName: APP_ID_NAME, privateKeyName: PRIVATE_KEY_NAME, terminal: false } as never)
+  await workspaces
+  let registry: MountedRegistry | undefined
+  try {
+    const service = ctx.get('dishWorkspaces') as DishWorkspaces
+    const result = await service.onboard(widget)
+    assert.deepEqual(result.workspace, { skipped: 'no workspace registry in this profile' })
+    // The registry comes before dish-projects has recorded the project ready: its own pass leaves it.
+    registry = await mountRegistryOn(ctx, join(world.dir, 'dsh'))
+    await waitFor('the scratch workspace', () => registry!.registry.list().some(item => item.title === 'scratch'))
+    await started!.idle()
+    const clone = join(world.workRoot, 'acme', 'widget')
+    assert.equal(await registry.registry.resolveByPath(clone), undefined)
+    projects.set('acme/widget', 'ready')
+    ctx.emit('dish-projects/status', 'acme/widget', { state: 'ready', at: Date.now(), readyAt: Date.now() })
+    const record = await waitFor('the workspace', () => registry!.registry.resolveByPath(clone))
+    assert.equal(record.title, 'acme/widget')
+    assert.deepEqual(logs, [])
+  } finally {
+    await workspaces.dispose()
+    await registry?.stop()
+    for (const fiber of fibers.reverse()) await fiber.dispose()
   }
 })

@@ -26,7 +26,7 @@ import { createDishWorkspaces } from './service.ts'
 import type { DishWorkspaces, WorkspacesInternals, WorkspacesService } from './service.ts'
 import { worktreeTool } from './tool.ts'
 
-export type { CloneInfo, DishWorkspaces, WorkspacesInternals } from './service.ts'
+export type { CloneInfo, DishWorkspaces, WorkspacesInternals, WorkspacesService } from './service.ts'
 export type { CreatedWorktree, Worktree, WorktreeInfo } from './worktrees.ts'
 export type { SweepResult } from './sweep.ts'
 
@@ -110,6 +110,8 @@ export function start(ctx: Context, config: Config, internals: WorkspacesInterna
   })
 
   ctx.on('dish-projects/changed', (names) => { service.projectsChanged(names) })
+  // A registry can appear between onboarding's last step and dish-projects recording the project ready.
+  ctx.on('dish-projects/status', (project, status) => { if (status.state === 'ready') service.registerIfMissing(project) })
   ctx.on('credentials/reference-updated', (ref) => { service.credentialsChanged(ref) })
   return service
 }

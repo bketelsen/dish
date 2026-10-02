@@ -660,9 +660,12 @@ async function excludeWorktrees(clone: string, step: OnboardStep): Promise<void>
   })
 }
 
-/** Step 3. The contract's keys (helper entries replaced as a pair, never accumulated), the identity, the exclude line once, all written with `git config --file <clone>/.git/config` (never `-C <clone>`, so nothing of the clone's runs before the check); then checkClone with the expectations. Idempotent. */
-export async function configureClone(clone: string, project: Project, identity: { name: string, email: string }, deps: CloneDeps): Promise<void> {
-  for (const [what, value] of [['name', identity.name], ['email', identity.email]] as const) {
+/**
+ * Step 3. The contract's keys (helper entries replaced as a pair, never accumulated), the identity, the exclude line once, all written with `git config --file <clone>/.git/config` (never `-C <clone>`, so nothing of the clone's runs before the check); then checkClone with the expectations. Idempotent.
+ * With `identity` undefined (a prepare at start that couldn't reach GitHub for the bot identity), `user.*` is left as it is and everything else is done.
+ */
+export async function configureClone(clone: string, project: Project, identity: { name: string, email: string } | undefined, deps: CloneDeps): Promise<void> {
+  for (const [what, value] of identity === undefined ? [] : [['name', identity.name], ['email', identity.email]] as const) {
     if (typeof value !== 'string' || value.trim() === '' || /[\x00-\x1f\x7f]/.test(value)) {
       throw new OnboardError('configure', `the bot identity's ${what} is empty or not one line`)
     }
@@ -676,8 +679,10 @@ export async function configureClone(clone: string, project: Project, identity: 
   // replaced before the check below, so a helper path from an older checkout passes.
   await editConfig(clone, project, deps, 'configure', [
     { args: ['--replace-all', 'credential.interactive', 'false'] },
-    { args: ['--replace-all', 'user.name', identity.name] },
-    { args: ['--replace-all', 'user.email', identity.email] },
+    ...identity === undefined ? [] : [
+      { args: ['--replace-all', 'user.name', identity.name] },
+      { args: ['--replace-all', 'user.email', identity.email] },
+    ],
     { args: ['--replace-all', 'remote.origin.url', url] },
     // Exit 5: there was none.
     { args: ['--unset-all', `credential.${web}.helper`], ok: [0, 5] },

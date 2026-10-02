@@ -3,15 +3,13 @@ import assert from 'node:assert/strict'
 import { lstat, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import type { Project } from 'dish-projects/registry'
-import type { ProjectState } from 'dish-projects'
 import { helperValue, tokensDir } from '../src/paths.ts'
 import { createDishWorkspaces } from '../src/service.ts'
 import type { WorkspacesInternals, WorkspacesService } from '../src/service.ts'
 import { exists, filesHolding } from './onboard-helpers.ts'
 import { runOk, tempDir, withEnv } from './helpers.ts'
 import {
-  APP_ID_NAME, HELPER, PRIVATE_KEY_NAME, credentialsStub, crewStub, fakeTimers, mountRegistryOn, projectOf, provideStub,
+  APP_ID_NAME, HELPER, PRIVATE_KEY_NAME, credentialsStub, crewStub, fakeTimers, mountRegistryOn, projectOf, projectsStub, provideStub,
   startServiceWorld, useScratchProcess, waitFor, watchLogs,
 } from './service-helpers.ts'
 import type { FakeTimers, MountedRegistry, ServiceWorld } from './service-helpers.ts'
@@ -20,45 +18,6 @@ const scratch = useScratchProcess()
 
 const widget = projectOf('acme/widget')
 const gadget = projectOf('acme/gadget')
-
-/** A `dishProjects` the test drives: the projects listed, their states, and a `list` the test can hold. */
-function projectsStub() {
-  const listed = new Map<string, Project>()
-  const states = new Map<string, ProjectState>()
-  let held: Promise<void> | undefined
-  let calls = 0
-  return {
-    add(project: Project, state: ProjectState = 'pending') {
-      listed.set(project.name.toLowerCase(), project)
-      states.set(project.name.toLowerCase(), state)
-    },
-    remove(name: string) {
-      listed.delete(name.toLowerCase())
-      states.delete(name.toLowerCase())
-    },
-    set(name: string, state: ProjectState) {
-      states.set(name.toLowerCase(), state)
-    },
-    /** Hold every `list()` until the returned function is called. */
-    hold(): () => void {
-      let release = (): void => {}
-      held = new Promise<void>((resolve) => { release = resolve })
-      return () => { held = undefined; release() }
-    },
-    calls: () => calls,
-    service: {
-      async list() {
-        calls++
-        if (held !== undefined) await held
-        return [...listed.values()]
-      },
-      async get(name: string) { return listed.get(name.toLowerCase()) },
-      status(name: string) { return { state: states.get(name.toLowerCase()) ?? 'pending', at: 0 } },
-      async retry() {},
-      async problem() { return undefined },
-    },
-  }
-}
 
 interface Setup {
   world: ServiceWorld
@@ -70,7 +29,7 @@ interface Setup {
   registry: MountedRegistry | undefined
 }
 
-async function setup(options: { registry?: boolean, timers?: FakeTimers, internals?: WorkspacesInternals, files?: Record<string, string>, world?: ServiceWorld } = {}): Promise<Setup> {
+async function setup(options: { registry?: boolean, timers?: FakeTimers, internals?: WorkspacesInternals, files?: Record<string, string>, world?: ServiceWorld, credentials?: unknown } = {}): Promise<Setup> {
   const world = options.world ?? await startServiceWorld({ files: options.files })
   const ctx = new Context()
   const logs = watchLogs(ctx, true)
@@ -78,7 +37,7 @@ async function setup(options: { registry?: boolean, timers?: FakeTimers, interna
   projects.add(widget)
   projects.add(gadget)
   await provideStub(ctx, 'dishProjects', projects.service)
-  await provideStub(ctx, 'credentials', credentialsStub(world.credentials))
+  await provideStub(ctx, 'credentials', options.credentials ?? credentialsStub(world.credentials))
   const crew = crewStub()
   await provideStub(ctx, 'dishCrew', crew.service)
   const registry = options.registry === true ? await mountRegistryOn(ctx, join(world.dir, 'dsh')) : undefined
@@ -288,6 +247,143 @@ test('prepare configures before it fetches: a helper path from an older checkout
     assert.equal(asked(), 2)
   } finally {
     await teardown(run)
+  }
+})
+
+test('prepare stays ready when GitHub can\'t give the bot identity: the clone keeps its own, the helper is put back, one warning, and the next prepare asks again', async () => {
+  const run = await setup()
+  try {
+    await run.service.onboard(widget)
+    const clone = join(run.world.workRoot, 'acme', 'widget')
+    const config = join(clone, '.git', 'config')
+    const web = run.world.git.origin
+    const current = helperValue(HELPER, tokensDir(run.world.state), web)
+    const older = helperValue('/old/checkout/plugins/workspaces/bin/git-credential-dish', tokensDir(run.world.state), web)
+    const bot = `${run.world.github.app.slug}[bot]`
+    assert.ok((await readFile(config, 'utf8')).includes(bot))
+    const warnings = () => run.logs.filter(line => line.includes('warn') && line.includes('bot identity'))
+    const asked = () => run.world.github.requests.filter(request => request.path === '/app').length
+
+    // A start before the network is up: GitHub fails the App lookup.
+    await writeFile(config, (await readFile(config, 'utf8')).replace(current, older))
+    run.service.credentialsChanged(APP_ID_NAME)
+    run.world.github.failNext('/app', 500)
+    await run.service.prepare(widget)
+    const after = await readFile(config, 'utf8')
+    assert.ok(after.includes(current) && !after.includes(older), 'the helper is put back without the identity')
+    assert.ok(after.includes(bot), 'the clone keeps the identity it has')
+    assert.equal(run.service.describe('acme/widget')?.lastFetch?.ok, true)
+    assert.equal(warnings().length, 1, run.logs.join('\n'))
+
+    // The same trouble again is not logged again; the next prepare asks GitHub again.
+    const before = asked()
+    run.world.github.failNext('/app', 500)
+    await run.service.prepare(widget)
+    assert.equal(asked(), before + 1)
+    assert.equal(warnings().length, 1)
+    await run.service.prepare(widget)
+    assert.equal(asked(), before + 2)
+    await run.service.prepare(widget)
+    assert.equal(asked(), before + 2, 'once found, it is kept')
+
+    // No App key at all: the same, with its own warning.
+    const key = run.world.credentials.get(PRIVATE_KEY_NAME)!
+    run.world.credentials.delete(PRIVATE_KEY_NAME)
+    run.service.credentialsChanged(PRIVATE_KEY_NAME)
+    await run.service.prepare(widget)
+    assert.equal(warnings().length, 2)
+    assert.match(warnings()[1]!, /Settings → GitHub App/)
+    run.world.credentials.set(PRIVATE_KEY_NAME, key)
+    for (const line of run.logs) assert.ok(!line.includes('ghs_') && !line.includes('PRIVATE KEY'), line)
+  } finally {
+    await teardown(run)
+  }
+})
+
+test('a registry that appears after onboarding\'s last step, before dish-projects records the project ready, registers it once it is', async () => {
+  const run = await setup()
+  let mounted: MountedRegistry | undefined
+  try {
+    const result = await run.service.onboard(widget)
+    assert.deepEqual(result.workspace, { skipped: 'no workspace registry in this profile' })
+    // dish-projects hasn't recorded it ready yet when the registry comes: the registry's own pass leaves it.
+    mounted = await mountRegistryOn(run.ctx, join(run.world.dir, 'dsh'))
+    run.service.useRegistry(mounted.registry)
+    await run.service.idle()
+    const clone = join(run.world.workRoot, 'acme', 'widget')
+    assert.equal(await mounted.registry.resolveByPath(clone), undefined)
+    // Then it does (dish-projects/status), and the workspace is registered.
+    run.projects.set('acme/widget', 'ready')
+    run.service.registerIfMissing('acme/widget')
+    await run.service.idle()
+    const record = await mounted.registry.resolveByPath(clone)
+    assert.equal(record?.title, 'acme/widget')
+    assert.deepEqual(run.service.describe('acme/widget')?.workspace, { id: record!.id, title: 'acme/widget' })
+    // Once.
+    run.service.registerIfMissing('acme/widget')
+    run.service.registerIfMissing('ACME/Widget')
+    await run.service.idle()
+    assert.equal(mounted.registry.list().filter(item => item.title === 'acme/widget').length, 1)
+  } finally {
+    await teardown(run)
+    await mounted?.stop()
+  }
+})
+
+test('a project removed while its registration waits for the lock gets no workspace; an aborted call doesn\'t wait for the lock', async () => {
+  const world = await startServiceWorld()
+  // Credentials the test can hold, so that a prepare holds the project's lock.
+  let gate: Promise<void> | undefined
+  let waiting = 0
+  const credentials = {
+    async resolve(ref: string) {
+      if (gate !== undefined) {
+        waiting++
+        await gate
+      }
+      const value = world.credentials.get(ref)
+      return value === undefined ? undefined : { value, source: 'file' }
+    },
+  }
+  const run = await setup({ world, credentials })
+  let mounted: MountedRegistry | undefined
+  let release = (): void => {}
+  try {
+    await run.service.onboard(widget)
+    run.projects.set('acme/widget', 'ready')
+    await run.service.idle()
+    run.service.credentialsChanged(APP_ID_NAME)
+    gate = new Promise<void>((resolve) => { release = resolve })
+    const preparing = run.service.prepare(widget)
+    await waitFor('prepare to hold the lock', () => waiting > 0)
+
+    // An aborted call is refused at once, not after the lock.
+    const aborted = run.service.onboard(widget, { signal: AbortSignal.abort() })
+    assert.equal(await settled(aborted, 100), true)
+    await assert.rejects(aborted, (error: Error) => error.name === 'AbortError')
+
+    // The registry comes: its pass finds the project ready and waits for the lock; so does a registerIfMissing.
+    mounted = await mountRegistryOn(run.ctx, join(run.world.dir, 'dsh'))
+    const listed = run.projects.calls()
+    run.service.useRegistry(mounted.registry)
+    await waitFor('the registry\'s pass to list the projects', () => run.projects.calls() > listed)
+    run.service.registerIfMissing('acme/widget')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    // Removed meanwhile.
+    run.projects.remove('acme/widget')
+    gate = undefined
+    release()
+    await preparing
+    await run.service.idle()
+    const clone = join(run.world.workRoot, 'acme', 'widget')
+    assert.equal(await mounted.registry.resolveByPath(clone), undefined)
+    assert.deepEqual(mounted.registry.list().map(item => item.title), ['scratch'])
+  } finally {
+    // A failed assertion must not leave the prepare holding the lock, or close would wait for it.
+    gate = undefined
+    release()
+    await teardown(run)
+    await mounted?.stop()
   }
 })
 

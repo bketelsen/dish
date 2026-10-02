@@ -19,9 +19,10 @@
  *   time; onboarding's own addition of a new repo goes through the same queue, and only adds.
  * - **The workspace registry** (`useRegistry`, from the plugin's `ctx.inject(['workspaceRegistry'])`): each time one
  *   appears, the scratch workspace (once, by its record) and every ready project whose clone state has no workspace,
- *   each under its project's lock. An onboarding that found no registry at its last step, and a prepare, register too
- *   when one has appeared since. The signal is checked before every registration, so a project removed while it
- *   onboarded never gets a workspace.
+ *   each under its project's lock. A project whose onboarding found no registry at its last step is registered when
+ *   dish-projects records it ready (`registerIfMissing`, on `dish-projects/status`), and a prepare registers one too.
+ *   Every registration checks the signal, and that the project is still ready, inside the lock: a project removed while
+ *   it onboarded, or while it waited for the lock, never gets a workspace.
  * - **The hourly round:** first `firstRoundMs` after `start`, then every `roundEveryMs`: per ready project, one at a time,
  *   under its lock: its fetch (which makes sure of its read token first), then the sweep. A round never overlaps the one
  *   before (a tick while one runs is skipped). A failure is logged once per project and error, and the round goes on.
@@ -84,7 +85,12 @@ export interface CloneInfo {
 export interface DishWorkspaces {
   /** Onboarding's steps 1 to 5 (onboard.ts), under the project's lock. */
   onboard(project: Project, options?: { signal?: AbortSignal, progress?: (step: OnboardStep) => void }): Promise<OnboardResult>
-  /** For a ready project at start: step 3 again (the helper path, the identity, the safety check), then its fetch; and its workspace, if it has none and a registry is there. */
+  /**
+   * For a ready project at start: step 3 again (the helper path, the identity, the safety check), then its fetch; and its
+   * workspace, if it has none and a registry is there. It fails only when the clone can't be configured or checked: a bot
+   * identity GitHub can't give (the network not up yet) leaves the clone's own, and a failed fetch is in `lastFetch`;
+   * each is logged once.
+   */
   prepare(project: Project): Promise<void>
   /** What dish knows of `name`'s clone, from memory; undefined for a project with no clone state. */
   describe(name: string): CloneInfo | undefined
@@ -138,6 +144,12 @@ export interface WorkspacesService extends DishWorkspaces {
   close(): Promise<void>
   /** dsh's workspace registry appeared: use it until the returned function is called. */
   useRegistry(registry: WorkspaceRegistryLike): () => void
+  /**
+   * `dish-projects/status` said `name` is ready: register its workspace if its clone state has none and a registry is
+   * there (a registry that appeared after its onboarding's last step looked, and before dish-projects recorded it ready).
+   * Under its lock; a project no longer ready by then gets none. In the background; a failure is logged once.
+   */
+  registerIfMissing(name: string): void
   /** `dish-projects/changed` (with the names it carries, which the recompute doesn't need): recompute the owner map. */
   projectsChanged(names?: readonly string[]): void
   /** `credentials/reference-updated`: look the bot identity up again if `ref` is one of the App's. */
@@ -362,6 +374,28 @@ class Service implements WorkspacesService {
     }
   }
 
+  registerIfMissing(name: string): void {
+    const registry = this.#registry
+    if (this.#closed || registry === undefined) return
+    const generation = this.#registryGeneration
+    const topic = `workspace ${name.toLowerCase()}`
+    this.#track((async () => {
+      const project = await this.#projects()?.get(name)
+      if (project === undefined) return
+      await this.#locked(project, undefined, async (signal) => {
+        if (this.#registryGeneration !== generation || !this.#stillReady(project)) return
+        try {
+          await this.#register(project, registry, signal)
+        } finally {
+          await this.#reload(project)
+        }
+      })
+      this.#clearTrouble(topic)
+    })().catch((error: unknown) => {
+      if (!this.#closed && !isAbort(error)) this.#warnOnce(topic, logged(error), 'could not register the workspace of %s: %s', name, logged(error))
+    }))
+  }
+
   projectsChanged(_names?: readonly string[]): void {
     if (!this.#closed) this.#track(this.#recomputeTokens())
   }
@@ -376,12 +410,9 @@ class Service implements WorkspacesService {
     try {
       return await this.#locked(project, options.signal, async (signal) => {
         try {
-          const result = await onboardProject(project, this.#onboardDeps(), { signal, ...(options.progress === undefined ? {} : { progress: options.progress }) })
-          if (!('skipped' in result.workspace)) return result
-          // A registry that appeared after its last step looked.
-          const registry = this.#registry
-          const id = registry === undefined ? undefined : await this.#register(project, registry, signal)
-          return id === undefined ? result : { ...result, workspace: { id } }
+          // A registry that appears after its last step looked registers the workspace once dish-projects records the
+          // project ready (`registerIfMissing`).
+          return await onboardProject(project, this.#onboardDeps(), { signal, ...(options.progress === undefined ? {} : { progress: options.progress }) })
         } finally {
           await this.#reload(project)
         }
@@ -400,27 +431,32 @@ class Service implements WorkspacesService {
           throw new Error(`dish has no record of ${project.name}'s clone (${file}); press Retry on Settings → Projects to onboard it again`)
         }
         if (current.installation !== null) await this.#addRepositories(new Map([[project.owner.toLowerCase(), { installation: current.installation, repos: [project.repo] }]]))
-        let identity: Identity
+        const topic = `project ${project.name.toLowerCase()}`
+        let troubled = false
+        // The unit can start before the network is up: without the bot identity, the clone keeps the one it has, the
+        // rest is configured all the same, and the project stays ready. The next prepare asks again.
+        let identity: Identity | undefined
         try {
           identity = await this.#botIdentity()
         } catch (error) {
-          throw error instanceof GitHubError && error.kind === 'no-credentials'
-            ? new Error('set the GitHub App on Settings → GitHub App')
-            : new Error(`looking up the dish App's bot identity failed: ${messageOf(error)}`)
+          troubled = true
+          const why = error instanceof GitHubError && error.kind === 'no-credentials' ? 'the GitHub App isn\'t set on Settings → GitHub App' : logged(error)
+          this.#warnOnce(topic, why, 'could not look up the dish App\'s bot identity for %s; its clone keeps the identity it has: %s', project.name, why)
         }
         // Configure first: the fetch checks the clone with today's helper path, which this puts back.
         await configureClone(current.clone, project, identity, this.#cloneDeps)
         if (signal.aborted) throw abortedBy(signal)
         try {
           await this.#fetch(project, signal)
-          this.#clearTrouble(`project ${project.name.toLowerCase()}`)
         } catch (error) {
           if (signal.aborted || isAbort(error)) throw error
+          troubled = true
           // Recorded in lastFetch, which the page shows; the round tries again.
-          this.#warnOnce(`project ${project.name.toLowerCase()}`, logged(error), 'could not fetch %s: %s', project.name, logged(error))
+          this.#warnOnce(topic, logged(error), 'could not fetch %s: %s', project.name, logged(error))
         }
+        if (!troubled) this.#clearTrouble(topic)
         const registry = this.#registry
-        if (registry !== undefined) await this.#register(project, registry, signal)
+        if (registry !== undefined && this.#stillReady(project)) await this.#register(project, registry, signal)
       } finally {
         await this.#reload(project)
       }
@@ -533,6 +569,7 @@ class Service implements WorkspacesService {
   async #locked<T>(project: Project, callerSignal: AbortSignal | undefined, body: (signal: AbortSignal) => Promise<T>): Promise<T> {
     if (this.#closed) throw stopped()
     const signal = callerSignal === undefined ? this.#closing.signal : AbortSignal.any([callerSignal, this.#closing.signal])
+    if (signal.aborted) throw abortedBy(signal)
     const job = this.#lock.run(project.name.toLowerCase(), async () => {
       if (this.#closed) throw stopped()
       if (signal.aborted) throw abortedBy(signal)
@@ -693,6 +730,11 @@ class Service implements WorkspacesService {
     return this.#ctx.get('dishProjects')
   }
 
+  /** Whether dish-projects says `project` is ready now (a removed one isn't: its status is forgotten). */
+  #stillReady(project: Project): boolean {
+    return this.#projects()?.status(project.name).state === 'ready'
+  }
+
   /** The project called `name` (any case), registered now. */
   async #registered(name: string): Promise<Project> {
     const projects = this.#projects()
@@ -828,7 +870,8 @@ class Service implements WorkspacesService {
       const topic = `workspace ${project.name.toLowerCase()}`
       try {
         await this.#locked(project, undefined, async (signal) => {
-          if (this.#registryGeneration !== generation) return
+          // Removed (or no longer ready) while it waited for the lock: no workspace.
+          if (this.#registryGeneration !== generation || !this.#stillReady(project)) return
           try {
             await this.#register(project, registry, signal)
           } finally {

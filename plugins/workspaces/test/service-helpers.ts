@@ -26,6 +26,7 @@ import * as storageDomain from '@deepseek-ai/dsh-storage-domain'
 import * as storageJson from '@deepseek-ai/dsh-storage-json'
 import workspace from '@deepseek-ai/dsh-workspace'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
+import type { ProjectState } from 'dish-projects'
 import type { Project } from 'dish-projects/registry'
 import { internals as cloneInternals } from '../src/clone.ts'
 import type { WorkspacesInternals } from '../src/service.ts'
@@ -97,6 +98,45 @@ export function projectOf(name: string, overrides: Partial<Project> = {}): Proje
     family: 'acme', role: 'a test project', gate: 'true', gateTimeout: '1m', gateTimeoutMs: 60_000,
     setup: undefined, setupTimeout: '15m', setupTimeoutMs: 900_000, gateEnv: {},
     ...overrides,
+  }
+}
+
+/** A `dishProjects` the test drives: the projects listed, their states, and a `list` the test can hold. */
+export function projectsStub() {
+  const listed = new Map<string, Project>()
+  const states = new Map<string, ProjectState>()
+  let held: Promise<void> | undefined
+  let calls = 0
+  return {
+    add(project: Project, state: ProjectState = 'pending') {
+      listed.set(project.name.toLowerCase(), project)
+      states.set(project.name.toLowerCase(), state)
+    },
+    remove(name: string) {
+      listed.delete(name.toLowerCase())
+      states.delete(name.toLowerCase())
+    },
+    set(name: string, state: ProjectState) {
+      states.set(name.toLowerCase(), state)
+    },
+    /** Hold every `list()` until the returned function is called. */
+    hold(): () => void {
+      let release = (): void => {}
+      held = new Promise<void>((resolve) => { release = resolve })
+      return () => { held = undefined; release() }
+    },
+    calls: () => calls,
+    service: {
+      async list() {
+        calls++
+        if (held !== undefined) await held
+        return [...listed.values()]
+      },
+      async get(name: string) { return listed.get(name.toLowerCase()) },
+      status(name: string) { return { state: states.get(name.toLowerCase()) ?? 'pending', at: 0 } },
+      async retry() {},
+      async problem() { return undefined },
+    },
   }
 }
 
