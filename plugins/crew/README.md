@@ -2,7 +2,7 @@
 
 A fixed crew of specialists the main agent hands work to, with the conversation staying open while they run.
 - **One tool, `delegate`.** It starts a child in a role, or sends a fix round to a child it already started. Each child gets its role's prompt from `dish-prompts`, its role's tools, and a model from its role's tier.
-- **Reviewers run on another family.** The reviewer always runs on a different model family, and vendor, from the work it reviews. The harness enforces this.
+- **Reviewers run on another family.** The reviewer runs on a different model family, and vendor, from the work it reviews, and the harness enforces this. A model `crew.yaml` doesn't list whose id names no known vendor counts as its own family, so an alias that hides its vendor can get a reviewer of the same vendor; list it in a family to close that.
 - **`crew.yaml`** in the config store holds the roles, tiers, models and limits.
 - **Crew keeps its own record.** It saves every child's final report, and finish notices name the child's role and model.
 - **Children report once, in their closing message.** A new child is told so after its task. A child's `send_message` longer than `messageLimit` characters (1200 by default) is refused, and `send_message` stays closed to it until it finishes, so the main agent gets one delivery and not two.
