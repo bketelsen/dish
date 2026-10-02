@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Then } from '../src/client/controller.ts'
+import { skipReason } from '../../workspaces/src/setup.ts'
 import {
   changedFields, fetchText, fieldValue, optionText, relativeTime, retryHint, shortId, skippedParts, stateLabel, stateTone, statusLine,
   thenText,
@@ -173,20 +174,22 @@ test('fetchText: never fetched, fetched, and failed with the reason', () => {
   assert.deepEqual(fetchText({ at: NOW, ok: false, message: null }, NOW), { text: 'fetch failed just now', ok: false })
 })
 
-test('skippedParts: the reason, and the command to run instead when the message gives one', () => {
+test('skippedParts: the reason, and the command to run instead, from the message dish-workspaces builds', () => {
   assert.deepEqual(
-    skippedParts('setup didn\'t run outside the sandbox: it is an existing checkout. Run it yourself in /home/dish/work/acme/widget: pnpm install --frozen-lockfile'),
-    {
-      reason: 'setup didn\'t run outside the sandbox: it is an existing checkout.',
-      where: '/home/dish/work/acme/widget',
-      command: 'pnpm install --frozen-lockfile',
-    },
+    skippedParts(skipReason('it is an existing checkout', '/home/dish/work/acme/widget', 'pnpm install --frozen-lockfile')),
+    { reason: 'it is an existing checkout.', where: '/home/dish/work/acme/widget', command: 'pnpm install --frozen-lockfile' },
   )
+  // A reason that ends in dots, a command with colons and several lines.
   assert.deepEqual(
-    skippedParts('Run it yourself in /w/x: make'),
-    { reason: '', where: '/w/x', command: 'make' },
+    skippedParts(skipReason('base dish/plan-x isn\'t on origin/main...', '/w/x', 'echo a: b\npnpm install')),
+    { reason: 'base dish/plan-x isn\'t on origin/main.', where: '/w/x', command: 'echo a: b\npnpm install' },
   )
+})
+
+test('skippedParts: other texts are the reason as they are', () => {
+  assert.deepEqual(skippedParts('Run it yourself in /w/x: make'), { reason: '', where: '/w/x', command: 'make' })
   assert.deepEqual(skippedParts('setup was skipped'), { reason: 'setup was skipped' })
+  assert.deepEqual(skippedParts('setup didn\'t run outside the sandbox: no reason given'), { reason: 'no reason given' })
   assert.deepEqual(skippedParts(''), { reason: '' })
 })
 

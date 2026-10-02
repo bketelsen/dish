@@ -268,6 +268,31 @@ const css = `
 .dish-projects-mono input {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+.dish-projects-textarea {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 72px;
+  margin: 0;
+  padding: 6px 10px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-settings-card-fill);
+  color: var(--dsw-alias-label-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  resize: vertical;
+}
+.dish-projects-textarea:focus-visible {
+  outline: none;
+  border-color: var(--dsw-alias-state-business-primary);
+}
+.dish-projects-textarea[readonly] {
+  color: var(--dsw-alias-label-secondary);
+}
 .dish-projects-env-rows {
   display: flex;
   flex-direction: column;

@@ -5,7 +5,7 @@
  * for a new project and fixed for an edit.
  */
 
-import type { KeyboardEvent, ReactNode } from 'react'
+import { useEffect, useRef, type KeyboardEvent, type ReactNode } from 'react'
 import { Button, Input } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { EnvRow, FieldKey, FormState, PageState, ProjectsActions } from './controller.ts'
 import { changedFields } from './format.ts'
@@ -22,26 +22,44 @@ function TextField(props: {
   placeholder?: string
   mono?: boolean
   wide?: boolean
+  /** Several lines: a text area. A one-line input would drop the newlines of a value that has them, and the next save would write that. */
+  multiline?: boolean
   readOnly: boolean
   autoFocus?: boolean
   onChange: (value: string) => void
 }) {
-  const { id, label, hint, value, placeholder, mono = false, wide = false, readOnly, autoFocus = false, onChange } = props
+  const { id, label, hint, value, placeholder, mono = false, wide = false, multiline = false, readOnly, autoFocus = false, onChange } = props
   return (
     <div className={`dish-projects-field${wide ? ' dish-projects-wide' : ''}`}>
       <label className="dish-projects-label" htmlFor={id}>{label}</label>
-      <Input
-        id={id}
-        className={`dish-projects-input${mono ? ' dish-projects-mono' : ''}`}
-        value={value}
-        readOnly={readOnly}
-        spellCheck={false}
-        autoComplete="off"
-        autoFocus={autoFocus}
-        placeholder={placeholder}
-        aria-describedby={hint === undefined ? undefined : `${id}-hint`}
-        onChange={(event) => { onChange(event.target.value) }}
-      />
+      {multiline
+        ? (
+          <textarea
+            id={id}
+            className="dish-projects-textarea"
+            value={value}
+            readOnly={readOnly}
+            spellCheck={false}
+            rows={3}
+            placeholder={placeholder}
+            aria-describedby={hint === undefined ? undefined : `${id}-hint`}
+            onChange={(event) => { onChange(event.target.value) }}
+          />
+        )
+        : (
+          <Input
+            id={id}
+            className={`dish-projects-input${mono ? ' dish-projects-mono' : ''}`}
+            value={value}
+            readOnly={readOnly}
+            spellCheck={false}
+            autoComplete="off"
+            autoFocus={autoFocus}
+            placeholder={placeholder}
+            aria-describedby={hint === undefined ? undefined : `${id}-hint`}
+            onChange={(event) => { onChange(event.target.value) }}
+          />
+        )}
       {hint !== undefined && <span id={`${id}-hint`} className="dish-projects-muted">{hint}</span>}
     </div>
   )
@@ -118,10 +136,10 @@ export function Form({ state, form, actions }: { state: PageState, form: FormSta
         <TextField
           id="dish-projects-setup"
           label="Setup (optional)"
-          hint="Run in a fresh clone when the project is onboarded, outside the sandbox. Skipped in a clone that is already there."
+          hint="Run in a fresh clone when the project is onboarded, outside the sandbox. Skipped in a clone that is already there. It may have several lines."
           value={form.fields.setup}
           placeholder="pnpm install --frozen-lockfile"
-          mono
+          multiline
           wide
           readOnly={frozen}
           onChange={text('setup')}
@@ -232,8 +250,15 @@ function CheckPanel({ form }: { form: FormState }) {
 /** The registry has other settings for this project than the form was opened over: what changed, and the two ways on. */
 function ConflictPanel({ form, theirs, actions }: { form: FormState, theirs: FormState['fields'], actions: Actions }) {
   const changes = changedFields(form.saved, theirs)
+  const panel = useRef<HTMLDivElement>(null)
+  // A save that ran into the conflict leaves focus on a Save that is disabled now, and focus would fall to the page: it goes to the
+  // panel, from where Tab reaches its two buttons. Somebody typing in a field when a live change arrives keeps their place.
+  useEffect(() => {
+    const active = document.activeElement
+    if (!(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)) panel.current?.focus()
+  }, [])
   return (
-    <div className="dish-projects-conflict" role="alert">
+    <div className="dish-projects-conflict" role="alert" tabIndex={-1} ref={panel}>
       <p className="dish-projects-text">
         <strong>{form.mode === 'add' ? `${form.name.trim()} was added while you were filling this in.` : 'This project changed while you were editing it.'}</strong>{' '}
         Your settings are still below. Saving now would replace the change shown here.

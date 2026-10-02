@@ -49,7 +49,7 @@ export function SkippedNote({ text }: { text: string }) {
   return (
     <Note tone="warn">
       <div className="dish-projects-note-skipped">
-        <span><strong>Setup skipped.</strong> {reason}</span>
+        <span><strong>Setup skipped{reason === '' ? '.' : ':'}</strong> {reason}</span>
         {command !== undefined && (
           <>
             <span>Run it yourself in <code className="dish-projects-code">{where}</code>:</span>

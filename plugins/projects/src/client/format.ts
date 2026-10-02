@@ -81,14 +81,19 @@ export interface SkippedParts {
   command?: string
 }
 
+/** How a skipped setup's message begins (`skipReason` in dish-workspaces' `setup.ts`; `test/client-helpers.test.ts` builds one with it). The page's own heading says it. */
+const SKIPPED_LEAD = 'setup didn\'t run outside the sandbox: '
+
 /**
- * Take the message dish-workspaces gives for a skipped setup apart: `<reason> Run it yourself in <directory>: <command>`. Any
- * other text is the reason as it is, shown whole.
+ * Take the message dish-workspaces gives for a skipped setup apart: `setup didn't run outside the sandbox: <reason>. Run it yourself
+ * in <directory>: <command>`. The reason is what follows the lead, which the heading above it already says. Any other text is the
+ * reason as it is, shown whole.
  */
 export function skippedParts(text: string): SkippedParts {
   const parts = /^(.*?)\s*Run it yourself in (.+?): (.+)$/s.exec(text)
-  if (parts === null) return { reason: text }
-  return { reason: parts[1]!, where: parts[2]!, command: parts[3]! }
+  const lead = (reason: string): string => reason.startsWith(SKIPPED_LEAD) ? reason.slice(SKIPPED_LEAD.length) : reason
+  if (parts === null) return { reason: lead(text) }
+  return { reason: lead(parts[1]!), where: parts[2]!, command: parts[3]! }
 }
 
 /** A project as the narrow page's `<select>` says it: its name, then the marks the list would show beside it. */

@@ -578,6 +578,33 @@ test('an edit is saved against the commit the form was opened on, as an edit', a
   assert.equal(state().projects.find(project => project.name === 'acme/widget')?.fields.setup, 'pnpm install')
 })
 
+test('a setup of several lines is kept as it is: through an edit of another field, and through an edit of the setup itself', async () => {
+  const made = await opened()
+  const { fake, page, state } = made
+  const setup = 'pnpm install\npnpm build\n'
+  fake.entries.set('acme/widget', fields({ setup }))
+  await page.onStatus()
+  await page.face.startEdit('acme/widget')
+  assert.equal(state().form?.fields.setup, setup)
+  assert.equal(state().form?.dirty, false)
+  // Another field: the setup is not touched, and the form is dirty for that field only.
+  page.face.editField('role', 'the widget, edited')
+  assert.equal(state().form?.fields.setup, setup)
+  await checked(made)
+  await page.face.save()
+  assert.equal(fake.saved.at(-1)?.fields.setup, setup, 'the newlines are saved')
+  // The setup itself: what is typed, newlines included, is what is saved.
+  await page.face.startEdit('acme/widget')
+  const edited = 'pnpm install\npnpm build\npnpm test\n'
+  page.face.editField('setup', edited)
+  assert.equal(state().form?.fields.setup, edited)
+  assert.equal(state().form?.dirty, true)
+  await checked(made)
+  assert.equal(fake.checked.at(-1)?.fields.setup, edited, 'the check sees the newlines')
+  await page.face.save()
+  assert.equal(fake.saved.at(-1)?.fields.setup, edited)
+})
+
 test('saving what is stored says there was nothing to save, and a clean edit form has nothing to save at all', async () => {
   const made = await opened()
   const { fake, page, state } = made

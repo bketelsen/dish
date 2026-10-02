@@ -4,7 +4,7 @@
  * unsaved edits) and the outcome of the last action are above the layout.
  */
 
-import { useEffect } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
 import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { InjectFace } from '@deepseek-ai/dsh-client-ui-slots'
@@ -82,25 +82,13 @@ export function Projects(props: Props) {
   )
 }
 
-/** The question the page is asking, if any: remove a project, or drop the form's edits to go elsewhere. */
+/**
+ * The question about leaving a form with edits, if it is being asked. (The question about removing a project is asked where the
+ * button was: `RemoveControl`.)
+ */
 function Question({ state, actions }: { state: PageState, actions: Actions }) {
   const { confirm, busy, form } = state
-  if (confirm === null) return null
-  if (confirm.kind === 'remove') {
-    const clone = state.projects.find(project => project.name === confirm.name)?.clone ?? null
-    const working = busy === 'remove'
-    return (
-      <div className="dish-projects-confirm" role="group" aria-label="Confirm the removal">
-        <p className="dish-projects-text">{removeQuestion(confirm.name, clone)}</p>
-        <div className="dish-projects-actions">
-          <Button variant="primary" size="sm" disabled={busy !== undefined} onClick={() => { void actions.remove() }}>
-            {working ? 'Removing…' : `Remove ${confirm.name}`}
-          </Button>
-          <Button variant="ghost" size="sm" disabled={working} onClick={actions.cancelConfirm}>Cancel</Button>
-        </div>
-      </div>
-    )
-  }
+  if (confirm === null || confirm.kind !== 'discard') return null
   const editing = form === null || form.name.trim() === '' ? 'the new project' : form.name.trim()
   return (
     <div className="dish-projects-confirm" role="group" aria-label="Unsaved changes">
@@ -211,18 +199,62 @@ function ProjectView({ state, project, actions }: { state: PageState, project: P
           </>
         )}
       </dl>
-      <div className="dish-projects-actions">
+      <RemoveControl project={project} state={state} actions={actions}>
         <Button variant="primary" size="sm" disabled={state.readOnly || !idle} onClick={() => { void actions.startEdit(name) }}>Edit</Button>
         {canRetry(project) && (
           <Button variant="outline" size="sm" title={retryHint(status.state)} disabled={!idle} onClick={() => { void actions.retry(name) }}>
             {retrying ? 'Retrying…' : 'Retry'}
           </Button>
         )}
-        <Button className="dish-projects-danger" variant="outline" size="sm" disabled={state.readOnly || !idle} onClick={() => { actions.askRemove(name) }}>
+      </RemoveControl>
+      {status.state === 'ready' && <p className="dish-projects-muted">{retryHint(status.state)}</p>}
+    </div>
+  )
+}
+
+/**
+ * The project's actions, and Remove among them; once Remove is pressed, the question in their place, where the eye is, with focus on
+ * Cancel (the button that was pressed goes away, and focus would fall to the page). Cancel, or a refused removal, puts focus back
+ * on Remove.
+ * @param children - the actions before Remove.
+ */
+function RemoveControl({ project, state, actions, children }: { project: ProjectInfo, state: PageState, actions: Actions, children: ReactNode }) {
+  const { name } = project
+  const { confirm, busy } = state
+  const asking = confirm !== null && confirm.kind === 'remove' && confirm.name === name
+  const remove = useRef<HTMLButtonElement>(null)
+  const wasAsking = useRef(false)
+  useEffect(() => {
+    if (wasAsking.current && !asking) remove.current?.focus()
+    wasAsking.current = asking
+  }, [asking])
+  if (!asking) {
+    return (
+      <div className="dish-projects-actions">
+        {children}
+        <Button
+          ref={remove}
+          className="dish-projects-danger"
+          variant="outline"
+          size="sm"
+          disabled={state.readOnly || busy !== undefined || confirm !== null}
+          onClick={() => { actions.askRemove(name) }}
+        >
           Remove
         </Button>
       </div>
-      {status.state === 'ready' && <p className="dish-projects-muted">{retryHint(status.state)}</p>}
+    )
+  }
+  const working = busy === 'remove'
+  return (
+    <div className="dish-projects-confirm" role="group" aria-label="Confirm the removal">
+      <p className="dish-projects-text">{removeQuestion(name, project.clone)}</p>
+      <div className="dish-projects-actions">
+        <Button variant="primary" size="sm" disabled={busy !== undefined} onClick={() => { void actions.remove() }}>
+          {working ? 'Removing…' : `Remove ${name}`}
+        </Button>
+        <Button variant="ghost" size="sm" autoFocus disabled={working} onClick={actions.cancelConfirm}>Cancel</Button>
+      </div>
     </div>
   )
 }
