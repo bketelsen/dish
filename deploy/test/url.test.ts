@@ -6,6 +6,9 @@
  *
  * Every run goes through `run`, which holds the two properties that matter most, whatever the case: stdout is empty or
  * exactly one line, and the token is on no stream but stdout. The journal the stubs serve always holds the token.
+ *
+ * url.sh runs only as the account (root's entry point is fleet's dish-url wrapper), so the stub `id` answers the
+ * account's uid unless a test says otherwise.
  */
 
 import assert from 'node:assert/strict'
@@ -55,6 +58,7 @@ fi
 echo "unexpected getent call" >&2; exit 99
 `,
   systemctl: `
+printf '%s\\n' "\${XDG_RUNTIME_DIR-unset}" > "$DISH_TEST_DIR/state/systemctl-runtime-dir"
 if [ -f "$DISH_TEST_DIR/state/systemctl-fails" ]; then echo "Failed to connect to bus" >&2; exit 1; fi
 cat "$DISH_TEST_DIR/state/show"
 `,
@@ -127,7 +131,7 @@ async function makeHost(): Promise<Host> {
       else await writeFile(path, content)
     },
   }
-  await host.state('uid', '0\n')
+  await host.state('uid', `${UID}\n`)
   await host.state('owner', `${OWNER}\n`)
   await host.state('checkout', await realpath(join(dir, 'dish')))
   await host.state('show', SHOW_RUNNING)
@@ -186,10 +190,11 @@ test('prints the sign-in link: the host from deploy.env, the token from the jour
   assert.equal(result.stdout, `https://${HOST}/?token=${TOKEN}\n`)
   assert.equal(result.stderr, '')
 
-  // It asks the account's user manager, by the checkout owner's name, and the journal by the start it was told.
+  // As the account, it asks its own user manager, and reads its own journal from the start it was told.
   assert.deepEqual(host.calls('getent'), [['passwd', OWNER]])
-  assert.deepEqual(host.calls('systemctl'), [['--user', '-M', `${OWNER}@`, 'show', 'dish-web.service', '--property=MainPID', '--property=ExecMainStartTimestamp']])
-  assert.deepEqual(host.calls('journalctl'), [[`_UID=${UID}`, '_SYSTEMD_USER_UNIT=dish-web.service', '--since', STARTED, '--no-pager', '-o', 'cat']])
+  assert.deepEqual(host.calls('systemctl'), [['--user', 'show', 'dish-web.service', '--property=MainPID', '--property=ExecMainStartTimestamp']])
+  assert.equal(readFileSync(join(host.dir, 'state', 'systemctl-runtime-dir'), 'utf8'), `/run/user/${UID}\n`)
+  assert.deepEqual(host.calls('journalctl'), [['--user', '-u', 'dish-web.service', '--since', STARTED, '-q', '--no-pager', '-o', 'cat']])
 })
 
 test('the latest of two sign-in lines wins, and lines that are not dsh web sign-in lines never do', async () => {
@@ -324,18 +329,30 @@ test('the host: a single-label name and a hyphenated one are fine', async () => 
   }
 })
 
-test('not root: exit 2, and nothing is asked of getent, systemctl or the journal', async () => {
+const REFUSED = `url: run dish-url as root (incus exec dish --project dish -- dish-url), or this script as ${OWNER}\n`
+
+test('as root: exit 2, pointing at dish-url, and nothing is asked of getent, systemctl or the journal', async () => {
+  const host = await makeHost()
+  await host.state('uid', '0\n')
+  const result = await run(host)
+  assert.equal(result.code, 2)
+  assert.equal(result.stdout, '')
+  assert.equal(result.stderr, REFUSED)
+  assert.deepEqual(host.calls('getent'), [])
+  assertNoQueries(host)
+})
+
+test('as another user: exit 2, and nothing is asked of systemctl or the journal', async () => {
   const host = await makeHost()
   await host.state('uid', '1000\n')
   const result = await run(host)
   assert.equal(result.code, 2)
   assert.equal(result.stdout, '')
-  assert.match(result.stderr, /run url\.sh as root \(incus exec gives root\)/)
-  assert.deepEqual(host.calls('getent'), [])
+  assert.equal(result.stderr, REFUSED)
   assertNoQueries(host)
 })
 
-test('any argument is exit 2, root or not, and nothing is asked', async () => {
+test('any argument is exit 2, as the account or as root, and nothing is asked', async () => {
   for (const args of [['--help'], ['-h'], ['x'], [''], ['a', 'b'], ['--', 'x']]) {
     const host = await makeHost()
     const result = await run(host, args)
@@ -346,9 +363,10 @@ test('any argument is exit 2, root or not, and nothing is asked', async () => {
     assertNoQueries(host)
   }
   const host = await makeHost()
-  await host.state('uid', '1000\n')
+  await host.state('uid', '0\n')
   const result = await run(host, ['x'])
   assert.equal(result.code, 2)
+  assert.match(result.stderr, /takes no arguments/)
 })
 
 test("a checkout owned by root is refused, and an account that can't be looked up is exit 1", async () => {
@@ -396,7 +414,7 @@ test('run through a symlink, it still finds the checkout it sits in, and so its 
   assert.equal(result.code, 0, result.stderr)
   assert.equal(result.stdout, `https://${HOST}/?token=${TOKEN}\n`)
   assert.deepEqual(host.calls('getent'), [['passwd', OWNER]])
-  assert.equal(host.calls('systemctl')[0]?.[2], `${OWNER}@`)
+  assert.deepEqual(host.calls('systemctl')[0]?.slice(0, 3), ['--user', 'show', 'dish-web.service'])
 })
 
 test('url.sh is committed executable', async () => {

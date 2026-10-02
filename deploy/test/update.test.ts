@@ -3,10 +3,15 @@
  * stubs for `id`, `getent`, `runuser`, `systemctl`, `journalctl`, `curl` and `pnpm`. install.sh is a stub that records
  * what it was given. Nothing here touches the real system's services, a real home, or the VM.
  *
+ * update.sh runs only as the account (root's entry point is fleet's dish-update wrapper), so runs are the account's
+ * unless a test says otherwise.
+ *
  * What matters most:
  * - it never half-updates: every refusal comes before the first change, and the stamp is written only after dsh answers;
- * - it restarts exactly when the service is stale, stopped, or install.sh changed the profile;
+ * - it restarts exactly when the service is stale, stopped, or install.sh changed the profile, and reloads the user
+ *   manager whenever it may hold another definition of the unit;
  * - install.sh gets the unit's environment and install.env's three inputs, and nothing of the caller's;
+ * - it never runs as root;
  * - it prints no line that mentions a token.
  */
 
@@ -19,7 +24,7 @@ import { join } from 'node:path'
 import { after, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { createHost, DEPLOY_ENV, git, INPUTS, INSTALL_ENV, LEAKED, PNPM_VERSION, removeHosts, UID } from './host.ts'
+import { createHost, DEPLOY_ENV, git, INPUTS, INSTALL_ENV, LEAKED, PNPM_VERSION, removeHosts } from './host.ts'
 import type { Host, HostOptions, Result } from './host.ts'
 
 const execFileAsync = promisify(execFile)
@@ -35,6 +40,16 @@ const INSTALL_NAMES = ['DISH_REMOTE', 'DISH_USER_EMAIL', 'DISH_USER_NAME', 'HOME
 const BASH_NAMES = ['OLDPWD', 'PWD', 'SHLVL', '_']
 
 const CHANGING_VERBS = ['restart', 'enable', 'daemon-reload']
+
+/** The journal read as the account, for the tail. */
+const JOURNAL_ARGS = ['--user', '-u', 'dish-web.service', '-n', '15', '-q', '--no-pager', '-o', 'short-iso']
+const JOURNAL_HEADER = 'update: journal (last 15 lines, credential lines removed):'
+const URL_HINT = 'update: run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)'
+
+/** systemctl's changing verbs in the order they were called. */
+function systemdSequence(host: Host): string[] {
+  return host.calls('systemctl').flatMap((argv) => argv.filter((arg) => CHANGING_VERBS.includes(arg)))
+}
 
 /** systemctl calls with one of the verbs that change something, per verb. */
 function systemdChanges(host: Host): Record<string, number> {
@@ -173,6 +188,8 @@ test('--apply to a new upstream commit installs, starts, waits and stamps', asyn
   assert.equal(host.installedUnit(), unit)
   assert.equal(statSync(join(host.home, '.config', 'systemd', 'user', 'dish-web.service')).mode & 0o777, 0o644)
   assert.deepEqual(systemdChanges(host), { restart: 1, enable: 1, 'daemon-reload': 1 })
+  assert.deepEqual(systemdSequence(host), ['daemon-reload', 'enable', 'restart'])
+  assert.equal(host.service().startedWith, unit, 'the restart used the installed unit')
 
   const { stdout: nodeVersion } = await execFileAsync(process.execPath, ['--version'], { encoding: 'utf8' })
   assert.equal(host.stamp(), [
@@ -191,12 +208,13 @@ test('--apply to a new upstream commit installs, starts, waits and stamps', asyn
   const lines = stdoutLines(result)
   assert.ok(lines.includes(`update: HEAD ${sha}`), result.stdout)
   assert.ok(lines.includes('update: dish-web.service: active (restarted)'), result.stdout)
-  assert.ok(lines.includes(`update: run ${host.checkout}/deploy/url.sh for a fresh sign-in link`), result.stdout)
+  assert.ok(lines.includes(URL_HINT), result.stdout)
   assert.ok(lines.includes('install: no changes to the profile'), "install.sh's output passes through")
-  // As root, the journal tail comes last, from root's journalctl.
-  assert.ok(lines.includes('update: journal (last 15 lines, credential lines removed):'), result.stdout)
+  // The journal tail comes last, read as the account.
+  assert.ok(lines.includes(JOURNAL_HEADER), result.stdout)
   assert.equal(lines.at(-1), '  2026-10-02T10:00:01+00:00 dish dsh[4242]: listening on 127.0.0.1:3080')
-  assert.deepEqual(host.calls('journalctl'), [[`_UID=${UID}`, '_SYSTEMD_USER_UNIT=dish-web.service', '-n', '15', '--no-pager', '-o', 'short-iso']])
+  assert.deepEqual(host.calls('journalctl'), [JOURNAL_ARGS])
+  assert.deepEqual(host.calls('runuser'), [], 'it never uses runuser')
   assert.deepEqual(host.calls('curl').at(-1), ['-q', '-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '2', 'http://127.0.0.1:3080/'])
   assert.equal(result.stderr, '')
 })
@@ -213,7 +231,7 @@ test('a second --apply with nothing new restarts nothing and leaves the stamp', 
   assert.ok(lines.includes('update: already at the target'))
   assert.ok(lines.includes('update: restart: not needed'))
   assert.ok(lines.includes('update: dish-web.service: active (unchanged)'))
-  assert.ok(!lines.some((line) => line.includes('url.sh')), 'no sign-in hint without a restart')
+  assert.ok(!lines.includes(URL_HINT), 'no sign-in hint without a restart')
 })
 
 interface StaleCase {
@@ -522,12 +540,34 @@ const REFUSALS: Refusal[] = [
       return { options: { deployEnv: null } }
     },
   },
-  {
-    name: 'a deploy.env without DISH_TRUSTED_HOST',
+  ...([
+    ['an empty DISH_TRUSTED_HOST', 'DISH_TRUSTED_HOST=\n'],
+    ['a deploy.env without DISH_TRUSTED_HOST', 'OTHER=1\n'],
+    ['a DISH_TRUSTED_HOST with a scheme', 'DISH_TRUSTED_HOST=https://dish.example.ts.net\n'],
+    ['DISH_TRUSTED_HOST twice', 'DISH_TRUSTED_HOST=a.example\nDISH_TRUSTED_HOST=b.example\n'],
+  ] as const).map(([name, deployEnv]): Refusal => ({
+    name,
     step: 'reading the inputs',
-    message: /deploy\.env has no DISH_TRUSTED_HOST=<host> line/,
+    message: /deploy\.env needs exactly one DISH_TRUSTED_HOST=<host> line with a bare host name/,
     async setup() {
-      return { options: { deployEnv: 'DISH_TRUSTED_HOST=\n' } }
+      return { options: { deployEnv } }
+    },
+  })),
+  {
+    name: 'a target without deploy/update.sh, where dish-update could not run again',
+    step: 'reading the target',
+    message: /origin\/main has no deploy\/update\.sh/,
+    async setup(host) {
+      await host.commit({ 'deploy/update.sh': null }, 'no update.sh')
+      return {}
+    },
+  },
+  {
+    name: "a user manager that doesn't answer",
+    step: "asking the account's user manager about dish-web.service",
+    message: /can't reach .*'s user manager \(XDG_RUNTIME_DIR=\/run\/user\/54321; is linger on\?\)/,
+    async setup() {
+      return { options: { manager: 'down' } }
     },
   },
   {
@@ -554,7 +594,7 @@ const REFUSALS: Refusal[] = [
     step: 'checking the environment',
     message: /DISH_UPDATE_CLEAN is update\.sh's own/,
     async setup() {
-      return { options: { as: 'account', env: { DISH_UPDATE_CLEAN: '1' } } }
+      return { options: { env: { DISH_UPDATE_CLEAN: '1' } } }
     },
   },
 ]
@@ -567,7 +607,9 @@ for (const refusal of REFUSALS) {
     const result = await host.run('update.sh', args ?? ['--apply'], options)
     assert.equal(result.code, 1, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`)
     assert.match(result.stderr, refusal.message)
-    assert.ok(result.stderr.split('\n').includes(`update: FAILED at step: ${refusal.step} (exit 1)`), result.stderr)
+    const step = refusal.step.replace("the account's", `${host.owner}'s`)
+    assert.ok(result.stderr.split('\n').includes(`update: FAILED at step: ${step} (exit 1)`), result.stderr)
+    assert.doesNotMatch(result.stderr, /the checkout is (still )?at/, 'nothing moved, so there is no state to report')
     await assertUnchanged(host, before)
     assertNoTokenLine(result)
   })
@@ -598,6 +640,7 @@ test('--apply refuses while another update holds the lock, and changes nothing',
 })
 
 for (const [name, options, message] of [
+  // install.sh's stderr passes through on stdout, with its stdout.
   ['exits non-zero', { installExit: 1 }, /^install: FAILED at step: pnpm build \(exit 1\)$/m],
   ['exits 2, which is still a failed step', { installExit: 2 }, /^install: FAILED at step: pnpm build \(exit 2\)$/m],
   ['ends without its summary line', { installLastLine: 'install: something else' }, /^update: deploy\/install\.sh did not end with its summary line/m],
@@ -607,8 +650,9 @@ for (const [name, options, message] of [
     const before = await snapshot(host)
     const result = await host.run('update.sh', ['--apply'], options)
     assert.equal(result.code, 1, result.stderr)
-    assert.match(result.stderr, message)
+    assert.match(`${result.stdout}${result.stderr}`, message)
     assert.ok(result.stderr.split('\n').some((line) => /^update: FAILED at step: running deploy\/install\.sh \(exit \d+\)$/.test(line)), result.stderr)
+    assert.ok(result.stderr.split('\n').includes(`update: the checkout is at ${sha} (was ${host.seed}); dish-web.service was not restarted; fix the problem and rerun dish-update --apply, or go back with dish-update --apply ${host.seed}`), result.stderr)
     assert.equal(await host.head(), sha, 'the checkout moved')
     assert.equal(host.installs().length, 1)
     assert.deepEqual(systemdChanges(host), before.systemd)
@@ -630,8 +674,9 @@ test('when dsh does not answer, it fails at the wait, writes no stamp, and shows
   assert.ok(result.stderr.split('\n').includes('update: FAILED at step: waiting for dsh on 127.0.0.1:3080 (exit 1)'), result.stderr)
   assert.equal(host.stamp(), undefined)
   assert.equal(systemdChanges(host).restart, 1)
-  assert.ok(stdoutLines(result).includes('update: journal (last 15 lines, credential lines removed):'), result.stdout)
+  assert.ok(stdoutLines(result).includes(JOURNAL_HEADER), result.stdout)
   assert.ok(host.calls('curl').length >= 2, 'it polled more than once')
+  assert.ok(result.stderr.split('\n').includes(`update: the checkout is at ${await host.head()} (was ${host.seed}); dish-web.service was restarted; fix the problem and rerun dish-update --apply, or go back with dish-update --apply ${host.seed}`), result.stderr)
 
   // The next run restarts again, since there is still no stamp.
   const again = await host.run('update.sh', ['--apply'])
@@ -654,13 +699,21 @@ test('the journal tail leaves out every line that mentions a token', async () =>
   assert.doesNotMatch(result.stdout + result.stderr, /SECRET123/)
   assertNoTokenLine(result)
   const lines = stdoutLines(result)
-  const header = lines.indexOf('update: journal (last 15 lines, credential lines removed):')
+  const header = lines.indexOf(JOURNAL_HEADER)
   assert.ok(header >= 0, result.stdout)
   assert.deepEqual(lines.slice(header + 1), [
     '  2026-10-02T10:00:00+00:00 dish dsh[4242]: starting',
     '  2026-10-02T10:00:03+00:00 dish dsh[4242]: dish-config: pushed',
     '  (2 lines left out)',
   ])
+})
+
+test('a journal with nothing to read says so', async () => {
+  const { host } = await hostWithUpdate()
+  const result = await host.run('update.sh', ['--apply'], { journal: [] })
+  assertOk(result)
+  assert.equal(stdoutLines(result).at(-1), `update: journal: nothing readable as ${host.owner} (journalctl --user -u dish-web.service)`)
+  assert.ok(!stdoutLines(result).includes(JOURNAL_HEADER))
 })
 
 test('commit subjects that mention a token are left out of the report too', async () => {
@@ -675,49 +728,141 @@ test('commit subjects that mention a token are left out of the report too', asyn
 
 // --- Who runs it -------------------------------------------------------------------------------------------------
 
-test('as root, it runs itself again as the account with a clean environment, and install.sh gets the unit\'s', async () => {
-  const { host } = await hostWithUpdate()
-  const result = await host.run('update.sh', ['--apply'], { as: 'root' })
-  assertOk(result)
-  const runuser = host.calls('runuser')
-  assert.equal(runuser.length, 1)
-  const [argv] = runuser
-  assert.deepEqual(argv.slice(0, 5), ['-u', host.owner, '--', 'env', '-i'])
-  assert.ok(argv.includes(`HOME=${host.home}`), argv.join(' '))
-  assert.ok(argv.includes(`XDG_RUNTIME_DIR=/run/user/${UID}`), argv.join(' '))
-  assert.ok(argv.includes(`PATH=${host.unitPath}`), argv.join(' '))
-  assert.ok(argv.includes('DISH_UPDATE_PARENT=root'), argv.join(' '))
-  assert.deepEqual(argv.slice(-2), [join(host.checkout, 'deploy', 'update.sh'), '--apply'])
-  for (const name of LEAKED) assert.ok(!argv.some((arg) => arg.startsWith(`${name}=`)), `${name} is not passed on`)
+const REFUSED = (owner: string): string =>
+  `update: run dish-update as root (incus exec dish --project dish -- dish-update [--apply] [<ref>]), or this script as ${owner}\n`
 
+test('as the account, it runs itself again with a clean environment, and install.sh gets the unit\'s', async () => {
+  const { host } = await hostWithUpdate()
+  const result = await host.run('update.sh', ['--apply'])
+  assertOk(result)
+  assert.deepEqual(host.calls('runuser'), [])
   const [install] = host.installs()
   for (const name of LEAKED) assert.ok(!install.names.includes(name), `install.sh does not see ${name}`)
   assert.deepEqual(install.names.filter((name) => !BASH_NAMES.includes(name)), INSTALL_NAMES)
   assert.deepEqual(install.env, INPUTS)
 })
 
-test('as the account, it runs itself again with the same clean environment, without runuser', async () => {
+test('as the account with only what the dish-update wrapper passes, the same', async () => {
   const { host } = await hostWithUpdate()
-  const result = await host.run('update.sh', ['--apply'], { as: 'account' })
+  const result = await host.run('update.sh', ['--apply'], { wrapper: true })
   assertOk(result)
-  assert.deepEqual(host.calls('runuser'), [])
   const [install] = host.installs()
   assert.deepEqual(install.names.filter((name) => !BASH_NAMES.includes(name)), INSTALL_NAMES)
-  assert.deepEqual(install.env, INPUTS)
-  // It tries the account's own journal.
-  assert.deepEqual(host.calls('journalctl'), [['--user', '-u', 'dish-web.service', '-n', '15', '--no-pager']])
-  assert.ok(stdoutLines(result).includes('update: journal (last 15 lines, credential lines removed):'), result.stdout)
 })
+
+for (const env of [{}, { DISH_UPDATE_CLEAN: '1' }] as Record<string, string>[]) {
+  test(`as root${'DISH_UPDATE_CLEAN' in env ? ', even claiming a clean environment,' : ''} it refuses before anything, pointing at dish-update`, async () => {
+    const { host } = await hostWithUpdate()
+    const before = await snapshot(host)
+    const result = await host.run('update.sh', ['--apply'], { as: 'root', env })
+    assert.equal(result.code, 2)
+    assert.equal(result.stderr, REFUSED(host.owner))
+    assert.equal(result.stdout, '')
+    await assertUnchanged(host, before)
+    assert.equal(existsSync(join(host.checkout, '.git', 'FETCH_HEAD')), false, 'no git fetch')
+    assert.deepEqual(host.calls('getent'), [])
+    assert.deepEqual(host.calls('runuser'), [])
+    assert.deepEqual(host.calls('systemctl'), [])
+  })
+}
 
 test('as another user, it refuses before fetching', async () => {
   const { host } = await hostWithUpdate()
   const before = await snapshot(host)
   const result = await host.run('update.sh', ['--apply'], { as: 'other' })
   assert.equal(result.code, 2)
-  assert.equal(result.stderr, `update: run update.sh as root or as ${host.owner}\n`)
+  assert.equal(result.stderr, REFUSED(host.owner))
   await assertUnchanged(host, before)
   assert.equal(existsSync(join(host.checkout, '.git', 'FETCH_HEAD')), false, 'no git fetch')
   assert.deepEqual(host.calls('runuser'), [])
+  assert.deepEqual(host.calls('systemctl'), [])
+})
+
+test('a shell trace in the environment stops at the guard, and never shows the journal', async () => {
+  const { host } = await hostWithUpdate()
+  const journal = ['2026-10-02T10:00:01+00:00 dish dsh[4242]: dsh web: http://127.0.0.1:3080/?token=SECRET123']
+  const traceFile = join(host.dir, 'trace.sh')
+  await writeFile(traceFile, 'set -x\n')
+  for (const env of [{ SHELLOPTS: 'xtrace' }, { BASH_ENV: traceFile }] as Record<string, string>[]) {
+    const result = await host.run('update.sh', ['--apply'], { journal, env })
+    assertOk(result)
+    assert.doesNotMatch(result.stdout + result.stderr, /SECRET123/)
+    assertNoTokenLine(result)
+    // Only the lines before the guard are traced.
+    const traced = result.stderr.split('\n').filter((line) => line.startsWith('+'))
+    assert.ok(traced.length > 0, 'the trace was on')
+    assert.ok(traced.every((line) => /^\++ set (-euo pipefail|\+o xtrace)$/.test(line)), JSON.stringify(Object.keys(env)) + '\n' + result.stderr)
+  }
+})
+
+// --- Reloading and restarting ------------------------------------------------------------------------------------
+
+for (const reportsReload of [true, false]) {
+  const how = reportsReload ? 'the user manager says it needs one' : "only the stamp says so: the manager doesn't report NeedDaemonReload"
+  test(`a daemon-reload that failed is done again by the next run, before the restart (${how})`, async () => {
+    const host = await appliedHost()
+    const unit = await readFile(join(host.checkout, 'deploy', 'dish-web.service'), 'utf8')
+    const changed = `${unit}# a new comment\n`
+    await host.commit({ 'deploy/dish-web.service': changed }, 'the unit changes')
+    const before = systemdChanges(host)
+
+    const failed = await host.run('update.sh', ['--apply'], { reloadFails: true, reportsReload })
+    assert.equal(failed.code, 1)
+    assert.ok(failed.stderr.split('\n').includes('update: FAILED at step: reloading the user manager (exit 1)'), failed.stderr)
+    assert.match(failed.stderr, /^update: the checkout is at [0-9a-f]+ \(was [0-9a-f]+\); dish-web\.service was not restarted;/m)
+    assert.equal(host.installedUnit(), changed, 'the unit file was moved into place')
+    assert.equal(systemdChanges(host).restart, before.restart)
+
+    const sequenceBefore = systemdSequence(host).length
+    const again = await host.run('update.sh', ['--apply'], { reportsReload })
+    assertOk(again)
+    assert.deepEqual(systemdSequence(host).slice(sequenceBefore), ['daemon-reload', 'restart'])
+    assert.equal(host.service().startedWith, changed, 'the restart used the new unit')
+    assert.match(host.stamp() ?? '', new RegExp(`^unit ${sha256(changed)}$`, 'm'))
+  })
+}
+
+test('a user manager that needs a daemon-reload gets one, and no restart for it alone', async () => {
+  const host = await appliedHost()
+  const before = systemdChanges(host)
+  const result = await host.run('update.sh', ['--apply'], { needDaemonReload: true })
+  assertOk(result)
+  assert.deepEqual(systemdChanges(host), { ...before, 'daemon-reload': before['daemon-reload'] + 1 })
+  assert.ok(stdoutLines(result).includes('update: restart: not needed'), result.stdout)
+})
+
+test('a service that runs but does not answer gets one restart, then the stamp', async () => {
+  const host = await appliedHost()
+  const before = systemdChanges(host)
+  const stamp = host.stamp()
+  const result = await host.run('update.sh', ['--apply'], { curl: 'after-restart', wait: 2 })
+  assertOk(result)
+  const lines = stdoutLines(result)
+  assert.ok(lines.includes('update: restart: not needed'), result.stdout)
+  assert.ok(lines.includes('update: restart: needed (did not answer on 127.0.0.1:3080 within 2 seconds)'), result.stdout)
+  assert.ok(lines.includes('update: dish-web.service: active (restarted)'), result.stdout)
+  assert.equal(systemdChanges(host).restart, before.restart + 1)
+  assert.equal(host.stamp(), stamp, 'the same start, stamped again')
+})
+
+test('a service that still does not answer after that restart fails, and is restarted only once', async () => {
+  const host = await appliedHost()
+  const before = systemdChanges(host)
+  const result = await host.run('update.sh', ['--apply'], { curl: 'down', wait: 0 })
+  assert.equal(result.code, 1)
+  assert.equal(systemdChanges(host).restart, before.restart + 1)
+  assert.ok(result.stderr.split('\n').includes('update: FAILED at step: waiting for dsh on 127.0.0.1:3080 (exit 1)'), result.stderr)
+  assert.match(result.stderr, /^update: the checkout is still at [0-9a-f]+; dish-web\.service was restarted; fix the problem and rerun dish-update --apply$/m)
+})
+
+test("install.sh's output leaves out lines that mention a token, and says how many", async () => {
+  const { host } = await hostWithUpdate()
+  const result = await host.run('update.sh', ['--apply'], { installOutput: ['SyntaxError: Unexpected token } in JSON', 'install: building'] })
+  assertOk(result)
+  assertNoTokenLine(result)
+  const lines = stdoutLines(result)
+  assert.ok(lines.includes('install: building'), result.stdout)
+  assert.ok(lines.includes("update: left out 1 line of install.sh's output"), result.stdout)
 })
 
 // --- Usage -------------------------------------------------------------------------------------------------------

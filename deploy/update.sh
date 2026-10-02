@@ -8,25 +8,26 @@
 #     <ref>        a commit or tag; with --apply, it is checked out detached (a rollback)
 #     -h, --help   usage
 #
-# Who runs it. You do, by hand: `incus exec dish --project dish -- /home/dish/dish/deploy/update.sh`.
-# - The account is the owner of the checkout this script sits in (`dish` on the VM). Its uid and home come from
-#   `getent passwd`. A checkout owned by root is refused.
-# - As root, which is what incus exec gives, it runs itself again as the account (runuser), with a clean environment.
-#   Then, after an --apply, it prints the service's journal, which root can read.
-# - As the account, it runs itself again with the same clean environment (env -i).
-# - Anyone else is refused.
-#
-# The clean environment is HOME, USER, LOGNAME, XDG_RUNTIME_DIR, the PATH of the checkout's unit, TMPDIR, LANG and
-# update.sh's own DISH_UPDATE_* names. Nothing else: no XDG_* directories, PNPM_HOME, DSH_* or NODE_ENV, as for the
-# unit. install.sh then runs with what the unit runs with, so the store `pnpm store path` gives it is the store the
-# unit's plugin manager works out again (the store-pin contract, in install.sh and the unit). install.sh and the version
-# checks get the PATH of the target's unit, the one that will run.
+# Who runs it. You do, by hand, as root through fleet's wrapper: `incus exec dish --project dish -- dish-update`.
+# - It runs only as the account: the owner of the checkout this script sits in (`dish` on the VM). Its uid and home
+#   come from `getent passwd`. A checkout owned by root is refused.
+# - Never as root: this file is the account's to write, so root running it would run whatever the account (or an agent
+#   acting as it) put here. Root's entry point is /usr/local/sbin/dish-update, a root-owned wrapper fleet installs,
+#   which runs this script as the account through runuser with a minimal environment and does nothing else. Run as
+#   root, or as anyone but the account, it refuses with exit 2.
+# - It runs itself again with a clean environment (env -i): HOME, USER, LOGNAME, XDG_RUNTIME_DIR=/run/user/<uid>, the
+#   PATH of the checkout's unit, TMPDIR, LANG and update.sh's own DISH_UPDATE_* names, and nothing else. No XDG_*
+#   directories, PNPM_HOME, DSH_* or NODE_ENV, as for the unit, so the store `pnpm store path` gives install.sh is the
+#   store the unit's plugin manager works out again (the store-pin contract, in install.sh and the unit).
+# - PATH: update.sh's own commands (git, curl, systemctl) use the PATH it starts with, the checkout's unit's as it is
+#   before the update. install.sh and the node and pnpm version checks get the PATH of the target's unit, the one that
+#   will run, read from git before anything changes.
 #
 # Inputs:
 # - ~/.config/dish/install.env, written by fleet, and never loaded by the unit: exactly DISH_REMOTE, DISH_USER_NAME and
 #   DISH_USER_EMAIL, one NAME=value line each, the value verbatim. Blank lines and lines starting with # are ignored. All
 #   three must be non-empty. An empty remote is refused: prod always pushes its store, and install.sh would remove it.
-# - ~/.config/dish/deploy.env, the unit's, which must have its DISH_TRUSTED_HOST line.
+# - ~/.config/dish/deploy.env, the unit's: exactly one DISH_TRUSTED_HOST=<host> line, a bare host[:port].
 # - The checkout's deploy/dish-web.service.
 # DISH_UPDATE_WAIT sets how many seconds to wait for dsh (default 120); the tests use it.
 #
@@ -42,24 +43,29 @@
 #      refusal comes before the first change, and a dry run that passes means --apply can start;
 #   7. move the checkout: a fast-forward of main, or a detached checkout of the ref;
 #   8. run install.sh, whose last line says whether it changed the profile;
-#   9. install the unit when it differs (and daemon-reload), make ~/work, enable the unit;
+#   9. install the unit when it differs, daemon-reload when the unit file or the unit the service last started with
+#      differs from the checkout's, or the user manager says it needs one; make ~/work; enable the unit;
 #  10. restart when the service isn't active, install.sh changed the profile, or the stamp is missing or differs;
-#  11. wait until 127.0.0.1:3080 answers;
+#  11. wait until 127.0.0.1:3080 answers. If it doesn't and this run didn't restart, restart once and wait again;
 #  12. after a restart, write the stamp: ~/.local/state/dish/deploy/started, six lines (revision, unit, deploy.env,
 #      install.env, node, pnpm) describing what the service started with. It is written only once dsh answers, so a run
 #      that fails after a restart restarts again next time.
-# A failure stops the script and names the step on stderr, as `update: FAILED at step: <step> (exit N)`.
+# A failure stops the script and names the step on stderr, as `update: FAILED at step: <step> (exit N)`. After the
+# checkout has moved, it also says where the checkout is and whether the service was restarted.
 #
-# Exit: 0 done or nothing to do; 1 a failed step; 2 usage or the wrong account.
+# Exit: 0 done or nothing to do; 1 a failed step; 2 usage, or not run as the account.
 #
-# Nothing it prints mentions a token: the journal tail and the commit list leave out every line that does, in any letter
-# case, since dsh's sign-in line carries its access token. deploy/url.sh prints the sign-in link. install.sh's own
-# output passes through as it is; it never starts dsh web, so it has no access token to print.
+# Nothing it prints mentions a token: the journal tail, the commit list and install.sh's output (both streams, passed
+# through on stdout) leave out every line that does, in any letter case, since dsh's sign-in line carries its access
+# token. dish-url prints the sign-in link.
 #
 # It updates the file it runs from, so everything is in functions and the last line calls main: bash has read the
 # whole script before git can change it.
 
 set -euo pipefail
+# A shell trace in the environment (SHELLOPTS, BASH_ENV) or from `bash -x` would print the journal's lines, and so the
+# access token in dsh's sign-in line, to stderr.
+set +o xtrace
 shopt -s inherit_errexit lastpipe
 
 readonly UNIT=dish-web.service
@@ -77,12 +83,16 @@ state_dir='' install_env='' deploy_env=''
 remote='' user_name='' user_email=''
 head='' branch='' target='' target_name='' target_path='' target_unit=''
 node_version='' pnpm_version=''
+active_state=''
 have_stamp=0
 declare -A last_stamp=()
 stamp=()
 reasons=()
 profile_changed=0
+moved=0
+old_head=''
 restarted=0
+answered=0
 
 say() { printf 'update: %s\n' "$*"; }
 warn() { printf 'update: %s\n' "$*" >&2; }
@@ -105,8 +115,9 @@ usage: deploy/update.sh [--apply] [<ref>]
   --apply      fast-forward main to origin/main, install, and restart dsh web when it is stale
   <ref>        a commit or tag; with --apply, checked out detached (a rollback)
   -h, --help   this help
-Run it as root (incus exec gives root) or as the account that owns the checkout.
-Exit: 0 done or nothing to do; 1 a failed step; 2 usage or the wrong account.
+As root, run dish-update instead (incus exec dish --project dish -- dish-update [--apply] [<ref>]): it runs this script
+as the account that owns the checkout, which is the only account it runs as.
+Exit: 0 done or nothing to do; 1 a failed step; 2 usage, or not run as the account.
 EOF
 }
 
@@ -120,10 +131,21 @@ usage_error() {
 # Run by the EXIT trap.
 # shellcheck disable=SC2329
 on_exit() {
-  local status=$?
+  local status=$? now service
   if [ "${#temporary[@]}" -gt 0 ]; then rm -f -- "${temporary[@]}"; fi
   if [ "$status" -ne 0 ] && [ -n "$step" ]; then
     warn "FAILED at step: $step (exit $status)"
+    # Once the checkout has moved, say where things stand and how to go on.
+    if [ "$moved" -eq 1 ]; then
+      now=$(git -C "$checkout" rev-parse --verify HEAD 2>/dev/null) || now='(unknown)'
+      service="$UNIT was not restarted"
+      if [ "$restarted" -eq 1 ]; then service="$UNIT was restarted"; fi
+      if [ "$now" = "$old_head" ]; then
+        warn "the checkout is still at $now; $service; fix the problem and rerun dish-update --apply${ref:+ $ref}"
+      else
+        warn "the checkout is at $now (was $old_head); $service; fix the problem and rerun dish-update --apply${ref:+ $ref}, or go back with dish-update --apply $old_head"
+      fi
+    fi
     # A failed step exits 1, whatever the failed command returned (install.sh can exit 2, which here means usage). A
     # signal keeps its code.
     case $status in
@@ -147,13 +169,12 @@ show_lines() {
     fi
   done
   if [ "$more" -gt 0 ]; then printf '  (and %d more)\n' "$more"; fi
-  if [ "$hidden" -eq 1 ]; then printf '  (1 line left out)\n'; fi
-  if [ "$hidden" -gt 1 ]; then printf '  (%d lines left out)\n' "$hidden"; fi
+  if [ "$hidden" -gt 0 ]; then printf '  (%s left out)\n' "$(plural "$hidden" line lines)"; fi
 }
 
 # "1 commit", "2 commits".
-commits() {
-  if [ "$1" -eq 1 ]; then printf '1 commit'; else printf '%d commits' "$1"; fi
+plural() {
+  if [ "$1" -eq 1 ]; then printf '1 %s' "$2"; else printf '%d %s' "$1" "$3"; fi
 }
 
 sha256() {
@@ -180,16 +201,14 @@ unit_path() {
   printf '%s\n' "$value"
 }
 
-# The journal's tail, without the lines that mention a token: journalctl with the arguments after <unreadable>, which
-# is what to say when it prints nothing.
-print_journal() {
-  local unreadable=$1 lines
-  shift
-  if lines=$(journalctl "$@" 2>/dev/null) && [ -n "$lines" ]; then
+# The service's last 15 journal lines, read as the account, without the lines that mention a token.
+print_the_journal() {
+  local lines
+  if lines=$(journalctl --user -u "$UNIT" -n 15 -q --no-pager -o short-iso 2>/dev/null 9>&-) && [ -n "$lines" ]; then
     say 'journal (last 15 lines, credential lines removed):'
     printf '%s\n' "$lines" | show_lines
   else
-    say "$unreadable"
+    say "journal: nothing readable as $account (journalctl --user -u $UNIT)"
   fi
 }
 
@@ -218,20 +237,32 @@ parse_arguments() {
 }
 
 # The checkout is this script's ../, and the account is its owner.
-find_the_account() {
-  step='finding the account'
-  local entry
+find_the_checkout() {
+  step='finding the checkout'
   self=$(readlink -f -- "${BASH_SOURCE[0]}")
   checkout=$(dirname -- "$(dirname -- "$self")")
   account=$(stat -c %U -- "$checkout")
   if [ "$account" = root ]; then fail "$checkout is owned by root; update.sh runs as the account that owns the checkout"; fi
+}
+
+find_the_account() {
+  step='finding the account'
+  local entry
   entry=$(getent passwd "$account") || fail "getent passwd has no $account, the owner of $checkout"
   IFS=: read -r _ _ uid _ _ home _ <<<"$entry"
   if ! [[ $uid =~ ^[0-9]+$ ]] || [[ $home != /* ]]; then fail "getent passwd $account gave no uid and home"; fi
 }
 
-# The environment the account's run gets, and nothing else. PATH is the unit's, read from the checkout as it is now.
-clean_environment() {
+# Root, or anyone but the account.
+refuse_the_caller() {
+  step=''
+  warn "run dish-update as root (incus exec dish --project dish -- dish-update [--apply] [<ref>]), or this script as $account"
+  exit 2
+}
+
+# As the account, from the wrapper, a login or a shell: run again with the clean environment. PATH is the unit's, read
+# from the checkout as it is now.
+run_clean() {
   step="reading PATH from $checkout/deploy/$UNIT"
   local path
   path=$(unit_path "the checkout's deploy/$UNIT" <"$checkout/deploy/$UNIT")
@@ -240,49 +271,32 @@ clean_environment() {
     TMPDIR=/tmp LANG=C.UTF-8 DISH_UPDATE_CLEAN=1
   )
   if [ -n "${DISH_UPDATE_WAIT+x}" ]; then clean+=("DISH_UPDATE_WAIT=$DISH_UPDATE_WAIT"); fi
-}
-
-# As root: run again as the account, then show the journal, which only root can read.
-run_as_the_account() {
-  clean_environment
-  step="moving to $home"
-  cd -- "$home"
-  step="running update.sh as $account"
-  local status=0
-  runuser -u "$account" -- env -i "${clean[@]}" DISH_UPDATE_PARENT=root "$BASH" "$self" "${args[@]}" || status=$?
-  # The run has named its own failure. Anything else (runuser's own) is a failed step here.
-  case $status in
-    0 | 1 | 2 | 130 | 143) step='' ;;
-  esac
-  if [ "$apply" -eq 1 ]; then
-    print_journal 'journal: could not be read' "_UID=$uid" "_SYSTEMD_USER_UNIT=$UNIT" -n 15 --no-pager -o short-iso
-  fi
-  exit "$status"
-}
-
-# As the account, from a login or a shell: run again with the clean environment.
-run_clean() {
-  clean_environment
   step="moving to $home"
   cd -- "$home"
   step='running update.sh again in a clean environment'
   exec env -i "${clean[@]}" "$BASH" "$self" "${args[@]}"
 }
 
-# DISH_UPDATE_CLEAN is update.sh's own. Set by hand, it must not let the caller's environment reach install.sh.
-refuse_a_borrowed_environment() {
+# DISH_UPDATE_CLEAN is update.sh's own. Set by hand, it must not let the caller's environment reach install.sh, so the
+# environment must hold the clean names and nothing else (bash adds PWD, OLDPWD, SHLVL and _ itself).
+check_the_environment() {
   step='checking the environment'
-  local name
-  local -a names
+  local name hidden=0
+  local -a names extra=()
   mapfile -t names < <(compgen -e)
   for name in "${names[@]}"; do
     case $name in
-      XDG_RUNTIME_DIR) ;;
-      XDG_* | PNPM_HOME | DSH_* | NODE_ENV | NODE_OPTIONS | npm_config_* | pnpm_config_*)
-        fail "the environment has names install.sh must not get (XDG_*, PNPM_HOME, DSH_*, NODE_*, npm or pnpm config); DISH_UPDATE_CLEAN is update.sh's own, so run update.sh without it"
+      HOME | USER | LOGNAME | XDG_RUNTIME_DIR | PATH | TMPDIR | LANG | DISH_UPDATE_CLEAN | DISH_UPDATE_WAIT) ;;
+      PWD | OLDPWD | SHLVL | _) ;;
+      *)
+        if [[ ${name,,} == *token* ]]; then hidden=$((hidden + 1)); else extra+=("$name"); fi
         ;;
     esac
   done
+  if [ $((${#extra[@]} + hidden)) -gt 0 ]; then
+    if [ "$hidden" -gt 0 ]; then extra+=("and $(plural "$hidden" other other)"); fi
+    fail "the environment has names besides update.sh's clean ones (${extra[*]}); DISH_UPDATE_CLEAN is update.sh's own, so run update.sh without it"
+  fi
   step='checking the tools on PATH'
   local tool
   for tool in git flock curl systemctl sha256sum mktemp; do
@@ -332,13 +346,18 @@ read_the_inputs() {
     if [[ $seen != *" $name "* ]]; then fail "$install_env has no $name line"; fi
   done
 
-  # The unit can't start without its trusted host, so an update would stop at the wait.
+  # The unit can't start without its trusted host, so an update would stop at the wait. The rule is url.sh's.
   if [ ! -f "$deploy_env" ]; then fail "$deploy_env is missing; fleet writes it"; fi
-  local host=''
+  local host='' hosts=0 host_re='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?$'
   while IFS= read -r line || [ -n "$line" ]; do
-    case $line in DISH_TRUSTED_HOST=?*) host=${line#DISH_TRUSTED_HOST=} ;; esac
+    if [[ $line == DISH_TRUSTED_HOST=* ]]; then
+      host=${line#DISH_TRUSTED_HOST=}
+      hosts=$((hosts + 1))
+    fi
   done <"$deploy_env"
-  if [ -z "$host" ]; then fail "$deploy_env has no DISH_TRUSTED_HOST=<host> line; fleet writes it"; fi
+  if [ "$hosts" -ne 1 ] || [[ ! $host =~ $host_re ]]; then
+    fail "$deploy_env needs exactly one DISH_TRUSTED_HOST=<host> line with a bare host name (no scheme or path); fleet writes it"
+  fi
 }
 
 find_the_target() {
@@ -379,6 +398,15 @@ read_the_stamp() {
   done <"$state_dir/started"
 }
 
+# The service's state, from the account's user manager. A manager that doesn't answer stops the update: systemctl
+# prints nothing then, where an unknown or stopped unit is "inactive".
+read_the_service() {
+  active_state=$(systemctl --user is-active "$UNIT" 2>/dev/null) || true
+  if [ -z "$active_state" ]; then
+    fail "can't reach $account's user manager (XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR-}; is linger on?)"
+  fi
+}
+
 # The stamp a start of <revision>, with the unit whose sha256 is <unit sum>, would get. Sets `stamp`.
 make_stamp() {
   local deploy_sum install_sum
@@ -389,10 +417,10 @@ make_stamp() {
 
 # Why the service, started with what `stamp` says, would need a restart. Sets `reasons`.
 stale_reasons() {
-  local active line key
+  local line key
   reasons=()
-  active=$(systemctl --user is-active "$UNIT" 2>/dev/null) || true
-  if [ "$active" != active ]; then reasons+=("not active (${active:-unknown})"); fi
+  read_the_service
+  if [ "$active_state" != active ]; then reasons+=("not active ($active_state)"); fi
   if [ "$have_stamp" -eq 0 ]; then
     reasons+=('no record of a start')
     return 0
@@ -428,16 +456,16 @@ report_the_commits() {
     say 'already at the target'
   elif git -C "$checkout" merge-base --is-ancestor "$head" "$target"; then
     count=$(git -C "$checkout" rev-list --count "$head..$target")
-    say "$(commits "$count") to apply"
+    say "$(plural "$count" commit commits) to apply"
     git -C "$checkout" log --no-color --format='%h %s' "$head..$target" | show_lines
   elif git -C "$checkout" merge-base --is-ancestor "$target" "$head"; then
     count=$(git -C "$checkout" rev-list --count "$target..$head")
-    say "$(commits "$count") to roll back"
+    say "$(plural "$count" commit commits) to roll back"
     git -C "$checkout" log --no-color --format='%h %s' "$target..$head" | show_lines
   else
     only_head=$(git -C "$checkout" rev-list --count "$target..$head")
     only_target=$(git -C "$checkout" rev-list --count "$head..$target")
-    say "diverged: $(commits "$only_head") only at HEAD, $only_target only at the target"
+    say "diverged: $(plural "$only_head" commit commits) only at HEAD, $only_target only at the target"
     git -C "$checkout" log --no-color --left-right --format='%m %h %s' "$head...$target" | show_lines
   fi
 }
@@ -445,9 +473,14 @@ report_the_commits() {
 # What the target would bring, and whether the service would restart for it. It changes nothing.
 report() {
   step='reading the target'
-  # An --apply that moved the checkout to a target without these would stop halfway, so they are checked first.
-  if ! git -C "$checkout" cat-file -e "$target:deploy/install.sh" 2>/dev/null; then fail "$target_name has no deploy/install.sh"; fi
-  if ! git -C "$checkout" cat-file -e "$target:deploy/$UNIT" 2>/dev/null; then fail "$target_name has no deploy/$UNIT"; fi
+  # An --apply that moved the checkout to a target without these would stop halfway, or leave a checkout that
+  # dish-update can't run in (a rollback to before update.sh existed), so they are checked first.
+  local file
+  for file in deploy/update.sh deploy/install.sh "deploy/$UNIT"; do
+    if ! git -C "$checkout" cat-file -e "$target:$file" 2>/dev/null; then
+      fail "$target_name has no $file, so the checkout can't move there; dish-update needs it there to run again"
+    fi
+  done
   target_path=$(git -C "$checkout" cat-file blob "$target:deploy/$UNIT" | unit_path "$target_name:deploy/$UNIT")
   target_unit=$(git -C "$checkout" cat-file blob "$target:deploy/$UNIT" | sha256)
   step='reading the node and pnpm versions'
@@ -455,6 +488,9 @@ report() {
   pnpm_version=$(version pnpm)
   step='reading the stamp'
   read_the_stamp
+  step="asking $account's user manager about $UNIT"
+  make_stamp "$target" "$target_unit"
+  stale_reasons
 
   step='reporting'
   local installed=$home/.config/systemd/user/$UNIT unit_line installed_sum deploy_line install_line
@@ -466,8 +502,6 @@ report() {
   fi
   deploy_line=$(input_state deploy.env "$deploy_env")
   install_line=$(input_state install.env "$install_env")
-  make_stamp "$target" "$target_unit"
-  stale_reasons
 
   say "HEAD $head (${branch:-detached})"
   say "target $target ($target_name)"
@@ -497,38 +531,42 @@ check_the_checkout() {
     fail "main has commits that origin/main doesn't, so it can't fast-forward; update.sh never resets it"
 }
 
+# The first change. The lock's descriptor is closed for git, whose gc or maintenance can outlive it.
 move_the_checkout() {
   local now
+  old_head=$head
+  moved=1
   if [ -n "$ref" ]; then
     begin "checking out $target detached"
-    git -C "$checkout" switch --quiet --detach "$target"
+    git -C "$checkout" switch --quiet --detach "$target" 9>&-
   else
     if [ -z "$branch" ]; then
       begin 'switching back to main'
-      git -C "$checkout" switch --quiet main
+      git -C "$checkout" switch --quiet main 9>&-
     fi
     now=$(git -C "$checkout" rev-parse --verify HEAD)
     if [ "$now" != "$target" ]; then
       begin 'fast-forwarding main to origin/main'
-      git -C "$checkout" merge --quiet --ff-only "$target"
+      git -C "$checkout" merge --quiet --ff-only "$target" 9>&-
     fi
   fi
   head=$(git -C "$checkout" rev-parse --verify HEAD)
   if [ "$head" != "$target" ]; then fail "HEAD is $head, not the target"; fi
 }
 
-# install.sh, with the unit's environment and install.env's inputs. Its output passes through; its last line says
-# whether it changed the profile.
+# install.sh, with the unit's environment and install.env's inputs. Its output, both streams, passes through on stdout,
+# less the lines that mention a token; its last line says whether it changed the profile.
 run_install() {
   begin 'running deploy/install.sh'
-  local line last=''
-  env -u DISH_UPDATE_CLEAN -u DISH_UPDATE_PARENT -u DISH_UPDATE_WAIT "PATH=$target_path" \
+  local line last='' hidden=0
+  env -u DISH_UPDATE_CLEAN -u DISH_UPDATE_WAIT "PATH=$target_path" \
     "DISH_REMOTE=$remote" "DISH_USER_NAME=$user_name" "DISH_USER_EMAIL=$user_email" \
-    "$checkout/deploy/install.sh" </dev/null 9>&- |
+    "$checkout/deploy/install.sh" </dev/null 9>&- 2>&1 |
     while IFS= read -r line || [ -n "$line" ]; do
-      printf '%s\n' "$line"
       last=$line
+      if [[ ${line,,} == *token* ]]; then hidden=$((hidden + 1)); else printf '%s\n' "$line"; fi
     done
+  if [ "$hidden" -gt 0 ]; then say "left out $(plural "$hidden" line lines) of install.sh's output"; fi
   case $last in
     'install: profile changed') profile_changed=1 ;;
     'install: no changes to the profile') profile_changed=0 ;;
@@ -536,9 +574,12 @@ run_install() {
   esac
 }
 
+# Copy the unit when it differs, and daemon-reload whenever the user manager may hold another definition: the file
+# changed, the service last started with another unit (or there is no record of a start), or the manager says so. A
+# reload that failed or was cut short is so done again by the next run, before any restart.
 install_the_unit() {
   step='comparing the installed unit'
-  local dir=$home/.config/systemd/user tmp source_sum installed_sum='' enabled
+  local dir=$home/.config/systemd/user tmp source_sum installed_sum='' pending enabled reload=0
   source_sum=$(sha256 "$checkout/deploy/$UNIT")
   if [ -f "$dir/$UNIT" ]; then installed_sum=$(sha256 "$dir/$UNIT"); fi
   if [ "$source_sum" != "$installed_sum" ]; then
@@ -549,7 +590,14 @@ install_the_unit() {
     cp -- "$checkout/deploy/$UNIT" "$tmp"
     chmod 0644 -- "$tmp"
     mv -f -- "$tmp" "$dir/$UNIT"
-    step='reloading the user manager'
+    reload=1
+  fi
+  if [ "$have_stamp" -eq 0 ] || [ "${last_stamp[unit]-}" != "$source_sum" ]; then reload=1; fi
+  step='asking whether the user manager needs a reload'
+  pending=$(systemctl --user show -p NeedDaemonReload --value "$UNIT" 2>/dev/null) || pending=''
+  if [ "$pending" = yes ]; then reload=1; fi
+  if [ "$reload" -eq 1 ]; then
+    begin 'reloading the user manager'
     systemctl --user daemon-reload
   fi
 
@@ -564,6 +612,14 @@ install_the_unit() {
   fi
 }
 
+# Restart for the reasons in `reasons`, and say them.
+restart_now() {
+  say "restart: needed ($(joined_reasons))"
+  begin "restarting $UNIT"
+  systemctl --user restart "$UNIT"
+  restarted=1
+}
+
 restart_when_stale() {
   step='deciding whether to restart'
   local unit_sum
@@ -571,28 +627,26 @@ restart_when_stale() {
   make_stamp "$head" "$unit_sum"
   stale_reasons
   if [ "$profile_changed" -eq 1 ]; then reasons+=('install.sh changed the profile'); fi
-  restarted=0
   if [ "${#reasons[@]}" -eq 0 ]; then
     say 'restart: not needed'
     return 0
   fi
-  say "restart: needed ($(joined_reasons))"
-  begin "restarting $UNIT"
-  systemctl --user restart "$UNIT"
-  restarted=1
+  restart_now
 }
 
-# Any HTTP answer, even a 401 for the missing sign-in, means dsh is up.
+# Poll until dsh answers or the wait runs out. Sets `answered`. Any HTTP answer, even a 401 for the missing sign-in,
+# means dsh is up.
 wait_for_dsh() {
   begin "waiting for dsh on $LISTEN"
   local deadline=$((SECONDS + wait_seconds)) code
+  answered=0
   while :; do
     code=$(curl -q -s -o /dev/null -w '%{http_code}' --max-time 2 "http://$LISTEN/" 9>&-) || true
-    if [ -n "$code" ] && [ "$code" != 000 ]; then return 0; fi
-    if [ "$SECONDS" -ge "$deadline" ]; then
-      if [ "${DISH_UPDATE_PARENT-}" != root ]; then print_journal_as_the_account; fi
-      fail "dsh did not answer on $LISTEN within $wait_seconds seconds"
+    if [ -n "$code" ] && [ "$code" != 000 ]; then
+      answered=1
+      return 0
     fi
+    if [ "$SECONDS" -ge "$deadline" ]; then return 0; fi
     sleep 2
   done
 }
@@ -606,26 +660,22 @@ write_the_stamp() {
   mv -f -- "$tmp" "$state_dir/started"
 }
 
-print_journal_as_the_account() {
-  print_journal "journal: not readable as $account; run update.sh as root to see it" --user -u "$UNIT" -n 15 --no-pager
-}
-
 print_the_result() {
   step='printing the result'
-  local active how=unchanged
-  active=$(systemctl --user is-active "$UNIT" 2>/dev/null) || true
+  local how=unchanged
   if [ "$restarted" -eq 1 ]; then how=restarted; fi
+  active_state=$(systemctl --user is-active "$UNIT" 2>/dev/null) || true
   say "HEAD $head"
-  say "$UNIT: ${active:-unknown} ($how)"
-  if [ "$restarted" -eq 1 ]; then say "run $checkout/deploy/url.sh for a fresh sign-in link"; fi
-  if [ "${DISH_UPDATE_PARENT-}" != root ]; then print_journal_as_the_account; fi
+  say "$UNIT: ${active_state:-unknown} ($how)"
+  if [ "$restarted" -eq 1 ]; then say 'run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)'; fi
+  print_the_journal
   step=''
 }
 
 # The work, as the account, in the clean environment.
 update() {
   cd -- "$home"
-  refuse_a_borrowed_environment
+  check_the_environment
   take_the_lock
   read_the_inputs
   step='fetching origin'
@@ -639,12 +689,21 @@ update() {
     return 0
   fi
 
-  # The first change.
   move_the_checkout
   run_install
   install_the_unit
   restart_when_stale
   wait_for_dsh
+  # A service that runs but doesn't answer, and that this run didn't restart, gets one restart.
+  if [ "$answered" -eq 0 ] && [ "$restarted" -eq 0 ]; then
+    reasons=("did not answer on $LISTEN within $wait_seconds seconds")
+    restart_now
+    wait_for_dsh
+  fi
+  if [ "$answered" -eq 0 ]; then
+    print_the_journal
+    fail "dsh did not answer on $LISTEN within $wait_seconds seconds"
+  fi
   if [ "$restarted" -eq 1 ]; then write_the_stamp; fi
   print_the_result
 }
@@ -655,18 +714,14 @@ main() {
   trap 'exit 143' TERM HUP
   args=("$@")
   parse_arguments "$@"
-  find_the_account
+  find_the_checkout
 
   step='checking who runs update.sh'
   local me
   me=$(id -u)
-  if [ "$me" = 0 ]; then run_as_the_account; fi
-  me=$(id -un)
-  if [ "$me" != "$account" ]; then
-    step=''
-    warn "run update.sh as root or as $account"
-    exit 2
-  fi
+  if [ "$me" = 0 ]; then refuse_the_caller; fi
+  find_the_account
+  if [ "$me" != "$uid" ]; then refuse_the_caller; fi
   if [ -z "${DISH_UPDATE_CLEAN+x}" ]; then run_clean; fi
   update
 }

@@ -26,11 +26,11 @@ EnvironmentFile=%h/.config/dish/deploy.env
 
 # Where Node and pnpm are found, which is a contract with fleet's dish_guest role: it makes /opt/dish/node a symlink to
 # the pinned Node install (24.21.0) and puts pnpm (11.25.0) in that Node's bin. Fleet no longer checks this line;
-# update.sh reads it, and runs install.sh with exactly this PATH, so an update installs with the tools the service
-# runs with. update.sh reads it from the unit as checked out when the update starts, before the fast-forward, so change
-# this line in an update of its own: an update that changes it runs install.sh on the old PATH and restarts on the new
-# one. Agents' commands inherit this PATH too (dsh keeps PATH and drops names that look like secrets), so it also says
-# what a shell command can run.
+# update.sh reads it. install.sh, and update.sh's node and pnpm version checks, run with the target's copy of this line,
+# read from git before the checkout moves, so an update installs with the tools of the service it starts. update.sh's
+# own commands (git, curl, systemctl) run with this line as checked out when the update starts. Agents' commands
+# inherit this PATH too (dsh keeps PATH and drops names that look like secrets), so it also says what a shell command
+# can run.
 #
 # A second contract with fleet: this unit sets none of HOME, XDG_DATA_HOME or PNPM_HOME, and pnpm works its store out
 # from them. install.sh pins the store that `pnpm store path` gives under its own environment into the profile, and

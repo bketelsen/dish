@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 # Print the link that signs you in to dish: https://<DISH_TRUSTED_HOST>/?token=<token>
 #
-# Run it on the VM as root, through `incus exec` (which gives root):
-#   incus exec dish --project dish -- /home/dish/dish/deploy/url.sh
+# Run it on the VM as root through fleet's wrapper, which `incus exec` reaches:
+#   incus exec dish --project dish -- dish-url
 # It takes no arguments.
+#
+# It runs only as the account: the owner of the checkout this script sits in (`dish` on the VM). Never as root: this
+# file is the account's to write, so root running it would run whatever the account (or an agent acting as it) put
+# here. Root's entry point is /usr/local/sbin/dish-url, a root-owned wrapper fleet installs, which runs this script as
+# the account through runuser with a minimal environment and does nothing else.
 #
 # It prints a secret, on purpose: the token. It is for your terminal. Don't paste the output anywhere.
 #
 # stdout is exactly one line, the link, and nothing else, ever. Everything else it says goes to stderr, and the token is
 # never in any of it. Exit 0: the link was printed. Exit 1: the service isn't running, hasn't printed a token since its
-# current start, or deploy.env is missing or unusable. Exit 2: an argument, or not run as root.
+# current start, or deploy.env is missing or unusable. Exit 2: an argument, or not run as the account.
 #
 # How it works:
 #   1. The account is the owner of the checkout this script sits in (`dish` on the VM). Its uid and home come from
 #      `getent passwd`.
 #   2. The host comes from <home>/.config/dish/deploy.env, the file fleet writes and the unit loads.
-#   3. The start comes from the account's user manager: `systemctl --user -M <account>@ show dish-web.service`.
+#   3. The start comes from the account's user manager: `systemctl --user show dish-web.service`, with
+#      XDG_RUNTIME_DIR=/run/user/<uid>.
 #   4. dsh makes a new token at every start and prints the link to stdout, which the unit sends to the journal. The
-#      token is in the last `dsh web: ` line since the current start. Root reads that journal by user id and unit.
+#      token is in the last `dsh web: ` line since the current start, read from the account's own user journal.
 #
 # It changes nothing: no file is written, and the token never touches a file or another program's arguments.
 #
@@ -50,19 +56,25 @@ trap 'exit 143' TERM HUP
 
 main() {
   if [ "$#" -ne 0 ]; then die 2 'takes no arguments'; fi
-  step='checking who runs it'
-  if [ "$(id -u)" != 0 ]; then die 2 'run url.sh as root (incus exec gives root)'; fi
 
-  step="finding the account and its home"
-  local self root account entry uid home
+  step='finding the account'
+  local self root account entry uid home me
   # The script's real path, so that a symlink to it still finds the checkout it sits in.
   self=$(readlink -f -- "${BASH_SOURCE[0]}")
   root=$(cd -- "$(dirname -- "$self")/.." && pwd -P)
   account=$(stat -c %U -- "$root")
   if [ "$account" = root ]; then die 1 "$root is owned by root; url.sh needs the account that runs dish-web.service to own the checkout"; fi
+
+  step='checking who runs it'
+  local refused="run dish-url as root (incus exec dish --project dish -- dish-url), or this script as $account"
+  me=$(id -u)
+  if [ "$me" = 0 ]; then die 2 "$refused"; fi
+
+  step="finding the account's home"
   entry=$(getent passwd "$account") || die 1 "can't look up the account $account (the owner of $root) with getent"
   IFS=: read -r _ _ uid _ _ home _ <<<"$entry"
   if [[ ! $uid =~ ^[0-9]+$ || $home != /* ]]; then die 1 "getent gave no uid and home for the account $account"; fi
+  if [ "$me" != "$uid" ]; then die 2 "$refused"; fi
 
   step='reading deploy.env'
   local env_file="$home/.config/dish/deploy.env"
@@ -81,8 +93,8 @@ main() {
 
   step="asking $account's user manager about dish-web.service"
   local show
-  show=$(systemctl --user -M "$account@" show dish-web.service --property=MainPID --property=ExecMainStartTimestamp) ||
-    die 1 "can't ask $account's user manager about dish-web.service"
+  show=$(XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user show dish-web.service --property=MainPID --property=ExecMainStartTimestamp) ||
+    die 1 "can't ask $account's user manager about dish-web.service (XDG_RUNTIME_DIR=/run/user/$uid; is linger on?)"
   local main_pid='' started=''
   while IFS= read -r line; do
     case $line in
@@ -91,12 +103,12 @@ main() {
     esac
   done <<<"$show"
   if [[ ! $main_pid =~ ^[0-9]+$ ]]; then die 1 "systemctl show gave no MainPID for dish-web.service"; fi
-  if [ "$main_pid" -eq 0 ]; then die 1 "dish-web.service isn't running; start it with deploy/update.sh --apply"; fi
+  if [ "$main_pid" -eq 0 ]; then die 1 "dish-web.service isn't running; start it with dish-update --apply"; fi
   if [ -z "$started" ]; then die 1 "systemctl show gave no start time for dish-web.service"; fi
 
   step='reading the journal'
   local journal
-  journal=$(journalctl "_UID=$uid" _SYSTEMD_USER_UNIT=dish-web.service --since "$started" --no-pager -o cat) ||
+  journal=$(journalctl --user -u dish-web.service --since "$started" -q --no-pager -o cat) ||
     die 1 "can't read the journal of dish-web.service since $started"
   # Process substitution, not a here-string: older bash writes a here-string to a temporary file.
   local token='' token_re='[?&]token=([A-Za-z0-9_-]+)'

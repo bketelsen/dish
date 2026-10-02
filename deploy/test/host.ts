@@ -2,6 +2,10 @@
  * A fake VM for `deploy/update.sh`: a bare repo standing in for GitHub, a clone of it as the account's checkout, the
  * account's home with its `~/.config/dish` inputs, and stub commands for everything that would reach the real system.
  *
+ * update.sh runs only as the account; as root, fleet's dish-update wrapper runs it through runuser. So a run here is the
+ * account's by default, and `as: 'root'` or `as: 'other'` is someone it must refuse. `runuser` is stubbed only so that a
+ * call to it would be seen.
+ *
  * Nothing a script does here can reach the real machine:
  * - `id`, `getent`, `runuser`, `systemctl`, `journalctl`, `curl` and `pnpm` are stubs, first on the PATH of the
  *   checkout's unit, which is the PATH update.sh runs everything with. createHost checks that each name resolves to its
@@ -58,14 +62,24 @@ const JOURNAL = [
 ]
 
 export interface HostOptions {
-  /** Who runs the script: root (as incus exec does, the default), the account, or another user. */
+  /** Who runs the script: the account (the default, as fleet's dish-update wrapper does), root, or another user. */
   as?: 'root' | 'account' | 'other'
   /** Set the service's state before the run. Without these, it stays as earlier runs left it: a new host has it active and not enabled. */
   active?: boolean
   enabled?: boolean
-  /** Whether 127.0.0.1:3080 answers. Default up. */
-  curl?: 'up' | 'down'
+  /** Whether the account's user manager answers at all. Default up. */
+  manager?: 'up' | 'down'
+  /** Make `systemctl --user daemon-reload` fail in this run. */
+  reloadFails?: boolean
+  /** Make the user manager hold an older definition of the unit than the installed file, so it needs a daemon-reload. */
+  needDaemonReload?: boolean
+  /** Whether `systemctl show -p NeedDaemonReload` answers. Default true; false prints nothing, as if it didn't know. */
+  reportsReload?: boolean
+  /** Whether 127.0.0.1:3080 answers: always, never, or only once the service has restarted during this run. Default up. */
+  curl?: 'up' | 'down' | 'after-restart'
   pnpmVersion?: string
+  /** Lines the stub install.sh prints before its last line. */
+  installOutput?: string[]
   /** The stub install.sh's last line. Default `install: no changes to the profile`. */
   installLastLine?: string
   installExit?: number
@@ -77,12 +91,26 @@ export interface HostOptions {
   wait?: number
   /** More variables for the run's environment. */
   env?: Record<string, string>
+  /** Run with exactly what fleet's dish-update wrapper passes (env -i, then HOME, USER, LOGNAME, XDG_RUNTIME_DIR, PATH). */
+  wrapper?: boolean
 }
 
 export interface Result {
   code: number
   stdout: string
   stderr: string
+}
+
+/** What the stub user manager holds. */
+export interface Service {
+  active: boolean
+  enabled: boolean
+  /** Restarts so far. */
+  starts: number
+  /** The unit file's text at the last daemon-reload; null before any. */
+  loaded: string | null
+  /** The definition the service last started with: `loaded` at the last restart. */
+  startedWith: string | null
 }
 
 export interface Install {
@@ -114,6 +142,7 @@ export interface Host {
   head(): Promise<string>
   stamp(): string | undefined
   installedUnit(): string | undefined
+  service(): Service
 }
 
 const hosts: string[] = []
@@ -146,10 +175,7 @@ export async function git(cwd: string, ...args: string[]): Promise<string> {
 /** The code each stub runs after recording its argv. `argv`, `config`, `state()`, `save()` and `fail()` are in scope. */
 const STUB_BODIES: Record<string, string> = {
   id: `
-    const root = config.as === 'root' && process.env.DISH_UPDATE_CLEAN === undefined
-    const other = config.as === 'other'
-    if (argv.length === 1 && argv[0] === '-u') console.log(root ? '0' : other ? '4242' : String(config.uid))
-    else if (argv.length === 1 && argv[0] === '-un') console.log(root ? 'root' : other ? 'someone-else' : config.owner)
+    if (argv.length === 1 && argv[0] === '-u') console.log(config.as === 'root' ? '0' : config.as === 'other' ? '4242' : String(config.uid))
     else fail()
   `,
   getent: `
@@ -167,9 +193,15 @@ const STUB_BODIES: Record<string, string> = {
     process.exit(result.status ?? 128 + (constants.signals[result.signal] ?? 0))
   `,
   systemctl: `
+    if (config.manager === 'down') {
+      console.error('Failed to connect to bus: No such file or directory')
+      process.exit(1)
+    }
     const verbs = ['is-active', 'is-enabled', 'restart', 'enable', 'daemon-reload', 'show']
     const verb = argv.find((arg) => verbs.includes(arg))
     const s = state()
+    const unitFile = config.home + '/.config/systemd/user/dish-web.service'
+    const installed = fs.existsSync(unitFile) ? fs.readFileSync(unitFile, 'utf8') : null
     if (verb === 'is-active') {
       console.log(s.active ? 'active' : 'inactive')
       process.exit(s.active ? 0 : 3)
@@ -179,12 +211,20 @@ const STUB_BODIES: Record<string, string> = {
     } else if (verb === 'restart') {
       s.active = true
       s.starts += 1
+      s.startedWith = s.loaded
       save(s)
     } else if (verb === 'enable') {
       s.enabled = true
       save(s)
     } else if (verb === 'daemon-reload') {
-      // Nothing to do: the stub reads no unit files.
+      if (config.reloadFails) {
+        console.error('Failed to reload daemon: Connection timed out')
+        process.exit(1)
+      }
+      s.loaded = installed
+      save(s)
+    } else if (verb === 'show' && argv.includes('NeedDaemonReload')) {
+      if (config.reportsReload) console.log(installed !== null && installed !== s.loaded ? 'yes' : 'no')
     } else if (verb === 'show') {
       console.log('MainPID=' + (s.active ? 4242 : 0))
       console.log('ExecMainStartTimestamp=' + (s.active ? 'Fri 2026-10-02 10:00:00 UTC' : ''))
@@ -196,8 +236,9 @@ const STUB_BODIES: Record<string, string> = {
     for (const line of config.journal) console.log(line)
   `,
   curl: `
-    process.stdout.write(config.curl === 'up' ? '200' : '000')
-    process.exit(config.curl === 'up' ? 0 : 7)
+    const up = config.curl === 'up' || (config.curl === 'after-restart' && state().starts > config.startsBefore)
+    process.stdout.write(up ? '200' : '000')
+    process.exit(up ? 0 : 7)
   `,
   pnpm: `
     if (argv.length === 1 && argv[0] === '--version') console.log(config.pnpmVersion)
@@ -236,6 +277,7 @@ for (const [name, value] of Object.entries(process.env)) if (name.startsWith('DI
 fs.appendFileSync(dir + '/calls/install.jsonl', JSON.stringify({ env, names: Object.keys(process.env).sort() }) + '\\n')
 const config = JSON.parse(fs.readFileSync(dir + '/config.json', 'utf8'))
 console.log('install: pnpm install --frozen-lockfile')
+for (const line of config.installOutput) console.log(line)
 if (config.installExit !== 0) {
   console.error('install: FAILED at step: pnpm build (exit ' + config.installExit + ')')
   process.exit(config.installExit)
@@ -284,7 +326,7 @@ export async function createHost(): Promise<Host> {
     await mkdir(path, { recursive: true })
   }
   for (const name of STUBBED) await writeFile(join(stubs, name), stubSource(dir, name), { mode: 0o755 })
-  await writeFile(join(dir, 'state.json'), JSON.stringify({ active: true, enabled: false, starts: 0 }))
+  await writeFile(join(dir, 'state.json'), JSON.stringify({ active: true, enabled: false, starts: 0, loaded: null, startedWith: null }))
 
   // The stubs must win: each stubbed name resolves to its stub on the unit's PATH.
   for (const name of STUBBED) {
@@ -340,24 +382,28 @@ export async function createHost(): Promise<Host> {
     },
 
     async run(script, args, options = {}) {
+      const state = host.service()
+      if (options.active !== undefined) state.active = options.active
+      if (options.enabled !== undefined) state.enabled = options.enabled
+      if (options.needDaemonReload) state.loaded = '# an older definition\n'
+      await writeFile(join(dir, 'state.json'), JSON.stringify(state))
       const config = {
         owner,
         uid: UID,
         home,
-        as: options.as ?? 'root',
+        as: options.as ?? 'account',
+        manager: options.manager ?? 'up',
+        reloadFails: options.reloadFails ?? false,
+        reportsReload: options.reportsReload ?? true,
         curl: options.curl ?? 'up',
+        startsBefore: state.starts,
         pnpmVersion: options.pnpmVersion ?? PNPM_VERSION,
+        installOutput: options.installOutput ?? [],
         installLastLine: options.installLastLine ?? 'install: no changes to the profile',
         installExit: options.installExit ?? 0,
         journal: options.journal ?? JOURNAL,
       }
       await writeFile(join(dir, 'config.json'), JSON.stringify(config))
-      if (options.active !== undefined || options.enabled !== undefined) {
-        const state = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')) as { active: boolean, enabled: boolean, starts: number }
-        if (options.active !== undefined) state.active = options.active
-        if (options.enabled !== undefined) state.enabled = options.enabled
-        await writeFile(join(dir, 'state.json'), JSON.stringify(state))
-      }
       for (const [name, content] of [['install.env', options.installEnv], ['deploy.env', options.deployEnv]] as const) {
         const path = join(home, '.config', 'dish', name)
         if (content === null) await rm(path, { force: true })
@@ -366,7 +412,7 @@ export async function createHost(): Promise<Host> {
 
       // A small environment of the test's own making, never the test runner's: HOME is somewhere else than the account's
       // home, and the variables update.sh must keep from install.sh are all set.
-      const env: NodeJS.ProcessEnv = {
+      const env: NodeJS.ProcessEnv = options.wrapper ? { PATH: unitPath, HOME: home, USER: owner, LOGNAME: owner, XDG_RUNTIME_DIR: `/run/user/${UID}` } : {
         PATH: unitPath,
         HOME: join(dir, 'elsewhere'),
         LANG: 'C.UTF-8',
@@ -407,6 +453,10 @@ export async function createHost(): Promise<Host> {
 
     installedUnit() {
       return readIfExists(join(home, '.config', 'systemd', 'user', 'dish-web.service'))
+    },
+
+    service() {
+      return JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')) as Service
     },
   }
   return host
