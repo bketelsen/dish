@@ -1,6 +1,7 @@
-# dsh web for dish: a systemd user unit of the unprivileged account that runs dsh (fleet's dish_guest role links it into
-# ~/.config/systemd/user, and the account has linger on). Nothing listens on the VM's own address: dsh binds
-# 127.0.0.1:3080, and `tailscale serve` is what puts it on the tailnet.
+# dsh web for dish: a systemd user unit of the unprivileged account that runs dsh (the account has linger on).
+# deploy/update.sh copies it to ~/.config/systemd/user/dish-web.service and restarts it when it is stale; fleet no
+# longer installs it. Nothing listens on the VM's own address: dsh binds 127.0.0.1:3080, and `tailscale serve` is what
+# puts it on the tailnet.
 [Unit]
 Description=dsh web for dish
 # The user manager has no network-online.target, so this does nothing. A start before the network is up fails, and
@@ -8,26 +9,41 @@ Description=dsh web for dish
 After=network-online.target
 
 [Service]
-WorkingDirectory=%h/dish
-# Written by fleet. It holds one line, DISH_TRUSTED_HOST=dish.<tailnet>.ts.net, which ExecStart below reads. The file is
+# ~/work is where agents start: it is the default directory of a new chat, the sandbox's fallback root, and where dsh
+# reads a project .env. update.sh creates it. Without it the start fails with 200/CHDIR, which is wanted: it says the
+# account was never set up, where a silent fallback to another directory would hand agents the wrong place. Keep it free
+# of a .env file. The binary below finds its own files from its own path, so the working directory does not matter to
+# it.
+WorkingDirectory=%h/work
+# Written by fleet. It holds one line, DISH_TRUSTED_HOST=dish.<tailnet>.ts.net, which ExecStart below reads, and nothing
+# else. The install's inputs (the config store's remote and the git identity) live in install.env, which this unit must
+# never load: dsh passes its environment on to every agent shell, so anything loaded here reaches agents. The file is
 # required, and both ways it can go wrong fail closed. With the file missing the unit does not start. With the variable
 # missing from it, systemd passes one empty argument, dsh refuses to load (the trustedHosts entry "" is not a bare
 # host[:port] authority), and the unit restarts every 5 seconds until fleet fixes the file.
 EnvironmentFile=%h/.config/dish/deploy.env
 
-# Where Node and pnpm are found, which is a contract with fleet's dish_guest role (F3): it makes /opt/dish/node a
-# symlink to the pinned Node install (24.21.0) and puts pnpm (11.25.0) in that Node's bin. Agents' commands inherit this
-# PATH too (dsh keeps PATH and drops names that look like secrets), so it also says what a shell command can run.
+# Where Node and pnpm are found, which is a contract with fleet's dish_guest role: it makes /opt/dish/node a symlink to
+# the pinned Node install (24.21.0) and puts pnpm (11.25.0) in that Node's bin. Fleet no longer checks this line;
+# update.sh reads it, and runs install.sh with exactly this PATH, so an update installs with the tools the service
+# runs with. Agents' commands inherit this PATH too (dsh keeps PATH and drops names that look like secrets), so it also
+# says what a shell command can run.
 #
 # A second contract with fleet: this unit sets none of HOME, XDG_DATA_HOME or PNPM_HOME, and pnpm works its store out
 # from them. install.sh pins the store that `pnpm store path` gives under its own environment into the profile, and
 # dsh's plugin manager, running here, works it out again from this one. They must be the same store (pnpm refuses a
 # profile recorded with another), so those three variables have to be the same for install.sh and for this unit.
-# Fleet must not set them for just one of the two.
+# update.sh sets none of them for install.sh, and fleet must not set them for just one of the two.
+#
+# No DISH_ENV either. Root package scripts go through the launcher (scripts/env.ts), which defaults to dev and sets the
+# dev environment; the service is prod because it never goes through the launcher, so it gets the account's own
+# directories. Setting DISH_ENV=prod here would reach every agent shell, since dsh passes its environment on.
 Environment=PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin
 
-# --trusted-host takes any number of values, so it must stay last. DISH_TRUSTED_HOST is a bare host name, no scheme.
-ExecStart=/usr/bin/env pnpm dsh web --host 127.0.0.1 --port 3080 --no-open --trusted-host ${DISH_TRUSTED_HOST}
+# The checkout's dsh binary, not `pnpm dsh`: root scripts are wrapped by the launcher, and the launcher would start the
+# VM on an empty dev store. --trusted-host takes any number of values, so it must stay last. DISH_TRUSTED_HOST is a bare
+# host name, no scheme.
+ExecStart=%h/dish/node_modules/.bin/dsh web --host 127.0.0.1 --port 3080 --no-open --trusted-host ${DISH_TRUSTED_HOST}
 Restart=on-failure
 RestartSec=5
 
@@ -38,8 +54,9 @@ RestartSec=5
 #                                       command.
 #   SystemCallFilter=                   it could block the calls bubblewrap and Landlock make.
 #   MemoryDenyWriteExecute=             V8's JIT needs memory that is writable and executable.
-#   ProtectSystem=                      it remounts the file system under dsh's own sandbox, which binds / and the
+#   ProtectSystem=, ProtectHome=        they remount the file system under dsh's own sandbox, which binds / and the
 #                                       workspace itself.
+#   NoNewPrivileges=                    it would also stop sudo in the escalated commands an agent is allowed to run.
 # That is reasoned from dsh's code, not tested (docs/research/2026-10-01-dsh-linux-host.md). If hardening is added
 # later, run dsh's bubblewrap probe and a real agent command under it first.
 
