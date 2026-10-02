@@ -34,7 +34,10 @@
  * - **A covered entry covers one request.** The gate records the tool (`exec.name`) and the reason dsh's tool will put on the request
  *   for the escalation (`escalate sandbox to <mode>: <justification>`, from `approveEscalation` in `dsh-sandbox`, which `bash` and
  *   `pwsh` both call). Only a request with that tool name and exactly that reason is approved. A hook's ask, or `run_code`'s,
- *   under the same call id is not the escalation the judge was shown.
+ *   under the same call id is not the escalation the judge was shown. The cover is used up before the request is answered
+ *   (`escalationCovered` is written back `false` through `VerdictCache.replace`), so a second request for the same call is
+ *   put to you, or refused for a child, and a cover that can't be used up covers nothing. The gate writes the entry afresh
+ *   when the same call comes through it again, its cover included.
  * - **The owner is always `verdictOwner(request.agent)`.** The cache is keyed by agent and call id, because a call id is the
  *   model provider's and two agents can use the same one at once: another agent's covered `allow` must not approve this
  *   agent's call.
@@ -168,9 +171,8 @@ const YOURS_WHY = 'you approved the command gate\'s ask about this call, which s
  * recorded from the arguments it judged). A hook's ask, or `run_code`'s, under a call id that bash's escalation also has, is
  * not covered; and neither is any request when the entry has no tool or no reason to compare with.
  */
-function covers(entry: VerdictEntry | undefined, request: ApprovalAnswererRequest): boolean {
-  return entry !== undefined
-    && entry.verdict === 'allow'
+function covers(entry: VerdictEntry, request: ApprovalAnswererRequest): boolean {
+  return entry.verdict === 'allow'
     && entry.escalationCovered
     && entry.tool !== undefined
     && entry.escalationReason !== undefined
@@ -258,10 +260,10 @@ export function approvalAnswerer(cache: Pick<VerdictCache, 'get' | 'replace'>, l
     /** Set when the request is the gate's ask that showed you the escalation: your yes to it is written there. */
     let shown: Found | undefined
     try {
-      if (covers(entry, request)) {
-        cover = 'judge'
+      // A cover is used up before the request is answered, so that it covers one request; one that can't be used up covers nothing.
+      if (found !== undefined && covers(found.entry, request)) {
+        if (cache.replace(found.owner, found.callId, found.entry, { ...found.entry, escalationCovered: false })) cover = 'judge'
       } else if (found !== undefined && yourYesCovers(topLevel, found.entry, request)) {
-        // Used up before it is answered, so that it covers one request; one that can't be used up covers nothing.
         if (cache.replace(found.owner, found.callId, found.entry, { ...found.entry, coveredByYou: false })) cover = 'you'
       } else if (found !== undefined && showsYouTheEscalation(found.entry, request)) {
         shown = found

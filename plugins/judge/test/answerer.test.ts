@@ -7,7 +7,7 @@ import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import { approvalAnswerer, childPolicy, CREW_LOOKUP_BUDGET_MS, registerApprovalAnswerer } from '../src/answerer.ts'
 import type { ApprovalAnswererRequest, ChildPolicyDeps } from '../src/answerer.ts'
 import type { Answer, Decision, JudgeRequest, JudgeResult } from '../src/client.ts'
-import { registerCommandGate, VERDICT_TTL_MS, VerdictCache, verdictOwner } from '../src/gate.ts'
+import { commandGate, registerCommandGate, VERDICT_TTL_MS, VerdictCache, verdictOwner } from '../src/gate.ts'
 import type { JudgeLogLine } from '../src/log.ts'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
 import { choiceAnswer, dirs, jevBody, mountJudge, noulAnswer, provideStub, startFakeJev } from './helpers.ts'
@@ -291,8 +291,9 @@ test('a collision across owners: agent B\'s covered allow can not approve agent 
   assert.equal(await answer(requestOf(b, 'bash', 'call-7'), forB.next), 'allowed-once', 'B\'s own request is covered')
   assert.equal(forB.spy.calls, 0)
 
-  // And the other way round: A's ask is not turned into B's.
+  // And the other way round: A's ask is not turned into B's. (B's cover was used up: the gate writes it again.)
   cache.set(verdictOwner(a), 'call-7', { verdict: 'ask', escalationCovered: false })
+  cache.set(verdictOwner(b), 'call-7', COVERED)
   const again = nextOf('rejected')
   assert.equal(await answer(requestOf(b, 'bash', 'call-7'), again.next), 'allowed-once')
   assert.equal(await answer(requestOf(a, 'bash', 'call-7'), nextOf().next), 'rejected')
@@ -362,6 +363,40 @@ test('a covered entry approves the one escalation the gate showed the judge: not
     const { spy, next } = nextOf('rejected')
     assert.equal(await answer({ agent, toolName: 'bash', callId: 'call-0' }, next), 'rejected')
     assert.equal(spy.calls, isChild ? 0 : 1)
+  }
+})
+
+test('a covered entry covers one request: a second for the same call is put to you, or refused for a child', async () => {
+  for (const make of [main, child]) {
+    const agent = make('agent-once')
+    const isChild = make === child
+    const cache = new VerdictCache()
+    cache.set(verdictOwner(agent), 'call-1', COVERED)
+    const { log, lines } = sink()
+    const answer = approvalAnswerer(cache, log)
+    const first = nextOf('rejected')
+    assert.equal(await answer(requestOf(agent), first.next), 'allowed-once')
+    assert.equal(first.spy.calls, 0)
+    assert.equal(cache.get(verdictOwner(agent), 'call-1')?.escalationCovered, false, 'used up')
+    assert.equal(cache.get(verdictOwner(agent), 'call-1')?.verdict, 'allow', 'and still the gate\'s allow')
+    const second = nextOf('rejected')
+    assert.equal(await answer(requestOf(agent), second.next), 'rejected')
+    assert.equal(second.spy.calls, isChild ? 0 : 1)
+    assert.deepEqual(lines.map(line => line.decision), ['allowed-once', isChild ? 'rejected' : 'pass'])
+  }
+})
+
+test('a covered entry that can not be used up covers nothing', async () => {
+  for (const make of [main, child]) {
+    const agent = make('agent-stuck')
+    const cache = new VerdictCache()
+    cache.set(verdictOwner(agent), 'call-1', COVERED)
+    for (const replace of [() => false, () => { throw new Error('the cache is broken') }]) {
+      const { spy, next } = nextOf('rejected')
+      assert.equal(await approvalAnswerer({ get: cache.get.bind(cache), replace }, sink().log)(requestOf(agent), next), 'rejected')
+      assert.equal(spy.calls, make === child ? 0 : 1)
+    }
+    assert.equal(cache.get(verdictOwner(agent), 'call-1')?.escalationCovered, true)
   }
 })
 
@@ -510,6 +545,48 @@ test('an entry written again, or deleted, while you were answering is left as it
   cache.set(owner, 'call-2', ASKED)
   await answer(requestOf(agent, 'bash', 'call-2', ASK_REASON), () => { cache.delete(owner, 'call-2'); return Promise.resolve('allowed-once') })
   assert.equal(cache.get(owner, 'call-2'), undefined)
+})
+
+test('a call gated again loses the mark your yes left: a later call with that id the gate does not judge is put to you', async () => {
+  const cache = new VerdictCache()
+  let settings = DEFAULT_SETTINGS
+  const judge = fakeJudge(() => answers(IRREVERSIBLE, 0.9))
+  const gate = commandGate({ judge: () => judge, settings: async () => settings, cache })
+  const agent = main('main-1')
+  const exec = () => ({ callId: 'call-0', name: 'bash', arguments: ESCALATE('git push --force'), agent, signal: new AbortController().signal }) as never
+  const passOn = () => Promise.resolve({ kind: 'allow' } as const)
+  const first = await gate(exec(), passOn)
+  assert.ok(first.kind === 'ask' && first.reason !== undefined)
+  const answer = approvalAnswerer(cache, sink().log)
+  assert.equal(await answer(requestOf(agent, 'bash', 'call-0', first.reason), nextOf('allowed-once').next), 'allowed-once')
+  assert.equal(cache.get('main-1', 'call-0')?.coveredByYou, true)
+  // The same call is gated again, as it was: the judge is not asked again, and the mark is gone.
+  assert.deepEqual(await gate(exec(), passOn), first)
+  assert.equal(judge.requests.length, 1)
+  assert.equal(cache.get('main-1', 'call-0')?.coveredByYou, undefined)
+  assert.equal(cache.get('main-1', 'call-0')?.askReason, first.reason, 'still the gate\'s ask, which a new yes would cover')
+  // bash is not gated any more: a call under that id is not judged, and its escalation is put to you.
+  settings = { ...DEFAULT_SETTINGS, tools: { ...DEFAULT_SETTINGS.tools, gated: [] } }
+  assert.deepEqual(await gate(exec(), passOn), { kind: 'allow' })
+  const escalation = nextOf('rejected')
+  assert.equal(await answer(requestOf(agent, 'bash', 'call-0'), escalation.next), 'rejected')
+  assert.equal(escalation.spy.calls, 1)
+})
+
+test('a call gated again gets the judge\'s cover back: the gate\'s verdict for it stands, as the first time', async () => {
+  const cache = new VerdictCache()
+  const judge = fakeJudge(() => answers(READ_ONLY, 0.95))
+  const gate = commandGate({ judge: () => judge, settings: async () => DEFAULT_SETTINGS, cache })
+  const agent = child('child-1')
+  const exec = () => ({ callId: 'call-0', name: 'bash', arguments: ESCALATE('npm test'), agent, signal: new AbortController().signal }) as never
+  const passOn = () => Promise.resolve({ kind: 'allow' } as const)
+  assert.deepEqual(await gate(exec(), passOn), { kind: 'allow' })
+  const answer = approvalAnswerer(cache, sink().log)
+  assert.equal(await answer(requestOf(agent, 'bash', 'call-0'), nextOf().next), 'allowed-once')
+  assert.equal(await answer(requestOf(agent, 'bash', 'call-0'), nextOf().next), 'rejected', 'used up')
+  assert.deepEqual(await gate(exec(), passOn), { kind: 'allow' })
+  assert.equal(judge.requests.length, 1)
+  assert.equal(await answer(requestOf(agent, 'bash', 'call-0'), nextOf().next), 'allowed-once')
 })
 
 test('a yes that came after the entry\'s 10 minutes still covers the escalation, when the entry is still the one that asked', async () => {

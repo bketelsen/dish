@@ -1387,6 +1387,59 @@ test('the gate\'s own ask shows you the escalation the call will ask for, whole 
   assert.equal(verdictFor(cache, second.exec)?.askReason, `${READING}${ALSO('danger-full-access', 'pushes')}`)
 })
 
+test('an escalation dsh will not ask for is not shown: the session\'s own mode, or a blank justification', async () => {
+  const modes: unknown[] = []
+  const { gate, cache } = gateOf(() => answers(IRREVERSIBLE, 0.9), { sandboxMode: (agent) => { modes.push(agent.id); return 'workspace-write' } })
+  // The mode the session already has: dsh's bash runs it with no request (approveEscalation returns at once).
+  const same = await run(gate, { args: { command: 'npm test', description: 'x', sandbox_permissions: 'workspace-write', justification: 'writes files' } })
+  assert.deepEqual(same.decision, { kind: 'ask', reason: READING, displayReason: { en: READING } })
+  assert.deepEqual([verdictFor(cache, same.exec)?.askReason, verdictFor(cache, same.exec)?.escalationReason], [undefined, undefined])
+  assert.deepEqual(modes, ['main-1'], 'the mode is the sandbox policy\'s for the agent')
+  // A blank justification: dsh's bash refuses the call before it asks.
+  for (const justification of ['', '   ', '\n']) {
+    const blank = await run(gate, { args: { command: 'npm install', description: 'x', sandbox_permissions: 'danger-full-access', justification } })
+    assert.deepEqual(blank.decision, { kind: 'ask', reason: READING, displayReason: { en: READING } }, JSON.stringify(justification))
+    assert.deepEqual([verdictFor(cache, blank.exec)?.askReason, verdictFor(cache, blank.exec)?.escalationReason], [undefined, undefined])
+  }
+  // A wider mode is shown, and so is any mode when the session's can't be read.
+  const wider = await run(gate, { args: { command: 'npm install', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'the network' } })
+  assert.equal(wider.decision.kind === 'ask' && wider.decision.reason, `${READING}${ALSO('danger-full-access', 'the network')}`)
+  for (const sandboxMode of [undefined, () => undefined, () => { throw new Error('no policy') }]) {
+    const unknown = gateOf(() => answers(IRREVERSIBLE, 0.9), { sandboxMode })
+    const shown = await run(unknown.gate, { args: { command: 'npm test', description: 'x', sandbox_permissions: 'workspace-write', justification: 'writes files' } })
+    assert.equal(shown.decision.kind === 'ask' && shown.decision.reason, `${READING}${ALSO('workspace-write', 'writes files')}`)
+  }
+})
+
+test('a call id gated again is judged again when the escalation dsh will ask for has changed, so the ask shows the one it will ask for', async () => {
+  let mode = 'read-only'
+  const { gate, judge, cache } = gateOf(() => answers(IRREVERSIBLE, 0.9), { sandboxMode: () => mode })
+  const args = { command: 'npm test', description: 'x', sandbox_permissions: 'workspace-write', justification: 'writes files' }
+  const first = await run(gate, { callId: 'again', args })
+  assert.equal(first.decision.kind === 'ask' && first.decision.reason, `${READING}${ALSO('workspace-write', 'writes files')}`)
+  // The session is at workspace-write now: dsh won't ask, so the ask doesn't show it.
+  mode = 'workspace-write'
+  const second = await run(gate, { callId: 'again', args })
+  assert.equal(second.decision.kind === 'ask' && second.decision.reason, READING)
+  assert.equal(verdictFor(cache, second.exec)?.askReason, undefined)
+  assert.equal(judge.requests.length, 2)
+  // Two justifications the judge reads alike (cut to 1,000 characters) are still two escalations.
+  const head = 'j'.repeat(1000)
+  const one = await run(gate, { callId: 'long', args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access', justification: `${head}one` } })
+  const other = await run(gate, { callId: 'long', args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access', justification: `${head}two` } })
+  assert.equal(judge.requests.length, 4)
+  assert.equal(one.decision.kind === 'ask' && one.decision.reason, `${READING}${ALSO('danger-full-access', `${head}one`)}`)
+  assert.equal(other.decision.kind === 'ask' && other.decision.reason, `${READING}${ALSO('danger-full-access', `${head}two`)}`)
+  assert.equal(verdictFor(cache, other.exec)?.askReason, `${READING}${ALSO('danger-full-access', `${head}two`)}`)
+})
+
+test('through the registry: the session\'s mode is read from the sandbox policy service, as dsh\'s bash reads it', async () => {
+  const w = await world({ script: () => answers(IRREVERSIBLE, 0.9), workspaceRoot: '/canonical/app', approval: 'rejected' })
+  await w.call('bash', BASH('npm test', { sandbox_permissions: 'workspace-write', justification: 'writes files' }), undefined, 'same-mode')
+  await w.call('bash', BASH('npm install', { sandbox_permissions: 'danger-full-access', justification: 'the network' }), undefined, 'wider')
+  assert.deepEqual(w.approvals.map(request => request.reason), [READING, `${READING}${ALSO('danger-full-access', 'the network')}`])
+})
+
 test('an ask with no escalation to show, an allow, a deny, and a later listener\'s ask are as they were, and keep no ask reason', async () => {
   const { gate, cache } = gateOf(() => answers(IRREVERSIBLE, 0.9))
   // No escalation, or none that dsh's tool would ask for (no justification, or a blank mode).

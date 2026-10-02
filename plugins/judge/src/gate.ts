@@ -23,7 +23,8 @@
  *   dsh's auto-review: a call that will not run should not start the `PreToolUse` hooks or recorders after it.
  * - **A verdict cache** (`VerdictCache`, below) is written before `next()` is called and read by the approval answerer.
  * - **Its ask shows you the escalation.** When the gate asks you about a call whose tool will then ask to escalate the
- *   sandbox (`sandbox_permissions` with a `justification`), the ask says so, with the mode and the whole justification
+ *   sandbox (`sandbox_permissions` with a `justification` that isn't blank, for a mode other than the session's, which the
+ *   sandbox policy gives as it gives dsh's `bash`), the ask says so, with the mode and the whole justification
  *   (`showingEscalation`), and the cache keeps the ask's reason (`askReason`). Your yes to that ask is then also your yes to
  *   the escalation's request, which the answerer allows once instead of asking you a second time about the same call.
  *
@@ -182,8 +183,9 @@ export interface VerdictEntry {
   readonly verdict: VerdictKind
   /**
    * `true` when the call carried a sandbox escalation (`sandbox_permissions`), the judge was shown it, and the verdict is
-   * `allow`: the verdict covers the escalation, so the approval request it leads to may be answered `allowed-once`. Always
-   * `false` for an `ask` or a `deny`, and for a call with no escalation.
+   * `allow`: the verdict covers the escalation, so the approval request it leads to may be answered `allowed-once`, once (the
+   * answerer writes it back `false` when it uses it, through `replace`). Always `false` for an `ask` or a `deny`, and for a
+   * call with no escalation.
    */
   readonly escalationCovered: boolean
   /**
@@ -438,14 +440,15 @@ interface EscalationAsked {
 }
 
 /**
- * The escalation this call's tool will ask for, or `undefined` if it would not ask (no `sandbox_permissions`, or no
- * `justification` to send with it: `bash` and `pwsh` ask only when they have both). The arguments as the model gave them, not
- * as they are shown to the judge.
+ * The escalation this call names, or `undefined` if its tool would not ask for one: no `sandbox_permissions`, or no
+ * `justification` with something in it (`bash` and `pwsh` ask only when they have both, and refuse a blank justification
+ * before they ask: `validateEscalationArgs` in `dsh-sandbox`). The arguments as the model gave them, not as they are shown to
+ * the judge. A mode the session already has is not asked for either; the gate reads that from the sandbox policy.
  */
 function escalationAskedOf(args: unknown): EscalationAsked | undefined {
   if (!isRecord(args)) return undefined
   const mode = given(args.sandbox_permissions)
-  if (mode === undefined || typeof args.justification !== 'string') return undefined
+  if (mode === undefined || typeof args.justification !== 'string' || args.justification.trim() === '') return undefined
   return { mode, justification: args.justification }
 }
 
@@ -622,18 +625,32 @@ export function taskOf(agent: GateAgent, topLevel: boolean): string {
 /** The sandbox policy's view of the workspace for an agent: its resolved `workspaceRoot`, or `undefined` if there is none. */
 export type WorkspaceRoot = (agent: GateAgent) => string | undefined
 
-/** `WorkspaceRoot` over `ctx.get('sandboxPolicy')`, looked up on every call (the service is a sibling's, and may come and go). */
-export function workspaceRootFrom(ctx: Context): WorkspaceRoot {
-  return (agent) => {
-    try {
-      const policy = (ctx as unknown as { get(name: string): unknown }).get('sandboxPolicy')
-      if (!isRecord(policy) || typeof policy.resolve !== 'function') return undefined
-      const resolved: unknown = policy.resolve({ session: agent.session })
-      return isRecord(resolved) ? given(resolved.workspaceRoot) : undefined
-    } catch {
-      return undefined
-    }
+/**
+ * The sandbox policy's mode for an agent's session (`read-only`, `workspace-write`, …), or `undefined` if there is none. It is
+ * what dsh's `bash` and `pwsh` read (`resolve({ session }).mode`), and a call that asks for that mode is run with no request.
+ */
+export type SandboxMode = (agent: GateAgent) => string | undefined
+
+/** What `ctx.get('sandboxPolicy')` resolves for an agent's session, looked up on every call (the service is a sibling's, and may come and go). */
+function resolvedPolicy(ctx: Context, agent: GateAgent): Record<string, unknown> | undefined {
+  try {
+    const policy = (ctx as unknown as { get(name: string): unknown }).get('sandboxPolicy')
+    if (!isRecord(policy) || typeof policy.resolve !== 'function') return undefined
+    const resolved: unknown = policy.resolve({ session: agent.session })
+    return isRecord(resolved) ? resolved : undefined
+  } catch {
+    return undefined
   }
+}
+
+/** `WorkspaceRoot` over `ctx.get('sandboxPolicy')`. */
+export function workspaceRootFrom(ctx: Context): WorkspaceRoot {
+  return agent => given(resolvedPolicy(ctx, agent)?.workspaceRoot)
+}
+
+/** `SandboxMode` over `ctx.get('sandboxPolicy')`. */
+export function sandboxModeFrom(ctx: Context): SandboxMode {
+  return agent => given(resolvedPolicy(ctx, agent)?.mode)
 }
 
 /** Whether `name` is one of `patterns`: a plain entry must match exactly, an entry ending in `*` is a prefix. */
@@ -723,6 +740,11 @@ export interface CommandGateDeps {
   settings(): Promise<JudgeSettings>
   /** The sandbox policy's workspace root for an agent. Without it, or when it says nothing, the workspace is `cwd`. */
   workspaceRoot?: WorkspaceRoot
+  /**
+   * The sandbox policy's mode for an agent: an escalation to it is not asked for, so the gate's ask doesn't show it. Without it,
+   * or when it says nothing, every escalation the call names is taken to be asked for.
+   */
+  sandboxMode?: SandboxMode
   /** Where verdicts are kept. */
   cache: VerdictCache
 }
@@ -752,7 +774,15 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     const args = exec.arguments
     const command = commandOf(exec.name, args)
     const escalation = shell ? escalationOf(args) : undefined
-    const asked = shell ? escalationAskedOf(args) : undefined
+    // The escalation dsh's tool will ask for: none for the mode the session already has.
+    const named = shell ? escalationAskedOf(args) : undefined
+    let mode: string | undefined
+    try {
+      if (named !== undefined) mode = deps.sandboxMode?.(agent)
+    } catch {
+      // Not known: the escalation is taken to be asked for.
+    }
+    const asked = named !== undefined && named.mode !== mode ? named : undefined
     const escalationReason = asked === undefined ? undefined : escalationReasonOf(asked)
     const sessionCwd = given(agent.session?.header?.cwd)
     const cwd = shell ? directoryOf(args, sessionCwd) : sessionCwd
@@ -764,14 +794,17 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     }
     workspace ??= cwd
 
-    // Once per call: a call of this agent that comes through again, as it was, is not put to the judge again.
+    // Once per call: a call of this agent that comes through again, as it was, is not put to the judge again. The escalation
+    // dsh's tool will ask for is part of it, whole, since the gate's ask shows it.
     const key = createHash('sha256')
-      .update(JSON.stringify([exec.name, command, cwd ?? null, escalation ?? null]))
+      .update(JSON.stringify([exec.name, command, cwd ?? null, escalation ?? null, escalationReason ?? null]))
       .digest('hex')
     const known = deps.cache.get(owner, callId)
 
     let ours: PreToolDecision
     if (known?.memo?.key === key) {
+      // Gated again, as it was: the same decision, and the entry is written afresh below. A yes you gave its earlier ask covers
+      // nothing of this one, and the judge's cover is back, as it was the first time.
       ours = known.memo.decision
     } else {
       const state: { [key: string]: JsonValue } = { command }
@@ -806,21 +839,18 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
       if (exec.signal.aborted) return { kind: 'cancel' }
       ours = (outcome ?? unavailable(topLevel)).pre
       // The gate's own ask shows you the escalation the tool will ask for, so that your yes to it can cover that request too.
-      let askReason: string | undefined
-      if (ours.kind === 'ask' && asked !== undefined) {
-        const shown = showingEscalation(ours, asked)
-        ours = shown
-        askReason = shown.reason
-      }
-      deps.cache.set(owner, callId, {
-        verdict: verdictOf(ours),
-        escalationCovered: ours.kind === 'allow' && escalation !== undefined,
-        tool: exec.name,
-        ...escalationReason === undefined ? {} : { escalationReason },
-        ...askReason === undefined ? {} : { askReason },
-        memo: { key, decision: ours },
-      })
+      if (ours.kind === 'ask' && asked !== undefined) ours = showingEscalation(ours, asked)
     }
+    // The ask's reason is kept when it showed you the escalation: a memo's decision did too, since the key holds the escalation.
+    const askReason = ours.kind === 'ask' && asked !== undefined ? ours.reason : undefined
+    deps.cache.set(owner, callId, {
+      verdict: verdictOf(ours),
+      escalationCovered: ours.kind === 'allow' && escalation !== undefined,
+      tool: exec.name,
+      ...escalationReason === undefined ? {} : { escalationReason },
+      ...askReason === undefined ? {} : { askReason },
+      memo: { key, decision: ours },
+    })
 
     // The gate's own deny is final, as dsh's auto-review's is: a call that will not run has no use for the hooks and
     // recorders that listen after this one, and must not trigger them.
@@ -849,6 +879,7 @@ export function registerCommandGate(ctx: Context): VerdictCache {
     judge: () => ctx.get('judge'),
     settings: () => ctx.get('dishJudge')?.settings() ?? Promise.resolve(DEFAULT_SETTINGS),
     workspaceRoot: workspaceRootFrom(ctx),
+    sandboxMode: sandboxModeFrom(ctx),
     cache,
   })
   ctx.on('tools/pre-execute', gate, { prepend: true })
