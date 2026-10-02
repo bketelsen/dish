@@ -15,7 +15,7 @@ You register repos as **projects**, and dish gets them ready to work on.
 | # | Topic | Decision |
 |---|---|---|
 | 1 | Who creates workspaces | dish's onboarding, never fleet. You can still add other workspaces by hand. |
-| 2 | Clone layout | `<work root>/<owner>/<repo>`. Prod's work root is `~/work`, dev's is `<checkout>/.dev/work` (6a's launcher sets `DISH_WORK_ROOT`). An existing clone at that path is adopted, not cloned again. |
+| 2 | Clone layout | `<work root>/<owner>/<repo>`. Prod's work root is `~/work`. When `DSH_DISH_HOME` is set (6a's dev), it's `$DSH_DISH_HOME/work`, which is `<checkout>/.dev/work`. dish-kit gains `workRoot()` for both. An existing clone at that path is adopted, not cloned again. |
 | 3 | Worktrees | `<clone>/.worktrees/<slug>` on branch `dish/<slug>`. The `.worktrees/` folder is git-ignored through the clone's `.git/info/exclude`, so no repo change is needed. |
 | 4 | Registry | `projects.yaml` in the config store. Edited on Settings → Projects, or by agent proposals you accept. |
 | 5 | Project fields | `owner/name`, `family`, `role`, `gate`, `gateTimeout`, and optional `setup`, `setupTimeout` and `gateEnv` (see the [gates spec](gates.md)). |
@@ -176,7 +176,7 @@ interface DishWorkspaces {
 - **The sweep:** a squash-merged PR, an ancestry merge, dirty kept, bound kept, and local branch removal.
 - **Crew:** `delegate` with a worktree (resolves, records, adds the brief block), an unknown worktree refused, and follow-ups keep the binding.
 - **Registry validation and namespace policy**, plus the Settings → Projects controller and remote, as for Skills.
-- **Dev isolation:** under the launcher, the work root is `<checkout>/.dev/work`.
+- **Dev isolation:** with `DSH_DISH_HOME` set, the work root is `$DSH_DISH_HOME/work`, and nothing is cloned under `~/work`.
 
 **Live, by you:**
 1. Create the dish-dev App on a test repo, onboard it in dev, and make and remove a worktree.
