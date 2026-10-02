@@ -1,1 +1,11 @@
-{}
+{
+  "skills/finishing-a-development-branch/SKILL.md": [
+    "822cd488d8a611d87cd6b4b15ad9e296edcc7a1938bff8280e0eae0110933f19"
+  ],
+  "skills/subagent-driven-development/SKILL.md": [
+    "9773520056f569849239b3a40d493302f988f3d79b582c304821dcfa3e5c516c"
+  ],
+  "skills/using-git-worktrees/SKILL.md": [
+    "61987da52ec2179010366cff1287a05dfdd209bb8e842078f20d9d72af4b81ec"
+  ]
+}

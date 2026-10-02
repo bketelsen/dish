@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
@@ -103,13 +104,72 @@ test('defaultsByPath is the shipped texts by their path in the store', () => {
   assert.notEqual(defaultsByPath(), byPath)
 })
 
-test('nothing has shipped yet, so PREVIOUS is empty', () => {
-  assert.deepEqual(PREVIOUS, {})
+const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex')
+
+/** The skills whose shipped text moved to the `worktree` tool (docs/specs/projects-workspaces.md, "The shipped skills"). */
+const WORKTREE_SKILLS = ['finishing-a-development-branch', 'subagent-driven-development', 'using-git-worktrees']
+
+test('PREVIOUS lists the earlier texts of exactly the three skills that moved to the worktree tool', () => {
+  assert.deepEqual(Object.keys(PREVIOUS).sort(), WORKTREE_SKILLS.map(pathFor).sort())
+  for (const name of WORKTREE_SKILLS) {
+    const hashes = PREVIOUS[pathFor(name)]!
+    assert.ok(hashes.length > 0, name)
+    // The shipped text is never its own predecessor, or an unedited copy would be "upgraded" to itself forever.
+    assert.ok(!hashes.includes(sha256(DEFAULTS[name]!)), name)
+  }
   assert.ok(Object.isFrozen(PREVIOUS))
 })
 
+test('the worktree skills use the worktree tool in a registered project and keep git for any other repo', () => {
+  const using = DEFAULTS['using-git-worktrees']!
+  // The tool's actions, its answer, delegate's input, and the way setup is handed on.
+  assert.match(using, /`worktree`/)
+  assert.match(using, /action `create`/)
+  assert.match(using, /`base`/)
+  assert.match(using, /`dish\/<slug>`/)
+  assert.match(using, /`delegate`'s `worktree`/)
+  assert.match(using, /`remove`/)
+  assert.match(using, /setup/)
+  // A repo that isn't a registered project keeps the git steps, and a coder doesn't have the tool.
+  assert.match(using, /git worktree add/)
+  assert.match(using, /A crew child's working directory is the main agent's/)
+  assert.match(using, /coder.*(?:don't|doesn't|never) have/s)
+  assert.match(using, /ask the main agent with `send_message`/)
+  // `force` throws work away, and `remove` deletes the branch dish/<slug>: only for a clean tree on that branch whose
+  // commits are on another one (git cherry from HEAD), or a discard the user asked for.
+  assert.match(using, /`force`.*`git -C <path> status --short` is empty, `git -C <path> branch --show-current` prints `dish\/<slug>`, and `git -C <path> cherry <plan branch>` \(the branch its work belongs on\) lists no `\+` line.*discard/s)
+
+  const driven = DEFAULTS['subagent-driven-development']!
+  assert.match(driven, /`worktree`.*`create`/s)
+  assert.match(driven, /`base`/)
+  assert.match(driven, /`delegate`.*`worktree`|`worktree`.*`delegate`/s)
+  assert.match(driven, /`remove`.*`force`|`force`.*`remove`/s)
+  assert.doesNotMatch(driven, /git worktree/)
+  assert.match(driven, /`force` only when `git -C <path> status --short` is empty, `git -C <path> branch --show-current` prints `dish\/<slug>`, and `git -C <path> cherry <plan branch>` lists no `\+` line/)
+  assert.match(driven, /a cherry-picked one never is/)
+  assert.match(driven, /fresh coder in a new worktree from the plan branch, bound with `delegate`'s `worktree`/)
+
+  const finishing = DEFAULTS['finishing-a-development-branch']!
+  assert.match(finishing, /`worktree` action `remove`, never `git worktree remove`/)
+  assert.match(finishing, /`git -C <path> status --short` is empty, `git -C <path> branch --show-current` prints `dish\/<slug>`, and `git -C <path> cherry <plan branch>` lists no `\+` line.*set `force`/s)
+  assert.match(finishing, /usually isn't merged there, and a cherry-picked one never is/)
+  assert.match(finishing, /`force` it only when the user says to discard it/)
+  assert.match(finishing, /through a coder in a new worktree from the plan branch, bound with `delegate`'s `worktree`/)
+  // Agents' git is read-only in a registered project: no push, no hunting for other credentials.
+  assert.match(finishing, /in a registered project \(.*\), don't push\. Agents' git there is read-only/)
+  // One checkable test for "a registered project" (every top-level agent has the worktree tool whenever dish-workspaces is loaded).
+  for (const text of [using, driven, finishing]) {
+    assert.match(text, /your chat's workspace is a clone dish set up: `git config --get-regexp '\^credential\\\..\*\\\.helper\$'` names `git-credential-dish`/)
+  }
+  assert.doesNotMatch(finishing, /you have the `worktree` tool/)
+  assert.doesNotMatch(using, /and you have the `worktree` tool\)/)
+  assert.match(finishing, /never look for other credentials/)
+  // Git's own remove stays for a worktree dish didn't make, never forced.
+  assert.match(finishing, /plain git.*`git worktree remove`, never `--force`/s)
+})
+
 test('replaceMap keeps the earlier hashes of the shipped paths and drops the rest', () => {
-  assert.deepEqual(replaceMap(), {})
+  assert.deepEqual(replaceMap(), Object.fromEntries(Object.entries(PREVIOUS).map(([path, hashes]) => [path, [...hashes]])))
   const hash = 'a'.repeat(64)
   const other = 'b'.repeat(64)
   const previous = {
