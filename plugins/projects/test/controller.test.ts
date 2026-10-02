@@ -1380,6 +1380,26 @@ test('a read that a newer one follows passes on that it follows a refused save, 
   assert.deepEqual(state().conflict, { theirs: fields({ role: 'theirs' }), commit: theirCommit })
 })
 
+test('a project added while a read was skipped still counts as a change for a new project\'s form: its name is checked again', async () => {
+  const made = await opened()
+  const { fake, page, state } = made
+  await page.face.startAdd()
+  await fillAdd(made, 'acme/x')
+  assert.equal(state().form?.problem, null)
+  // Somebody else adds the very name. Read A sees it and is skipped, because read B follows; B must still find the change.
+  fake.external(entries => entries.set('acme/x', fields({ role: 'theirs' })))
+  const slow = gate()
+  fake.gates.set('projects', slow)
+  const first = page.onStatus()
+  await until('read A to be out', () => count(fake.calls, 'projects') === 2)
+  const second = page.onStatus()
+  slow.release()
+  await Promise.all([first, second])
+  await until('the check', () => state().form?.checking === false)
+  assert.equal(count(fake.calls, 'projects'), 3)
+  assert.match(state().form?.problem ?? '', /already in projects\.yaml/)
+})
+
 // --- the name of a new project while a conflict is open ---------------------------------------
 
 test('renaming a new project while a conflict is open drops the conflict, and Save adds the new name', async () => {

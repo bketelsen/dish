@@ -412,6 +412,12 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
   let shown = false
   /** The stream was lost: the poll stays off until the next stream opens (or the page is opened again), whatever reads land meanwhile. */
   let streamLost = false
+  /**
+   * The names of the projects the form was last reconciled against (`reconcileForm` ran on that list). A new list is compared with
+   * this, not with the read before it: a read that a newer one follows is not reconciled, and a project it saw would otherwise not
+   * count as a change when the newer read comes.
+   */
+  let reconciledNames = ''
   /** `dispose` was called: nothing is scheduled, and nothing that lands is taken. */
   let disposed = false
 
@@ -648,7 +654,6 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
       return
     }
     const { projects, commit, problem, pendingProposals } = result.value
-    const before = get().projects.map(project => project.name).join('\n')
     patch({ projects, commit, problem, pendingProposals, listLoaded: true, listError: undefined, readOnly: commit === '' })
     // A write is out: its own commit is on its way back, and would be taken for someone else's. The read it makes after does this.
     if (writing()) {
@@ -660,7 +665,9 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     } else if (problem === null && commit !== '') {
       // Without a registry to read (it doesn't parse, or there is no store) there is nothing to hold a form to.
       reconcileSelection()
-      reconcileForm(before !== projects.map(project => project.name).join('\n'), afterConflict)
+      const names = projects.map(project => project.name).join('\n')
+      reconcileForm(reconciledNames !== names, afterConflict)
+      reconciledNames = names
     }
     armPoll()
   }
