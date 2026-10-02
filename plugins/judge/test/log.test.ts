@@ -54,6 +54,12 @@ async function dayLines(directory: string, day: string): Promise<JudgeLogLine[]>
   return text.slice(0, -1).split('\n').map(one => JSON.parse(one) as JudgeLogLine)
 }
 
+/** The whole lines of a day file that is still being written to: the ones up to its last newline. After it can be part of a line being appended. */
+async function wholeLines(directory: string, day: string): Promise<JudgeLogLine[]> {
+  const text = await readFile(join(directory, `${day}.jsonl`), 'utf8')
+  return text.slice(0, text.lastIndexOf('\n') + 1).split('\n').filter(one => one !== '').map(one => JSON.parse(one) as JudgeLogLine)
+}
+
 async function names(directory: string): Promise<string[]> {
   return (await readdir(directory)).sort()
 }
@@ -900,6 +906,7 @@ test('a write that was queued while the read waited is not waited for, and the r
 test('flush resolves while writes keep coming: it waits for what was queued when it was called, and no more', async () => {
   const { directory } = await scratch()
   const log = new JudgeLog(directory)
+  const days = ['2026-10-01', '2026-10-02', '2026-10-03']
   let stop = false
   let queued = 0
   // A burst of writes in every turn of the event loop: the queue is never empty while this runs.
@@ -910,20 +917,28 @@ test('flush resolves while writes keep coming: it waits for what was queued when
     }
   })()
   try {
-    await new Promise<void>(resolve => setTimeout(resolve, 30))
+    // A backlog in every day's queue, counted in lines and not waited for in time, so that it is the same on any machine.
+    while (queued < 300) await new Promise<void>(resolve => setImmediate(resolve))
     const before = queued
-    const outcome = await Promise.race([
-      log.flush().then(() => 'flushed'),
-      new Promise<string>(resolve => setTimeout(() => resolve('still waiting'), 3000)),
-    ])
-    assert.equal(outcome, 'flushed', 'flush did not wait for writes that came after it')
+    const flushed = log.flush().then(() => 'flushed')
+    // A line for each day, queued just after the call. A day's lines go to the disk one at a time, in order, so that day's
+    // line is begun only once the last one the flush waits for there is done, and it needs the disk once more: a flush that
+    // waits for what was queued, and no more, is done before all three are, however slow the machine.
+    const later = Promise.all(days.map((_, index) => log.write(line({ callId: `c${queued++}`, at: NOON + index * DAY })))).then(() => 'later')
+    const outcome = await Promise.race([flushed, later])
+    assert.equal(outcome, 'flushed', 'flush waited for writes that came after it')
     assert.equal(stop, false, 'and the writer was still going')
-    // What was queued before it is on the disk.
-    const lines = await Promise.all(['2026-10-01', '2026-10-02', '2026-10-03'].map(async day => (await dayLines(directory, day)).length))
-    assert.ok(lines.reduce((total, count) => total + count, 0) >= before, `${lines} lines for ${before} queued`)
+    // Every line that was queued before it is on the disk, whole. The writer is still going, so a file can end in part of
+    // a line that came after: the whole lines are the ones before that.
+    const written = new Set((await Promise.all(days.map(day => wholeLines(directory, day)))).flat().map(one => one.callId))
+    const missing = Array.from({ length: before }, (_, index) => `c${index}`).filter(callId => !written.has(callId))
+    assert.deepEqual(missing, [], `of the ${before} lines queued before the flush`)
   } finally {
     stop = true
     await writer
     await log.flush()
   }
+  // Once the writes stop, every file ends with a newline, and every line is in one.
+  const lines = await Promise.all(days.map(async day => (await dayLines(directory, day)).length))
+  assert.equal(lines.reduce((total, count) => total + count, 0), queued)
 })
