@@ -1,4 +1,4 @@
-import { after, describe, test } from 'node:test'
+import { after, before, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -7,7 +7,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
-import { computePrevious, defaultFiles, readPrevious } from '../src/defaults.ts'
+import { computePrevious, defaultFiles, parsePrevious, readPrevious } from '../src/defaults.ts'
 import * as kit from '../src/index.ts'
 
 const run = promisify(execFile)
@@ -16,6 +16,24 @@ const SCRIPT = new URL('../scripts/previous-defaults.mjs', import.meta.url).path
 const roots: string[] = []
 after(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }) })
 
+// A developer's own git config (core.autocrlf, signing, hooks, attributes) must not change what these tests see, so the
+// test process, and every git it starts, runs with neither the global nor the system config. Settings passed in the
+// environment as GIT_CONFIG_COUNT/KEY/VALUE survive that, which is why the helper below also pins the ones that matter.
+const ISOLATE = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }
+const saved = new Map<string, string | undefined>()
+before(() => {
+  for (const [name, value] of Object.entries(ISOLATE)) {
+    saved.set(name, process.env[name])
+    process.env[name] = value
+  }
+})
+after(() => {
+  for (const [name, value] of saved) {
+    if (value === undefined) delete process.env[name]
+    else process.env[name] = value
+  }
+})
+
 /** A fresh scratch directory. It is resolved, so paths compared against git's own agree. */
 function scratch(): string {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'dish-kit-defaults-')))
@@ -23,10 +41,14 @@ function scratch(): string {
   return root
 }
 
-/** Run git in `cwd` with a throwaway identity and no signing or hooks, and never touch any git config. */
+/**
+ * Run git in `cwd` with a throwaway identity, no signing or hooks, and no line-ending or attribute conversion.
+ * Nothing here writes git config.
+ */
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', [
     '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
+    '-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false', '-c', 'core.attributesFile=/dev/null',
     '-C', cwd, ...args,
   ], { encoding: 'utf8' })
 }
@@ -200,10 +222,25 @@ describe('computePrevious', () => {
     // Whatever repository the temp directory might sit inside, git must not look for it above here.
     process.env.GIT_CEILING_DIRECTORIES = outside
     try {
-      await assert.rejects(computePrevious(path.join(outside, 'd'), 'p/'), { code: 'NO_HISTORY' })
+      await assert.rejects(computePrevious(path.join(outside, 'd'), 'p/'), (error: Error & { code?: string }) =>
+        error.code === 'NO_HISTORY' && /not a git repository/i.test(error.message))
     } finally {
       if (before === undefined) delete process.env.GIT_CEILING_DIRECTORIES
       else process.env.GIT_CEILING_DIRECTORIES = before
+    }
+  })
+
+  test('when git cannot be run the history is unavailable, and the message says why', async () => {
+    const root = repo()
+    put(root, 'd/a.md', 'a')
+    commit(root, 'v1')
+    const before = process.env.PATH
+    process.env.PATH = path.join(root, 'no-such-bin')
+    try {
+      await assert.rejects(computePrevious(path.join(root, 'd'), 'p/'), (error: Error & { code?: string }) =>
+        error.code === 'NO_HISTORY' && /ENOENT/.test(error.message))
+    } finally {
+      process.env.PATH = before
     }
   })
 
@@ -269,6 +306,38 @@ describe('readPrevious', () => {
   })
 })
 
+describe('parsePrevious', () => {
+  const HASH = 'b'.repeat(64)
+
+  test('parses a valid document synchronously', () => {
+    assert.deepEqual(parsePrevious(JSON.stringify({ 'p/a.md': [HASH], 'p/b.md': [] }), '/x/previous.json'), { 'p/a.md': [HASH], 'p/b.md': [] })
+    assert.deepEqual(parsePrevious('{}\n', '/x/previous.json'), {})
+  })
+
+  test('a bad document throws an error that names the file', () => {
+    for (const text of ['', '{', '[]', 'null', '{"p/a.md":"x"}', '{"p/a.md":["ABC"]}', `{"p/a.md":["${HASH.toUpperCase()}"]}`]) {
+      assert.throws(() => parsePrevious(text, '/x/previous.json'), (error: Error) => error.message.includes('/x/previous.json'), text)
+    }
+  })
+
+  test('the result is a plain object, even for a __proto__ key', () => {
+    const parsed = parsePrevious(`{ "__proto__": ["${HASH}"] }`, 'previous.json')
+    assert.equal(Object.getPrototypeOf(parsed), Object.prototype)
+    assert.deepEqual(Object.keys(parsed), ['__proto__'])
+  })
+
+  test('readPrevious gives what parsePrevious gives for the same text', async () => {
+    const root = scratch()
+    const text = JSON.stringify({ 'p/a.md': [HASH] })
+    await writeFile(path.join(root, 'previous.json'), text)
+    assert.deepEqual(await readPrevious(root), parsePrevious(text, path.join(root, 'previous.json')))
+  })
+
+  test('it is exported from the package index', () => {
+    assert.equal(kit.parsePrevious, parsePrevious)
+  })
+})
+
 describe('scripts/previous-defaults.mjs', () => {
   test('writes previous.json: sorted keys, two-space JSON, trailing newline', async () => {
     const root = repo()
@@ -280,8 +349,7 @@ describe('scripts/previous-defaults.mjs', () => {
       commit(root, text)
     }
     const directory = path.join(root, 'plugin/defaults')
-    const { stdout } = await run(process.execPath, [SCRIPT, directory, 'skills/', '--exclude', 'NOTICE.md'])
-    assert.equal(typeof stdout, 'string')
+    await run(process.execPath, [SCRIPT, directory, 'skills/', '--exclude', 'NOTICE.md'])
     const expected = ['one', 'two'].map(sha256).sort()
     assert.equal(
       await readFile(path.join(directory, 'previous.json'), 'utf8'),

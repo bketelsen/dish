@@ -70,7 +70,7 @@ export async function defaultFiles(
 /** The top of the git work tree holding `directory`, or `NO_HISTORY` when there is none or it is a shallow clone. */
 async function repositoryTop(directory: string): Promise<string> {
   const top = await git(directory, ['rev-parse', '--show-toplevel'])
-  if (!top.ok) throw noHistory(`${directory} is not inside a git repository`)
+  if (!top.ok) throw noHistory(`no git history for ${directory}: ${top.stderr}`)
   const shallow = await git(directory, ['rev-parse', '--is-shallow-repository'])
   if (shallow.ok && shallow.stdout.toString('utf8').trim() === 'true') {
     throw noHistory(`${directory} is in a shallow clone, which has no history to read`)
@@ -139,18 +139,11 @@ export async function computePrevious(
 }
 
 /**
- * Read `<directory>/previous.json`, or `{}` when there is none. It must be an object whose values are arrays
- * of lowercase hex sha256 strings (64 characters each); anything else throws.
+ * Parse the text of a `previous.json`. It must be an object whose values are arrays of lowercase hex sha256
+ * strings (64 characters each); anything else throws, with `file` named in the message. Synchronous, for a
+ * plugin that loads its `previous.json` when its module loads.
  */
-export async function readPrevious(directory: string): Promise<Record<string, string[]>> {
-  const file = path.join(directory, PREVIOUS_FILE)
-  let text: string
-  try {
-    text = await readFile(file, 'utf8')
-  } catch (error) {
-    if ((error as { code?: unknown }).code === 'ENOENT') return {}
-    throw error
-  }
+export function parsePrevious(text: string, file: string): Record<string, string[]> {
   let value: unknown
   try {
     value = JSON.parse(text)
@@ -169,4 +162,17 @@ export async function readPrevious(directory: string): Promise<Record<string, st
   }
   // `fromEntries` defines own properties, so a key of `__proto__` stays an entry.
   return Object.fromEntries(entries)
+}
+
+/** Read `<directory>/previous.json` with `parsePrevious`, or `{}` when there is none. */
+export async function readPrevious(directory: string): Promise<Record<string, string[]>> {
+  const file = path.join(directory, PREVIOUS_FILE)
+  let text: string
+  try {
+    text = await readFile(file, 'utf8')
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'ENOENT') return {}
+    throw error
+  }
+  return parsePrevious(text, file)
 }
