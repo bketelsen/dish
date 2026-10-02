@@ -16,8 +16,9 @@ interface Stubs {
 }
 
 /**
- * Provide `value` as the service `name` from a sibling plugin, the way dsh's plugins provide theirs: a plugin that doesn't
- * inject a service can't read it as a property, so a stub at the root would hide a plugin that does it wrong.
+ * Provide `value` as the service `name` from a sibling plugin, the way dsh's plugins provide theirs. Dispose the handle to
+ * take the service away. This topology does not enforce `inject` on reads (a sibling's service is readable as a property
+ * whether or not the plugin injects it), so the `inject` list is guarded by the mount-gating test below, not by `status()`.
  */
 function provideStub(ctx: Context, name: string, value: unknown) {
   return ctx.plugin({
@@ -94,3 +95,42 @@ test('signedIn and inFlight do not depend on the route', async () => {
     assert.deepEqual([status.signedIn, status.inFlight, status.route], [false, true, true])
   })
 })
+
+/** Poll until `check` holds, or fail after a few seconds. */
+async function until(what: string, check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`)
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+}
+
+const SERVICES = {
+  authorization: { describe: () => undefined },
+  credentials: { readRecord: async () => undefined },
+  settings: { describe: () => [] },
+} as const
+
+// `status()` reads all three services, so the remote must not mount before each is there. The stubs above are readable
+// as properties whatever `inject` says, so only whether the remote mounts shows what `inject` lists.
+for (const missing of Object.keys(SERVICES) as (keyof typeof SERVICES)[]) {
+  test(`the remote does not mount until ${missing} is provided`, async () => {
+    const ctx = new Context()
+    const handles = Object.entries(SERVICES)
+      .filter(([name]) => name !== missing)
+      .map(([name, value]) => provideStub(ctx, name, value))
+    const remote = ctx.plugin(CopilotRemote, { enterpriseDomain: '' })
+    try {
+      await Promise.all(handles)
+      // Give a mount that wrongly ignores the missing service time to happen.
+      await new Promise(resolve => setTimeout(resolve, 50))
+      assert.equal(ctx.get('dishCopilot'), undefined, `mounted without ${missing}`)
+
+      handles.push(provideStub(ctx, missing, SERVICES[missing]))
+      await until('the remote to mount', () => ctx.get('dishCopilot') !== undefined)
+    } finally {
+      await remote.dispose()
+      await Promise.all(handles.map(handle => handle.dispose()))
+    }
+  })
+}
