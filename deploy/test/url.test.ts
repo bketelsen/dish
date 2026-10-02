@@ -418,6 +418,8 @@ test('run through a symlink, it still finds the checkout it sits in, and so its 
 })
 
 test('url.sh is committed executable', async () => {
-  const { stdout } = await execFileAsync('git', ['ls-files', '-s', 'deploy/url.sh'], { cwd: ROOT, encoding: 'utf8' })
+  const home = await mkdtemp(join(tmpdir(), 'dish-url-test-home-'))
+  scratches.push(home)
+  const { stdout } = await execFileAsync('git', ['ls-files', '-s', 'deploy/url.sh'], { cwd: ROOT, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home } })
   assert.match(stdout, /^100755 /)
 })

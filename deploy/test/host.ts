@@ -330,7 +330,7 @@ export async function createHost(): Promise<Host> {
 
   // The stubs must win: each stubbed name resolves to its stub on the unit's PATH.
   for (const name of STUBBED) {
-    const { stdout } = await execFileAsync('bash', ['-c', 'command -v -- "$1"', 'bash', name], { env: { PATH: unitPath } })
+    const { stdout } = await execFileAsync('bash', ['-c', 'command -v -- "$1"', 'bash', name], { env: { PATH: unitPath, HOME: join(dir, 'elsewhere') } })
     assert.equal(stdout.trim(), join(stubs, name), `${name} resolves to its stub`)
   }
 

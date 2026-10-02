@@ -19,7 +19,8 @@ import assert from 'node:assert/strict'
 import { spawn, execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, statSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -32,6 +33,11 @@ const ROOT = fileURLToPath(new URL('../..', import.meta.url))
 const UPDATE = join(ROOT, 'deploy', 'update.sh')
 
 after(removeHosts)
+
+/** The environment of the commands the tests run themselves (node, flock, git, bash, shellcheck): never the runner's home. */
+const OWN_HOME = await mkdtemp(join(tmpdir(), 'dish-update-test-home-'))
+after(() => rm(OWN_HOME, { recursive: true, force: true }))
+const OWN_ENV: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: OWN_HOME }
 
 const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex')
 
@@ -191,7 +197,7 @@ test('--apply to a new upstream commit installs, starts, waits and stamps', asyn
   assert.deepEqual(systemdSequence(host), ['daemon-reload', 'enable', 'restart'])
   assert.equal(host.service().startedWith, unit, 'the restart used the installed unit')
 
-  const { stdout: nodeVersion } = await execFileAsync(process.execPath, ['--version'], { encoding: 'utf8' })
+  const { stdout: nodeVersion } = await execFileAsync(process.execPath, ['--version'], { encoding: 'utf8', env: OWN_ENV })
   assert.equal(host.stamp(), [
     `revision ${sha}`,
     `unit ${sha256(unit)}`,
@@ -685,11 +691,11 @@ test('--apply refuses while another update holds the lock, and changes nothing',
   const { host } = await hostWithUpdate()
   const lock = join(host.home, '.local', 'state', 'dish', 'deploy', 'lock')
   await mkdir(join(lock, '..'), { recursive: true })
-  const holder = spawn('flock', [lock, 'sleep', '60'], { stdio: 'ignore', detached: true })
+  const holder = spawn('flock', [lock, 'sleep', '60'], { stdio: 'ignore', detached: true, env: OWN_ENV })
   try {
     // Wait until the lock is taken.
     for (let tries = 0; ; tries++) {
-      const free = await execFileAsync('flock', ['-n', lock, 'true']).then(() => true, () => false)
+      const free = await execFileAsync('flock', ['-n', lock, 'true'], { env: OWN_ENV }).then(() => true, () => false)
       if (!free) break
       assert.ok(tries < 100, 'the flock subprocess took the lock')
       await new Promise((resolve) => setTimeout(resolve, 50))
@@ -980,15 +986,15 @@ test('its body is functions, and the last line calls main', () => {
 })
 
 test('update.sh is executable in git', async () => {
-  const { stdout } = await execFileAsync('git', ['ls-files', '-s', 'deploy/update.sh'], { cwd: ROOT, encoding: 'utf8' })
+  const { stdout } = await execFileAsync('git', ['ls-files', '-s', 'deploy/update.sh'], { cwd: ROOT, encoding: 'utf8', env: OWN_ENV })
   assert.match(stdout, /^100755 /)
 })
 
 test('update.sh passes shellcheck', async (t) => {
-  const found = await execFileAsync('bash', ['-c', 'command -v shellcheck']).then(() => true, () => false)
+  const found = await execFileAsync('bash', ['-c', 'command -v shellcheck'], { env: OWN_ENV }).then(() => true, () => false)
   if (!found) {
     t.skip('shellcheck is not on PATH')
     return
   }
-  await execFileAsync('shellcheck', [UPDATE])
+  await execFileAsync('shellcheck', [UPDATE], { env: OWN_ENV })
 })
