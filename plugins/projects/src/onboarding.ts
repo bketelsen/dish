@@ -190,11 +190,18 @@ export class Onboarding {
     while (this.#draining !== undefined) await this.#draining
   }
 
-  /** Cancel everything, and take no more jobs. Safe to call twice. */
+  /**
+   * Cancel everything, and take no more jobs. Safe to call twice. No grace period: nothing follows a close, so there is
+   * no queue to go on with, and nothing should be logged once the plugin is gone.
+   */
   close(): void {
     this.#closed = true
     this.#queue = []
-    if (this.#running !== undefined) this.#abort(this.#running)
+    const running = this.#running
+    if (running === undefined) return
+    running.controller.abort()
+    if (running.grace !== undefined) clearTimeout(running.grace)
+    running.grace = undefined
   }
 
   /** Abort `running`, and give it the grace period to settle before the queue goes on without it. */

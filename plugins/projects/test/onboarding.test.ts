@@ -458,3 +458,24 @@ test('onboarding(name) says whether an onboarding is queued or running; a prepar
   p.resolve()
   await onboarding.idle()
 })
+
+test('close starts no grace timer and clears one already running: nothing is logged after the plugin is gone', async () => {
+  // A job that never settles, closed.
+  const first = await harness({ abortGraceMs: 40 })
+  first.onboarding.enqueue(project('acme/a'), 'onboard')
+  const a = await first.fake.next('onboard', 'acme/a')
+  first.onboarding.close()
+  assert.equal(a.signal!.aborted, true)
+
+  // A job cancelled (its grace running), then closed before the grace runs out.
+  const second = await harness({ abortGraceMs: 40 })
+  second.onboarding.enqueue(project('acme/b'), 'onboard')
+  const b = await second.fake.next('onboard', 'acme/b')
+  second.onboarding.cancel('acme/b')
+  assert.equal(b.signal!.aborted, true)
+  second.onboarding.close()
+
+  await new Promise(resolve => setTimeout(resolve, 150))
+  assert.deepEqual(first.logs.filter(line => line.startsWith('warn:')), [])
+  assert.deepEqual(second.logs.filter(line => line.startsWith('warn:')), [])
+})

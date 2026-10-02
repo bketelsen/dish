@@ -198,9 +198,16 @@ export function createDishProjects(options: ProjectsOptions): ProjectsService {
     }
   }
 
+  /** The projects the last pass saw, by lower-cased name; `undefined` before the first. */
+  let known: Map<string, Project> | undefined
+
   async function retry(name: string): Promise<void> {
     const project = await get(name)
-    if (project === undefined) throw new Error(`no project ${name} in projects.yaml`)
+    // A pass that saw a later commit may have removed it while this read an earlier one: that pass cancelled its
+    // jobs and forgot it, and nothing would cancel one queued now.
+    if (project === undefined || (known !== undefined && !known.has(keyOf(project.name)))) {
+      throw new Error(`no project ${name} in projects.yaml`)
+    }
     const under = onboarding.onboarding(project.name)
     if (under === 'queued') throw new Error(`${project.name} is queued for onboarding already`)
     if (under === 'running') throw new Error(`${project.name} is being onboarded`)
@@ -212,8 +219,6 @@ export function createDishProjects(options: ProjectsOptions): ProjectsService {
 
   // --- driving ------------------------------------------------------------------------------------
 
-  /** The projects the last pass saw, by lower-cased name; `undefined` before the first. */
-  let known: Map<string, Project> | undefined
   let closed = false
   /** The trouble reading the registry told last, so a store that keeps failing is told once. */
   let readTrouble: string | undefined
