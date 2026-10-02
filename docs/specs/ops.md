@@ -8,7 +8,7 @@ dish runs like any web app: a **prod** configuration, which only the VM's servic
 - **Dev data.** It lives in a git-ignored `.dev/` folder inside the checkout. `pnpm dsh` and `pnpm dev`, run by you or by an agent, can't reach prod's data unless they say `DISH_ENV=prod`. The guarantee covers those two only: dsh's binary or `deploy/install.sh`, run directly in an agent's shell on the VM, use prod's data ([The boundary of the guarantee](#the-boundary-of-the-guarantee)). Tests use temp directories of their own.
 - **Updates.** You run them yourself with a script on the VM, `deploy/update.sh`, through `incus exec` and fleet's root entry point, `dish-update`. A second script, `deploy/url.sh`, run through `dish-url`, prints the sign-in link when your cookie expires.
 - **Fleet.** It goes back to provisioning only.
-- **Default chat folder.** The service starts in `~/work`, so a chat opened without a workspace no longer lands in the live checkout.
+- **The live checkout stays out of chats.** The service starts in `~/work`, not the checkout. dsh's web UI starts every chat in a workspace, so general chats get a scratch workspace, `~/work/scratch`, and no workspace points at the checkout ([Notes from the build](#notes-from-the-build)).
 
 ## Decisions (from the 2026-10-02 discussion)
 
@@ -19,7 +19,7 @@ dish runs like any web app: a **prod** configuration, which only the VM's servic
 | 3 | Prod and dev | `DISH_ENV` is `prod` or `dev`, and dev is the default. Only the service is prod. It gets there by running dsh directly, with the account's defaults, and not by setting `DISH_ENV`: dsh passes its environment on to every agent shell, so a `DISH_ENV=prod` on the service would make every agent's `pnpm dsh` prod. |
 | 4 | Where dev data lives | `<checkout>/.dev/` (git-ignored) holds dev's dsh home and dish's config, state, data and cache. pnpm's store stays the account's, for prod and dev alike ([Checks](#checks-2026-10-02)). A dev run then writes only inside the checkout, apart from pnpm's shared store and caches. |
 | 5 | Fleet | Provisioning only: the VM, packages, Node and pnpm, the account, Tailscale and `tailscale serve`, the keys, the first clone, `deploy.env`, and the install inputs (`install.env`). Fleet stops updating the checkout, running the install, and installing or restarting the unit. dish owns its unit. |
-| 6 | Workspaces | dish never sets one up here. The service's working directory moves to `~/work`. You've removed the `/home/dish/dish` workspace record by hand. Step 6b's onboarding creates project workspaces. |
+| 6 | Workspaces | dish never sets one up here. The service's working directory moves to `~/work`. You remove the `/home/dish/dish` workspace in the UI, and add a scratch workspace, `~/work/scratch`, for general chats: the web UI has no chat without a workspace ([Notes from the build](#notes-from-the-build)). Step 6b's onboarding creates project workspaces, and the scratch one. |
 | 7 | Installs with approval | `apt` through a narrow sudo rule (fleet), which allows one root-owned wrapper and nothing else. User-level tools through mise. Both are agent commands that write outside the workspace, so they go through dsh's escalation: the main agent asks you, and a child is refused unless the judge approves. |
 | 8 | `update.sh` default | A dry run that shows what would change. `--apply` acts. A ref argument checks out that commit, as a rollback. |
 | 9 | Sign-in link | `deploy/url.sh` prints `https://<tailnet name>/?token=…` from the service's journal. |
@@ -105,7 +105,7 @@ Everything else stays: `EnvironmentFile` (`deploy.env`, which still holds only `
 - A scratch install, started from another directory, served the page and loaded all six dish plugins.
 
 dsh uses its working directory for three things:
-- new chats with no workspace;
+- new chats with no workspace, which only a raw `session.create` call gets: the web UI always names one;
 - the sandbox's fallback root;
 - a `.env` file there, which it loads. dsh refuses `PATH`, `DSH_*`, `XDG_*` and the other launch variables from it, but other names reach the service. So keep `~/work` free of a `.env`.
 
@@ -240,12 +240,12 @@ The order matters. A dish whose `pnpm dsh` goes through the launcher, started by
    - It writes `install.env`, `~/work`, the apt rule, mise, and root's entry points, `/usr/local/sbin/dish-update` and `/usr/local/sbin/dish-url`.
    - It touches nothing of dish's checkout, profile or unit.
 3. Fast-forward the VM's checkout once by hand. It predates `update.sh`: `incus exec minideb:dish --project dish -- su - dish -c 'test -z "$(git -C ~/dish status --porcelain)" && git -C ~/dish pull --ff-only origin main'`. This changes no running code.
-   - It pulls only into a clean checkout. Before 6a, chats with no workspace started in `~dish/dish`, so agents may have left files there. `dish-update` would then refuse with "local changes", and the old unit would keep running against the new launcher, the window step 4 closes.
+   - It pulls only into a clean checkout. Before 6a, chats in the `/home/dish/dish` workspace ran in the live checkout, so agents may have left files there. `dish-update` would then refuse with "local changes", and the old unit would keep running against the new launcher, the window step 4 closes.
    - If it prints nothing and fails, run `git -C ~/dish status` as `dish`, and clear what it lists first.
 4. Right after it, run `dish-update`, then `dish-update --apply`. It installs, copies the new unit, restarts once (there is no stamp yet), and writes its stamp. Steps 3 and 4 run back to back: the old unit still runs `pnpm dsh web` from the checkout, so a restart between them (a crash, then `Restart=on-failure`) would start it through the new launcher, on an empty dev store.
 5. Check:
    - over `https://<tailnet name>`, Settings → General → Work details survives a reload, and Settings → Models loads (`dish-web`);
-   - a new chat opened with no workspace starts in `~/work`;
+   - a new chat in the scratch workspace starts in `~/work/scratch`, and no workspace points at `/home/dish/dish`;
    - `dish-url` prints a link that signs you in;
    - Settings shows prod's data;
    - an agent's shell sees no `DISH_REMOTE`.
@@ -285,7 +285,7 @@ These replace the open items. Each was run against a scratch `DSH_HOME` and scra
     - dish-copilot and dish-config logged;
     - the new store got the seed commits of prompts, judge, crew and skills;
     - the five dish client bundles were served.
-  - In dsh's code, the working directory is the default for a new chat (`dsh-api-session-controller`), the sandbox's fallback root (`dsh-base`'s `workspaceRoot: !!js process.cwd()`), and where the project `.env` is read (`dsh-app-boot`).
+  - In dsh's code, the working directory is the default for a new chat with no workspace (`dsh-api-session-controller`; the web UI never creates one, see [Notes from the build](#notes-from-the-build)), the sandbox's fallback root (`dsh-base`'s `workspaceRoot: !!js process.cwd()`), and where the project `.env` is read (`dsh-app-boot`).
 - **dsh's environment reaches agent shells.** `dsh-subprocess`'s `scrubbedParentEnv` copies the whole environment except names matching `KEY|PASSWORD|SECRET|TOKEN` and names starting with `DSH_`. `dsh-shell-env` then adds `DSH_HOME` (dsh's own), `DSH_SHELL`, `DSH_SESSION_ID`, `DSH_PROFILE` and `DSH_PROFILE_DIR`. Three things follow:
   - **`DISH_ENV=prod` on the unit** would reach every agent shell, so it's dropped (decision 3).
   - **`XDG_*` set for dev** would reach every agent shell, so dev moves dish's directories with `DSH_DISH_HOME` instead.
@@ -314,6 +314,7 @@ These replace the open items. Each was run against a scratch `DSH_HOME` and scra
 
 ## Notes from the build
 
+- **The web UI has no chat without a workspace** (found after the rollout). Every chat it creates names a workspace (`dsh-client-ui-workspace`'s `startSession`), and with none selected the composer stays disabled ("Choose a workspace to start"). The server's fallback to its working directory is reached only by a raw `session.create` call with neither `workspaceId` nor `cwd`. There's no default-workspace setting: a new chat goes to the current chat's workspace, else the one used last, and the `workspace-controller` row's `documentsDirectory` only moves dsh's first-use default workspace, to `<it>/deepseek-harness/default-workspace`. So general chats use a scratch workspace, `~/work/scratch`, not `~/work` itself: a workspace's folder is where agents write without asking, dsh reads `~/work/.env` at start, and 6b's clones live under `~/work`. Step 6b's onboarding registers it.
 - **Root never runs dish's scripts.** The plan had `update.sh` and `url.sh` run as root and drop to the account themselves. Review found that root would then run a file the `dish` account, and so any agent, can write. Both now run only as the account, and exit 2 for root or anyone else, naming the entry point. Fleet's root-owned `dish-update` and `dish-url` are root's way in ("Who it runs as and how", above). Both scripts read the account's own user manager and user journal, which `dish` can read (checked on the VM).
 - **The entry points pass `--pty` only with a controlling terminal.** `runuser -u` never calls `setsid()`, so without `--pty` the account's process would share root's session and terminal. There it could push input into root's shell (`TIOCSTI`), or, left running, read what root types next. With a terminal the entry points pass `--pty`, and the script's stderr then arrives on stdout, with CRLF line ends. Without one, as through `ssh` without `-t`, they pass `--no-pty`, and the two streams stay apart.
 - **The apt wrapper names packages exactly and removes nothing.** It runs `apt-get -o APT::Cmd::Pattern-Only=true install --yes --no-install-recommends --no-remove <names>`. Without `Pattern-Only`, apt-get reads a name that is not a package as a regex, so `ripgre.` would also install `ripgrep-all`. Without `--no-remove`, `--yes` could remove an installed package (`sudo`, `tailscale`, `bubblewrap`) to make room. It also refuses a name ending in `-`, which `apt-get install` reads as "remove".
