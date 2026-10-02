@@ -1,0 +1,37 @@
+# dsh web for dish: a systemd user unit of the unprivileged account that runs dsh (fleet's dish_guest role links it into
+# ~/.config/systemd/user, and the account has linger on). Nothing listens on the VM's own address: dsh binds
+# 127.0.0.1:3080, and `tailscale serve` is what puts it on the tailnet.
+[Unit]
+Description=dsh web for dish
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/dish
+# Written by fleet. It holds one line, DISH_TRUSTED_HOST=dish.<tailnet>.ts.net, which ExecStart below reads. The file is
+# required: with no host to trust, dsh answers every /api call from the tailnet name with a 403.
+EnvironmentFile=%h/.config/dish/deploy.env
+
+# Where Node and pnpm are found, which is a contract with fleet's dish_guest role (F3): it makes /opt/dish/node a
+# symlink to the pinned Node install (24.21.0) and puts pnpm (11.25.0) in that Node's bin. Agents' commands inherit this
+# PATH too (dsh keeps PATH and drops names that look like secrets), so it also says what a shell command can run.
+Environment=PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin
+
+# --trusted-host takes any number of values, so it must stay last. DISH_TRUSTED_HOST is a bare host name, no scheme.
+ExecStart=/usr/bin/env pnpm dsh web --host 127.0.0.1 --port 3080 --no-open --trusted-host ${DISH_TRUSTED_HOST}
+Restart=on-failure
+RestartSec=5
+
+# No sandboxing options on purpose. Every command an agent runs is a child of this service, and dsh confines those
+# itself, with bubblewrap (user, PID and mount namespaces) or else Landlock, inside a transient user scope. Options that
+# restrict the whole service are inherited by those children, and would break them, or V8:
+#   RestrictNamespaces=, PrivateUsers=  bubblewrap could not make its namespaces, so dsh would refuse every shell
+#                                       command.
+#   SystemCallFilter=                   it could block the calls bubblewrap and Landlock make.
+#   MemoryDenyWriteExecute=             V8's JIT needs memory that is writable and executable.
+#   ProtectSystem=                      it remounts the file system under dsh's own sandbox, which binds / and the
+#                                       workspace itself.
+# That is reasoned from dsh's code, not tested (docs/research/2026-10-01-dsh-linux-host.md). If hardening is added
+# later, run dsh's bubblewrap probe and a real agent command under it first.
+
+[Install]
+WantedBy=default.target
