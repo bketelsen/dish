@@ -22,6 +22,7 @@ const AGENT = { kind: 'agent', sessionId: 's1', role: 'main' } as const
 const USER = { kind: 'user' } as const
 const COMMIT = /^[0-9a-f]{40}$/
 const TOKEN = `ghp_${'a'.repeat(40)}`
+const INSTALL_TOKEN = `ghs_${'a1B2'.repeat(9)}`
 
 // --- helpers ------------------------------------------------------------------------------------
 
@@ -355,6 +356,21 @@ test('a store whose registry file is missing reads as no projects', async () => 
   })
 })
 
+test('what dish-workspaces says of the last fetch is masked: a token in its message does not reach the page', async () => {
+  await withRemote(async ({ remote, write, described }) => {
+    await write({ 'acme/widget': fileFields() })
+    described.set('acme/widget', {
+      clone: '/work/acme/widget',
+      workspace: null,
+      lastFetch: { at: 1800, ok: false, message: `fetch failed (exit 128): https://x-access-token:${INSTALL_TOKEN}@github.com/acme/widget.git` },
+    })
+    const result = await remote.projects()
+    const message = info(ok(result).projects, 'acme/widget').lastFetch?.message
+    assert.match(message ?? '', /^fetch failed \(exit 128\)/)
+    assert.ok(!JSON.stringify(result).includes(INSTALL_TOKEN), JSON.stringify(result))
+  })
+})
+
 // --- pending proposals -----------------------------------------------------------------------------
 
 test('pendingProposals counts the open and stale proposals that change projects.yaml, and not rejected or accepted ones', async () => {
@@ -606,6 +622,79 @@ test('editing a ready project writes the file and does not onboard it again', as
     await new Promise(resolve => setTimeout(resolve, 50))
     assert.deepEqual(fake.calls.map(call => `${call.kind} ${call.project.name}`), ['onboard acme/widget'])
     assert.equal((await service().get('acme/widget'))!.gate, 'make test')
+  })
+})
+
+// --- a write is held to the file it was built on -------------------------------------------------------
+
+/**
+ * Make the next read of the registry through `store` be followed, before it returns, by a write of `text` to `path`
+ * as the user: a change that lands between a remote's read of the registry and its write. Returns a function that
+ * puts the store right.
+ */
+function interleave(store: DishConfigService, path: string, text: string): () => void {
+  const original = store.read
+  let done = false
+  store.read = (async (...args: Parameters<DishConfigService['read']>) => {
+    const read = await original.apply(store, args)
+    if (!done && args[0] === PROJECTS_PATH) {
+      done = true
+      await store.write([{ path, text }], { author: USER })
+    }
+    return read
+  }) as DishConfigService['read']
+  return () => { store.read = original }
+}
+
+test('with no base, a change to the registry made after the read is a CONFLICT, not overwritten: save and remove', async () => {
+  await withRemote(async ({ remote, store, write }) => {
+    await write({ 'acme/base': fileFields() })
+    const theirs = serializeProjects({ 'acme/base': fileFields(), 'acme/theirs': fileFields({ role: 'theirs' }) })
+    for (const call of [
+      () => remote.save('acme/mine', wireFields(), '', '', true),
+      () => remote.save('acme/base', wireFields({ gate: 'mine' }), '', '', false),
+      () => remote.save('acme/mine', wireFields(), undefined as unknown as string, '', true),
+      () => remote.remove('acme/base', '', ''),
+    ]) {
+      await store.write([{ path: PROJECTS_PATH, text: serializeProjects({ 'acme/base': fileFields() }) }], { author: USER })
+      const restore = interleave(store, PROJECTS_PATH, theirs)
+      try {
+        assert.match(failed(await call(), 'CONFLICT'), /projects\.yaml/)
+      } finally {
+        restore()
+      }
+      // Their change stands, and the call changed nothing.
+      assert.equal(await store.read(PROJECTS_PATH), theirs)
+    }
+  })
+})
+
+test('a change elsewhere in the store is no race, and a write with no base carries the commit it read as its base', async () => {
+  await withRemote(async ({ remote, store, write }) => {
+    await write({ 'acme/base': fileFields() })
+    const restore = interleave(store, 'README.md', '# elsewhere\n')
+    try {
+      // The registry did not change between the read and the write, so there is nothing to conflict with.
+      await store.write([{ path: 'README.md', text: '# before\n' }], { author: USER })
+      assert.ok(ok(await remote.save('acme/mine', wireFields(), '', '', true)))
+    } finally {
+      restore()
+    }
+    assert.deepEqual(Object.keys(await stored(store)), ['acme/base', 'acme/mine'])
+    // With no race the write carries the commit it read as its base.
+    const bases: Array<string | undefined> = []
+    const original = store.write
+    store.write = (async (...args: Parameters<DishConfigService['write']>) => {
+      bases.push(args[1].base)
+      return original.apply(store, args)
+    }) as DishConfigService['write']
+    try {
+      const head = await store.head()
+      ok(await remote.save('acme/more', wireFields(), '', '', true))
+      assert.deepEqual(bases, [head])
+    } finally {
+      store.write = original
+    }
   })
 })
 
@@ -952,12 +1041,28 @@ test('the store has the last word: what it refuses after the page\'s own check i
   })
 })
 
-test('retry maps whatever the service refuses with to INVALID, masked, and a store failure on the way is not a refusal', async () => {
+test('retry makes the service\'s own refusal INVALID, masked; a store failure is the store\'s outcome; anything else is a bug and is thrown', async () => {
+  const coded = (code: string) => Object.assign(new Error(`failed: ${code}`), { code })
+  // What DishProjects.retry throws on purpose: a plain Error with no code.
   await withStubs({}, async (remote) => {
     const message = failed(await remote.retry('acme/widget'), 'INVALID')
     assert.ok(!message.includes(TOKEN), message)
     assert.match(message, /refused/)
   }, { retry: async () => { throw new Error(`refused: ${TOKEN}`) } })
+  // The store failing under it (its `get` reads the registry): the store's code, not INVALID.
+  await withStubs({}, async (remote) => {
+    assert.equal(failed(await remote.retry('acme/widget'), 'LOCKED'), 'x')
+  }, { retry: async () => { throw Object.assign(new Error('x'), { code: 'LOCKED' }) } })
+  // Not refusals: an errno, a bug (a subclass of Error), a thrown string.
+  await withStubs({}, async (remote) => {
+    await assert.rejects(remote.retry('acme/widget'), /EACCES/)
+  }, { retry: async () => { throw coded('EACCES') } })
+  await withStubs({}, async (remote) => {
+    await assert.rejects(remote.retry('acme/widget'), TypeError)
+  }, { retry: async () => { throw new TypeError('not a function') } })
+  await withStubs({}, async (remote) => {
+    await assert.rejects(remote.retry('acme/widget'), /boom/)
+  }, { retry: async () => { throw 'boom' } })
   await withStubs({}, async (remote) => {
     assert.deepEqual(await remote.retry('acme/widget'), { ok: true, value: null })
   })

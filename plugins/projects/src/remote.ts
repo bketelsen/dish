@@ -22,7 +22,7 @@
  *
  * **How a change is made.** `save` and `remove` read `projects.yaml` at the commit the page loaded (`base`, or the
  * head for `''`), change the one entry, and write the whole document back through `serializeProjects` with that
- * `base`. The store refuses the write as `CONFLICT` when the file changed after `base` (the check is per document:
+ * `base` (the commit it read, when the caller gave none). The store refuses the write as `CONFLICT` when the file changed after `base` (the check is per document:
  * a commit elsewhere in the store is no conflict), so what is edited is the very file the page showed. A save is
  * read back through the registry's own parser before it is written, so a field it refuses is `INVALID` with its
  * sentence, what is written is trimmed as the parser would have it, and `check` says exactly what `save` would; the
@@ -79,6 +79,11 @@ class Refusal extends Error {
     this.name = 'Refusal'
     this.code = code
   }
+}
+
+/** An error the service made on purpose: a plain `Error`, not a subclass (a `TypeError` is a bug) and with no `code` (an errno or a store's is not its own). */
+function isPlainRefusal(error: unknown): error is Error {
+  return error instanceof Error && error.constructor === Error && (error as { code?: unknown }).code === undefined
 }
 
 function describe(error: unknown): string {
@@ -208,15 +213,17 @@ function parseStored(text: string | undefined): ParseResult {
 }
 
 /**
- * The projects in the file at `base` (the head for `''`), as the file says them. A file that doesn't parse is
- * `INVALID`, with its problem: the page can't change what it can't read, and says where it can be fixed.
+ * The projects in the file at `base` (the head for `''`), as the file says them, and the commit they were read at: a
+ * write built on them passes it as its `base` when the caller gave none, so a change made after this read is a
+ * `CONFLICT`, never silently overwritten. A file that doesn't parse is `INVALID`, with its problem: the page can't
+ * change what it can't read, and says where it can be fixed.
  * @throws the store's `NOT_FOUND` when `base` isn't a commit.
  */
-async function registryAt(store: DishConfigService, base: string): Promise<Record<string, ProjectFields>> {
+async function registryAt(store: DishConfigService, base: string): Promise<{ commit: string, fields: Record<string, ProjectFields> }> {
   const commit = base === '' ? await store.head() : base
   const parsed = parseStored(await store.read(PROJECTS_PATH, commit))
   if (!parsed.ok) throw new Refusal('INVALID', `${parsed.problem}; the page can't change a registry that doesn't parse: fix or revert it on History`)
-  return parsed.fields
+  return { commit, fields: parsed.fields }
 }
 
 /**
@@ -288,7 +295,9 @@ function cloneOf(reader: WorkspacesReader | undefined, name: string, trouble: (m
     return {
       clone: described.clone,
       workspace: described.workspace?.title ?? null,
-      lastFetch: fetched === null || fetched === undefined ? null : { at: fetched.at, ok: fetched.ok, message: fetched.message ?? null },
+      lastFetch: fetched === null || fetched === undefined
+        ? null
+        : { at: fetched.at, ok: fetched.ok, message: fetched.message === undefined ? null : statusMessage(fetched.message) },
     }
   } catch (error) {
     trouble(statusMessage(describe(error)))
@@ -362,7 +371,7 @@ export class ProjectsRemote extends TypertRemoteService {
       const add = addingOf(adding)
       const store = this.ctx.get('dishConfig')
       try {
-        withProject(store === undefined ? undefined : await registryAt(store, ''), project, entry, add)
+        withProject(store === undefined ? undefined : (await registryAt(store, '')).fields, project, entry, add)
         return { problem: null }
       } catch (error) {
         if (error instanceof Refusal && error.code === 'INVALID') return { problem: error.message }
@@ -379,7 +388,7 @@ export class ProjectsRemote extends TypertRemoteService {
    * one reads its new settings from its next fetch, worktree and gate.
    * @param name - `owner/repo`.
    * @param fields - the form's settings; `''` for what is left out.
-   * @param base - `''` for none; else the full commit id the page loaded (`projects`' `commit`), and a registry that has changed since is `CONFLICT`.
+   * @param base - `''` for the head as this call reads it; else the full commit id the page loaded (`projects`' `commit`). Either way, a registry that has changed since is `CONFLICT`.
    * @param note - `''` for none; else why, in a line, which becomes the commit's `Dish-Note`.
    * @param adding - `true` for a new project, `false` for an edit.
    * @returns the commit, or `null` when the file already says this.
@@ -392,8 +401,10 @@ export class ProjectsRemote extends TypertRemoteService {
       const after = stringOf('base', base)
       const why = stringOf('note', note)
       const store = storeToWrite(this.ctx)
-      const text = withProject(await registryAt(store, after), project, entry, add)
-      return await store.write([{ path: PROJECTS_PATH, text }], metaOf(after, why)) ?? null
+      const read = await registryAt(store, after)
+      const text = withProject(read.fields, project, entry, add)
+      // Built on the file at `read.commit`, so the write is held to it even when the caller gave no base.
+      return await store.write([{ path: PROJECTS_PATH, text }], metaOf(read.commit, why)) ?? null
     })
   }
 
@@ -401,7 +412,7 @@ export class ProjectsRemote extends TypertRemoteService {
    * Remove a project from `projects.yaml`, as the user: a commit, so it can be reverted. Nothing on disk goes: the
    * clone and the workspace stay, and dish stops fetching, sweeping and gating it; its onboarding is stopped. A
    * name the file doesn't have (only the spelling it has is there) is `NOT_FOUND`.
-   * @param base - `''` for none; else the commit the page loaded, and a registry that has changed since is `CONFLICT`.
+   * @param base - `''` for the head as this call reads it; else the commit the page loaded. Either way, a registry that has changed since is `CONFLICT`.
    * @param note - `''` for "Removed <name>; its clone and workspace stay"; else why, in a line.
    * @returns the commit.
    */
@@ -411,12 +422,13 @@ export class ProjectsRemote extends TypertRemoteService {
       const after = stringOf('base', base)
       const why = stringOf('note', note)
       const store = storeToWrite(this.ctx)
-      const current = await registryAt(store, after)
+      const read = await registryAt(store, after)
+      const current = read.fields
       if (!Object.hasOwn(current, project)) throw new Refusal('NOT_FOUND', `there is no project ${shown(project)} in ${PROJECTS_PATH}`)
       const rest: Record<string, ProjectFields> = {}
       for (const [key, value] of Object.entries(current)) if (key !== project) put(rest, key, value)
       const text = serializeProjects(rest)
-      return await store.write([{ path: PROJECTS_PATH, text }], metaOf(after, why === '' ? `Removed ${project}; its clone and workspace stay` : why)) ?? null
+      return await store.write([{ path: PROJECTS_PATH, text }], metaOf(read.commit, why === '' ? `Removed ${project}; its clone and workspace stay` : why)) ?? null
     })
   }
 
@@ -433,9 +445,10 @@ export class ProjectsRemote extends TypertRemoteService {
       try {
         await this.ctx.dishProjects.retry(project)
       } catch (error) {
-        // The store failing on the way is the store's to report; the service's own refusals are plain errors.
-        if (isStoreCode((error as { code?: unknown } | null)?.code)) throw error
-        throw new Refusal('INVALID', statusMessage(describe(error)))
+        // The service's refusals (queued, being onboarded, no such project) are plain `Error`s with no code. Anything else
+        // is not a refusal: the store failing on the way (its code is reported by `outcome`), an errno, a bug.
+        if (!isPlainRefusal(error)) throw error
+        throw new Refusal('INVALID', statusMessage(error.message))
       }
       return null
     })
