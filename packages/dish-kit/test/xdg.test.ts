@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { homedir } from 'node:os'
+import path from 'node:path'
 import { INSTANCE_HOME, workRoot, xdgPaths } from '../src/xdg.ts'
 import * as kit from '../src/index.ts'
 
@@ -78,7 +79,7 @@ test('workRoot follows xdgPaths: the same instance variable moves both', () => {
 })
 
 test('workRoot defaults home to os.homedir()', () => {
-  assert.equal(workRoot({}), `${homedir()}/work`)
+  assert.equal(workRoot({}), path.join(homedir(), 'work'))
 })
 
 test('workRoot reads process.env by default', () => {
@@ -87,7 +88,7 @@ test('workRoot reads process.env by default', () => {
     process.env.DSH_DISH_HOME = '/inst'
     assert.equal(workRoot(), '/inst/work')
     delete process.env.DSH_DISH_HOME
-    assert.equal(workRoot(), `${homedir()}/work`)
+    assert.equal(workRoot(), path.join(homedir(), 'work'))
   } finally {
     if (saved === undefined) delete process.env.DSH_DISH_HOME
     else process.env.DSH_DISH_HOME = saved
