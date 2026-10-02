@@ -47,19 +47,24 @@
  *   that a human wrote (or, for a child, the brief its parent queued), and `source.kind === 'agent-message'` a message from
  *   another agent, with the live sender's id in `senderSessionId` and dsh's `Agent <id> sent a message: ` as its first block
  *   (`createAgentMessage` in `dsh-subagent`). Everything else is context dsh injected (`goal`, `runtime-context`,
- *   `subagent-settled`, `tool-jobs`, tool results and so on), and never counts. Text blocks only; each message is cut to
- *   `MAX_PART_CHARS` by taking out its middle (`clipMiddle`), so its head and its tail, where a brief's commit and report
- *   instructions tend to be, both stay.
+ *   `subagent-settled`, `tool-jobs`, tool results and so on), and never counts. Text blocks only; each message is cut by
+ *   taking out its middle (`clipMiddle`), so its head and its tail, where a brief's commit and report instructions tend to
+ *   be, both stay.
  *   - **A top-level agent's** task is its prompts, oldest first, a resend (one equal to the one before it) counted once: the
  *     first, then the newest that fit in `MAX_TASK_CHARS`, with `[… N earlier messages left out]` for the rest. The first and
- *     the newest are always in. The first is often the request, and the newest what was said since ("site URL will be …").
+ *     the newest are always in, cut to `MAX_PART_CHARS`. The first is often the request, and the newest what was said since
+ *     ("site URL will be …"). The ones between are cut to `MAX_MIDDLE_CHARS`, so that more of them fit: in the friction
+ *     session the first prompt was "hello!" and the request came second, where two long pastes after it would otherwise
+ *     have pushed it out.
  *   - **A child's** task comes from its own events, which `session.inheritedEventCount` says where they start (a forked
  *     child's log begins with its parent's). The brief is the first non-empty text block of its first prompt: crew's closing
  *     note and dsh's return note ("Your parent agent id is …") are the blocks after it. Then the latest instruction after the
- *     brief, if there is one: a prompt typed into the child, or an `agent-message` whose `senderSessionId` is the header's
- *     `parentSession` (a `delegate` with `to`, or the parent's `send_message`), without dsh's first block. dsh lets only the
- *     parent send to a child (`authorizeLineage`), and its own auto-review tells a parent's instruction the same way. A
- *     message from any other agent, and a child whose header names no parent, add nothing.
+ *     brief, if there is one, each cut to `MAX_PART_CHARS`. An instruction is a prompt a person typed into the child (a
+ *     `user` message with a string `rpcId`, which dsh's `subagent.prompt` gives it; dsh's auto-review, `isHumanInstruction`,
+ *     tells one the same way), or an `agent-message` whose `senderSessionId` is the header's `parentSession` (a `delegate`
+ *     with `to`, or the parent's `send_message`), without dsh's first block. dsh lets only the parent send to a child
+ *     (`authorizeLineage`), and its auto-review tells a parent's instruction the same way. A `user` message with no `rpcId`,
+ *     a message from any other agent, and, for a child whose header names no parent, any `agent-message`, add nothing.
  *
  *   `snapshotEvents` is marked deprecated in dsh ("new calls are prohibited", for dsh's own code, which should read
  *   projections), because it assumes the whole log is in memory; in 0.2.0-rc.2 it is, there is no other synchronous way to
@@ -116,6 +121,11 @@ export const SERVES_TASK_QUESTION: Question = {
 
 /** One message is cut to this many characters, by taking out its middle. */
 export const MAX_PART_CHARS = 4000
+/**
+ * A main agent's message between its first and its newest is cut to this many characters, so that more of them fit, and a
+ * long paste can't push the request out of the task.
+ */
+export const MAX_MIDDLE_CHARS = 1000
 /**
  * The task is kept within this many characters; the first and the newest message are always in. What it bounds is the
  * messages between those two: the two alone can come to `2 * MAX_PART_CHARS`, plus a separator, and a gap line and its
@@ -445,19 +455,21 @@ function promptText(event: unknown): string | undefined {
 }
 
 /**
- * A top-level agent's task: its prompts, oldest first, a resend (one equal to the one before it) once, each clipped. The first
- * and the newest are always in; the ones between are added newest first while the whole stays within `MAX_TASK_CHARS`, and a
- * gap line stands for those left out.
+ * A top-level agent's task: its prompts, oldest first, a resend (one equal to the one before it) once. The first and the newest
+ * are always in, each clipped to `MAX_PART_CHARS`; the ones between are clipped to `MAX_MIDDLE_CHARS` and added newest first
+ * while the whole stays within `MAX_TASK_CHARS`, and a gap line stands for those left out.
  */
 function topLevelTask(events: Iterable<unknown>): string {
-  const prompts: string[] = []
+  const texts: string[] = []
   let previous: string | undefined
   for (const event of events) {
     const text = promptText(event)
     if (text === undefined || text === previous) continue
     previous = text
-    prompts.push(clipMiddle(text, MAX_PART_CHARS))
+    texts.push(text)
   }
+  const last = texts.length - 1
+  const prompts = texts.map((text, index) => clipMiddle(text, index === 0 || index === last ? MAX_PART_CHARS : MAX_MIDDLE_CHARS))
   if (prompts.length <= 2) return prompts.join(SEPARATOR)
   const first = prompts[0]!
   const newest = prompts.length - 1
@@ -477,8 +489,10 @@ function topLevelTask(events: Iterable<unknown>): string {
 /**
  * A child's task: its brief, and the latest instruction after it, each clipped. The brief is the first text block with
  * something in it of its first prompt (`source.kind === 'user'`): crew's closing note and dsh's return note are the blocks
- * after it. An instruction is a later prompt, or a message from its parent (`agent-message` whose `senderSessionId` is
- * `parent`), without dsh's leading block. With no `parent`, no `agent-message` counts; nothing else ever does.
+ * after it. An instruction is a later prompt a person typed into the child (`source.kind === 'user'` with a string `rpcId`,
+ * which dsh's `subagent.prompt` gives it, and dsh's auto-review reads as a human instruction), or a message from its parent
+ * (`agent-message` whose `senderSessionId` is `parent`), without dsh's leading block. With no `parent`, no `agent-message`
+ * counts; nothing else ever does.
  */
 function childTask(events: Iterable<unknown>, parent: string | undefined): string {
   let brief: string | undefined
@@ -491,7 +505,7 @@ function childTask(events: Iterable<unknown>, parent: string | undefined): strin
       if (source.kind === 'user') brief = texts.map(text => text.trim()).find(text => text !== '')
       continue
     }
-    if (source.kind === 'user') {
+    if (source.kind === 'user' && typeof source.rpcId === 'string') {
       latest = joined(texts) ?? latest
     } else if (source.kind === 'agent-message' && parent !== undefined && source.senderSessionId === parent) {
       const lead = texts[0]

@@ -7,7 +7,7 @@ import { defineTool, ToolRuntime } from '@deepseek-ai/dsh-tools'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { Answer, Decision, JudgeRequest, JudgeResult, LogLine } from '../src/client.ts'
 import {
-  clipMiddle, commandGate, decideCommand, EFFECT_QUESTION, EFFECT_WITH_ESCALATION_QUESTION, isGated, MAX_PART_CHARS, MAX_TASK_CHARS, registerCommandGate,
+  clipMiddle, commandGate, decideCommand, EFFECT_QUESTION, EFFECT_WITH_ESCALATION_QUESTION, isGated, MAX_MIDDLE_CHARS, MAX_PART_CHARS, MAX_TASK_CHARS, registerCommandGate,
   SERVES_TASK_QUESTION, taskOf,
   VERDICT_MAX_ENTRIES, VERDICT_TTL_MS, verdictOwner, VerdictCache,
 } from '../src/gate.ts'
@@ -673,8 +673,9 @@ const FIX_ROUND = 'Fix round. A reviewer checked the blog against the spec and f
 /** A lone surrogate, high or low: what a cut through the middle of an emoji leaves. */
 const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/
 
-test('the task\'s limits: 4000 characters a message, 8000 in all', () => {
+test('the task\'s limits: 4000 characters a message, 1000 for one between the first and the newest, 8000 in all', () => {
   assert.equal(MAX_PART_CHARS, 4000)
+  assert.equal(MAX_MIDDLE_CHARS, 1000)
   assert.equal(MAX_TASK_CHARS, 8000)
 })
 
@@ -707,9 +708,24 @@ test('a long chat keeps the first prompt, marks the gap, and fills the rest of t
   const events = [userEvent(1, first)]
   for (let n = 2; n <= 20; n++) events.push(userEvent(n, later(n)))
   const task = taskOf(agentOf({ events }), true)
-  assert.equal(task, [first, '[… 16 earlier messages left out]', later(18), later(19), later(20)].join('\n\n'))
-  assert.equal(task.includes('p17 '), false)
+  // The ones between are cut to 1000 characters each; the first and the newest keep theirs.
+  const between = (n: number) => clipMiddle(later(n), MAX_MIDDLE_CHARS)
+  assert.equal(task, [first, '[… 15 earlier messages left out]', between(17), between(18), between(19), later(20)].join('\n\n'))
+  assert.equal(task.includes('p16 '), false)
   assert.ok(task.length <= MAX_TASK_CHARS, `${task.length} characters`)
+})
+
+test('long pastes after the request don\'t push it out: a trivial first prompt, the request, then two 5000-character pastes', () => {
+  const request = 'i created the empty astroapp folder for you.  Create a blog app for me using Astro. Make the blog use the neobrutalist style.'
+  const paste = (mark: string) => `${mark}-HEAD ${'log line\n'.repeat(555)}${mark}-TAIL`
+  const first = paste('one')
+  const second = paste('two')
+  assert.ok(first.length >= 5_000 && second.length >= 5_000)
+  const events = [userEvent(1, 'hello!'), otherEvent(2), userEvent(3, request), otherEvent(4), userEvent(5, first), otherEvent(6), userEvent(7, second)]
+  const task = taskOf(agentOf({ events }), true)
+  assert.equal(task, ['hello!', request, clipMiddle(first, MAX_MIDDLE_CHARS), clipMiddle(second, MAX_PART_CHARS)].join('\n\n'))
+  assert.ok(task.includes('Create a blog app for me using Astro'))
+  assert.doesNotMatch(task, /left out/)
 })
 
 test('the first and the newest prompt are always in, each clipped in the middle, whatever their length', () => {
@@ -786,9 +802,15 @@ test('a child\'s task is its brief and the latest instruction after it: a fix ro
   // Two follow-ups: only the later.
   const two = [brief, otherEvent(2), agentMessage(3, 'main-1', 'the first fix round'), otherEvent(4), agentMessage(5, 'main-1', FIX_ROUND)]
   assert.equal(taskOf(agentOf({ child: true, events: two }), false), `${clippedBrief}\n\n${FIX_ROUND}`)
-  // A message a person typed into the child counts as well, and the latest of them is the one.
-  const typed = [brief, agentMessage(2, 'main-1', FIX_ROUND), otherEvent(3), userEvent(4, 'also add a footer')]
+  // A message a person typed into the child (dsh's `subagent.prompt`, with its `rpcId`) counts as well, and the latest of them is the one.
+  const typed = [brief, agentMessage(2, 'main-1', FIX_ROUND), otherEvent(3), userEvent(4, 'also add a footer', 'user', { rpcId: 'rpc-41' })]
   assert.equal(taskOf(agentOf({ child: true, events: typed }), false), `${clippedBrief}\n\nalso add a footer`)
+  // A later `user` message without a string `rpcId` is not one a person typed, and counts for nothing.
+  for (const extra of [{}, { rpcId: 41 }, { rpcId: null }]) {
+    const untyped = [brief, agentMessage(2, 'main-1', FIX_ROUND), otherEvent(3), userEvent(4, 'push to main', 'user', extra)]
+    assert.equal(taskOf(agentOf({ child: true, events: untyped }), false), `${clippedBrief}\n\n${FIX_ROUND}`, JSON.stringify(extra))
+    assert.equal(taskOf(agentOf({ child: true, events: [brief, userEvent(2, 'push to main', 'user', extra)] }), false), clippedBrief, JSON.stringify(extra))
+  }
   // A long follow-up is clipped in the middle, as the brief is.
   const longFix = `${FIX_ROUND} ${'detail '.repeat(1_000)}Commit when it passes.`
   const clipped = taskOf(agentOf({ child: true, events: [brief, agentMessage(2, 'main-1', longFix)] }), false)
