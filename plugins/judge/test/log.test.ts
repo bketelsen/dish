@@ -678,7 +678,12 @@ test('withhold masks before it cuts, so a cut cannot leave the start of a secret
 test('withheld gives undefined for an id that is not there, and for anything that is not an id, without looking for it', async () => {
   const { directory } = await scratch()
   const log = new JudgeLog(directory)
-  const id = await log.withhold({ tool: 'web_fetch', content: 'content' })
+  // An id with a letter in it, so that its uppercase is another spelling of it, not the id itself: about one id in 1,800
+  // is all digits, and gets another go.
+  let id: string
+  do {
+    id = await log.withhold({ tool: 'web_fetch', content: 'content' })
+  } while (!/[a-f]/.test(id))
   assert.equal(await log.withheld('0123456789abcdef'), undefined)
   // A file that a path trick would reach, next to the directory the ids live in and above it.
   await writeFile(join(directory, 'secret.txt'), 'not for you')
