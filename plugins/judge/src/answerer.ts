@@ -9,7 +9,7 @@
  *
  * | The gate's verdict for this agent's call | Main agent | Child |
  * |---|---|---|
- * | `allow`, with the escalation it was shown (`escalationCovered`), and this is that escalation's request | `allowed-once` | `allowed-once` |
+ * | `allow`, with the escalation it was shown (`escalationCovered`), and this is that escalation's request, the first | `allowed-once` | `allowed-once` |
  * | `ask`, the gate's own, which showed you the escalation, and you said yes to it (`coveredByYou`); this is that escalation's request, the first | `allowed-once` | `rejected` (a child is never asked, so never has one) |
  * | `ask` (the gate's own, or another listener's: the cache keeps the stricter) | `next()`: you | `rejected` |
  * | `deny`, `allow` with nothing covered, or no entry at all | `next()`: you | `rejected` |
