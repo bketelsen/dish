@@ -203,21 +203,31 @@ test('whatever dsh\'s renderPrompt accepts, interpolate renders to the same text
 
 // --- the listener ---------------------------------------------------------------------------------
 
-test('the listener patches the sections for an agent, asks for its snapshot by role, and passes on what next returns', async () => {
+test('the listener asks for the snapshot, calls next once, and patches what next returns, after it ran', async () => {
   const spy = service()
   const logger = recorder()
-  const listener = personaListener({ role: 'main', service: () => spy, logger })
+  const order: string[] = []
+  const listener = personaListener({
+    role: 'main',
+    service: () => ({ ...spy, snapshot: async (who, role) => { order.push('snapshot'); return spy.snapshot(who, role) } }),
+    logger,
+  })
   const assembly = build()
   const sentinel = build()
-  let patchedWhenNextRan: string | undefined
+  let seenWhenNextRan: string | undefined
   const result = await listener(assembly, assembling(agent('a1')), async () => {
-    patchedWhenNextRan = section(assembly, PERSONA_PREFIX_SECTION).text
+    order.push('next')
+    seenWhenNextRan = section(assembly, PERSONA_PREFIX_SECTION).text
     return sentinel
   })
   assert.equal(result, sentinel, 'what next returns is what the listener returns')
-  assert.equal(patchedWhenNextRan, 'You are deepseek-x, the main agent.', 'later listeners see the persona')
+  assert.deepEqual(order, ['snapshot', 'next'], 'the snapshot is asked for before next, so a slow store runs outside the other listeners\' time')
+  assert.equal(seenWhenNextRan, 'global prefix {{model}}', 'the listeners inside the waterfall see the preset\'s text: the persona is applied after them')
+  assert.equal(section(sentinel, PERSONA_PREFIX_SECTION).text, 'You are deepseek-x, the main agent.')
+  assert.equal(section(sentinel, PERSONA_SUFFIX_SECTION).text, 'Rules, in /work.')
+  assert.equal(section(sentinel, PERSONA_PREFIX_SECTION).interpolate, false)
+  assert.equal(section(assembly, PERSONA_PREFIX_SECTION).text, 'global prefix {{model}}', 'the assembly it was given is not what it patches')
   assert.deepEqual(spy.snapshots, [['a1', 'main']])
-  assert.equal(section(assembly, PERSONA_SUFFIX_SECTION).text, 'Rules, in /work.')
   assert.deepEqual(logger.lines, [])
 })
 
@@ -451,6 +461,57 @@ test('forget lets an agent be told about again, and leaves the row-wide warning 
   listener.forget('never-seen')
 })
 
+test('every path through the listener calls next exactly once, and returns what it returned', async () => {
+  const logger = recorder()
+  const throwing = service({ snapshot: async () => { throw new Error('the store is gone') } })
+  const frozen = (): PromptAssembly => {
+    const assembly = build()
+    Object.freeze(section(assembly, PERSONA_PREFIX_SECTION))
+    Object.freeze(section(assembly, PERSONA_SUFFIX_SECTION))
+    return assembly
+  }
+  const paths: [string, () => DishPrompts | undefined, Agent | undefined, () => PromptAssembly][] = [
+    ['an agent with a persona', () => service(), agent('top'), build],
+    ['a child', () => service(), agent('kid', true), build],
+    ['no agent', () => service(), undefined, build],
+    ['no agent and no service', () => undefined, undefined, build],
+    ['no service', () => undefined, agent('top'), build],
+    ['no service, a child', () => undefined, agent('kid', true), build],
+    ['a snapshot that fails', () => throwing, agent('top'), build],
+    ['a snapshot that fails, a child', () => throwing, agent('kid', true), build],
+    ['a snapshot that throws without rejecting', () => service({ snapshot: () => { throw new TypeError('not a promise') } }), agent('top'), build],
+    ['a snapshot that is not a persona', () => service({ snapshot: async () => undefined as unknown as Persona }), agent('top'), build],
+    ['sections that can\'t be patched', () => service(), agent('top'), frozen],
+    ['sections that can\'t be patched, a child', () => service(), agent('kid', true), frozen],
+  ]
+  for (const [label, current, who, make] of paths) {
+    const listener = personaListener({ role: 'main', service: current, logger })
+    const returned = make()
+    let nexts = 0
+    const result = await listener(make(), assembling(who), async () => { nexts++; return returned })
+    assert.equal(nexts, 1, label)
+    assert.equal(result, returned, label)
+  }
+})
+
+test('an error from next goes on to the caller, and is not the row\'s trouble', async () => {
+  const logger = recorder()
+  const listener = personaListener({ role: 'main', service: () => service(), logger })
+  let nexts = 0
+  await assert.rejects(
+    listener(build(), assembling(agent('a1')), async () => { nexts++; throw new Error('a listener inside failed') }),
+    /a listener inside failed/,
+  )
+  assert.equal(nexts, 1)
+  const missing = personaListener({ role: 'main', service: () => undefined, logger })
+  await assert.rejects(
+    missing(build(), assembling(agent('a1', true)), async () => { nexts++; throw new Error('a listener inside failed') }),
+    /a listener inside failed/,
+  )
+  assert.equal(nexts, 2)
+  assert.deepEqual(logger.lines.filter(line => /could not set/.test(line)), [])
+})
+
 // --- the row --------------------------------------------------------------------------------------
 
 /** A context with a `systemPrompt` that does nothing, which is all the row asks of it: its events are `ctx`'s. */
@@ -568,7 +629,7 @@ test('agent/disposed lets the row tell about an agent\'s trouble again, if the s
   assert.match(logs[2]!, /agent a1 /)
 })
 
-test('the row patches an assembly dispatched through ctx.waterfall, and the original object is what comes out', async () => {
+test('the row patches an assembly dispatched through ctx.waterfall, and what next returns is what comes out, patched', async () => {
   const ctx = contextWithStubs()
   const spy = service()
   ctx.provide('dishPrompts', spy)
@@ -578,11 +639,86 @@ test('the row patches an assembly dispatched through ctx.waterfall, and the orig
   assert.equal(result, assembly)
   assert.equal(section(result, PERSONA_PREFIX_SECTION).text, 'You are deepseek-x, the main agent.')
   assert.deepEqual(spy.snapshots, [['a1', 'main']])
+  // What the innermost step returns is what is patched, even if it is not the assembly the waterfall started with.
+  const other = build({ model: 'deepseek-y', cwd: '/elsewhere' })
+  const returned = await ctx.waterfall('system-prompt/assemble', build(), assembling(agent('a1')), () => Promise.resolve(other))
+  assert.equal(returned, other)
+  assert.equal(section(returned, PERSONA_PREFIX_SECTION).text, 'You are deepseek-y, the main agent.')
+  assert.equal(section(returned, PERSONA_SUFFIX_SECTION).text, 'Rules, in /elsewhere.')
   // With no agent it is the assembly dsh built.
   const diagnostic = build()
   const before = structuredClone(diagnostic)
   assert.equal(await ctx.waterfall('system-prompt/assemble', diagnostic, {}, () => Promise.resolve(diagnostic)), diagnostic)
   assert.deepEqual(diagnostic, before)
+})
+
+// --- {{model}} is the model the session selected -----------------------------------------------------
+
+const SELECTED = 'halogen-qwen3.8-flash-next'
+
+/**
+ * A listener shaped like dsh-agent's `installModelSelection` (0.2.0-rc.2, lib/index.js:166): it sets `provider` and
+ * `model` on what its own `next()` returns, in a new assembly, and does so after `next()`. `select` is the user
+ * switching the model in the chat; `returned` is what the listener has returned, in order.
+ */
+function selecting(model: string, provider: string): { returned: PromptAssembly[], select(model: string, provider: string): void, listener: Parameters<Context['on']>[1] } {
+  const selection = { model, provider }
+  const returned: PromptAssembly[] = []
+  const listener = async (_assembly: PromptAssembly, _context: AssembleContext, next: () => Promise<PromptAssembly>): Promise<PromptAssembly> => {
+    const selected = { ...selection }
+    const assembled = await next()
+    const result = { ...assembled, variables: { ...assembled.variables, provider: selected.provider, model: selected.model } }
+    returned.push(result)
+    return result
+  }
+  return {
+    returned,
+    select(nextModel, nextProvider) {
+      selection.model = nextModel
+      selection.provider = nextProvider
+    },
+    listener: listener as never,
+  }
+}
+
+const SELECTION_PERSONA: Persona = { prefix: 'You are {{model}}, on {{provider}}, in {{cwd}}.', suffix: 'Rules, for {{model}}.', commit: null }
+
+for (const registered of ['before the row, as dsh does it', 'after the row']) {
+  test(`a session\'s selected model is the {{model}} of the persona, with the selection listener registered ${registered}`, async () => {
+    const ctx = contextWithStubs()
+    const logs = watchLogs(ctx)
+    ctx.provide('dishPrompts', service({ snapshot: async () => SELECTION_PERSONA }))
+    const selection = selecting(SELECTED, 'selfie')
+    if (registered.startsWith('before')) ctx.on('system-prompt/assemble', selection.listener as never)
+    await ctx.plugin(row, { role: 'main' })
+    if (registered.startsWith('after')) ctx.on('system-prompt/assemble', selection.listener as never)
+
+    // The preset's own default is deepseek-x: the model the agent was created with, not the one the session selected.
+    const assembly = build({ model: 'deepseek-x', provider: 'deepseek', cwd: '/work' })
+    const result = await ctx.waterfall('system-prompt/assemble', assembly, assembling(agent('a1')), () => Promise.resolve(assembly))
+    assert.equal(selection.returned.length, 1)
+    assert.equal(result, selection.returned[0], 'what comes out is the object the selection listener returned')
+    assert.notEqual(result, assembly)
+    assert.deepEqual(result.variables, { model: SELECTED, provider: 'selfie', cwd: '/work' })
+    assert.equal(section(result, PERSONA_PREFIX_SECTION).text, `You are ${SELECTED}, on selfie, in /work.`)
+    assert.equal(section(result, PERSONA_SUFFIX_SECTION).text, `Rules, for ${SELECTED}.`)
+    assert.equal(section(result, PERSONA_PREFIX_SECTION).interpolate, false)
+    assert.equal(section(result, PERSONA_SUFFIX_SECTION).interpolate, false)
+    assert.ok(!renderPrompt(result).includes('deepseek-x'), renderPrompt(result))
+    assert.deepEqual(logs, [])
+  })
+}
+
+test('a child keeps the model its assembly has: it has no selection to read', async () => {
+  const ctx = contextWithStubs()
+  ctx.provide('dishPrompts', service({ snapshot: async () => SELECTION_PERSONA }))
+  await ctx.plugin(row, { role: 'main' })
+  const child = build({ model: 'gpt-5.6-sol', provider: 'openai', cwd: '/work' })
+  section(child, PERSONA_PREFIX_SECTION).text = 'You are the coder, on {{model}}.'
+  const result = await ctx.waterfall('system-prompt/assemble', child, assembling(agent('kid', true)), () => Promise.resolve(child))
+  assert.equal(result, child)
+  assert.equal(section(result, PERSONA_PREFIX_SECTION).text, 'You are the coder, on gpt-5.6-sol.')
+  assert.equal(section(result, PERSONA_SUFFIX_SECTION).text, 'Rules, for gpt-5.6-sol.')
 })
 
 test('the row without dishPrompts leaves the assembly alone, and the service arriving later is used', async () => {
@@ -649,6 +785,41 @@ test('with dsh\'s own SystemPrompt and the dishPrompts service on the shipped de
   // An assembly with no agent, a diagnostic, is dsh's own.
   const diagnostic = renderPrompt(await ctx.systemPrompt.assemble())
   assert.ok(diagnostic.includes('global prefix') && diagnostic.includes('global suffix'))
+  assert.deepEqual(logs, [])
+})
+
+test('with dsh\'s own SystemPrompt and a model selection after next, the rendered prompt says the selected model', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  await ctx.plugin(SystemPrompt, { personaPrefix: 'global prefix', personaSuffix: 'global suffix' })
+  ctx.systemPrompt.variable('model', () => 'deepseek-x')
+  ctx.systemPrompt.variable('provider', () => 'deepseek')
+  ctx.systemPrompt.variable('cwd', () => '/work')
+  ctx.systemPrompt.section({ name: 'tool:bash', order: 1000, text: 'Use bash in {{cwd}}, on {{model}}.' })
+  // Registered before the row, which is where dsh puts the agent's selection: the row is mounted when the preset is.
+  const selection = selecting(SELECTED, 'selfie')
+  ctx.on('system-prompt/assemble', selection.listener as never)
+  await mountPrompts(ctx, where.state)
+  await ctx.plugin(row, { role: 'main' })
+
+  assert.ok(DEFAULTS.main!.includes('{{model}}'), 'main.md names the model')
+  const assembly = await ctx.systemPrompt.assemble({ agent: agent('a1') } as AssembleContext)
+  assert.equal(selection.returned.length, 1)
+  const rendered = renderPrompt(assembly)
+  assert.equal(rendered, [
+    'You are an AI agent powered by DeepSeek Harness.',
+    DEFAULTS.main!.replaceAll('{{model}}', SELECTED),
+    `Use bash in /work, on ${SELECTED}.`,
+    DEFAULTS.common!.replaceAll('{{cwd}}', '/work'),
+  ].join('\n\n'))
+  assert.ok(!rendered.includes('deepseek-x'))
+  // The next step, after the user switches the model in the chat: the new one.
+  selection.select('gpt-6.1-sol', 'openai')
+  const switched = renderPrompt(await ctx.systemPrompt.assemble({ agent: agent('a1') } as AssembleContext))
+  assert.ok(switched.includes(DEFAULTS.main!.replaceAll('{{model}}', 'gpt-6.1-sol')), switched)
+  assert.ok(switched.includes('Use bash in /work, on gpt-6.1-sol.'), switched)
+  assert.ok(!switched.includes(SELECTED) && !switched.includes('deepseek-x'), switched)
   assert.deepEqual(logs, [])
 })
 

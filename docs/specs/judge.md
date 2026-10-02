@@ -148,8 +148,16 @@ A host-level `tools/pre-execute` listener, prepended, for tools listed in `tools
 ```json
 { "command": "<the command text>", "cwd": "<the session's working directory>", "workspace": "<the sandbox's workspace root>",
   "escalation": "<sandbox_permissions and justification, if any>",
-  "task": "<the agent's task: the main agent's latest user message, or a child's brief; up to 4000 characters>" }
+  "task": "<the agent's task: the main agent's first and latest prompts, or a child's brief and its latest instruction; see below>" }
 ```
+
+**The task** (since 2026-10-02; see the [friction spec](friction.md#the-judges-task-dish-judge)):
+- **The main agent's:** its prompts, the messages a human wrote (`source.kind: 'user'`, text blocks joined), oldest first, with a resend (one equal to the one before it) counted once. The first is always in, and so is the newest. The ones between are cut to 1,000 characters each, so that more of them fit, and are added newest first while the task stays within 8,000 characters, the separators and the gap line counted. A gap reads `[… N earlier messages left out]`. Messages are joined by a blank line. In the friction session the first prompt was "hello!" and the request came second: cut to 1,000, two long pastes after the request no longer push it out.
+- **A child's,** from its own events (after `inheritedEventCount`): the brief, which is the first non-empty text block of its first prompt, so crew's closing note and dsh's return note after it are left out; then, after a blank line, the latest instruction after the brief, if there is one. That is a prompt a person typed into the child (a `user` message with a string `rpcId`, which dsh's `subagent.prompt` gives it, as dsh's auto-review tells a human instruction), or an `agent-message` from its parent (`senderSessionId` equal to the header's `parentSession`: a `delegate` with `to`, or the parent's `send_message`), without dsh's leading `Agent <id> sent a message: ` block.
+- **Each message is cut by taking out its middle,** to 4,000 characters (1,000 for the main agent's messages between its first and its newest): half from the head and half from the tail stay, joined by `\n[…]\n`, with no surrogate pair split. A brief's commit and report instructions, which tend to come last, survive. Only the first and the newest can take the main agent's task past 8,000 characters: two full messages, a gap line and the blank lines between them come to a little over.
+- **Secrets are masked before the cut,** in each message the task keeps (and in the one that didn't fit), with dish-kit's `maskSecrets`. A private key is found by its `-----BEGIN … PRIVATE KEY-----` header and a token by its prefix, so a cut that took out the header, or went through a token, would leave the key's base64 and END line, or half the token, for the client's own mask to miss. Each mask then becomes a plain marker, `[<kind>, left out]` (`[a private key, left out]`, `[a GitHub token, left out]`). The client refuses a request that holds a private key's mask as opaque, which is right for a command, whose text is what runs; but the first prompt is always in the task, so one key in it would make every later command in the session ask you, or be refused. The marker holds nothing the client masks or refuses.
+- **What never counts:** a child's `agent-message` to the main agent, `subagent-settled` notices, tool results, `goal`, `runtime-context`, `skill-catalog`, `agent-instructions`, `tool-jobs` and every other injected kind, and an `agent-message` from anyone but the parent. A later `user` message without an `rpcId` is not one a person typed, and doesn't count. A child whose header names no parent reads no `agent-message`. An instruction from the parent has the same standing as the brief, which the parent also wrote.
+- **The bar is unchanged:** `servesTask` stays 0.50, and the questions are as they were. Before this, the main agent's task was only its latest message, and a child's the first 4,000 characters of its brief. Commits then scored `serves_task` 0.17–0.48 against a message that only gave the site URL, and a coder was refused commits whose instruction came past the cut. The fix was to give the judge the task, not to lower the bar.
 
 **Questions,** which live in code and are reviewed like code:
 - **`effect`** (choice): "What would running `command` from `cwd` do to files, systems and data?" The options are:
@@ -325,7 +333,16 @@ Whatever leaves `dishJudge` that came from outside the code (log lines, withheld
   - the cache;
   - Jev unavailable;
   - non-gated tools pass through;
-  - task text from the main agent and from a child.
+  - task text from the main agent and from a child:
+    - the site-URL session: every prompt, "hello!" once, with no child's message and no notice;
+    - a long chat: the first prompt, the gap line and the newest that fit, the ones between cut to 1,000, within 8,000 characters; the first and the newest always in;
+    - long pastes: "hello!", the request, then two 5,000-character pastes, and the request is still in;
+    - clipping: the head and the tail kept, a message of exactly 4,000 unchanged, no surrogate split, a tiny limit kept;
+    - secrets: a private key whose header falls in a cut, in each place a message can be, and a token a cut goes through, leave nothing of the key or token and no END line; a key in the first prompt, through the real client and a fake Jev, lets later commands be judged, not refused as opaque;
+    - the 5.8k brief: it keeps its commit instructions, without crew's and dsh's notes;
+    - the fix round: the brief and the parent's follow-up, without dsh's leading line; the later of two; a typed message after the brief, with an `rpcId`, and one without, which doesn't count;
+    - not the parent's: another agent's message, notices, `goal` and `tool-jobs` change nothing, and a child with no `parentSession` reads no `agent-message`;
+    - a fork, and the task through the gate.
 - **The approval answerer:** the four cases, for main and child; a child is never sent through `next()`; the child's policy switches to `ask` and stays put across a resume.
 - **The screen:**
   - withhold, warn and pass;

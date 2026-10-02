@@ -1216,15 +1216,18 @@ test('reviews "main": the main agent\'s model is read from its latest request, e
   assert.equal((await switched.delegate({ ...REVIEW, reviews: 'main' })).model, 'gpt-5.6-sol')
 })
 
-test('reviews "main" when the main agent\'s model can\'t be told is refused, and nothing starts', async () => {
+test('reviews "main" with no main model is refused and nothing starts; a model of no known vendor, or a qwen one, gets the first reviewer family', async () => {
   const w = await world()
   w.mainModel.current = undefined
   const message = await refusal(w.delegate({ ...REVIEW, reviews: 'main' }))
   assert.match(message, /can't tell which model you/)
   assert.match(message, /reviews/)
-  w.mainModel.current = 'mystery-1'
-  assert.match(await refusal(w.delegate({ ...REVIEW, reviews: 'main' })), /can't tell the family of model "mystery-1"/)
   assert.equal(w.starts.length, 0)
+  w.mainModel.current = 'mystery-1'
+  assert.equal((await w.delegate({ ...REVIEW, reviews: 'main' })).model, 'gpt-5.6-sol')
+  w.mainModel.current = 'halogen-qwen3.8-flash-next'
+  assert.equal((await w.delegate({ ...REVIEW, reviews: 'main' })).model, 'gpt-5.6-sol')
+  assert.equal(w.starts.length, 2)
 })
 
 test('a child that was started on a model crew.yaml no longer lists is still reviewed from outside its vendor', async () => {

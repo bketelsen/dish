@@ -7,9 +7,11 @@
  *
  * What counts as the same family is wider than a name. `crew.yaml` calls its families whatever it likes, and the work
  * under review can be on a model it doesn't list at all, so the family *name* of the work may be nothing the file has.
- * A reviewer is therefore kept away from the work's vendor too (`vendorsOf`: Claude, GPT, Gemini, Grok, told by model
- * id), so Claude reviewing Claude is refused whatever the file calls its families. An alias that names no vendor at all
- * (`sonnet-x`) tells nothing, and can only be told apart by the name of its family.
+ * A reviewer is therefore kept away from the work's vendor too (`vendorsOf`: Claude, GPT, Gemini, Grok, Qwen, DeepSeek,
+ * Kimi, GLM, Llama and Mistral, told by model id), so Claude reviewing Claude is refused whatever the file calls its
+ * families. A model that names no vendor at all (`sonnet-x`) and that no family lists is its own family: it excludes
+ * nothing, so the first of `reviewerFamilies` reviews it. The risk is an alias that hides its vendor, which can then get
+ * a reviewer of the same vendor; listing it in a family of `crew.yaml` closes that.
  *
  * Where a model runs is a separate matter from which family it is in. A family may have a provider of its own
  * (`families.<name>.provider`), and a route takes it; nothing about the reviewer rule reads a provider, only model ids.
@@ -60,6 +62,12 @@ const VENDORS: ReadonlyArray<readonly [vendor: string, token: RegExp]> = [
   ['openai', /^(?:openai$|codex|o\d)|gpt/],
   ['google', /^(?:google$|gemini)/],
   ['xai', /^(?:xai$|grok)/],
+  ['alibaba', /^(?:alibaba$|qwen|qwq)/],
+  ['deepseek', /^deepseek/],
+  ['moonshot', /^(?:moonshot|kimi)/],
+  ['zhipu', /^(?:zhipu$|glm|chatglm)/],
+  ['meta', /^(?:meta$|llama)/],
+  ['mistral', /^(?:mistral|mixtral|codestral|devstral|magistral|ministral|pixtral)/],
 ]
 
 /** What separates the tokens of a model id: provider and host prefixes, versions, regions and fine-tune markers all come between them. */
@@ -85,7 +93,8 @@ function folded(name: string): string {
 /**
  * The vendors a model id belongs to. The id is cut into tokens at `/ . : @ _ -` and whitespace, and a token names a
  * vendor if it is the vendor's name (`anthropic`), starts with what its models are called (`claude`; `codex`, `o<digit>`;
- * `gemini`; `grok`) or, for OpenAI's, contains `gpt` (`chatgpt`). Every token counts, wherever it sits, so a provider
+ * `gemini`; `grok`; `qwen`; `deepseek`; `kimi`; `glm`; `llama`; `mistral` and its kin: the `VENDORS` table) or, for
+ * OpenAI's, contains `gpt` (`chatgpt`). Every token counts, wherever it sits, so a provider
  * (`github-copilot/claude-opus-4.7`), a host (`azure-gpt-4o`, `us.anthropic.claude-3-5-sonnet…`), an alias
  * (`my-claude`) or a fine-tune (`ft:gpt-4o:…`) all name their vendor. An id can name more than one vendor, which only
  * widens what a reviewer is kept away from, and one that names none (`sonnet-x`) names none.
@@ -177,8 +186,9 @@ function modelAt(settings: CrewSettings, family: string, tier: Tier): string | u
 
 /**
  * The family a model is in. The families in `crew.yaml` come first: a model one of them lists is in that family. Only
- * a model no family lists is told by its vendor (see `vendorsOf`): `anthropic`, `openai`, `google` or `xai`, whatever
- * the file calls its own families. A model that names no vendor, or two, has no family: `undefined`.
+ * a model no family lists is told by its vendor (see `vendorsOf`): `anthropic`, `openai`, `google`, `xai`, `alibaba`,
+ * `deepseek`, `moonshot`, `zhipu`, `meta` or `mistral`, whatever the file calls its own families. A model that names no
+ * vendor, or two, has no family: `undefined`.
  */
 export function familyOf(model: string, settings: CrewSettings): string | undefined {
   const listedIn = listedFamily(settings, model)
@@ -225,10 +235,10 @@ interface Avoided {
  * - it lists a model of a vendor the work is on. That is the vendor of the work's model, of any model of the work's
  *   family (when that is a family of the file), or the work's family name itself when that is a vendor's (`anthropic`).
  *
- * A family that lists models of two vendors counts as both. Returns a problem instead when the work can't be placed:
- * a model the file doesn't list, whose id names no vendor, and no family given to say.
+ * A family that lists models of two vendors counts as both. A model the file doesn't list, whose id names no vendor,
+ * with no family given to say, is its own family: it is labelled by its id and excludes nothing.
  */
-function avoided(settings: CrewSettings, model: string | undefined, family: string | undefined): Avoided | { problem: string } {
+function avoided(settings: CrewSettings, model: string | undefined, family: string | undefined): Avoided {
   const names = new Set<string>()
   const vendors = new Set<string>()
   const reviewedModels: string[] = []
@@ -246,9 +256,6 @@ function avoided(settings: CrewSettings, model: string | undefined, family: stri
       reviewedModels.push(...modelsOf(settings, home))
     }
     const own = vendorsOf(model)
-    if (family === undefined && home === undefined && own.size === 0) {
-      return { problem: `can't tell the family of model ${quoted(model)}, so there's no telling a different family from it; add it to a family in crew.yaml.` }
-    }
     label ??= home ?? [...own][0] ?? truncate(model)
   }
   for (const reviewed of reviewedModels) for (const vendor of vendorsOf(reviewed)) vendors.add(vendor)
@@ -268,7 +275,6 @@ function reviewerRoute(settings: CrewSettings, name: string, role: RoleSettings,
     return refuse(`the ${name} role runs on a different model family from the work it reviews, so it needs the model or family of the work and none was given. Set reviews to a crew child's id, or "main" for your own work.`)
   }
   const avoid = avoided(settings, model, family)
-  if ('problem' in avoid) return refuse(avoid.problem)
   if (override !== undefined) {
     const found = offeredModel(settings, override)
     if (found === undefined) {
