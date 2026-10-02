@@ -127,6 +127,8 @@ export function apply(ctx: Context, config: Config): void {
       return
     }
     const row: IndexInjection = { kind: 'script', placement: 'head', text: flipScript(hosts) }
+    // Prepended only defensively, to keep the row ahead of the module-bootstrap rows: in dsh 0.2.0-rc.2 the order makes no
+    // difference, because the connection reads the global after `__DSH_BOOT_READY__`, which settles after the last row.
     child.on('webserver/index-inject', (table) => { table.push({ ...row }) }, { prepend: true })
     logger.info('pages on %s count as this machine', hosts.join(', '))
   })
