@@ -11,7 +11,7 @@ import type { Change } from '../src/store/git.ts'
 import { secretKind } from '../src/store/guard.ts'
 import { ConfigStore } from '../src/store/store.ts'
 import type { WriteMeta } from '../src/store/store.ts'
-import { AGENT, AGENTA, USER, USERA, isPlainError, isStoreError, ns, openAt, openStore, recorder, repoPath } from './helpers.ts'
+import { AGENT, AGENTA, USER, USERA, isPlainError, isStoreError, ns, openAt, openStore, ownEnv, recorder, repoPath } from './helpers.ts'
 
 const MAIN = 'refs/heads/main'
 const TOKEN = `ghp_${'a'.repeat(36)}`
@@ -49,7 +49,7 @@ async function externalCommit(git: Git, path: string, text: string): Promise<str
 
 /** A pid that certainly isn't running: a child that was started and has already exited. */
 async function deadPid(): Promise<number> {
-  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore', env: ownEnv() })
   const pid = child.pid
   assert.ok(pid !== undefined)
   await once(child, 'exit')

@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { ConfigStoreError } from '../src/store/errors.ts'
 import { SerialQueue, acquireLock } from '../src/store/lock.ts'
-import { tempDir } from './helpers.ts'
+import { ownEnv, tempDir } from './helpers.ts'
 
 const BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
 
@@ -31,7 +31,7 @@ async function currentBootId(): Promise<string | undefined> {
 
 /** A pid that certainly isn't running: a child that was started and has already exited. */
 async function deadPid(): Promise<number> {
-  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore', env: ownEnv() })
   const pid = child.pid
   assert.ok(pid !== undefined)
   await once(child, 'exit')
@@ -46,7 +46,7 @@ after(() => {
 
 /** The pid of a process that stays running for the whole test file, and is not this one. */
 function livePid(): number {
-  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], { stdio: 'ignore' })
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], { stdio: 'ignore', env: ownEnv() })
   child.unref()
   livePids.push(child)
   assert.ok(child.pid !== undefined)
@@ -329,7 +329,7 @@ const LOCK_MODULE = pathToFileURL(join(import.meta.dirname, '../src/store/lock.t
 function startLockingChild(dir: string, pauseAt: 'after-write' | 'after-link'): { child: ChildProcess, waitFor: (line: string) => Promise<void>, go: () => void } {
   const child = spawn(process.execPath, ['--input-type=module', '-e', CHILD_SOURCE], {
     stdio: ['pipe', 'pipe', 'inherit'],
-    env: { ...process.env, LOCK_DIR: dir, PAUSE_AT: pauseAt, LOCK_MODULE },
+    env: ownEnv({ LOCK_DIR: dir, PAUSE_AT: pauseAt, LOCK_MODULE }),
   })
   livePids.push(child)
   child.stdin!.on('error', () => {})
@@ -354,14 +354,14 @@ catch (error) { console.log(JSON.stringify({ code: error.code, message: error.me
 `
 
 test('a process in another pid namespace on this machine does not take the lock from a live holder', async t => {
-  const probe = spawnSync('unshare', [...UNSHARE, 'true'], { stdio: 'ignore' })
+  const probe = spawnSync('unshare', [...UNSHARE, 'true'], { stdio: 'ignore', env: ownEnv() })
   if (probe.status !== 0) return t.skip('unshare with user, pid and uts namespaces is not permitted here')
   const { dir, file } = await lockPath()
   const release = await acquireLock(dir)
   const run = spawnSync('unshare', [...UNSHARE, 'sh', '-c', 'hostname ctr && exec "$0" --input-type=module -e "$1"', process.execPath, IN_NAMESPACE_SOURCE], {
     encoding: 'utf8',
     timeout: 30_000,
-    env: { ...process.env, LOCK_DIR: dir, LOCK_MODULE },
+    env: ownEnv({ LOCK_DIR: dir, LOCK_MODULE }),
   })
   assert.equal(run.status, 0, run.stderr)
   const result = JSON.parse(run.stdout.trim().split('\n').at(-1) ?? '')

@@ -1,3 +1,4 @@
+import { mkdtempSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -31,6 +32,20 @@ export async function tempDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'dish-config-'))
   made.push(dir)
   return dir
+}
+
+let home: string | undefined
+
+/**
+ * The environment for a process a test starts itself (git, node, sh, rm): PATH, a scratch HOME (never the runner's; one
+ * per test file, removed with the temp dirs) and no global git config, then `extra`.
+ */
+export function ownEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  if (home === undefined) {
+    home = mkdtempSync(join(tmpdir(), 'dish-config-home-'))
+    made.push(home)
+  }
+  return { PATH: process.env.PATH, HOME: home, GIT_CONFIG_GLOBAL: '/dev/null', ...extra }
 }
 
 /** A repository path (`<temp>/config.git`) that doesn't exist yet. */

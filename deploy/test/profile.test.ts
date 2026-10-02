@@ -75,6 +75,8 @@ let counter = 0
 
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), 'dish-profile-test-'))
+  // The HOME of the CLI the tests run: never the runner's.
+  await mkdir(join(dir, 'home'))
 })
 after(async () => {
   await rm(dir, { recursive: true, force: true })
@@ -92,7 +94,7 @@ interface Run { code: number, stdout: string, stderr: string }
 
 function run(args: string[]): Promise<Run> {
   return new Promise((resolve) => {
-    execFile(process.execPath, [CLI, ...args], (error, stdout, stderr) => {
+    execFile(process.execPath, [CLI, ...args], { env: { PATH: process.env.PATH, HOME: join(dir, 'home') } }, (error, stdout, stderr) => {
       const code = error === null ? 0 : typeof error.code === 'number' ? error.code : 1
       resolve({ code, stdout, stderr })
     })

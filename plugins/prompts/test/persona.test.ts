@@ -16,7 +16,7 @@ import * as row from '../src/persona.ts'
 import { applyPersona, personaListener } from '../src/persona.ts'
 import { pathFor } from '../src/roles.ts'
 import type { DishPrompts, Persona } from '../src/service.ts'
-import { captureStderr, dirs, mountPrompts, watchLogs } from './helpers.ts'
+import { captureStderr, dirs, mountPrompts, tempDir, watchLogs } from './helpers.ts'
 
 const run = promisify(execFile)
 
@@ -682,7 +682,7 @@ test('loading the row loads neither defaults.ts nor the service, so the row can\
     await import(${JSON.stringify(personaUrl)})
     console.log(JSON.stringify(loaded))
   `
-  const { stdout } = await run(process.execPath, ['--input-type=module', '-e', script])
+  const { stdout } = await run(process.execPath, ['--input-type=module', '-e', script], { env: { PATH: process.env.PATH, HOME: await tempDir() } })
   const loaded = (JSON.parse(stdout) as string[]).filter(url => url.startsWith('file:'))
   const ours = loaded.filter(url => url.includes('/plugins/prompts/src/')).map(url => url.slice(url.lastIndexOf('/') + 1)).sort()
   assert.deepEqual(ours, ['interpolate.ts', 'persona.ts'])

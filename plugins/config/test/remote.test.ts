@@ -10,7 +10,7 @@ import type { DishConfigService } from '../src/index.ts'
 import type { ConfigEvent, ErrorCode, Outcome } from '../src/protocol.ts'
 import { ConfigRemote } from '../src/remote.ts'
 import { Git } from '../src/store/git.ts'
-import { AGENTA, USERA, ns, repoPath, tempDir } from './helpers.ts'
+import { AGENTA, USERA, ns, ownEnv, repoPath, tempDir } from './helpers.ts'
 
 const run = promisify(execFile)
 
@@ -463,7 +463,7 @@ test('remoteStatus is { pending: 0 } with no remote, and follows a push when the
       assert.ok(tries < 400, `never pushed: ${JSON.stringify(status)}`)
       await new Promise(resolve => setTimeout(resolve, 25))
     }
-    assert.equal((await run('git', [`--git-dir=${bare}`, 'rev-parse', 'main'])).stdout.trim(), written.id)
+    assert.equal((await run('git', [`--git-dir=${bare}`, 'rev-parse', 'main'], { env: ownEnv() })).stdout.trim(), written.id)
   })
 })
 
@@ -517,7 +517,7 @@ test('watch reports the remote status as it changes, and a page that opens mid-e
   await new Git(gone).initBare('main')
   await withRemote({ remote: gone }, async (remote, service) => {
     service.claim(ns('t/'))
-    await run('rm', ['-rf', gone])
+    await run('rm', ['-rf', gone], { env: ownEnv() })
     await service.write([{ path: 't/a.md', text: 'one' }], { author: USERA })
     for (let tries = 0; ; tries++) {
       const status = ok(await remote.remoteStatus())

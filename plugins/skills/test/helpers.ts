@@ -115,12 +115,15 @@ export function skillText(name: string, roles: string[] | null = null, body = `D
   return ['---', `name: ${name}`, `description: Use when you need ${name}.`, ...metadata, '---', body, ''].join('\n')
 }
 
-/** Run git in `gitDir` with an environment that nothing in the caller's shell can redirect. */
-function git(gitDir: string, args: string[], options: { input?: string, env?: Record<string, string> } = {}): Promise<string> {
+let gitHome: Promise<string> | undefined
+
+/** Run git in `gitDir` with an environment that nothing in the caller's shell can redirect, and a scratch HOME. */
+async function git(gitDir: string, args: string[], options: { input?: string, env?: Record<string, string> } = {}): Promise<string> {
   const env: Record<string, string> = {}
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined && !key.startsWith('GIT_')) env[key] = value
   }
+  env.HOME = await (gitHome ??= tempDir())
   return new Promise((resolve, reject) => {
     const child = execFile('git', ['--git-dir', gitDir, ...args], { env: { ...env, ...options.env }, encoding: 'utf8' }, (error, stdout, stderr) => {
       if (error) reject(new Error(`git ${args.join(' ')} failed: ${stderr.trim() || error.message}`))
