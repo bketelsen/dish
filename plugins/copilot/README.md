@@ -1,7 +1,7 @@
 # dish-copilot
 
 Use your GitHub Copilot subscription as a model provider in DeepSeek Harness. The package holds three pieces:
-- a sign-in card on **Settings → Models**
+- a sign-in card on **Settings → Models** (in the footer until Copilot has a route)
 - a server remote the card talks to
 - a catalog plugin that keeps the model picker in step with what your account actually offers
 
@@ -27,9 +27,15 @@ Upstream moved the *button* that starts that flow out of the product, for provid
 
 | Piece | File | Role |
 |---|---|---|
-| Card | `src/client/` | Registered into the Models page's `settings.models.provider-card` seat under the `llm-pi-ai` key. It renders only on the `github-copilot` card and shows sign-in, the device code (with Copy and Open GitHub), sign-out, and **Refresh models**. |
+| Card | `src/client/` | Registered into the Models page's `settings.models.provider-card` seat under the `llm-pi-ai` key. It renders only on the `github-copilot` card and shows sign-in, the device code (with Copy and Open GitHub), sign-out, and **Refresh models**. On a fresh profile it also registers in the `settings.models.footer` seat; see below. |
 | Remote | `src/remote.ts` | `CopilotRemote`, a Typert remote service. `signIn` is a stream: it calls `ctx.authorization.begin()` and pushes each notice (the device code arrives as one) until the attempt settles. Closing the stream cancels the attempt. |
 | Plugin | `src/index.ts` | Mounts the remote. On `authorization/settled` for the Copilot key, it adds the `github-copilot` route if it's missing and refreshes the catalog. This works however the sign-in was started, whether from the card, the terminal, or another tab. |
+
+**The first sign-in.** The provider card sits on the `github-copilot` route's card, and a fresh profile has no such route: the plugin adds it only after a sign-in. So on a fresh profile the same panel, titled **GitHub Copilot**, sits in the Models page's footer until the route exists.
+- `CopilotRemote.status()` reports `route`, whether `llm-pi-ai` has a `github-copilot` provider (`src/route.ts`). The footer shows while the status has loaded and `route` is false (`src/client/first-sign-in.ts`).
+- The footer and the provider card share one store, so a sign-in started in either shows in both.
+- After a sign-in the plugin adds the route. The client reloads the status when the settings change, so the footer goes away and the provider card takes over.
+- With `addRoute: false` the route never appears, so the footer stays.
 
 The token is written, refreshed, and read only by `llm-pi-ai`. The card and remote only ever see "signed in: yes/no".
 
@@ -78,7 +84,7 @@ Set in `~/.dsh/profiles/web/cordis.patch.yml`.
 |---|---|---|
 | `enterpriseDomain` | `''` | GitHub Enterprise host (e.g. `company.ghe.com`); blank means github.com. Used by the card and the terminal. |
 | `addRoute` | `true` | Add the `github-copilot` route after a successful sign-in. |
-| `terminalSignIn` | `false` | At startup, when not signed in, start the sign-in and print the device code to the terminal. |
+| `terminalSignIn` | `false` | At startup, when not signed in, start the sign-in and print the device code to the terminal. Not needed for a first sign-in; the Models page offers one. |
 | `terminal` | `true` | Print this plugin's messages to the terminal. |
 | `flowWaitMs` | `30000` | How long the terminal sign-in waits for `llm-pi-ai` to register its flow. |
 

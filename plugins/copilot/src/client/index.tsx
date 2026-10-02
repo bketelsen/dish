@@ -1,6 +1,8 @@
 /**
  * Browser half of dish-copilot: a GitHub Copilot card inside the Models page's
- * provider rows, through the `settings.models.provider-card` seat.
+ * provider rows, through the `settings.models.provider-card` seat. A fresh
+ * profile has no Copilot route, so no such row; there the same panel shows in
+ * the page's footer (`settings.models.footer`) until the route exists.
  *
  * The sign-in stream lives here, not in the component, so leaving the page
  * does not abandon an attempt the human is finishing in another tab.
@@ -11,7 +13,7 @@ import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-models/client'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
-import { CopilotCard, type CardActions, type CardState } from './CopilotCard.tsx'
+import { CopilotCard, CopilotFirstSignIn, type CardActions, type CardState } from './CopilotCard.tsx'
 import { copilotRemote } from './remote.ts'
 import './styles.ts'
 
@@ -88,4 +90,11 @@ function registerCard(ctx: Context): void {
     key: 'llm-pi-ai',
     inject: () => actions,
   }, CopilotCard))
+  ctx.slots.inject('settings.models.footer', () => ctx.slots.register({
+    name: 'settings.models.footer',
+    id: 'dish-copilot',
+    order: 100,
+    label: 'GitHub Copilot',
+    inject: () => actions,
+  }, CopilotFirstSignIn))
 }

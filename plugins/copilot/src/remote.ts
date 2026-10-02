@@ -17,6 +17,7 @@ import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { markRemote } from 'dish-kit'
 import type {} from './catalog.ts'
 import { NAMESPACE, type CopilotStatus, type SignInEvent } from './protocol.ts'
+import { hasCopilotRoute } from './route.ts'
 
 export const KEY = 'llm-pi-ai/github-copilot' as CredentialKey
 
@@ -25,7 +26,7 @@ export interface RemoteConfig {
 }
 
 export class CopilotRemote extends TypertRemoteService {
-  static inject = ['authorization', 'credentials']
+  static inject = ['authorization', 'credentials', 'settings']
 
   private readonly config: RemoteConfig
 
@@ -39,6 +40,7 @@ export class CopilotRemote extends TypertRemoteService {
     return {
       signedIn: await this.ctx.credentials.readRecord(KEY) !== undefined,
       inFlight: this.ctx.authorization.describe(KEY)?.inFlight ?? false,
+      route: hasCopilotRoute(this.ctx),
       ...report === undefined ? {} : {
         models: {
           refreshedAt: report.refreshedAt,

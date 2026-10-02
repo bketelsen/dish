@@ -22,19 +22,14 @@
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { Context, Logger } from '@deepseek-ai/cordis'
 import type { AuthorizationInteraction } from '@deepseek-ai/dsh-authorization'
-import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs } from 'dish-kit'
 import type {} from './catalog.ts'
 import { CopilotRemote, KEY } from './remote.ts'
+import { PI_AI_NS, PROVIDER_ID, addCopilotRoute, hasCopilotRoute } from './route.ts'
 
 export const name = 'dish-copilot'
 export const inject = ['authorization', 'credentials', 'settings']
-
-/** The `llm-pi-ai` entry id in the base bundle, which is also its settings namespace. */
-const PI_AI_NS = 'llm-pi-ai' as SettingsNamespace
-/** pi-ai's catalog id for Copilot; also the route key the model picker shows. */
-const PROVIDER_ID = 'github-copilot'
 
 export interface Config {
   terminal: boolean
@@ -100,7 +95,7 @@ async function startup(ctx: Context, logger: Logger, config: Config, signal: Abo
 
 async function afterSignIn(ctx: Context, logger: Logger, config: Config): Promise<void> {
   logger.info('GitHub Copilot: signed in')
-  if (config.addRoute && !hasRoute(ctx)) await addRoute(ctx, logger)
+  if (config.addRoute && !hasCopilotRoute(ctx)) await addCopilotRoute(ctx, logger)
   await ctx.get('copilotCatalog')?.refresh()
 }
 
@@ -139,25 +134,4 @@ function terminalInteraction(logger: Logger, config: Config): AuthorizationInter
       return Promise.reject(new Error(`cannot answer "${prompt.message}" from the terminal`))
     },
   }
-}
-
-function piAiSettings(ctx: Context) {
-  return ctx.settings.describe().find(descriptor => descriptor.ns === PI_AI_NS)
-}
-
-function hasRoute(ctx: Context): boolean {
-  const value = piAiSettings(ctx)?.value as { providers?: Record<string, unknown> } | undefined
-  return value?.providers?.[PROVIDER_ID] !== undefined
-}
-
-async function addRoute(ctx: Context, logger: Logger): Promise<void> {
-  const descriptor = piAiSettings(ctx)
-  if (descriptor === undefined) {
-    logger.warn('GitHub Copilot: no %s settings namespace; add the route on the Models page', PI_AI_NS)
-    return
-  }
-  // An empty profile keeps pi-ai's installed Copilot catalog: endpoint, per-model
-  // wire protocol, and models; the catalog refresh then narrows it to the account.
-  await ctx.settings.mutate(PI_AI_NS, [{ op: 'set', path: ['providers', PROVIDER_ID], value: {} }], descriptor.revision)
-  logger.info('GitHub Copilot: added the "%s" route', PROVIDER_ID)
 }

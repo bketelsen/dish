@@ -12,6 +12,11 @@ export interface CopilotStatus {
   signedIn: boolean
   /** A sign-in attempt is running, possibly started elsewhere (terminal, another tab). */
   inFlight: boolean
+  /**
+   * `llm-pi-ai` has a `github-copilot` route. Until it does, a fresh profile
+   * has no Copilot card on the Models page, so the first sign-in card shows.
+   */
+  route: boolean
   /** The latest model refresh, if any has run. */
   models?: {
     refreshedAt: number

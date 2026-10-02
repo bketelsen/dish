@@ -1,4 +1,8 @@
-/** The GitHub Copilot sign-in block rendered inside the Copilot provider card. */
+/**
+ * The GitHub Copilot sign-in block. It renders in two seats that share one
+ * store: inside the Copilot provider card, and, on a fresh profile where that
+ * card doesn't exist yet, as the Models page's footer.
+ */
 
 import { useState } from 'react'
 import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -6,6 +10,7 @@ import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { InjectFace } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ProviderCardExtrasOwnerProps } from '@deepseek-ai/dsh-client-ui-settings-models/client'
 import type { CopilotStatus } from '../protocol.ts'
+import { showFirstSignIn } from './first-sign-in.ts'
 
 export interface CardState {
   status?: CopilotStatus
@@ -23,14 +28,34 @@ export interface CardActions {
   refreshModels(): void
 }
 
-type Props = ProviderCardExtrasOwnerProps & InjectFace<CardActions>
+type Actions = InjectFace<CardActions>
+type Props = ProviderCardExtrasOwnerProps & Actions
 
 /** One registration serves every llm-pi-ai card; only Copilot's gets content. */
 export function CopilotCard(props: Props) {
   return props.provider.provider === 'github-copilot' ? <CopilotPanel {...props} /> : null
 }
 
-function CopilotPanel({ keyConfigured, useCard, signIn, cancel, signOut, refreshModels }: Props) {
+/**
+ * The Models page's footer seat, for a profile with no Copilot route yet: a
+ * titled block around the same panel, gone once the route exists (the provider
+ * card shows the same state from then on).
+ */
+export function CopilotFirstSignIn(props: Actions) {
+  const status = props.useCard(state => state.status)
+  if (!showFirstSignIn(status)) return null
+  return (
+    <section className="dish-copilot-first" aria-labelledby="dish-copilot-first-title">
+      <h3 className="dish-copilot-first-title" id="dish-copilot-first-title">GitHub Copilot</h3>
+      <p className="dish-copilot-meta">Sign in to add Copilot&apos;s models to the model picker.</p>
+      <CopilotPanel keyConfigured={false} {...props} />
+    </section>
+  )
+}
+
+type PanelProps = { keyConfigured: boolean } & Actions
+
+function CopilotPanel({ keyConfigured, useCard, signIn, cancel, signOut, refreshModels }: PanelProps) {
   const { status, signingIn, busy, notice, error } = useCard(state => state)
   return (
     <div className="dish-copilot" role="group" aria-label="GitHub Copilot sign-in">
