@@ -131,7 +131,9 @@ Once the VM is up and its first fleet run has passed, in this order:
 
 - **dsh's token** is new on every start, but signing in once lasts 30 days across restarts. A new browser needs the token from the journal.
 - **The credential file** (`~dish/.dsh/.credentials.yaml`) holds the Copilot sign-in, the TypeSafe key and the browser-session secret. It is in the nightly backup, so the NAS copy is as sensitive as the VM.
-- **dsh's Linux sandbox** may need packages or kernel features in the guest (bubblewrap, user namespaces). The plan finds this out from `dsh-sandbox` before the guest role is written.
+- **dsh's Linux sandbox needs `bubblewrap`** (Debian's package; no sysctl). It falls back to Landlock, and with neither, refuses every agent shell command ([host research](../research/2026-10-01-dsh-linux-host.md)). Install it before the unit's first start, since dsh caches the verdict.
+- **The sandbox confines writes, not reads.** An agent's shell can read anything the `dish` account can, the deploy keys and `~/.dsh/.credentials.yaml` (the Copilot sign-in, the TypeSafe key, the browser-session secret) included. That is already so on the desktop. The judge's gate is the guard: reading a credential file doesn't serve a coding task, so it asks you or is refused for a child, and secrets are masked in the log and in what is sent to TypeSafe.
+- **The tailnet must have HTTPS certificates enabled** before the guest play runs (admin console), or `tailscale serve --https` stops for an interactive prompt.
 - **Disk.** 40 GiB is fine for dsh, sessions and logs. Step 6's workspaces will need more, which is an OpenTofu change then.
 - **The desktop and the VM must not both push.** Step 1 of the move comes before the VM's first start.
 - **Agent safety on an always-on host.** Agents run as `dish`, with no sudo, behind the judge's gate. The deploy keys are the most sensitive thing on the box:
