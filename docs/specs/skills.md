@@ -1,6 +1,6 @@
 # Spec: dish skills (`dish-skills`)
 
-Status: built 2026-10-02 on branch `skills` (not merged). Checked end to end against a scratch dsh profile (see the build notes); your own live pass is still to do. Implements roadmap step 3a. Builds on the [design](../design.md), the [config store](config-store.md), [prompts](prompts.md) and [crew](crew.md).
+Status: implemented 2026-10-02 and deployed to the VM the same day. Checked end to end against a scratch dsh profile (see the build notes). Implements roadmap step 3a. Builds on the [design](../design.md), the [config store](config-store.md), [prompts](prompts.md) and [crew](crew.md).
 
 ## Summary
 
@@ -329,3 +329,9 @@ Live (needs you):
 - **Ruling (final review): a store that fails to read gives the shipped skills as incomplete, not as an answer.** Before, a transient failure returned the shipped defaults as a complete catalog, which dsh's registry caches until the next change under `skills/`, so agents ran on the shipped skills for the rest of the session. `Catalog.degraded` now marks it, and both providers report an incomplete observation (see "A store that is there but fails to read" above). The cost if wrong is low: one extra read of the store per step while it fails.
 - **Ruling (final review): the main agent may merge when the user tells it to in so many words.** `common.md` said never to merge, and `finishing-a-development-branch` said to merge when the user says so. The controller ruled for the skill, and `common.md` was amended (see its row above) so the two agree. The cost if wrong is low: the house rule can go back to "humans merge" alone, and the skill's step 6 with it.
 - **Live end-to-end check (2026-10-02).** Real `dsh web` 0.2.0-rc.2 in a scratch profile (scratch XDG and `DSH_HOME`, never the user's store or profile) against a fake OpenAI-compatible model on loopback. The main agent's catalog was exactly its 14 skills. A coder child's was exactly its 5, also after a fix-round resume. The `skill` tool refused skills outside the role.
+
+## Notes from the rollout
+
+- Deployed 2026-10-02 by rerunning fleet's guest play (preview, apply, rerun with no changes). At the restart the store got the 18 skills in one `dish-skills defaults` commit, and all eight prompts moved to the new texts in one `dish-prompts defaults` commit with the note "updated to the new defaults".
+- `prompts/crew/reviewer.md` and `writer.md` had "edited in web UI" commits, but their stored texts were byte-for-byte shipped defaults (resets made through the page before the reset note was fixed), so they upgraded as intended. No edited prompt was overwritten.
+- Still to do by hand: `/brainstorming` from the `/` menu in the browser.
