@@ -12,9 +12,12 @@ import type { Clone } from './helpers.ts'
 /** Shaped like a GitHub installation token (`ghs_` and 40 letters and digits); not one. */
 const TOKEN = `ghs_${'Ab1Cd2Ef3G'.repeat(4)}`
 
-// The code's own git, and setup's, drop every GIT_* name they are given; this gives them no system config, as every
-// test git has.
+// The code's own git drops every GIT_* name of process.env; this gives it no system config, as every test git has.
+// (Setup's environment never gets it: a setup command that runs git exports GIT_CONFIG_NOSYSTEM itself, `NOSYSTEM_SH`.)
 internals.gitEnv = NOSYSTEM
+
+/** Put first in a setup command that runs git: setup's scrub drops every GIT_* name it is given. */
+const NOSYSTEM_SH = 'export GIT_CONFIG_NOSYSTEM=1; '
 
 async function exists(file: string): Promise<boolean> {
   try {
@@ -74,8 +77,8 @@ async function pidsIn(file: string): Promise<number[]> {
 
 /**
  * The environment a test gives setup's bash: a scratch HOME and HISTFILE, the runner's PATH and nothing else of it.
- * (`GIT_CONFIG_NOSYSTEM` is given too, as to every test process; setup's scrub drops it, and `internals.gitEnv` puts it
- * back for setup's git.)
+ * (`GIT_CONFIG_NOSYSTEM` is given too, as to every test process; setup's scrub drops it, so a command that runs git
+ * starts with `NOSYSTEM_SH`.)
  */
 async function bashEnv(dir: string, extra: Record<string, string> = {}): Promise<NodeJS.ProcessEnv> {
   const home = join(dir, 'home')
@@ -173,13 +176,66 @@ test('more than 64 KB of output keeps the tail only, from a whole line; a token 
   }
 })
 
-test('one line over 64 KB is cut to the last 64 KB, masked', async () => {
+test('once output is dropped, a PEM block cut at the drop leaves no fragment in the log, even when masking shrinks the rest', async () => {
   const dir = await tempDir()
-  const result = await setupIn(dir, `head -c 100000 /dev/zero | tr '\\0' y; printf ' ${TOKEN}'`)
+  // A private key whose header falls in the dropped output and whose body runs past the 80 KB kept before masking, then
+  // lines with long tokens: masked, they shrink the kept output well under 64 KB, which used to keep its start, key
+  // body and all.
+  const body = Array.from({ length: 60 }, (_, index) => `Zm9v${String(index).padStart(4, '0')}${'Qk'.repeat(28)}`)
+  const pem = ['-----BEGIN RSA PRIVATE KEY-----', ...body, '-----END RSA PRIVATE KEY-----', ''].join('\n')
+  const tokenLine = (index: number): string => `token ghs_${`${String(index).padStart(4, '0')}${'Ab1Cd2Ef3G'.repeat(20)}`.slice(0, 200)} done\n`
+  const kept = LOG_TAIL_BYTES + 16 * 1024
+  const tokens = Array.from({ length: Math.floor((kept - 2_000) / tokenLine(0).length) }, (_, index) => tokenLine(index)).join('')
+  const output = `${'filler line\n'.repeat(1_000)}${pem}${tokens}`
+  // The fixture: the drop falls inside the key's body.
+  const keptPart = output.slice(-kept)
+  assert.ok(output.length > kept)
+  assert.ok(keptPart.includes('Zm9v') && !keptPart.includes('BEGIN'), 'the kept output starts inside the key body')
+  const file = join(dir, 'output.txt')
+  await writeFile(file, output)
+  const result = await setupIn(dir, `cat '${file}'`)
+  assert.equal(result.exitCode, 0)
   const log = await readFile(result.log, 'utf8')
+  for (const [what, shown] of [['log', log], ['tail', result.tail]] as const) {
+    assert.equal(shown.includes('Zm9v'), false, `no line of the key in the ${what}`)
+    assert.equal(shown.includes('ghs_'), false, `no token in the ${what}`)
+    assert.equal(shown.includes('PRIVATE KEY'), false, `no part of the key's lines in the ${what}`)
+  }
+  assert.match(log, /^token ‹secret: [^›]+› done\n/, 'the log starts at a whole line')
+  assert.ok(log.endsWith('done\n'))
+})
+
+test('a key that runs across the start of the last 64 KB is masked whole, not left as its last lines', async () => {
+  const dir = await tempDir()
+  const body = Array.from({ length: 60 }, (_, index) => `Zm9v${String(index).padStart(4, '0')}${'Qk'.repeat(28)}`)
+  const pem = ['-----BEGIN RSA PRIVATE KEY-----', ...body, '-----END RSA PRIVATE KEY-----', ''].join('\n')
+  const after = 'after the key\n'.repeat(Math.ceil((LOG_TAIL_BYTES - 2_000) / 'after the key\n'.length))
+  const output = `${'filler line\n'.repeat(600)}${pem}${after}`
+  // The fixture: nothing is dropped, and the last 64 KB start inside the key's body.
+  assert.ok(output.length < LOG_TAIL_BYTES + 16 * 1024)
+  const window = output.slice(-LOG_TAIL_BYTES)
+  assert.ok(window.includes('Zm9v') && !window.includes('BEGIN'))
+  const file = join(dir, 'output.txt')
+  await writeFile(file, output)
+  const result = await setupIn(dir, `cat '${file}'`)
+  const log = await readFile(result.log, 'utf8')
+  assert.equal(log.includes('Zm9v'), false, 'no line of the key')
+  assert.equal(log.includes('PRIVATE KEY'), false)
+  assert.ok(log.endsWith('after the key\n'))
+  assert.ok(Buffer.byteLength(log) <= LOG_TAIL_BYTES)
+})
+
+test("one line over 64 KB is cut to the last 64 KB, masked; once output was dropped, a line with no start isn't kept", async () => {
+  const dir = await tempDir()
+  // 70 KB: nothing dropped, so the line's start was read and masking saw all of it.
+  const kept = await setupIn(dir, `head -c 70000 /dev/zero | tr '\\0' y; printf ' ${TOKEN}'`)
+  const log = await readFile(kept.log, 'utf8')
   assert.ok(Buffer.byteLength(log) <= LOG_TAIL_BYTES)
   assert.equal(log.includes('ghs_'), false)
   assert.match(log, /^y+ ‹secret: [^›]+›$/)
+  // 100 KB: the line began in what was dropped, so none of it is safe to show.
+  const dropped = await setupIn(dir, `head -c 100000 /dev/zero | tr '\\0' y; printf ' ${TOKEN}'`)
+  assert.equal(await readFile(dropped.log, 'utf8'), "[setup's last 80 KB of output were part of one line; not kept]\n")
 })
 
 test('a timeout ends the whole process group: bash and the grandchild it started are gone, and nothing is left', async () => {
@@ -360,7 +416,7 @@ test("every setting SAFE_FLAGS carries reaches setup's git, over the clone's own
   }
   const settings = protectedSettings()
   assert.ok(settings.length >= 9)
-  const command = `${settings.map(([key]) => `git config --get ${key}`).join('; ')}; echo "$GIT_GRAFT_FILE"`
+  const command = `${NOSYSTEM_SH}${settings.map(([key]) => `git config --get ${key}`).join('; ')}; echo "$GIT_GRAFT_FILE"`
   const result = await setupIn(f.dir, command, { cwd: f.worktree, env: await bashEnv(f.dir) })
   assert.equal(result.exitCode, 0, result.tail)
   assert.equal(result.tail, [...settings.map(([, value]) => value), '/dev/null'].join('\n'))
@@ -372,7 +428,7 @@ test("a post-checkout hook planted in the clone's shared .git/hooks doesn't run 
   const hook = join(f.clone, '.git', 'hooks', 'post-checkout')
   await writeFile(hook, await readFile(script))
   await chmod(hook, 0o755)
-  const result = await setupIn(f.dir, 'git checkout -q -b other', { cwd: f.worktree, env: await bashEnv(f.dir) })
+  const result = await setupIn(f.dir, `${NOSYSTEM_SH}git checkout -q -b other`, { cwd: f.worktree, env: await bashEnv(f.dir) })
   assert.equal(result.exitCode, 0, result.tail)
   assert.equal(await exists(marker), false, "the planted hook ran under setup's git")
   await unprotected(f.dir, f.worktree, 'git checkout -q -b other-plain')
@@ -383,7 +439,7 @@ test("a core.fsmonitor planted in the clone's config doesn't run on setup's git 
   const f = await cloneWithWorktree()
   const { script, marker } = await markerScript(f.dir, 'fsmonitor')
   await runOk('git', ['-C', f.clone, 'config', 'core.fsmonitor', script], { env: f.env })
-  const result = await setupIn(f.dir, 'git status --porcelain >/dev/null', { cwd: f.worktree, env: await bashEnv(f.dir) })
+  const result = await setupIn(f.dir, `${NOSYSTEM_SH}git status --porcelain >/dev/null`, { cwd: f.worktree, env: await bashEnv(f.dir) })
   assert.equal(result.exitCode, 0, result.tail)
   assert.equal(await exists(marker), false, "the planted fsmonitor ran under setup's git")
   await unprotected(f.dir, f.worktree, 'git status --porcelain >/dev/null')
@@ -407,10 +463,25 @@ test('an explicit git submodule update inside setup still works', async () => {
   const worktree = join(clone, '.worktrees', 'x')
   await runOk('git', ['-C', clone, 'worktree', 'add', '-q', '-b', 'dish/x', worktree, 'origin/main'], { env })
   assert.deepEqual(await readdirOf(join(worktree, 'vendor', 'sub')), [], 'the new worktree leaves the gitlink empty')
-  const result = await setupIn(dir, 'git submodule update --init -q && cat vendor/sub/s.txt', { cwd: worktree, env: await bashEnv(dir) })
+  const before = await sharedSubmoduleKeys(clone, env)
+  assert.deepEqual(before, [], 'nothing about the submodule in the shared config yet')
+  const result = await setupIn(dir, `${NOSYSTEM_SH}git submodule update --init -q && cat vendor/sub/s.txt`, { cwd: worktree, env: await bashEnv(dir) })
   assert.equal(result.exitCode, 0, result.tail)
   assert.equal(result.tail, 'from the submodule')
+  // What it writes, and where: `submodule.<name>.url` and `.active`, in the clone's shared .git/config (a worktree has no
+  // config of its own). checkClone's allowlist has no submodule.* key, so the clone is refused afterwards until that
+  // changes (being handled on `projects`).
+  assert.deepEqual(await sharedSubmoduleKeys(clone, env), [
+    `submodule.vendor/sub.active true`,
+    `submodule.vendor/sub.url file://${sub}`,
+  ])
 })
+
+/** The `submodule.*` entries of `clone`'s shared `.git/config`, sorted, as `key value`. */
+async function sharedSubmoduleKeys(clone: string, env: Record<string, string>): Promise<string[]> {
+  const result = await run('git', ['config', '--file', join(clone, '.git', 'config'), '--get-regexp', '^submodule\\.'], { env })
+  return result.stdout.split('\n').filter(line => line !== '').sort()
+}
 
 async function readdirOf(path: string): Promise<string[]> {
   const { readdir } = await import('node:fs/promises')

@@ -4,10 +4,9 @@
  *
  * - **runSetup** runs `bash -c <setup>` in a clone or a new worktree: stdin closed, the environment `childEnvironment()`
  *   gives dish's own children (dsh's scrub, no `GIT_*` name, `GIT_TERMINAL_PROMPT=0`) plus `SAFE_FLAGS`' settings as
- *   `GIT_CONFIG_*` and `GIT_GRAFT_FILE=/dev/null`, so any git setup or its tools run (a pnpm git dependency,
- *   `git submodule update`) is protected from a clone agents can write as dish's own git is; its own process group,
- *   and a time limit. A timeout or an abort sends the group TERM, then KILL after `KILL_GRACE_MS`; so does bash's exit, for anything
- *   it left running (nothing setup starts outlives it in its group). The last 64 KB of its output, masked, is the log.
+ *   `GIT_CONFIG_*` and `GIT_GRAFT_FILE=/dev/null`, its own process group, and a time limit. A timeout or an abort sends
+ *   the group TERM, then KILL after `KILL_GRACE_MS`; so does bash's exit, for anything it left running in its group.
+ *   The last 64 KB of its output, masked, is the log.
  * - **onMergedCode** is the spec's decision 1, as hardened on 2026-10-02 (option A, then Task 6's review): setup runs
  *   outside the sandbox only on code a human merged, and only in a checkout dish has just made (its own fresh clone, or
  *   a new worktree), since an existing checkout's ignored files can't be trusted. So it checks a commit, never a
@@ -19,9 +18,22 @@
  *     (`core.commitGraph=false`), each of which an agent can plant to make its commit look like an ancestor.
  *   - No gitlink or nested-repository check: see `onMergedCode`.
  *
- *   What is left: a forged object (an agent overwriting a stored object under its real hash), and the time between the
- *   check and the run, as the spec says. The caller fetches and checks the clone (`checkClone`, with its expected origin
- *   URL) just before.
+ * What neither covers (known limits, on top of the spec's forged objects and the time between check and run):
+ * - **A new worktree is not a clean room.** It sits at `<clone>/.worktrees/<slug>`, inside a clone agents can write,
+ *   and tools read config from parent directories: pnpm and npm workspaces (`pnpm-workspace.yaml`, a parent
+ *   `package.json`'s `workspaces`), `.pnpmfile.cjs`, `.npmrc`, Node's `node_modules` resolution up the tree,
+ *   `.cargo/config.toml`, `go.work`, and the like. Such a file an agent put in the clone reaches the worktree's setup,
+ *   so merged code in the worktree can still run code an agent wrote. Only the fresh clone is free of this.
+ * - **`GIT_CONFIG_COUNT` protects the git that setup runs, not everything:**
+ *   - a tool that builds its own environment (dropping these names), or passes its own `GIT_CONFIG_COUNT` or `-c`
+ *     (which can turn a setting back);
+ *   - tools that use libgit2 or another git library, not the git binary;
+ *   - config outside `SAFE_FLAGS` in the shared `.git/config` and `.git/info/attributes` (filters, a
+ *     `submodule.<name>.update=!command`, credential helpers): setup's git reads them for the whole run, and
+ *     `checkClone` vouches for them only at the moment it ran;
+ *   - `safe.bareRepository=explicit` breaks a tool that runs git in a bare repository by its working directory.
+ * - **The group kill** reaches what stays in setup's process group: a process that calls `setsid` or daemonizes
+ *   escapes it and outlives setup.
  *
  * @module dish-workspaces/setup
  */
@@ -76,7 +88,7 @@ function safeSettings(): Array<[string, string]> {
   return pairs
 }
 
-/** For tests only, never set by dish: put on top of the environment of this module's git and of setup's (a test's `GIT_CONFIG_NOSYSTEM`). */
+/** For tests only, never set by dish: put on top of the environment of this module's own git (a test's `GIT_CONFIG_NOSYSTEM`); never setup's. */
 export const internals: { gitEnv?: Record<string, string> } = {}
 
 /**
@@ -86,7 +98,7 @@ export const internals: { gitEnv?: Record<string, string> } = {}
  * from outside.
  */
 function setupEnvironment(env: NodeJS.ProcessEnv | undefined): Record<string, string> {
-  const child: Record<string, string> = { ...childEnvironment(env), ...internals.gitEnv }
+  const child: Record<string, string> = childEnvironment(env)
   const settings = safeSettings()
   child.GIT_CONFIG_COUNT = String(settings.length)
   settings.forEach(([key, value], index) => {
@@ -130,8 +142,9 @@ export interface SetupResult {
 
 /**
  * `bash -c <command>` in `cwd`, detached, stdin closed, env childEnvironment(options.env) plus SAFE_FLAGS' settings as
- * `GIT_CONFIG_*` and `GIT_GRAFT_FILE=/dev/null` (so every git it runs is protected as dish's own is). Output (both streams,
- * interleaved as read) keeps its last LOG_TAIL_BYTES, masked, written to `log` (0600) when it ends. A timeout or abort
+ * `GIT_CONFIG_*` and `GIT_GRAFT_FILE=/dev/null` (the git it runs gets dish's git's settings, within the module's known
+ * limits). Output (both streams, interleaved as read) keeps its last LOG_TAIL_BYTES, masked, written to `log` (0600)
+ * when it ends. A timeout or abort
  * sends TERM to the group, then KILL after KILL_GRACE_MS; when bash exits, whatever it left in its group is ended the
  * same way. `tail` is the log's last 40 lines. Never throws for the command's failure (one that can't even start is a
  * result with `exitCode: null`, its log saying why); rejects only for a time limit that isn't a positive number of
@@ -148,7 +161,7 @@ export async function runSetup(options: SetupOptions): Promise<SetupResult> {
     return { exitCode: null, signal: null, timedOut: false, aborted: true, durationMs: 0, log: options.log, tail: '' }
   }
   const run = await runGroup(options)
-  const text = logText(run.output, run.failure)
+  const text = run.failure === undefined ? logText(run.output, run.dropped) : mask(`setup couldn't start: ${run.failure}\n`)
   await writeFileAtomic(options.log, text, 0o600)
   return {
     exitCode: run.exitCode,
@@ -167,6 +180,8 @@ interface GroupRun {
   timedOut: boolean
   aborted: boolean
   output: Buffer
+  /** Whether output was dropped from the front of `output`. */
+  dropped: boolean
   /** Why bash couldn't start, if it couldn't. */
   failure?: string
 }
@@ -175,6 +190,7 @@ interface GroupRun {
 class Tail {
   private readonly chunks: Buffer[] = []
   private size = 0
+  private total = 0
   private readonly limit: number
 
   constructor(limit: number) {
@@ -184,7 +200,13 @@ class Tail {
   add(chunk: Buffer): void {
     this.chunks.push(chunk)
     this.size += chunk.length
+    this.total += chunk.length
     while (this.chunks.length > 1 && this.size - this.chunks[0]!.length >= this.limit) this.size -= this.chunks.shift()!.length
+  }
+
+  /** Whether more was added than `bytes()` holds: its start is then the middle of something. */
+  get dropped(): boolean {
+    return this.total > this.limit
   }
 
   bytes(): Buffer {
@@ -206,7 +228,7 @@ function runGroup(options: SetupOptions): Promise<GroupRun> {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
     } catch (error) {
-      resolve({ exitCode: null, signal: null, timedOut: false, aborted: false, output: output.bytes(), failure: messageOf(error) })
+      resolve({ exitCode: null, signal: null, timedOut: false, aborted: false, output: output.bytes(), dropped: false, failure: messageOf(error) })
       return
     }
     const { signal } = options
@@ -281,7 +303,7 @@ function runGroup(options: SetupOptions): Promise<GroupRun> {
       signal?.removeEventListener('abort', onAbort)
       child.stdout?.destroy()
       child.stderr?.destroy()
-      resolve({ exitCode, signal: exitSignal, timedOut, aborted, output: output.bytes() })
+      resolve({ exitCode, signal: exitSignal, timedOut, aborted, output: output.bytes(), dropped: output.dropped })
     }
 
     const timer = setTimeout(() => {
@@ -310,7 +332,7 @@ function runGroup(options: SetupOptions): Promise<GroupRun> {
       settled = true
       clearTimeout(timer)
       signal?.removeEventListener('abort', onAbort)
-      resolve({ exitCode: null, signal: null, timedOut: false, aborted: false, output: output.bytes(), failure: messageOf(error) })
+      resolve({ exitCode: null, signal: null, timedOut: false, aborted: false, output: output.bytes(), dropped: false, failure: messageOf(error) })
     })
     child.on('exit', (code, name) => {
       exited = true
@@ -342,33 +364,65 @@ function messageOf(error: unknown): string {
 }
 
 /**
- * The log: the output's last LOG_TAIL_BYTES, masked, starting at a whole line (masked before the cut, from a margin
- * more, so a secret that straddles the cut is masked whole; a single line longer than the log is cut and masked again).
- * A start that failed is the log's one line.
+ * The log: the output's last LOG_TAIL_BYTES, masked, from a whole line.
+ *
+ * Where it starts is chosen in the output as read, never in the masked text (masking can shrink the text, which would
+ * pull the start back into what isn't safe to show):
+ * - from a line start at or after the last LOG_TAIL_BYTES;
+ * - once output has been dropped, the kept part starts in the middle of something (a token's line, or a private key
+ *   whose header is gone, which nothing can recognize any more), so the start is also past the kept part's first line
+ *   and past the MASK_MARGIN_BYTES before the log, which is more than a key's masked length (8 KB). With nothing to
+ *   start from, the log says so instead.
+ * The kept part is masked whole, so a secret that starts before the log's start and runs past it is masked whole; the
+ * log is the masked text from where it stops matching the masked text before the start (the start itself, or the
+ * mask of a secret that runs across it). Masked once more after the cut, and cut at a line again if a mask grew it.
  */
-function logText(output: Buffer, failure: string | undefined): string {
-  const raw = failure === undefined ? decodeFrom(output, 0) : `setup couldn't start: ${failure}\n`
-  const masked = Buffer.from(mask(raw), 'utf8')
-  if (masked.length <= LOG_TAIL_BYTES) return masked.toString('utf8')
-  const cut = masked.length - LOG_TAIL_BYTES
-  const newline = masked.indexOf(0x0a, cut - 1)
-  if (newline >= 0 && newline < masked.length - 1) return masked.subarray(newline + 1).toString('utf8')
-  // One line longer than the log: cut inside it, and mask again (the cut may have removed what kept a token from
-  // matching). A mask can be longer than what it hides, so cut again while it is over; past a few rounds, a few bytes
-  // over is better than a cut that isn't masked.
-  let text = mask(decodeFrom(masked, cut))
+function logText(output: Buffer, dropped: boolean): string {
+  const raw = Buffer.from(decodeFrom(output, 0), 'utf8')
+  let start = 0
+  if (dropped || raw.length > LOG_TAIL_BYTES) {
+    const from = Math.max(raw.length - LOG_TAIL_BYTES, dropped ? Math.min(MASK_MARGIN_BYTES, raw.length) : 0)
+    const firstLine = dropped ? raw.indexOf(0x0a) + 1 : 0
+    if (dropped && firstLine === 0) return `[setup's last ${Math.round(raw.length / 1024)} KB of output were part of one line; not kept]\n`
+    const at = Math.max(from, firstLine)
+    const newline = raw.indexOf(0x0a, at - 1)
+    // A line start if there is one; else the middle of the last line, which began after the first (so it is masked
+    // in context) and is cut at a character.
+    start = newline >= 0 && newline < raw.length - 1 ? newline + 1 : charStart(raw, at)
+  }
+  const whole = mask(raw.toString('utf8'))
+  const before = mask(raw.subarray(0, start).toString('utf8'))
+  let text = mask(whole.slice(commonPrefix(whole, before)))
+  if (Buffer.byteLength(text) <= LOG_TAIL_BYTES) return text
+  // Masks longer than what they hid: cut at a line again, or, in one long line, at a character, masking each time.
+  const bytes = Buffer.from(text, 'utf8')
+  const newline = bytes.indexOf(0x0a, bytes.length - LOG_TAIL_BYTES - 1)
+  if (newline >= 0 && newline < bytes.length - 1) return mask(bytes.subarray(newline + 1).toString('utf8'))
   for (let round = 0; round < 4 && Buffer.byteLength(text) > LOG_TAIL_BYTES; round++) {
-    const bytes = Buffer.from(text, 'utf8')
-    text = mask(decodeFrom(bytes, bytes.length - LOG_TAIL_BYTES))
+    const over = Buffer.from(text, 'utf8')
+    text = mask(decodeFrom(over, over.length - LOG_TAIL_BYTES))
   }
   return text
 }
 
+/** How many characters `a` and `b` share from their start. */
+function commonPrefix(a: string, b: string): number {
+  const length = Math.min(a.length, b.length)
+  let index = 0
+  while (index < length && a.charCodeAt(index) === b.charCodeAt(index)) index++
+  return index
+}
+
+/** `at`, moved forward past any UTF-8 continuation bytes of `bytes`. */
+function charStart(bytes: Buffer, at: number): number {
+  let index = Math.max(0, at)
+  while (index < bytes.length && (bytes[index]! & 0xc0) === 0x80) index++
+  return index
+}
+
 /** `bytes` from `start`, moved forward past any UTF-8 continuation bytes so no character is cut in half. */
 function decodeFrom(bytes: Buffer, start: number): string {
-  let at = Math.max(0, start)
-  while (at < bytes.length && (bytes[at]! & 0xc0) === 0x80) at++
-  return bytes.subarray(at).toString('utf8')
+  return bytes.subarray(charStart(bytes, start)).toString('utf8')
 }
 
 function mask(text: string): string {
@@ -395,12 +449,13 @@ export type MergedCheck = { ok: true } | { ok: false, reason: string }
  * - The commit is an ancestor of (or equal to) that sha.
  *
  * A gitlink (a submodule) in the commit is not refused. The rule against nested repositories was for an existing
- * checkout, where `--ignore-submodules=dirty` hides edits inside one; a checkout dish has just made has none of those.
- * A commit can't hold a nested repository (git refuses a `.git` path), and dish's `worktree add` (submodule recursion
- * off) leaves a gitlink an empty directory. If setup fetches it (`git submodule update`), it gets the commit the merged
- * tree pins, from the URL the merged `.gitmodules` names (a `submodule.*` key in the clone's config is refused by
- * `checkClone`), into a module directory that is new too (a fresh clone's `.git/modules`, or a new worktree's own
- * `.git/worktrees/<name>/modules`, not the shared `.git/modules`: checked with git 2.47): nothing an agent wrote.
+ * checkout, where `--ignore-submodules=dirty` hides edits inside one. A commit can't hold a nested repository (git
+ * refuses a `.git` path), and dish's `worktree add` (submodule recursion off) leaves a gitlink an empty directory. If
+ * setup fetches it (`git submodule update`), it gets the commit the merged tree pins, from the URL the merged
+ * `.gitmodules` names, into a module directory git makes new (a fresh clone's `.git/modules`, or a new worktree's own
+ * `.git/worktrees/<name>/modules`, not the shared `.git/modules`: checked with git 2.47). It also writes
+ * `submodule.<name>.url` and `.active` into the clone's shared `.git/config`. This says nothing about the rest of
+ * what a new worktree's setup can read from the clone around it (see the module's known limits).
  *
  * Ancestry ignores replace refs, grafts and the commit-graph file. Uses git() only. Never throws: a failure is a
  * refusal with its reason.
