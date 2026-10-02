@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { access, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DEFAULT_GIT_TIMEOUT_MS, GitError, SAFE_FLAGS, git, gitOk, submoduleProblem } from '../src/git.ts'
+import { DEFAULT_GIT_TIMEOUT_MS, GitError, SAFE_FLAGS, git, gitOk, maskUrlPasswords, submoduleProblem } from '../src/git.ts'
 import { NOSYSTEM, dishHome, makeClone, runOk, scratchGitEnv, tempDir, withEnv } from './helpers.ts'
 import type { Clone } from './helpers.ts'
 
@@ -54,20 +54,22 @@ async function asDish<T>(dir: string, body: () => Promise<T>): Promise<T> {
   return withEnv(await dishHome(dir), body)
 }
 
-test('SAFE_FLAGS turn hooks, fsmonitor and submodule recursion off, and every call passes them', async () => {
+test('SAFE_FLAGS turn hooks, fsmonitor, submodule recursion, replace refs and bare-repo discovery off, and every call passes them', async () => {
   assert.deepEqual(SAFE_FLAGS, [
     '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
     '-c', 'fetch.recurseSubmodules=false', '-c', 'submodule.recurse=false',
+    '-c', 'core.useReplaceRefs=false', '-c', 'safe.bareRepository=explicit',
   ])
   assert.equal(Object.isFrozen(SAFE_FLAGS), true)
   assert.equal(DEFAULT_GIT_TIMEOUT_MS, 120_000)
   const dir = await tempDir()
   await asDish(dir, async () => {
     // `-c` values are what `git config --get` reads first: the flags reached git.
-    assert.equal(await gitOk(['config', '--get', 'core.hooksPath'], { cwd: dir, env: NOSYSTEM }), '/dev/null\n')
-    assert.equal(await gitOk(['config', '--get', 'core.fsmonitor'], { cwd: dir, env: NOSYSTEM }), 'false\n')
-    assert.equal(await gitOk(['config', '--get', 'fetch.recurseSubmodules'], { cwd: dir, env: NOSYSTEM }), 'false\n')
-    assert.equal(await gitOk(['config', '--get', 'submodule.recurse'], { cwd: dir, env: NOSYSTEM }), 'false\n')
+    for (const [key, value] of [
+      ['core.hooksPath', '/dev/null'], ['core.fsmonitor', 'false'],
+      ['fetch.recurseSubmodules', 'false'], ['submodule.recurse', 'false'],
+      ['core.useReplaceRefs', 'false'], ['safe.bareRepository', 'explicit'],
+    ]) assert.equal(await gitOk(['config', '--get', key], { cwd: dir, env: NOSYSTEM }), `${value}\n`, key)
   })
 })
 
@@ -382,6 +384,13 @@ test("fetch doesn't recurse into a nested repository (and does without SAFE_FLAG
   assert.equal(await exists(marker), true, 'the fixture proved itself: the nested uploadpack runs without the flags')
 })
 
+test('maskUrlPasswords masks a password in a URL and leaves the rest', () => {
+  assert.equal(maskUrlPasswords('https://user:pw@host/r.git'), 'https://user:***@host/r.git')
+  assert.equal(maskUrlPasswords('url.https://user:hunter2@host/.insteadof'), 'url.https://user:***@host/.insteadof')
+  assert.equal(maskUrlPasswords('ssh://git@host/r'), 'ssh://git@host/r')
+  assert.equal(maskUrlPasswords('plain text'), 'plain text')
+})
+
 test('submoduleProblem: only status and diff* are guarded, and only before the end of options', () => {
   assert.equal(submoduleProblem(['log', '--oneline']), undefined)
   assert.equal(submoduleProblem(['worktree', 'add', 'x']), undefined)
@@ -399,6 +408,63 @@ test('submoduleProblem: only status and diff* are guarded, and only before the e
     // A pathspec after `--` that looks like the option is not an option.
     assert.match(submoduleProblem([sub, '--', '--ignore-submodules=all']) ?? '', /--ignore-submodules/, sub)
   }
+})
+
+// --- planted object rewrites can't fool dish's git ------------------------------------------------------------------
+
+/** `clone`'s `origin/main` commit, and a second "evil" commit the agent makes and then leaves only as a loose object. */
+async function baseAndEvil(made: Clone): Promise<{ base: string, evil: string }> {
+  const { clone, env } = made
+  const base = (await runOk('git', ['-C', clone, 'rev-parse', 'origin/main'], { env })).trim()
+  await writeFile(join(clone, 'a'), 'evil\n')
+  await runOk('git', ['-C', clone, 'add', 'a'], { env })
+  await runOk('git', ['-C', clone, 'commit', '-q', '-m', 'evil'], { env })
+  const evil = (await runOk('git', ['-C', clone, 'rev-parse', 'HEAD'], { env })).trim()
+  await runOk('git', ['-C', clone, 'reset', '-q', '--hard', 'origin/main'], { env })
+  return { base, evil }
+}
+
+test("a planted refs/replace/<sha> doesn't rewrite what dish's git resolves (and does without the flag)", async () => {
+  const dir = await tempDir()
+  const made = await makeClone(dir, { a: 'real\n' })
+  const { clone, env } = made
+  const { base, evil } = await baseAndEvil(made)
+  await runOk('git', ['-C', clone, 'update-ref', `refs/replace/${base}`, evil], { env })
+  await asDish(dir, async () => {
+    assert.equal(await gitOk(['-C', clone, 'cat-file', '-p', `${base}:a`], { env: NOSYSTEM }), 'real\n')
+  })
+  // The fixture is real: git without the flag resolves the base's tree through the replacement, to the agent's content.
+  assert.equal(await runOk('git', ['-C', clone, 'cat-file', '-p', `${base}:a`], { env }), 'evil\n')
+})
+
+test("a planted .git/info/grafts doesn't rewrite history for dish's git (and does without GIT_GRAFT_FILE)", async () => {
+  const dir = await tempDir()
+  const made = await makeClone(dir, { a: 'real\n' })
+  const { clone, env } = made
+  const { base, evil } = await baseAndEvil(made)
+  // A graft that makes `evil` an ancestor of origin/main, which it is not.
+  await writeFile(join(clone, '.git', 'info', 'grafts'), `${base} ${evil}\n`)
+  await asDish(dir, async () => {
+    const guarded = await git(['-C', clone, 'merge-base', '--is-ancestor', evil, 'origin/main'], { env: NOSYSTEM })
+    assert.equal(guarded.code, 1, "dish's git honoured the planted graft")
+  })
+  // The fixture is real: with the graft file read (GIT_GRAFT_FILE pointing at it), the false ancestry becomes true.
+  const leaked = await runOk('git', [
+    '-c', 'advice.graftFileDeprecated=false', '-C', clone, 'merge-base', '--is-ancestor', evil, 'origin/main',
+  ], { env: { ...env, GIT_GRAFT_FILE: join(clone, '.git', 'info', 'grafts') } }).then(() => 0).catch(() => 1)
+  assert.equal(leaked, 0, 'the fixture proved itself: the graft makes the false ancestry true')
+})
+
+test('safe.bareRepository=explicit refuses a -C into a bare repository, but --git-dir still works', async () => {
+  const dir = await tempDir()
+  const made = await makeClone(dir)
+  await asDish(dir, async () => {
+    const refused = await git(['-C', made.bare, 'rev-parse', '--is-bare-repository'], { env: NOSYSTEM })
+    assert.notEqual(refused.code, 0)
+    assert.match(refused.stderr, /safe\.bareRepository/)
+    // dish names a git dir explicitly, which is allowed.
+    assert.equal(await gitOk(['--git-dir', made.bare, 'rev-parse', '--is-bare-repository'], { env: NOSYSTEM }), 'true\n')
+  })
 })
 
 // --- git() is the one way -------------------------------------------------------------------------------------------

@@ -20,10 +20,13 @@ import { lstat, open, readdir, realpath } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { basename, isAbsolute, join } from 'node:path'
 import { maskSecrets } from 'dish-kit'
-import { GitError, gitOk } from './git.ts'
+import { GitError, gitOk, maskUrlPasswords } from './git.ts'
+
+/** When `expect.url` is given, origin's refspec must be exactly this, so a planted one can't fetch into `refs/remotes/origin/*` from elsewhere. */
+export const ORIGIN_FETCH = '+refs/heads/*:refs/remotes/origin/*'
 
 export interface CloneExpectations {
-  /** `remote.origin.url` must be exactly this (and be there). */
+  /** `remote.origin.url` must be exactly this (and be there), and `remote.origin.fetch`, when set, exactly `ORIGIN_FETCH`. */
   url?: string
   /** The one non-empty value a `credential.<web>.helper` may have: `helperValue(...)`. Without it, only `''` is allowed. */
   helper?: string
@@ -76,9 +79,9 @@ function normalizeKey(key: string): string {
   return first === last ? `${section}.${variable}` : `${section}.${key.slice(first + 1, last)}.${variable}`
 }
 
-/** A key as a problem shows it: control characters replaced, cut short. (The whole problem is masked after.) */
+/** A key as a problem shows it: a password in a subsection URL masked, control characters replaced, cut short. (The whole problem is masked after.) */
 function showKey(key: string): string {
-  return Array.from(key.replace(CONTROL, '?')).slice(0, MAX_KEY_CHARS).join('')
+  return Array.from(maskUrlPasswords(key).replace(CONTROL, '?')).slice(0, MAX_KEY_CHARS).join('')
 }
 
 function isAllowed(key: string): boolean {
@@ -105,6 +108,10 @@ function valueProblem(key: string, value: string, expect: CloneExpectations): st
     if (problem !== undefined) return `${shown} ${problem}`
     if (key === 'remote.origin.url' && expect.url !== undefined && value !== expect.url) return `remote.origin.url is not ${expect.url}`
     return undefined
+  }
+  // A planted origin refspec could fetch into refs/remotes/origin/* from elsewhere, so pin it once the URL is known.
+  if (key === 'remote.origin.fetch' && expect.url !== undefined && value !== ORIGIN_FETCH) {
+    return `remote.origin.fetch is not ${ORIGIN_FETCH}`
   }
   const credential = /^credential\.(.+)\.(helper|usehttppath)$/.exec(key)
   if (credential !== null) {
@@ -265,6 +272,14 @@ async function worktreeProblem(clone: string, path: string): Promise<string | un
     realClone = await realpath(clone)
   } catch {
     return `the clone ${clone} can't be resolved`
+  }
+  // The worktree path's own last component must not be a symbolic link: `git worktree remove` on a link that an agent
+  // swapped in would delete whatever it points at (`<clone>/src`). An intermediate link (a clone reached through one)
+  // is fine, so lstat the path itself, which follows every component but the last.
+  try {
+    if ((await lstat(path)).isSymbolicLink()) return `${path} is a symbolic link`
+  } catch {
+    return `${path} can't be read`
   }
   try {
     realPath = await realpath(path)

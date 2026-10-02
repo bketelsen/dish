@@ -11,6 +11,13 @@
  *   commands' submodule recursion off (`-c` beats an agent's `.gitmodules`), and `status`, `diff`, `diff-index` and
  *   `diff-files`, which look inside a nested repository to tell whether it is dirty, are refused unless the call
  *   passes `--ignore-submodules=dirty` or `=all` (only the command-line option beats `.gitmodules`' `ignore`).
+ * - no planted object rewrite: `core.useReplaceRefs=false` ignores a `refs/replace/<sha>` an agent wrote (which
+ *   otherwise makes `rev-parse`, `cat-file` and `worktree add <sha>` resolve to the agent's tree), and
+ *   `GIT_GRAFT_FILE=/dev/null` ignores a planted `.git/info/grafts` (which otherwise rewrites history, turning a
+ *   `merge-base --is-ancestor` from false to true). Only the env var switches grafts off, so it is set after the
+ *   scrub, which has dropped every inherited `GIT_*` name.
+ * - `safe.bareRepository=explicit`, so a bare repository an agent planted where dish `-C`s is refused unless named
+ *   with `--git-dir`. dish never `-C`s into a bare repository, so this changes nothing it does.
  * - the environment is `childEnvironment()`: no inherited `GIT_*` name (that could point git at another repository
  *   or config), nothing credential-shaped, no `DSH_*`, and `GIT_TERMINAL_PROMPT=0`.
  * - git runs detached: in its own session and process group, with no terminal to prompt on and stdin closed unless
@@ -27,10 +34,15 @@ import type { ChildProcess } from 'node:child_process'
 import { maskSecrets } from 'dish-kit'
 import { childEnvironment } from './env.ts'
 
-/** Passed before every git command dish runs: no hooks, no fsmonitor, no recursion into submodules, whatever the clone's own files say. */
+/**
+ * Passed before every git command dish runs, whatever the clone's own files say (`-c` beats every config file): no
+ * hooks, no fsmonitor, no recursion into submodules, no replace refs, and a bare repository only when named.
+ * Grafts are switched off through `GIT_GRAFT_FILE` in the environment, since no `-c` key does it.
+ */
 export const SAFE_FLAGS: readonly string[] = Object.freeze([
   '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
   '-c', 'fetch.recurseSubmodules=false', '-c', 'submodule.recurse=false',
+  '-c', 'core.useReplaceRefs=false', '-c', 'safe.bareRepository=explicit',
 ])
 /** How long one git command may run before its process group is killed. */
 export const DEFAULT_GIT_TIMEOUT_MS = 120_000
@@ -148,7 +160,9 @@ export function git(args: readonly string[], options: GitOptions = {}): Promise<
   return new Promise((resolve, reject) => {
     const child: ChildProcess = spawn('git', [...SAFE_FLAGS, ...args], {
       cwd: options.cwd,
-      env: { ...childEnvironment(), ...options.env },
+      // GIT_GRAFT_FILE after the scrub (which dropped every inherited GIT_*): only it switches a planted grafts file off.
+      // A caller's options.env still wins, for a test that must point it elsewhere.
+      env: { ...childEnvironment(), GIT_GRAFT_FILE: '/dev/null', ...options.env },
       detached: true,
       stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     })
@@ -259,8 +273,8 @@ function subcommand(args: readonly string[]): string {
   return at < 0 ? '' : Array.from(maskSecrets(args[at]!.replace(/[\x00-\x1f\x7f]/g, ' '))).slice(0, 40).join('')
 }
 
-/** A password in a URL (`scheme://user:secret@host`), masked. */
-function maskUrlPasswords(text: string): string {
+/** A password in a URL (`scheme://user:secret@host`), masked. `maskSecrets` doesn't cover these, so dish does. */
+export function maskUrlPasswords(text: string): string {
   return text.replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^/\s@:]*):[^/\s@]*@/gi, '$1:***@')
 }
 

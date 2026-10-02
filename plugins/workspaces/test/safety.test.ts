@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { access, appendFile, chmod, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { helperValue } from '../src/paths.ts'
-import { ALLOWED, checkClone, checkWorktree, configProblem } from '../src/safety.ts'
+import { ALLOWED, ORIGIN_FETCH, checkClone, checkWorktree, configProblem } from '../src/safety.ts'
 import type { CloneExpectations, SafetyResult } from '../src/safety.ts'
 import { makeClone, run, runOk, tempDir } from './helpers.ts'
 import type { Clone } from './helpers.ts'
@@ -192,6 +192,27 @@ test('remote.origin.url other than the expected URL is refused, and so is none a
   assert.match(problemOf(await checkClone(clone, EXPECT)), /no remote\.origin\.url/)
 })
 
+test('remote.origin.fetch must be exactly the standard refspec when the URL is expected', async () => {
+  const { clone, env } = await dishClone()
+  assert.equal(ORIGIN_FETCH, '+refs/heads/*:refs/remotes/origin/*')
+  assert.deepEqual(await checkClone(clone, EXPECT), { ok: true }, 'the refspec git clone wrote passes')
+  // A planted refspec that would fetch into refs/remotes/origin/* from another remote's heads.
+  await runOk('git', ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/upstream/*'], { cwd: clone, env })
+  assert.match(problemOf(await checkClone(clone, EXPECT)), /remote\.origin\.fetch is not \+refs\/heads\/\*:refs\/remotes\/origin\/\*/)
+  // Without an expected URL, the refspec isn't pinned (the clone's identity isn't established).
+  assert.deepEqual(await checkClone(clone, { web: WEB, helper: HELPER }), { ok: true })
+  await runOk('git', ['config', 'remote.origin.fetch', ORIGIN_FETCH], { cwd: clone, env })
+  assert.deepEqual(await checkClone(clone, EXPECT), { ok: true })
+})
+
+test('a URL password inside a key name is masked in the problem text', async () => {
+  const { clone } = await dishClone()
+  await appendFile(join(clone, '.git', 'config'), '[url "https://user:hunter2-pw@host/"]\n\tinsteadOf = x\n')
+  const problem = problemOf(await checkClone(clone, EXPECT))
+  assert.match(problem, /url\.https:\/\/user:\*\*\*@host/)
+  assert.equal(problem.includes('hunter2-pw'), false)
+})
+
 test("a problem never quotes a value, and shows a key's control characters and secrets masked", async () => {
   const { clone } = await dishClone()
   const config = join(clone, '.git', 'config')
@@ -310,6 +331,19 @@ test('checkWorktree passes a worktree as git made it, also when reached through 
   assert.deepEqual(await checkWorktree(clone, join(clone, '.worktrees', 'one')), { ok: true })
   await symlink(clone, join(dir, 'via-link'))
   assert.deepEqual(await checkWorktree(join(dir, 'via-link'), join(dir, 'via-link', '.worktrees', 'one')), { ok: true })
+})
+
+test('checkWorktree refuses a worktree path that is itself a symbolic link, so worktree remove never deletes its target', async () => {
+  const { clone, env, dir } = await dishClone()
+  await runOk('git', ['worktree', 'add', '-q', '-b', 'dish/one', '.worktrees/one'], { cwd: clone, env })
+  const path = join(clone, '.worktrees', 'one')
+  // The reviewer's swap: replace the worktree directory with a link at another tracked directory (`<clone>/src`).
+  await mkdir(join(clone, 'src'))
+  await rm(path, { recursive: true })
+  await symlink(join(clone, 'src'), path)
+  const result = await checkWorktree(clone, path)
+  assert.equal(result.ok, false)
+  assert.match(problemOf(result), /is a symbolic link/)
 })
 
 test('checkWorktree refuses a rewritten .git file, commondir or gitdir, a config.worktree, and a .git directory', async () => {
