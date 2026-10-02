@@ -6,6 +6,11 @@
  * - every call passes `SAFE_FLAGS`: hooks come from `/dev/null` and fsmonitor is off, whatever `.git/hooks` and
  *   `.git/config` say (`-c` beats every config file). Other keys that run programs (filters, drivers, includes, …)
  *   can't be turned off one by one: `checkClone` (safety.ts) refuses a clone that has them before dish works in it.
+ * - nothing recurses into a nested repository (a submodule, or any repository an agent made inside the clone and
+ *   `git add`ed): that repository's config is outside `checkClone`'s reach. `SAFE_FLAGS` turn fetch's and the other
+ *   commands' submodule recursion off (`-c` beats an agent's `.gitmodules`), and `status`, `diff`, `diff-index` and
+ *   `diff-files`, which look inside a nested repository to tell whether it is dirty, are refused unless the call
+ *   passes `--ignore-submodules=dirty` or `=all` (only the command-line option beats `.gitmodules`' `ignore`).
  * - the environment is `childEnvironment()`: no inherited `GIT_*` name (that could point git at another repository
  *   or config), nothing credential-shaped, no `DSH_*`, and `GIT_TERMINAL_PROMPT=0`.
  * - git runs detached: in its own session and process group, with no terminal to prompt on and stdin closed unless
@@ -22,8 +27,11 @@ import type { ChildProcess } from 'node:child_process'
 import { maskSecrets } from 'dish-kit'
 import { childEnvironment } from './env.ts'
 
-/** Passed before every git command dish runs: no hooks, no fsmonitor, whatever the clone's own files say. */
-export const SAFE_FLAGS: readonly string[] = Object.freeze(['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false'])
+/** Passed before every git command dish runs: no hooks, no fsmonitor, no recursion into submodules, whatever the clone's own files say. */
+export const SAFE_FLAGS: readonly string[] = Object.freeze([
+  '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+  '-c', 'fetch.recurseSubmodules=false', '-c', 'submodule.recurse=false',
+])
 /** How long one git command may run before its process group is killed. */
 export const DEFAULT_GIT_TIMEOUT_MS = 120_000
 
@@ -39,6 +47,10 @@ const MAX_ERROR_CHARS = 200
 const MAX_MASKED_CHARS = 64 * 1024
 /** The longest delay `setTimeout` takes. */
 const MAX_TIMER_MS = 2 ** 31 - 1
+/** Subcommands that run git inside a nested repository to see whether it is dirty, unless told not to. */
+const LOOKS_INSIDE_SUBMODULES: ReadonlySet<string> = new Set(['status', 'diff', 'diff-index', 'diff-files'])
+/** The values of `--ignore-submodules` that keep them from it. */
+const SUBMODULES_LEFT_ALONE: ReadonlySet<string> = new Set(['--ignore-submodules=dirty', '--ignore-submodules=all'])
 
 export interface GitOptions {
   /** The working directory. Default: this process's. */
@@ -97,11 +109,35 @@ class Capture {
 }
 
 /**
+ * Why `args` would let git look inside a nested repository, or `undefined`. For `status`, `diff`, `diff-index` and
+ * `diff-files`: every option of the `--ignore-submodules` family before the end of the options (git takes the last
+ * one, and abbreviations: `--ignore-sub=none`, `--no-ignore-submodules`) must be `--ignore-submodules=dirty` or
+ * `--ignore-submodules=all`, and there must be one.
+ */
+export function submoduleProblem(args: readonly string[]): string | undefined {
+  const at = subcommandIndex(args)
+  if (at < 0 || !LOOKS_INSIDE_SUBMODULES.has(args[at]!)) return undefined
+  let found = false
+  for (const arg of args.slice(at + 1)) {
+    if (arg === '--' || arg === '--end-of-options') break
+    if (!/^--(?:no-)?ignore-s/.test(arg)) continue
+    if (!SUBMODULES_LEFT_ALONE.has(arg)) return `git ${args[at]} refused: ${arg.split('=')[0]} must be --ignore-submodules=dirty or =all`
+    found = true
+  }
+  return found
+    ? undefined
+    : `git ${args[at]} refused: pass --ignore-submodules=dirty or --ignore-submodules=all, so git doesn't run inside a nested repository`
+}
+
+/**
  * `git ...SAFE_FLAGS ...args`, detached (its own process group), stdin `input` or closed, env childEnvironment() plus
  * `options.env`. A timeout or an abort kills the group. Output capped at 4 MB each. Never throws for an exit code;
- * throws only when git can't be started (or for a time limit that isn't a positive number of milliseconds).
+ * throws only when git can't be started, for a time limit that isn't a positive number of milliseconds, and, before
+ * starting anything, for a `status` or `diff*` call that `submoduleProblem` refuses.
  */
 export function git(args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
+  const refused = submoduleProblem(args)
+  if (refused !== undefined) return Promise.reject(new Error(refused))
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   if (!(typeof timeoutMs === 'number' && timeoutMs > 0 && timeoutMs <= MAX_TIMER_MS)) {
     return Promise.reject(new RangeError('git: timeoutMs must be a positive number of milliseconds'))
@@ -204,18 +240,23 @@ export async function gitOk(args: readonly string[], options: GitOptions = {}): 
 /** Global options of git that take their value as the next argument. */
 const VALUED_OPTIONS = new Set(['-c', '-C', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix', '--attr-source'])
 
-/** The subcommand of `args` (what follows git's own options), shown masked and short; `''` if there is none. */
-function subcommand(args: readonly string[]): string {
+/** Where the subcommand of `args` is (the first argument after git's own options), or -1 if there is none. */
+function subcommandIndex(args: readonly string[]): number {
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!
     if (VALUED_OPTIONS.has(arg)) {
       index++
       continue
     }
-    if (arg.startsWith('-')) continue
-    return Array.from(maskSecrets(arg.replace(/[\x00-\x1f\x7f]/g, ' '))).slice(0, 40).join('')
+    if (!arg.startsWith('-')) return index
   }
-  return ''
+  return -1
+}
+
+/** The subcommand of `args`, shown masked and short; `''` if there is none. */
+function subcommand(args: readonly string[]): string {
+  const at = subcommandIndex(args)
+  return at < 0 ? '' : Array.from(maskSecrets(args[at]!.replace(/[\x00-\x1f\x7f]/g, ' '))).slice(0, 40).join('')
 }
 
 /** A password in a URL (`scheme://user:secret@host`), masked. */

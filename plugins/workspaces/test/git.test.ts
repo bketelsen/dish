@@ -1,10 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { access, chmod, readFile, readdir, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DEFAULT_GIT_TIMEOUT_MS, GitError, SAFE_FLAGS, git, gitOk } from '../src/git.ts'
+import { DEFAULT_GIT_TIMEOUT_MS, GitError, SAFE_FLAGS, git, gitOk, submoduleProblem } from '../src/git.ts'
 import { NOSYSTEM, dishHome, makeClone, runOk, scratchGitEnv, tempDir, withEnv } from './helpers.ts'
+import type { Clone } from './helpers.ts'
 
 /** Shaped like a GitHub installation token (`ghs_` and 40 letters and digits); not one. */
 const TOKEN = `ghs_${'Ab1Cd2Ef3G'.repeat(4)}`
@@ -53,8 +54,11 @@ async function asDish<T>(dir: string, body: () => Promise<T>): Promise<T> {
   return withEnv(await dishHome(dir), body)
 }
 
-test('SAFE_FLAGS turn hooks and fsmonitor off, and every call passes them', async () => {
-  assert.deepEqual(SAFE_FLAGS, ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false'])
+test('SAFE_FLAGS turn hooks, fsmonitor and submodule recursion off, and every call passes them', async () => {
+  assert.deepEqual(SAFE_FLAGS, [
+    '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+    '-c', 'fetch.recurseSubmodules=false', '-c', 'submodule.recurse=false',
+  ])
   assert.equal(Object.isFrozen(SAFE_FLAGS), true)
   assert.equal(DEFAULT_GIT_TIMEOUT_MS, 120_000)
   const dir = await tempDir()
@@ -62,6 +66,8 @@ test('SAFE_FLAGS turn hooks and fsmonitor off, and every call passes them', asyn
     // `-c` values are what `git config --get` reads first: the flags reached git.
     assert.equal(await gitOk(['config', '--get', 'core.hooksPath'], { cwd: dir, env: NOSYSTEM }), '/dev/null\n')
     assert.equal(await gitOk(['config', '--get', 'core.fsmonitor'], { cwd: dir, env: NOSYSTEM }), 'false\n')
+    assert.equal(await gitOk(['config', '--get', 'fetch.recurseSubmodules'], { cwd: dir, env: NOSYSTEM }), 'false\n')
+    assert.equal(await gitOk(['config', '--get', 'submodule.recurse'], { cwd: dir, env: NOSYSTEM }), 'false\n')
   })
 })
 
@@ -76,7 +82,7 @@ test('a version call works', async () => {
 
 test('a non-zero exit is a result, not a throw', async () => {
   const dir = await tempDir()
-  const result = await asDish(dir, () => git(['-C', join(dir, 'missing'), 'status'], { cwd: dir, env: NOSYSTEM }))
+  const result = await asDish(dir, () => git(['-C', join(dir, 'missing'), 'status', '--ignore-submodules=dirty'], { cwd: dir, env: NOSYSTEM }))
   assert.equal(result.code, 128)
   assert.notEqual(result.stderr, '')
   assert.equal(result.timedOut, false)
@@ -217,7 +223,7 @@ test('gitOk throws a GitError for a timeout and for an abort', async () => {
     assert.equal(timedOut.message, 'git slow timed out after 100 ms')
     const controller = new AbortController()
     controller.abort()
-    const aborted = await gitOk(['status'], { cwd: dir, signal: controller.signal }).catch((e: unknown) => e)
+    const aborted = await gitOk(['status', '--ignore-submodules=dirty'], { cwd: dir, signal: controller.signal }).catch((e: unknown) => e)
     assert.ok(aborted instanceof GitError)
     assert.equal(aborted.message, 'git status was aborted')
   })
@@ -267,11 +273,132 @@ test("a core.fsmonitor command planted in .git/config doesn't run on dish's stat
   await chmod(script, 0o755)
   await runOk('git', ['config', 'core.fsmonitor', script], { cwd: clone, env })
 
-  await asDish(dir, () => gitOk(['status', '--porcelain'], { cwd: clone, env: NOSYSTEM }))
+  await asDish(dir, () => gitOk(['status', '--porcelain', '--ignore-submodules=dirty'], { cwd: clone, env: NOSYSTEM }))
   assert.equal(await exists(marker), false, "dish's git ran the planted fsmonitor")
 
   await runOk('git', ['status', '--porcelain'], { cwd: clone, env })
   assert.match(await readFile(marker, 'utf8'), /^ran\n/)
+})
+
+// --- a nested repository agents could plant can't choose what dish's git runs --------------------------------------
+
+/**
+ * A repository `nested` inside `clone`, with a filter whose program writes `marker`, committed as a gitlink. git runs
+ * the filter when it looks inside `nested` to see whether it is dirty. Returns the clone's scratch git env and `marker`.
+ */
+async function withPlantedNested(clone: Clone, dir: string): Promise<{ marker: string, script: string }> {
+  const marker = join(dir, 'nested-filter-ran')
+  const script = join(dir, 'filter.sh')
+  await writeFile(script, `#!/bin/sh\necho ran >> '${marker}'\ncat\n`)
+  await chmod(script, 0o755)
+  const nested = join(clone.clone, 'nested')
+  await runOk('git', ['init', '-q', '-b', 'main', nested], { env: clone.env })
+  await writeFile(join(nested, '.gitattributes'), '* filter=evil\n')
+  await writeFile(join(nested, 'f'), 'x\n')
+  await runOk('git', ['-C', nested, 'add', '-A'], { env: clone.env })
+  await runOk('git', ['-C', nested, 'commit', '-q', '-m', 'nested'], { env: clone.env })
+  await runOk('git', ['-C', clone.clone, 'add', 'nested'], { env: clone.env })
+  await runOk('git', ['-C', clone.clone, 'commit', '-q', '-m', 'add nested'], { env: clone.env })
+  // The filter is configured only now, after the gitlink is committed, so nothing in this fixture runs it. A recursing
+  // status runs `git status` inside `nested`, which runs the clean filter on the dirty `f`: that is the planted program.
+  await runOk('git', ['-C', nested, 'config', 'filter.evil.clean', script], { env: clone.env })
+  await runOk('git', ['-C', nested, 'config', 'filter.evil.smudge', script], { env: clone.env })
+  await writeFile(join(nested, 'f'), 'changed\n')
+  if (await exists(marker)) throw new Error('the fixture ran the filter itself')
+  return { marker, script }
+}
+
+test("status and diff with --ignore-submodules=dirty never run a nested repository's filter (and do run it without the flag)", async () => {
+  const dir = await tempDir()
+  const made = await makeClone(dir)
+  const { marker } = await withPlantedNested(made, dir)
+  const { clone } = made
+  await asDish(dir, async () => {
+    for (const args of [
+      ['status', '--porcelain', '--ignore-submodules=dirty'],
+      ['status', '--porcelain', '--ignore-submodules=all'],
+      ['diff', '--quiet', '--ignore-submodules=dirty'],
+      ['diff-index', '--quiet', '--ignore-submodules=dirty', 'HEAD'],
+      ['diff-files', '--quiet', '--ignore-submodules=dirty'],
+    ]) {
+      await git(['-C', clone, ...args], { env: NOSYSTEM })
+      assert.equal(await exists(marker), false, `${args.join(' ')} ran the nested filter`)
+    }
+  })
+  // The fixture is real: a plain status (what git runs directly) recurses into the nested repository and runs it.
+  await runOk('git', ['-C', clone, 'status', '--porcelain'], { env: made.env })
+  assert.match(await readFile(marker, 'utf8'), /^ran\n/)
+})
+
+test('a status or diff* call without --ignore-submodules=dirty/all is refused before git starts', async () => {
+  const dir = await tempDir()
+  const made = await makeClone(dir)
+  const { marker } = await withPlantedNested(made, dir)
+  const { clone } = made
+  await asDish(dir, async () => {
+    for (const args of [
+      ['status', '--porcelain'],
+      ['status', '--porcelain', '--ignore-submodules=none'],
+      ['status', '--porcelain', '--ignore-submodules'],
+      ['status', '--porcelain', '--no-ignore-submodules'],
+      ['status', '--ignore-submodules=all', '--ignore-submodules=none'],
+      ['diff'],
+      ['diff-index', 'HEAD'],
+      ['diff-files'],
+    ]) {
+      await assert.rejects(git(['-C', clone, ...args], { env: NOSYSTEM }), /--ignore-submodules/, args.join(' '))
+    }
+    assert.equal(await exists(marker), false, 'a refused call started git anyway')
+  })
+})
+
+test("fetch doesn't recurse into a nested repository (and does without SAFE_FLAGS' submodule settings)", async () => {
+  const dir = await tempDir()
+  const made = await makeClone(dir)
+  const { clone } = made
+  const marker = join(dir, 'uploadpack-ran')
+  const uploadpack = join(dir, 'uploadpack.sh')
+  await writeFile(uploadpack, `#!/bin/sh\necho ran >> '${marker}'\nexit 1\n`)
+  await chmod(uploadpack, 0o755)
+  const nested = join(clone, 'nested')
+  await runOk('git', ['init', '-q', '-b', 'main', nested], { env: made.env })
+  await writeFile(join(nested, 'f'), 'x\n')
+  await runOk('git', ['-C', nested, 'add', '-A'], { env: made.env })
+  await runOk('git', ['-C', nested, 'commit', '-q', '-m', 'n'], { env: made.env })
+  await runOk('git', ['-C', nested, 'remote', 'add', 'origin', made.bare], { env: made.env })
+  await runOk('git', ['-C', nested, 'config', 'remote.origin.uploadpack', uploadpack], { env: made.env })
+  // An agent's .gitmodules, committed with the gitlink so recursion treats `nested` as a submodule to fetch.
+  await writeFile(join(clone, '.gitmodules'), '[submodule "nested"]\n\tpath = nested\n\turl = ./nested\n\tfetchRecurseSubmodules = true\n')
+  await runOk('git', ['-C', clone, 'add', '.gitmodules', 'nested'], { env: made.env })
+  await runOk('git', ['-C', clone, 'commit', '-q', '-m', 'add submodule'], { env: made.env })
+
+  await asDish(dir, () => git(['-C', clone, 'fetch', 'origin'], { env: NOSYSTEM }))
+  assert.equal(await exists(marker), false, "dish's fetch recursed into the nested repository")
+
+  // Without the two settings (but with the hook and fsmonitor ones), the same fetch runs the nested uploadpack.
+  await runOk('git', [
+    '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', clone, 'fetch', 'origin',
+  ], { env: made.env }).catch(() => {})
+  assert.equal(await exists(marker), true, 'the fixture proved itself: the nested uploadpack runs without the flags')
+})
+
+test('submoduleProblem: only status and diff* are guarded, and only before the end of options', () => {
+  assert.equal(submoduleProblem(['log', '--oneline']), undefined)
+  assert.equal(submoduleProblem(['worktree', 'add', 'x']), undefined)
+  assert.equal(submoduleProblem(['fetch', 'origin']), undefined)
+  assert.equal(submoduleProblem([]), undefined)
+  for (const sub of ['status', 'diff', 'diff-index', 'diff-files']) {
+    assert.match(submoduleProblem([sub]) ?? '', /--ignore-submodules/, sub)
+    assert.equal(submoduleProblem(['-C', '/x', sub, '--ignore-submodules=dirty']), undefined, sub)
+    assert.equal(submoduleProblem([sub, '--ignore-submodules=all']), undefined, sub)
+    assert.match(submoduleProblem([sub, '--ignore-submodules=none']) ?? '', /--ignore-submodules/, sub)
+    assert.match(submoduleProblem([sub, '--ignore-sub=untracked']) ?? '', /--ignore-sub/, sub)
+    assert.match(submoduleProblem([sub, '--no-ignore-submodules']) ?? '', /--no-ignore-submodules/, sub)
+    // The last one wins, as it does for git: a good one then a bad one is still refused.
+    assert.match(submoduleProblem([sub, '--ignore-submodules=all', '--ignore-submodules=none']) ?? '', /--ignore-submodules/, sub)
+    // A pathspec after `--` that looks like the option is not an option.
+    assert.match(submoduleProblem([sub, '--', '--ignore-submodules=all']) ?? '', /--ignore-submodules/, sub)
+  }
 })
 
 // --- git() is the one way -------------------------------------------------------------------------------------------
