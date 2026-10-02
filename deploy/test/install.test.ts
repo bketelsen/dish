@@ -257,7 +257,8 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal((JSON.parse(modules) as { storeDir: string }).storeDir, store, "the profile records the account's store")
 
   // A bundle that goes missing (a failed first run, or a removal) is linked again, and only that one.
-  const removal = await run('pnpm', ['exec', 'dsh', 'plugin', '--profile', 'web', 'remove', 'dish-judge'], scratch)
+  // Run directly, not through the install, so DSH_DISH_HOME (which the scratch has, like `pnpm dev`) is taken away here.
+  const removal = await run('pnpm', ['exec', 'dsh', 'plugin', '--profile', 'web', 'remove', 'dish-judge'], scratch, { ...scratch.env, DSH_DISH_HOME: undefined })
   assert.equal(removal.code, 0, removal.stderr)
   const repair = await run(INSTALL, [], scratch)
   assert.equal(repair.code, 0, repair.stderr)
@@ -265,6 +266,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.match(repair.stdout, /install: dish rows \(.*\): unchanged/)
   const repairCalls = dshCalls(scratch).slice(7)
   assert.equal(repairCalls.length, 2, 'the removal, and one `plugin add`')
+  assert.equal(repairCalls[0].instanceHome, undefined, 'the removal ran without DSH_DISH_HOME')
   assertIsolated(scratch, repairCalls.slice(1))
   assertRowsFirst(repairCalls)
 
@@ -272,6 +274,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   const throwaway = join(scratch.dir, 'throwaway')
   const dump = await run('pnpm', ['exec', 'dsh', '--profile', 'web', '--dump-config'], scratch, {
     ...scratch.env,
+    DSH_DISH_HOME: undefined,
     XDG_CONFIG_HOME: join(throwaway, 'config'),
     XDG_STATE_HOME: join(throwaway, 'state'),
     XDG_DATA_HOME: join(throwaway, 'data'),

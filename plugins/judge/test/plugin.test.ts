@@ -1576,3 +1576,26 @@ test('withhold of a short key leaves the content as it is: only a key of 20 char
     await stub.dispose()
   }
 })
+
+// DSH_DISH_HOME moves every dish directory ahead of XDG_*. A parent environment that has it (a `pnpm dev` shell) must not
+// leak into the tests that steer dish's directories with XDG_*: withEnv hides it for its body and puts it back.
+test('withEnv hides an inherited DSH_DISH_HOME, so XDG_* steer dish in its body, and puts it back', async () => {
+  const root = await tempDir()
+  const instance = join(root, 'instance')
+  const inherited = process.env.DSH_DISH_HOME
+  process.env.DSH_DISH_HOME = instance
+  try {
+    await withEnv({ XDG_STATE_HOME: join(root, 'xdg') }, async () => {
+      assert.equal(process.env.DSH_DISH_HOME, undefined)
+      assert.equal(xdgPaths('dish').state, join(root, 'xdg', 'dish'))
+      assert.equal(plugin.stateDirectoryPath(undefined), join(root, 'xdg', 'dish', 'judge'))
+    })
+    assert.equal(process.env.DSH_DISH_HOME, instance, 'put back after the body')
+    await assert.rejects(withEnv({ XDG_STATE_HOME: join(root, 'xdg') }, async () => { throw new Error('boom') }), /boom/)
+    assert.equal(process.env.DSH_DISH_HOME, instance, 'put back after a failing body too')
+    assert.equal(existsSync(instance), false, 'nothing was written under DSH_DISH_HOME')
+  } finally {
+    if (inherited === undefined) delete process.env.DSH_DISH_HOME
+    else process.env.DSH_DISH_HOME = inherited
+  }
+})
