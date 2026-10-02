@@ -1,0 +1,7 @@
+# The web plugin's host row (settings over the tailnet). It does nothing unless the
+# profile is dsh's web one (it waits for `webRuntime`) and `--trusted-host` names a
+# DNS name. Config: `enabled` (true by default) and `hosts` (overrides the page hosts
+# derived from the trusted hosts; DNS names only).
+- insert:
+    - id: dish-web
+      name: dish-web

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install dish into a dsh profile: build, create the profile, write dish's rows, link the six bundles.
+# Install dish into a dsh profile: build, create the profile, write dish's rows, link its bundles.
 #
 # Run it from anywhere as the account that runs `dsh web` (it moves to the checkout's root itself). It is idempotent: a
 # second run changes nothing, and says so on its last line.
@@ -97,7 +97,7 @@ run_dsh() {
     pnpm exec dsh "$@"
 }
 
-bundles=(copilot config prompts skills crew judge)
+bundles=(copilot config prompts skills crew judge web)
 profile_dir="${DSH_HOME:-$HOME/.dsh}/profiles/$profile"
 patch="$profile_dir/cordis.patch.yml"
 changed=0
