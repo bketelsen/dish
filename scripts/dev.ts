@@ -7,7 +7,9 @@
  *   store never has a remote, so it can never push over prod's) and the checkout's git identity. It is idempotent, so
  *   every run does it: the install, the build, and on the first run the profile, then any new bundle.
  * 3. Start the plugins' client bundle watchers (`pnpm ... run dev`) and `dsh web` on `127.0.0.1:<port>` (3090), and print
- *   `dev: open <url>` after dsh's own sign-in line.
+ *   `dev: open <url>` after dsh's own sign-in line. Neither gets install.sh's inputs (`DISH_REMOTE`, `DISH_USER_NAME`,
+ *   `DISH_USER_EMAIL`, `DISH_PROFILE`), set here or inherited: dsh passes its environment on to agent shells, where an
+ *   install.sh run by hand would find an inherited remote and make dev's store push to it.
  *
  * When one of the two stops, the other is stopped. The exit code is the first non-zero code of the two, or 128+n when
  * this process was itself sent signal n.
@@ -108,6 +110,20 @@ export function installEnvironment(devEnv: NodeJS.ProcessEnv, identity: { name: 
     DISH_USER_EMAIL: identity.email,
     DISH_PROFILE: 'web',
   }
+}
+
+/** install.sh's inputs, which dsh and the watchers never get (`serverEnvironment`). */
+const INSTALL_INPUTS = ['DISH_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL', 'DISH_PROFILE'] as const
+
+/**
+ * `devEnv` less install.sh's inputs, whatever it inherited: what dsh and the watchers get. dsh passes its environment on
+ * to every agent shell, and an install.sh run there by hand would take an inherited DISH_REMOTE (the real one, from a
+ * shell or an .envrc on the desktop) and make dev's config store a second pusher of prod's.
+ */
+export function serverEnvironment(devEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...devEnv }
+  for (const name of INSTALL_INPUTS) delete env[name]
+  return env
 }
 
 const SIGN_IN_LINE = /^dsh web: (https?:\/\/\S+)/
@@ -259,6 +275,7 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
     return 1
   }
   const env = devEnvironment(root, inherited)
+  const serverEnv = serverEnvironment(env)
 
   const children: Running[] = []
   const guard = guardSignals(() => children)
@@ -285,13 +302,13 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
 
     const watchers = start('the watchers', 'pnpm', ['--filter', './plugins/*', '--parallel', '--if-present', 'run', 'dev'], {
       cwd: root,
-      env,
+      env: serverEnv,
       stdio: 'inherit',
       detached: true,
     }, { forwarding: WATCHER_SIGNALS, group: true })
     const server = start('dsh', join(root, 'node_modules', '.bin', 'dsh'), [
       'web', '--host', '127.0.0.1', '--port', String(port), '--no-open',
-    ], { cwd: root, env, stdio: ['inherit', 'pipe', 'inherit'], detached: true }, { forwarding: DSH_SIGNALS })
+    ], { cwd: root, env: serverEnv, stdio: ['inherit', 'pipe', 'inherit'], detached: true }, { forwarding: DSH_SIGNALS })
     children.push(watchers, server)
 
     let announced = false

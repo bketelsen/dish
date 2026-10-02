@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { UsageError } from '../env.ts'
-import { DEFAULT_PORT, gitIdentity, installEnvironment, main, parseDevArgs, signInLink } from '../dev.ts'
+import { DEFAULT_PORT, gitIdentity, installEnvironment, main, parseDevArgs, serverEnvironment, signInLink } from '../dev.ts'
 
 const DEV = fileURLToPath(new URL('../dev.ts', import.meta.url))
 const REPO = fileURLToPath(new URL('../..', import.meta.url))
@@ -123,6 +123,25 @@ test('installEnvironment: the remote is always empty, the profile is web, the id
 test('installEnvironment: adds exactly its four names to an environment that has none of them', () => {
   const result = installEnvironment({ PATH: BASE_PATH }, { name: 'n', email: 'e@x' })
   assert.deepEqual(Object.keys(result).sort(), ['DISH_PROFILE', 'DISH_REMOTE', 'DISH_USER_EMAIL', 'DISH_USER_NAME', 'PATH'])
+})
+
+// ---- serverEnvironment ------------------------------------------------------------------------------------------
+
+test('serverEnvironment: install.sh\'s four inputs are taken out, whatever their values, and nothing else is', () => {
+  const devEnv: NodeJS.ProcessEnv = {
+    PATH: BASE_PATH,
+    DSH_HOME: '/r/.dev/dsh',
+    DSH_DISH_HOME: '/r/.dev',
+    DISH_ENV: 'dev',
+    DISH_REMOTE: 'git@github-dish-config:bketelsen/dish-config.git',
+    DISH_PROFILE: 'web',
+    DISH_USER_NAME: 'inherited',
+    DISH_USER_EMAIL: '',
+    OTHER: 'kept',
+  }
+  const before = { ...devEnv }
+  assert.deepEqual(serverEnvironment(devEnv), { PATH: BASE_PATH, DSH_HOME: '/r/.dev/dsh', DSH_DISH_HOME: '/r/.dev', DISH_ENV: 'dev', OTHER: 'kept' })
+  assert.deepEqual(devEnv, before, 'the input is not modified')
 })
 
 // ---- gitIdentity ------------------------------------------------------------------------------------------------
@@ -445,7 +464,13 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
       exitAfterMs: 400,
     },
   })
-  fixture.env.DISH_REMOTE = 'git@github-dish-config:bketelsen/dish-config.git'
+  // install.sh's inputs, as a shell or an .envrc on the desktop might have them: the real remote among them.
+  Object.assign(fixture.env, {
+    DISH_REMOTE: 'git@github-dish-config:bketelsen/dish-config.git',
+    DISH_USER_NAME: 'Inherited Name',
+    DISH_USER_EMAIL: 'inherited@example.com',
+    DISH_PROFILE: 'inherited-profile',
+  })
   fixture.env.DSH_HOME = '/elsewhere'
   const run = await launch(fixture, ['--port', '3999'])
   try {
@@ -456,6 +481,7 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
     assert.ok(install!.includes('DISH_REMOTE=[] '), `an inherited remote is emptied: ${install}`)
     assert.ok(install!.includes('DISH_PROFILE=[web]'), install)
     assert.ok(/DISH_USER_NAME=\[[^\]]+\]/.test(install!) && /DISH_USER_EMAIL=\[[^\]]+@[^\]]+\]/.test(install!), install)
+    assert.ok(!install!.includes('nherited'), `the identity is the checkout's, not the inherited one: ${install}`)
     assert.ok(install!.includes(`DSH_HOME=[${join(fixture.root, '.dev', 'dsh')}]`), `DSH_HOME is the dev one: ${install}`)
     assert.ok(install!.includes(`DSH_DISH_HOME=[${join(fixture.root, '.dev')}]`), install)
     assert.ok(install!.includes('DISH_ENV=[dev]'), install)
@@ -474,11 +500,10 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
     assert.equal(watchers.cwd, fixture.root)
     assert.equal(watchers.DSH_DISH_HOME, join(fixture.root, '.dev'))
 
-    // Nothing of the install's reaches dsh or the watchers (nor, through dsh, an agent's shell). DISH_REMOTE is there
-    // only because the test's environment had it, and as it had it: the install got the empty one, not them.
+    // Neither the install's inputs nor the inherited ones reach dsh or the watchers (nor, through dsh, an agent's shell,
+    // where an install.sh run by hand would otherwise find the real remote and make dev's store a second pusher).
     for (const [name, seen] of [['dsh', dsh], ['the watchers', watchers]] as const) {
-      assert.deepEqual(seen.dishNames, ['DISH_ENV', 'DISH_REMOTE'], `${name}: no DISH_USER_NAME, DISH_USER_EMAIL or DISH_PROFILE`)
-      assert.equal(seen.DISH_REMOTE, 'git@github-dish-config:bketelsen/dish-config.git', `${name}: the remote as inherited`)
+      assert.deepEqual(seen.dishNames, ['DISH_ENV'], `${name}: only DISH_ENV, whatever the parent had`)
     }
     // dsh and the watchers each lead a process group of their own, apart from pnpm dev's (the wrapper's).
     for (const [name, seen] of [['dsh', dsh], ['the watchers', watchers]] as const) {
