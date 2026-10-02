@@ -1,5 +1,5 @@
 /**
- * The wire shapes shared by the server remote (`remote.ts`) and the Prompts page (`client/`). Types and one constant,
+ * The wire shapes shared by the server remote (`remote.ts`) and the Prompts page (`client/`). Types and constants,
  * so both halves can import it, and it imports nothing: the browser build must not reach into the store (or, through
  * it, into Node's modules). `CommitInfo` is therefore declared here, as `dish-config`'s own `protocol.ts` declares it,
  * and `remote.ts` checks at compile time that the store's type fits it, so a change to either side is a type error.
