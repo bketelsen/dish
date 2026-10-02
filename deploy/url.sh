@@ -54,8 +54,10 @@ main() {
   if [ "$(id -u)" != 0 ]; then die 2 'run url.sh as root (incus exec gives root)'; fi
 
   step="finding the account and its home"
-  local root account entry uid home
-  root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+  local self root account entry uid home
+  # The script's real path, so that a symlink to it still finds the checkout it sits in.
+  self=$(readlink -f -- "${BASH_SOURCE[0]}")
+  root=$(cd -- "$(dirname -- "$self")/.." && pwd -P)
   account=$(stat -c %U -- "$root")
   if [ "$account" = root ]; then die 1 "$root is owned by root; url.sh needs the account that runs dish-web.service to own the checkout"; fi
   entry=$(getent passwd "$account") || die 1 "can't look up the account $account (the owner of $root) with getent"
@@ -95,7 +97,7 @@ main() {
   step='reading the journal'
   local journal
   journal=$(journalctl "_UID=$uid" _SYSTEMD_USER_UNIT=dish-web.service --since "$started" --no-pager -o cat) ||
-    die 1 "can't read the journal of dish-web.service (is this root?)"
+    die 1 "can't read the journal of dish-web.service since $started"
   # Process substitution, not a here-string: older bash writes a here-string to a temporary file.
   local token='' token_re='[?&]token=([A-Za-z0-9_-]+)'
   while IFS= read -r line; do

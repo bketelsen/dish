@@ -11,8 +11,8 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir, userInfo } from 'node:os'
+import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -28,7 +28,8 @@ const STARTED = 'Fri 2026-10-02 10:15:30 UTC'
 /** What the journal holds. It's looked for on stderr, so it must never be a substring of a word the script says. */
 const TOKEN = 'Zq9-SECRETsecret_0123456789'
 const OLD_TOKEN = 'Aa1-OLDold_9876543210'
-const OWNER = userInfo().username
+/** The checkout's owner as the stat stub reports it; the account the script must ask getent and systemctl about. */
+const OWNER = 'dish'
 
 /** `systemctl show` for a service that's running. */
 const SHOW_RUNNING = `MainPID=4321\nExecMainStartTimestamp=${STARTED}\n`
@@ -61,10 +62,15 @@ cat "$DISH_TEST_DIR/state/show"
 if [ -f "$DISH_TEST_DIR/state/journalctl-fails" ]; then echo "journalctl: no access" >&2; exit 1; fi
 cat "$DISH_TEST_DIR/state/journal"
 `,
-  // The checkout's owner is whoever the test is, unless the test says the checkout is root's.
+  // The owner of the checkout is a fixed name, whoever runs the tests (so the suite passes as root too), and the name
+  // the test file says if it changes it. Any other path has another owner, so a script that looks at the wrong
+  // directory, such as a symlink's, gets the wrong account.
   stat: `
-if [ -f "$DISH_TEST_DIR/state/owner" ] && [ "$1" = -c ] && [ "$2" = %U ]; then cat "$DISH_TEST_DIR/state/owner"; exit 0; fi
-exec /usr/bin/stat "$@"
+if [ "$1" = -c ] && [ "$2" = %U ] && [ "$3" = -- ] && [ "$#" -eq 4 ]; then
+  if [ "$4" = "$(cat "$DISH_TEST_DIR/state/checkout")" ]; then cat "$DISH_TEST_DIR/state/owner"; else echo not-the-checkout-owner; fi
+  exit 0
+fi
+echo "unexpected stat call" >&2; exit 99
 `,
 }
 
@@ -122,6 +128,8 @@ async function makeHost(): Promise<Host> {
     },
   }
   await host.state('uid', '0\n')
+  await host.state('owner', `${OWNER}\n`)
+  await host.state('checkout', await realpath(join(dir, 'dish')))
   await host.state('show', SHOW_RUNNING)
   await host.state('journal', `systemd: starting\ndsh web: http://127.0.0.1:3080/?token=${TOKEN}\nsome later line\n`)
   await host.deployEnv(`DISH_TRUSTED_HOST=${HOST}\n`)
@@ -138,7 +146,7 @@ interface Result {
  * Run the script on the host, with only the stubs' directory and the real PATH in its environment. Whatever the case,
  * stdout is empty or exactly one line, and neither token is on stderr.
  */
-async function run(host: Host, args: string[] = [], extraEnv: Record<string, string> = {}): Promise<Result> {
+async function run(host: Host, args: string[] = [], extraEnv: Record<string, string> = {}, script: string = host.script): Promise<Result> {
   const env = {
     PATH: `${join(host.dir, 'stubs')}:${process.env.PATH ?? '/usr/bin:/bin'}`,
     HOME: join(host.dir, 'rhome'),
@@ -148,7 +156,7 @@ async function run(host: Host, args: string[] = [], extraEnv: Record<string, str
   }
   let result: Result
   try {
-    const { stdout, stderr } = await execFileAsync(host.script, args, { env, encoding: 'utf8', timeout: 30_000 })
+    const { stdout, stderr } = await execFileAsync(script, args, { env, encoding: 'utf8', timeout: 30_000 })
     result = { code: 0, stdout, stderr }
   } catch (error) {
     const failure = error as { code?: unknown; stdout?: string; stderr?: string }
@@ -257,7 +265,7 @@ test("systemctl failing, or the journal not being readable, is exit 1 and says w
   const second = await run(other)
   assert.equal(second.code, 1)
   assert.equal(second.stdout, '')
-  assert.match(second.stderr, /journal/)
+  assert.ok(second.stderr.includes(`can't read the journal of dish-web.service since ${STARTED}`), second.stderr)
 })
 
 test("a journal with no sign-in line since the start is exit 1, naming the start and saying to try again", async () => {
@@ -377,6 +385,18 @@ test('it never writes: the host holds the same files after a run as before', asy
   assert.equal(await readFile(join(host.home, '.config', 'dish', 'deploy.env'), 'utf8'), before)
   assert.ok(!existsSync(join(host.home, '.local')), 'it made a state directory')
   assert.ok(!existsSync(join(host.home, 'work')), 'it made ~/work')
+})
+
+test('run through a symlink, it still finds the checkout it sits in, and so its owner', async () => {
+  const host = await makeHost()
+  const link = join(host.dir, 'elsewhere', 'link-to-url.sh')
+  await mkdir(join(host.dir, 'elsewhere'), { recursive: true })
+  await symlink(host.script, link)
+  const result = await run(host, [], {}, link)
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(result.stdout, `https://${HOST}/?token=${TOKEN}\n`)
+  assert.deepEqual(host.calls('getent'), [['passwd', OWNER]])
+  assert.equal(host.calls('systemctl')[0]?.[2], `${OWNER}@`)
 })
 
 test('url.sh is committed executable', async () => {
