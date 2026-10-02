@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
+import { appendFile, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
@@ -359,6 +359,28 @@ test('a torn last line, with no newline, is left on its own: the next append doe
   assert.deepEqual((await dayLines(directory, '2026-10-02')).map(one => one.callId), ['new-2'])
   assert.deepEqual((await dayLines(directory, '2026-10-03')).map(one => one.callId), ['ok', 'new-3'])
   assert.deepEqual((await dayLines(directory, '2026-10-04')).map(one => one.callId), ['new-4'])
+})
+
+test('an append that fails partway leaves the start of its line, and the next append does not glue to it', async () => {
+  const { directory } = await scratch()
+  const file = join(directory, '2026-10-01.jsonl')
+  const log = new JudgeLog(directory)
+  await log.write(line({ callId: 'before' }))
+  // A short write and then ENOSPC leaves the first part of the line. To fail an append for real, the day file is moved
+  // aside and a directory put in its place; the part of the line that the failed append would have left is then added
+  // by hand, and the file put back.
+  await rename(file, `${file}.aside`)
+  await mkdir(file)
+  await assert.rejects(log.write(line({ callId: 'failed' })), { code: 'EISDIR' })
+  await rm(file, { recursive: true })
+  await appendFile(`${file}.aside`, JSON.stringify(line({ callId: 'failed' })).slice(0, 60))
+  await rename(`${file}.aside`, file)
+  await log.write(line({ callId: 'after-1' }))
+  await log.write(line({ callId: 'after-2' }))
+  const page = await log.read({})
+  assert.deepEqual(page.lines.map(one => one.callId), ['after-2', 'after-1', 'before'])
+  assert.equal(page.skipped, 1, 'the torn line, and not one more')
+  assert.equal((await readFile(file, 'utf8')).includes('\n\n'), false, 'no blank line is left')
 })
 
 test('concurrent writes are all kept, one whole line each, in the order they were made', async () => {
