@@ -288,13 +288,6 @@ process.on('uncaughtException', error => {
   process.exit(1)
 })
 process.on('exit', code => fs.writeFileSync(process.env.STUB_LOG + '/' + role + '.exit', String(code)))
-log('start ' + JSON.stringify({
-  argv: process.argv.slice(2), cwd: process.cwd(), pid: process.pid, pgrp,
-  DSH_HOME: process.env.DSH_HOME, DSH_DISH_HOME: process.env.DSH_DISH_HOME, DISH_ENV: process.env.DISH_ENV,
-  dishNames: Object.keys(process.env).filter(name => /^DISH_/.test(name)).sort(), DISH_REMOTE: process.env.DISH_REMOTE,
-}))
-for (const line of stub.print || []) console.log(line)
-for (const line of stub.printErr || []) console.error(line)
 // The streams' own write, not console's, which would swallow a failed write: a failure must end the stand-in.
 const stop = code => {
   const bursts = stub.stopLines ? ['stdout', 'stderr', 'stdout', 'stderr', 'stdout'] : []
@@ -306,10 +299,6 @@ const stop = code => {
   }
   next()
 }
-if (stub.grandchild) {
-  const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
-  fs.writeFileSync(process.env.STUB_LOG + '/' + role + '.child.pid', String(child.pid))
-}
 let ending = false
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(signal, () => {
@@ -319,6 +308,19 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     if (signal === 'SIGINT') setTimeout(() => stop(130), stub.interruptMs ?? 300)
     else setTimeout(() => stop(stub.termCode ?? 0), stub.termMs ?? 0)
   })
+}
+// The tests signal a stand-in only once it has logged its start, so every handler is in place before that: a signal
+// that came first would kill it, with no exit recorded.
+log('start ' + JSON.stringify({
+  argv: process.argv.slice(2), cwd: process.cwd(), pid: process.pid, pgrp,
+  DSH_HOME: process.env.DSH_HOME, DSH_DISH_HOME: process.env.DSH_DISH_HOME, DISH_ENV: process.env.DISH_ENV,
+  dishNames: Object.keys(process.env).filter(name => /^DISH_/.test(name)).sort(), DISH_REMOTE: process.env.DISH_REMOTE,
+}))
+for (const line of stub.print || []) console.log(line)
+for (const line of stub.printErr || []) console.error(line)
+if (stub.grandchild) {
+  const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+  fs.writeFileSync(process.env.STUB_LOG + '/' + role + '.child.pid', String(child.pid))
 }
 if (stub.exitAfterMs !== undefined) setTimeout(() => process.exit(stub.code ?? 0), stub.exitAfterMs)
 setInterval(() => {}, 1000)
