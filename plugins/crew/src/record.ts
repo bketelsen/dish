@@ -46,7 +46,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import type { Dirent } from 'node:fs'
 import { lstat, mkdir, open, readdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { SubagentStopReason } from '@deepseek-ai/dsh-subagent'
 
 /** Where a child is in its work, as of its latest run. */
@@ -77,6 +77,11 @@ export interface ChildRecord {
   family: string
   /** For a reviewer: the id of the crew child it reviews, or `"main"` for the main agent's own work. */
   reviews?: string
+  /**
+   * For a child bound to a worktree (`delegate`'s `worktree`): the worktree's absolute, canonical path. Absent for an unbound
+   * child. A follow-up keeps it, and dish-gates (6c) reads it here, through `lookup`.
+   */
+  worktree?: string
   /** When the child was recorded, in ms since the epoch. */
   startedAt: number
   /** How many follow-ups it has been sent. */
@@ -94,6 +99,8 @@ export interface NewChild {
   model: string
   family: string
   reviews?: string
+  /** The worktree the child is bound to: an absolute path, canonical (the caller's `realpath`). */
+  worktree?: string
   /** Defaults to now. */
   startedAt?: number
 }
@@ -136,6 +143,22 @@ export const STOP_REASON_STATUS = {
  */
 export function statusFor(stopReason: string): Exclude<ChildStatus, 'running'> {
   return Object.hasOwn(STOP_REASON_STATUS, stopReason) ? STOP_REASON_STATUS[stopReason as SubagentStopReason] : 'stopped'
+}
+
+/** What the running rule needs of dsh's agent registry (`ctx.agents`): the live agent of an id, if there is one. */
+export interface LiveAgents {
+  get(id: string): { status?: unknown } | undefined
+}
+
+/**
+ * Whether a recorded child is running: its agent is stepping, or the record says running and the agent exists (accepted,
+ * not stepping yet). A record that says running with no agent is a crash's, and isn't running. With no registry to ask,
+ * the record's own word. `delegate`'s limits and `dishCrew.worktreeBindings` both count by this.
+ */
+export function isRunning(record: ChildRecord, agents: LiveAgents | undefined): boolean {
+  if (agents === undefined) return record.last === 'running'
+  const live = agents.get(record.id)
+  return live?.status === 'running' || (record.last === 'running' && live !== undefined)
 }
 
 /**
@@ -217,9 +240,10 @@ function parseRun(value: unknown): RunRecord | undefined {
 /** The child in `value`, or `undefined` if it isn't shaped like one. Other fields are dropped. */
 function parseChild(value: unknown): ChildRecord | undefined {
   if (!isObject(value)) return undefined
-  const { id, n, role, title, model, family, reviews, startedAt, followUps, runs, last } = value
+  const { id, n, role, title, model, family, reviews, worktree, startedAt, followUps, runs, last } = value
   if (!isText(id) || id === '' || !isNumber(n) || !isText(role) || !isText(title) || !isText(model) || !isText(family)) return undefined
   if (reviews !== undefined && !isText(reviews)) return undefined
+  if (worktree !== undefined && !isText(worktree)) return undefined
   if (!isNumber(startedAt) || !isNumber(followUps) || !Array.isArray(runs)) return undefined
   if (!isText(last) || !['running', 'finished', 'failed', 'stopped'].includes(last)) return undefined
   const parsed: RunRecord[] = []
@@ -229,8 +253,8 @@ function parseChild(value: unknown): ChildRecord | undefined {
     parsed.push(one)
   }
   return {
-    id, n, role, title, model, family, ...reviews === undefined ? {} : { reviews }, startedAt, followUps, runs: parsed,
-    last: last as ChildStatus,
+    id, n, role, title, model, family, ...reviews === undefined ? {} : { reviews }, ...worktree === undefined ? {} : { worktree },
+    startedAt, followUps, runs: parsed, last: last as ChildStatus,
   }
 }
 
@@ -268,6 +292,7 @@ function newChildProblem(value: unknown): string | undefined {
   }
   if (!isText(value.title)) return 'title must be a string'
   if (value.reviews !== undefined && !isText(value.reviews)) return 'reviews must be a string'
+  if (value.worktree !== undefined && !(isText(value.worktree) && isAbsolute(value.worktree))) return 'worktree must be an absolute path'
   if (value.startedAt !== undefined && !isNumber(value.startedAt)) return 'startedAt must be a finite number'
   return undefined
 }
@@ -453,6 +478,7 @@ export class CrewRecords {
         model: record.model,
         family: record.family,
         ...record.reviews === undefined ? {} : { reviews: record.reviews },
+        ...record.worktree === undefined ? {} : { worktree: record.worktree },
         startedAt: record.startedAt ?? Date.now(),
         followUps: 0,
         runs: [],
@@ -529,6 +555,37 @@ export class CrewRecords {
       const child = loaded?.children.find(candidate => candidate.id === childId)
       return loaded === undefined || child === undefined ? undefined : { sessionId: loaded.sessionId, record: structuredClone(child) }
     })
+  }
+
+  /**
+   * Every recorded child bound to `worktree`, compared exactly (the record keeps canonical paths, so the caller passes one),
+   * across sessions, with the session each belongs to: oldest first. For `dishCrew.worktreeBindings`, which says which of
+   * them are running.
+   *
+   * It waits for the writes queued when it is called, then reads each session's file through its queue, so a corrupt one is
+   * set aside and reported as every read does it (under the session directory's name). What is not named like a session, or
+   * is not a directory (a link is not followed), is skipped.
+   */
+  async boundTo(worktree: string): Promise<Array<{ sessionId: string, record: ChildRecord }>> {
+    if (!isText(worktree) || worktree === '') return []
+    await Promise.all([...this.#queues.values()])
+    let entries: Dirent[]
+    try {
+      entries = await readdir(join(this.#directory, SESSIONS), { withFileTypes: true })
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return []
+      throw error
+    }
+    const found: Array<{ sessionId: string, record: ChildRecord }> = []
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !HASH.test(entry.name)) continue
+      const loaded = await this.#serial(entry.name, () => this.#load(entry.name))
+      if (loaded === undefined) continue
+      for (const child of loaded.children) {
+        if (child.worktree === worktree) found.push({ sessionId: loaded.sessionId, record: structuredClone(child) })
+      }
+    }
+    return found.sort((a, b) => a.record.startedAt - b.record.startedAt || a.sessionId.localeCompare(b.sessionId) || a.record.n - b.record.n)
   }
 
   /** Resolve once every write that is queued now is done. For a shutdown to wait on. */

@@ -5,8 +5,10 @@
  * reads what is provided here. The plugin:
  *
  * - provides the `dishCrew` service: `settings()` is the `crew.yaml` in the config store as it is now (see
- *   `settings.ts`), `records` is the crew's own record of its children and their reports (see `record.ts`), and
- *   `whenRecorded(child)` is the run of that child that is being recorded now, if there is one;
+ *   `settings.ts`), `records` is the crew's own record of its children and their reports (see `record.ts`),
+ *   `whenRecorded(child)` is the run of that child that is being recorded now, if there is one, and
+ *   `worktreeBindings(path)` is the children bound to a worktree, with whether each is running (for `delegate`, and for
+ *   dish-workspaces' `list`, `remove` and sweep);
  * - captures every crew child's runs: the error an `agent/error` reports is held for the child, `subagent/end` files the
  *   run, with that error and the closing message, in the record, and `subagent/start` marks the child running again (dsh
  *   starts a run each time it brings a child up, not only the first). A child's starts and ends are recorded in the order
@@ -33,17 +35,29 @@ import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
 import { approvalGuard } from './guard.ts'
-import { CrewRecords, closingOf } from './record.ts'
-import type { EndedRun } from './record.ts'
+import { CrewRecords, closingOf, isRunning } from './record.ts'
+import type { EndedRun, LiveAgents } from './record.ts'
 import { DEFAULT_MESSAGE_LIMIT, reportGuard } from './report-guard.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from './settings.ts'
 import type { CrewSettings } from './settings.ts'
 
 export type { CrewSettings, FamilySettings, Limits, ParseResult, RoleSettings, Tier } from './settings.ts'
-export type { ChildRecord, ChildStatus, EndedRun, NewChild, RunEnd, RunRecord } from './record.ts'
-export { CrewRecords, statusFor } from './record.ts'
+export type { ChildRecord, ChildStatus, EndedRun, LiveAgents, NewChild, RunEnd, RunRecord } from './record.ts'
+export { CrewRecords, isRunning, statusFor } from './record.ts'
 
 export const name = 'dish-crew'
+
+/** A crew child bound to a worktree, as `worktreeBindings` gives it. */
+export interface WorktreeBinding {
+  /** The child's agent (session) id. */
+  child: string
+  /** The session that started it. */
+  sessionId: string
+  role: string
+  title: string
+  /** Whether it is running now, by `isRunning`: dsh's agent registry, else the record's word. */
+  running: boolean
+}
 
 /** The `dishCrew` service. */
 export interface DishCrew {
@@ -63,6 +77,13 @@ export interface DishCrew {
   whenRecorded(childId: string): Promise<EndedRun | undefined> | undefined
   /** The `ctx.subagents` provider the crew's children are created on: the `subagentProvider` setting. The preset row can't see the host's config. */
   readonly subagentProvider: string
+  /**
+   * The crew children bound to `worktree` (an absolute, canonical path, compared exactly), across sessions, oldest first,
+   * with whether each is running: dsh's agent registry (`ctx.get('agents')`) says so, or the record says running and the
+   * agent exists, which is `delegate`'s rule; with no registry, the record's `last === 'running'`. Rejects only if the
+   * record can't be read.
+   */
+  worktreeBindings(worktree: string): Promise<WorktreeBinding[]>
 }
 
 // Here, with the type, so that whoever imports it also gets `ctx.get('dishCrew')` typed.
@@ -389,8 +410,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     warn('could not prune the crew\'s old records in %s: %s', directory, describe(error))
   }
 
+  /** `DishCrew.worktreeBindings`. The registry is a sibling's service, read on each call. */
+  const worktreeBindings = async (worktree: string): Promise<WorktreeBinding[]> => {
+    const found = await records.boundTo(worktree)
+    const agents = lookup.get('agents') as LiveAgents | undefined
+    return found.map(({ sessionId, record }) => ({ child: record.id, sessionId, role: record.role, title: record.title, running: isRunning(record, agents) }))
+  }
+
   try {
-    ctx.provide('dishCrew', { settings, records, whenRecorded: (childId: string) => pending.get(childId), subagentProvider: text(config.subagentProvider) ?? 'spawn' })
+    ctx.provide('dishCrew', {
+      settings, records, whenRecorded: (childId: string) => pending.get(childId), subagentProvider: text(config.subagentProvider) ?? 'spawn', worktreeBindings,
+    })
   } catch (error) {
     // Unloaded while it was pruning: the plugin is going away, and didn't fail.
     if (unloaded(error)) return

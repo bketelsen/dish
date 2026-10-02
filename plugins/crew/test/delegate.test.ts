@@ -1,3 +1,5 @@
+import { mkdir, realpath, symlink } from 'node:fs/promises'
+import { join } from 'node:path'
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
@@ -8,8 +10,9 @@ import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ContinuableStartSpec } from '@deepseek-ai/dsh-subagent'
 import * as promptsPlugin from 'dish-prompts'
 import * as row from '../src/delegate.ts'
-import { CrewRecords } from '../src/record.ts'
+import { CrewRecords, isRunning } from '../src/record.ts'
 import type { ChildRecord } from '../src/record.ts'
+import { worktreeBrief } from '../src/text.ts'
 import { DEFAULT_SETTINGS, parseSettings } from '../src/settings.ts'
 import type { CrewSettings } from '../src/settings.ts'
 import { provideStub, shippedWith, tempDir, watchLogs } from './helpers.ts'
@@ -53,6 +56,18 @@ interface Options {
   globalTools?: string[]
   /** Standard tools the preset leaves out. */
   withoutTools?: string[]
+  /** Whether dish-workspaces' service is there (a stub that resolves what `makeWorktree` made). */
+  workspaces?: boolean
+}
+
+/** A worktree as dish-workspaces' `resolve` gives one. */
+interface Worktree {
+  project: string
+  slug: string
+  branch: string
+  path: string
+  clone: string
+  base: string
 }
 
 /** Everything a test of the `delegate` tool stands on: a real Context, the real tool registry, and recording stubs for the rest. */
@@ -71,6 +86,12 @@ interface World {
   personaAsked: string[]
   /** What `startContinuable` sees of the record at the moment it is called, per child id. */
   recordedAtStart: Map<string, ChildRecord | undefined>
+  /** The main session's `cwd`: a temp directory (canonical) that stands for a project's clone. */
+  workspace: string
+  /** What the `dishWorkspaces` stub resolves, by `<project>/<slug>` and by path. */
+  worktrees: Map<string, Worktree>
+  /** What `dishWorkspaces.resolve` was asked, in order. */
+  resolveAsked: string[]
   stub: {
     /** An error `startContinuable` throws instead of starting. */
     startFails: Error | undefined
@@ -84,6 +105,8 @@ interface World {
     promptFails: Error | undefined
     /** The status a started child has in `ctx.agents` once started. */
     startedStatus: 'running' | 'idle'
+    /** An error `dishWorkspaces.resolve` throws instead of answering. */
+    resolveWorktreeFails: Error | undefined
   }
   main: Agent
   /** A scoped agent as dsh makes one under the preset. */
@@ -94,6 +117,10 @@ interface World {
   delegate(args: Record<string, unknown>, exec?: ToolRunContext): Promise<any>
   /** Put a child in the record, as `delegate` would have, and in `ctx.agents` as `status` says. */
   seed(child: Partial<ChildRecord> & { id: string }, status?: 'running' | 'idle' | 'absent', session?: string): Promise<ChildRecord>
+  /** Make `<root>/.worktrees/<slug>` (root defaults to the workspace) and have the stub resolve it as `frostyard/snosi/<slug>` and by path. */
+  makeWorktree(slug: string, root?: string): Promise<Worktree>
+  /** The main agent of another chat, top-level, whose session's `cwd` is `cwd` (none if `undefined`). */
+  chat(id: string, cwd: string | undefined): Agent
 }
 
 let counter = 0
@@ -125,7 +152,13 @@ async function world(options: Options = {}): Promise<World> {
   const resolves: World['resolves'] = []
   const personaAsked: string[] = []
   const recordedAtStart = new Map<string, ChildRecord | undefined>()
-  const stub: World['stub'] = { startFails: undefined, sendFails: undefined, resolveFails: undefined, startMs: 0, noPrompt: new Set(), promptFails: undefined, startedStatus: 'running' }
+  const stub: World['stub'] = {
+    startFails: undefined, sendFails: undefined, resolveFails: undefined, startMs: 0, noPrompt: new Set(), promptFails: undefined, startedStatus: 'running',
+    resolveWorktreeFails: undefined,
+  }
+  const workspace = await realpath(await tempDir())
+  const worktrees = new Map<string, Worktree>()
+  const resolveAsked: string[] = []
 
   if (options.agents !== false) await provide(ctx, 'agents', { get: (id: string) => agents.get(id) })
   await provide(ctx, 'llm', {
@@ -152,7 +185,25 @@ async function world(options: Options = {}): Promise<World> {
     },
   })
   if (options.dishCrew !== false) {
-    await provide(ctx, 'dishCrew', { settings: async () => settings.current, records, whenRecorded: () => undefined, subagentProvider: 'spawn' })
+    await provide(ctx, 'dishCrew', {
+      settings: async () => settings.current, records, whenRecorded: () => undefined, subagentProvider: 'spawn',
+      // The host's own, over the same record and registry.
+      async worktreeBindings(path: string) {
+        return (await records.boundTo(path)).map(({ sessionId, record }) => ({
+          child: record.id, sessionId, role: record.role, title: record.title, running: isRunning(record, { get: (id: string) => agents.get(id) }),
+        }))
+      },
+    })
+  }
+  if (options.workspaces !== false) {
+    await provide(ctx, 'dishWorkspaces', {
+      async resolve(ref: string) {
+        resolveAsked.push(ref)
+        if (stub.resolveWorktreeFails !== undefined) throw stub.resolveWorktreeFails
+        const found = worktrees.get(ref)
+        return found === undefined ? undefined : { ...found }
+      },
+    })
   }
   if (options.realPrompts === true) {
     disposables.push(await ctx.plugin(promptsPlugin, { terminal: false, stateDirectory: await tempDir() } as promptsPlugin.Config))
@@ -174,7 +225,7 @@ async function world(options: Options = {}): Promise<World> {
     const made: Record<string, unknown> = {
       id,
       session: {
-        header: { id },
+        header: { id, ...id === SESSION ? { cwd: workspace } : {} },
         requestHeader: () => id === SESSION && mainModel.current !== undefined ? { config: { provider: 'github-copilot', model: mainModel.current } } : undefined,
       },
       options: {},
@@ -191,7 +242,17 @@ async function world(options: Options = {}): Promise<World> {
 
   return {
     ctx, settings, records, directory, mainModel, agents, starts, sends, resolves, personaAsked, recordedAtStart, stub, main, agent, exec, tool,
+    workspace, worktrees, resolveAsked,
     delegate: (args, who = exec()) => tool.execute(args, who),
+    async makeWorktree(slug, root = workspace) {
+      const path = join(root, '.worktrees', slug)
+      await mkdir(path, { recursive: true })
+      const made = { project: 'frostyard/snosi', slug, branch: `dish/${slug}`, path, clone: root, base: 'a'.repeat(40) }
+      worktrees.set(`frostyard/snosi/${slug}`, made)
+      worktrees.set(path, made)
+      return made
+    },
+    chat: (id, cwd) => agent(id, { session: { header: { id, ...cwd === undefined ? {} : { cwd } }, requestHeader: () => undefined } }),
     async seed(child, status = 'running', session = SESSION) {
       const added = await records.addChild(session, {
         role: 'coder', title: 'a task', model: 'claude-sonnet-5.5', family: 'anthropic', ...child,
@@ -246,7 +307,7 @@ test('it registers delegate with a schema the tool registry accepts, and the out
   assert.deepEqual(Object.keys(schema.properties).sort(), ['child', 'label', 'model', 'role'])
   assert.deepEqual([...schema.required].sort(), ['child', 'label', 'model', 'role'])
   const parameters = w.tool.parameters as { properties: Record<string, unknown>, required: string[] }
-  assert.deepEqual(Object.keys(parameters.properties).sort(), ['model', 'reviews', 'role', 'task', 'title', 'to'])
+  assert.deepEqual(Object.keys(parameters.properties).sort(), ['model', 'reviews', 'role', 'task', 'title', 'to', 'worktree'])
   assert.deepEqual([...parameters.required].sort(), ['role', 'task', 'title'])
 })
 
@@ -1440,4 +1501,249 @@ test('if a failed start can\'t be recorded as failed, the refusal still comes, a
   const message = await refusal(w.delegate(CODER))
   assert.match(message, /provider down/)
   assert.ok(logs.some(line => /disk full/.test(line)), logs.join('\n'))
+})
+
+// --- binding a worktree ------------------------------------------------------------------------------------------
+
+/** The block a bound coder's prompt gets after its task, as the plan words it. */
+function brief(path: string, branch: string): string {
+  return `Your worktree is \`${path}\` on branch \`${branch}\`. Work only there: use absolute paths, and \`git -C ${path}\` or \`cd ${path} &&\` in commands. `
+    + 'The main agent\'s own checkout is not yours to change.'
+}
+
+/** Finish child `id`: its run ends and its agent is idle. */
+async function finish(w: World, id: string): Promise<void> {
+  w.agents.set(id, { status: 'idle' })
+  await w.records.endRun(id, { stopReason: 'completed', closing: 'done' })
+}
+
+test('worktreeBrief names the path and the branch, says to work only there, and keeps the main agent\'s checkout out of it', () => {
+  assert.equal(worktreeBrief({ path: '/work/o/r/.worktrees/fix-1', branch: 'dish/fix-1' }), brief('/work/o/r/.worktrees/fix-1', 'dish/fix-1'))
+})
+
+test('the worktree parameter and the description say what binding is', async () => {
+  const w = await world()
+  const parameters = w.tool.parameters as { properties: Record<string, { type: string, description: string }>, required: string[] }
+  assert.equal(parameters.properties.worktree!.type, 'string')
+  assert.ok(!parameters.required.includes('worktree'))
+  assert.equal(parameters.properties.worktree!.description, 'A worktree from the `worktree` tool, as `<project>/<slug>` or the path it returned, to bind a coder to: '
+    + 'its brief names it, and the harness checks its work there. Only for roles that write. Leave empty otherwise.')
+  assert.match(w.tool.description, /`worktree`/)
+})
+
+test('a coder bound to a worktree: the record has its path, and the prompt is the task, the brief, and the closing note last', async () => {
+  const w = await world()
+  const tree = await w.makeWorktree('fix-1')
+  const result = await w.delegate({ ...CODER, worktree: ' frostyard/snosi/fix-1 ' })
+  assert.deepEqual(w.resolveAsked, ['frostyard/snosi/fix-1'])
+  assert.equal(w.starts.length, 1)
+  assert.deepEqual(w.starts[0]!.request.prompt, [
+    { type: 'text', text: CODER.task },
+    { type: 'text', text: brief(tree.path, 'dish/fix-1') },
+    { type: 'text', text: CLOSING_NOTE },
+  ])
+  // Recorded before the start, with the binding.
+  assert.equal(w.recordedAtStart.get(result.child)?.worktree, tree.path)
+  const [recorded] = await w.records.children(SESSION)
+  assert.equal(recorded!.worktree, tree.path)
+  assert.equal((await w.records.lookup(result.child))?.record.worktree, tree.path)
+
+  // By the path `create` returned, once the first coder is done with it.
+  await finish(w, result.child)
+  const again = await w.delegate({ ...CODER, title: 'fix it again', worktree: tree.path })
+  assert.equal((await w.records.lookup(again.child))?.record.worktree, tree.path)
+})
+
+test('a bound child without send_message gets the task and the brief', async () => {
+  const w = await world({ settings: settingsFrom((d) => { d.roles.coder.tools = ['read', 'write', 'edit'] }) })
+  const tree = await w.makeWorktree('fix-1')
+  await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: CODER.task }, { type: 'text', text: brief(tree.path, 'dish/fix-1') }])
+})
+
+test('a start without a worktree is as it was: no brief, no binding, and dish-workspaces is not asked', async () => {
+  const w = await world()
+  await w.delegate({ ...CODER, worktree: '' })
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: CODER.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.ok(!('worktree' in (await w.records.children(SESSION))[0]!))
+  assert.deepEqual(w.resolveAsked, [])
+  // Nor is it needed: a start without one works with no dish-workspaces at all.
+  const without = await world({ workspaces: false })
+  await without.delegate(CODER)
+  assert.equal(without.starts.length, 1)
+})
+
+test('a role that doesn\'t write is refused a worktree, before dish-workspaces is asked, and is told to put the path in its task', async () => {
+  const w = await world()
+  await w.makeWorktree('fix-1')
+  await w.seed({ id: 'c1', role: 'coder', last: 'finished' }, 'idle')
+  const reviewer = await refusal(w.delegate({ role: 'reviewer', title: 'review it', task: 'Review c1.', reviews: 'c1', worktree: 'frostyard/snosi/fix-1' }))
+  assert.equal(reviewer, '`worktree` is for roles that write; give a reviewer the path in its task instead')
+  const researcher = await refusal(w.delegate({ ...RESEARCHER, worktree: 'frostyard/snosi/fix-1' }))
+  assert.match(researcher, /give a researcher the path in its task instead/)
+  assert.deepEqual(w.resolveAsked, [])
+  assert.equal(w.starts.length, 0)
+  assert.equal((await w.records.children(SESSION)).length, 1)
+})
+
+test('without dish-workspaces a worktree is refused, naming the plugin, and nothing starts', async () => {
+  const w = await world({ workspaces: false })
+  const message = await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' }))
+  assert.match(message, /dish-workspaces plugin is not running/)
+  assert.equal(w.starts.length, 0)
+  assert.deepEqual(await w.records.children(SESSION), [])
+})
+
+test('a worktree dish-workspaces doesn\'t know is refused, with how to make one; one it can\'t look up is refused with why', async () => {
+  const w = await world()
+  const message = await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/nope' }))
+  assert.equal(message, 'no worktree `frostyard/snosi/nope` in a registered project; make one with the worktree tool (action create)')
+  w.stub.resolveWorktreeFails = new Error('the state directory is unreadable')
+  const failed = await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/nope' }))
+  assert.match(failed, /could not look up worktree `frostyard\/snosi\/nope`/)
+  assert.match(failed, /the state directory is unreadable/)
+  assert.equal(w.starts.length, 0)
+  assert.deepEqual(await w.records.children(SESSION), [])
+})
+
+test('a worktree outside the calling chat\'s workspace is refused, where a coder couldn\'t write; a workspace reached by a link is the same place', async () => {
+  const w = await world()
+  const tree = await w.makeWorktree('fix-1')
+  const elsewhere = await realpath(await tempDir())
+  const other = w.chat('session-other', elsewhere)
+  const message = await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' }, w.exec(other)))
+  assert.equal(message, `worktree \`${tree.path}\` is outside this chat's workspace (\`${elsewhere}\`), where a coder couldn't write; `
+    + `start a chat in the project's workspace (\`${w.workspace}\`)`)
+  // A chat with no workspace at all.
+  assert.match(await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' }, w.exec(w.chat('session-bare', undefined)))), /this chat has no workspace/)
+  // The clone's parent is not the clone: the worktree must be inside the chat's workspace, not beside it.
+  const sibling = await w.makeWorktree('fix-2', elsewhere)
+  assert.match(await refusal(w.delegate({ ...CODER, worktree: sibling.path })), /is outside this chat's workspace/)
+  assert.equal(w.starts.length, 0)
+
+  // Through a link to the workspace: both sides are compared canonically.
+  const links = await tempDir()
+  await symlink(w.workspace, join(links, 'clone'))
+  const linked = w.chat('session-linked', join(links, 'clone'))
+  await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' }, w.exec(linked))
+  assert.equal(w.starts.length, 1)
+  assert.equal((await w.records.children('session-linked'))[0]!.worktree, tree.path)
+})
+
+test('a worktree bound to a running child is refused, naming it; once that child has finished, it can be bound again', async () => {
+  const w = await world()
+  const tree = await w.makeWorktree('fix-1')
+  // A coder of another chat in the same clone: this session's limits don't see it.
+  await w.seed({ id: 'theirs', role: 'coder', title: 'their fix', worktree: tree.path }, 'running', 'session-other')
+  const message = await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' }))
+  assert.match(message, /coder «their fix» \(child theirs\)/)
+  assert.match(message, /running/)
+  assert.ok(message.includes(tree.path), message)
+  assert.equal(w.starts.length, 0)
+  assert.deepEqual(await w.records.children(SESSION), [])
+  // Another worktree is free.
+  await w.makeWorktree('fix-2')
+  await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-2' })
+  assert.equal(w.starts.length, 1)
+
+  // Finished: bound, but not running.
+  const other = await world()
+  const free = await other.makeWorktree('fix-1')
+  await other.seed({ id: 'theirs', role: 'coder', worktree: free.path, last: 'finished' }, 'idle', 'session-other')
+  await other.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  assert.equal(other.starts.length, 1)
+})
+
+test('a running child bound there is refused within one session too, when crew.yaml allows several writers', async () => {
+  const w = await world({ settings: settingsFrom((d) => { d.limits = { running: 4, writers: 2, perSession: 30 } }) })
+  await w.makeWorktree('fix-1')
+  await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  assert.match(await refusal(w.delegate({ ...CODER, title: 'second', worktree: 'frostyard/snosi/fix-1' })), /is bound to coder «add login»/)
+  assert.equal(w.starts.length, 1)
+})
+
+test('two chats binding one worktree in one step: exactly one starts', async () => {
+  const w = await world()
+  w.stub.startMs = 30
+  await w.makeWorktree('fix-1')
+  const second = w.chat('session-two', w.workspace)
+  const results = await Promise.allSettled([
+    w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' }),
+    w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' }, w.exec(second)),
+  ])
+  assert.deepEqual(results.map(result => result.status).sort(), ['fulfilled', 'rejected'])
+  assert.equal(w.starts.length, 1)
+  const refused = results.find(result => result.status === 'rejected') as PromiseRejectedResult
+  assert.match(refused.reason.message, /is bound to coder «add login»/)
+})
+
+test('a follow-up keeps the binding and adds nothing to its text; naming the same worktree, by ref or path, is fine', async () => {
+  const w = await world()
+  const tree = await w.makeWorktree('fix-1')
+  const started = await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  await finish(w, started.child)
+  await w.delegate({ ...CODER, task: 'Fix the findings.', to: started.child })
+  assert.deepEqual(w.sends[0]!.content, [{ type: 'text', text: 'Fix the findings.' }])
+  // The binding was checked: the worktree is still there.
+  assert.deepEqual(w.resolveAsked, ['frostyard/snosi/fix-1', tree.path])
+  await finish(w, started.child)
+  await w.delegate({ ...CODER, task: 'Once more.', to: started.child, worktree: 'frostyard/snosi/fix-1' })
+  await finish(w, started.child)
+  await w.delegate({ ...CODER, task: 'And again.', to: started.child, worktree: tree.path })
+  assert.equal(w.sends.length, 3)
+  const record = (await w.records.lookup(started.child))!.record
+  assert.equal(record.worktree, tree.path)
+  assert.equal(record.followUps, 3)
+})
+
+test('a follow-up naming another worktree is refused, and so is binding a child that started unbound', async () => {
+  const w = await world()
+  const tree = await w.makeWorktree('fix-1')
+  await w.makeWorktree('fix-2')
+  const bound = await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  await finish(w, bound.child)
+  const moved = await refusal(w.delegate({ ...CODER, task: 'Move.', to: bound.child, worktree: 'frostyard/snosi/fix-2' }))
+  assert.match(moved, new RegExp(`child ${bound.child} is bound to worktree`))
+  assert.ok(moved.includes(tree.path), moved)
+  const unbound = await w.delegate({ ...CODER, title: 'unbound' })
+  await finish(w, unbound.child)
+  assert.match(await refusal(w.delegate({ ...CODER, task: 'Bind.', to: unbound.child, worktree: 'frostyard/snosi/fix-2' })), /isn't bound to a worktree, and a follow-up can't bind one/)
+  // A worktree nobody knows is refused as for a start.
+  assert.match(await refusal(w.delegate({ ...CODER, task: 'x', to: bound.child, worktree: 'frostyard/snosi/nope' })), /no worktree `frostyard\/snosi\/nope`/)
+  assert.equal(w.sends.length, 0)
+})
+
+test('a follow-up to a child whose worktree is gone is refused, and so is one when dish-workspaces is not there to say', async () => {
+  const w = await world()
+  const tree = await w.makeWorktree('fix-1')
+  const started = await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  await finish(w, started.child)
+  // Merged and swept, or removed.
+  w.worktrees.clear()
+  assert.equal(await refusal(w.delegate({ ...CODER, task: 'Fix it.', to: started.child })),
+    `child ${started.child}'s worktree \`${tree.path}\` is gone (merged or removed); start a new coder`)
+  assert.equal(w.sends.length, 0)
+
+  const records = new CrewRecords(await tempDir())
+  const bound = await records.addChild(SESSION, { id: 'c1', role: 'coder', title: 't', model: 'claude-sonnet-5.5', family: 'anthropic', worktree: tree.path })
+  await records.endRun(bound.id, { stopReason: 'completed', closing: 'x' })
+  const without = await world({ workspaces: false, records })
+  assert.match(await refusal(without.delegate({ ...CODER, task: 'Fix it.', to: 'c1' })), /dish-workspaces plugin is not running/)
+  assert.equal(without.sends.length, 0)
+})
+
+test('a follow-up to a bound child is refused while another running child is bound to its worktree', async () => {
+  const w = await world()
+  const tree = await w.makeWorktree('fix-1')
+  const mine = await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  await finish(w, mine.child)
+  // Another chat bound the worktree once this one's coder was done.
+  await w.seed({ id: 'theirs', role: 'coder', title: 'their fix', worktree: tree.path }, 'running', 'session-other')
+  assert.match(await refusal(w.delegate({ ...CODER, task: 'Fix it.', to: mine.child })), /is bound to coder «their fix» \(child theirs\)/)
+  assert.equal(w.sends.length, 0)
+  // A follow-up to a child that is itself running is not refused on its own account.
+  await finish(w, 'theirs')
+  w.agents.set(mine.child, { status: 'running' })
+  await w.delegate({ ...CODER, task: 'One more thing.', to: mine.child })
+  assert.equal(w.sends.length, 1)
 })

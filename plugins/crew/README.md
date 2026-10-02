@@ -32,6 +32,14 @@ Talk to the main agent as usual. It delegates by itself, as its prompt (`prompts
 - **Fix rounds:** `delegate` again with `to` set to the same child. It continues with its history.
 - **Reviews:** the `reviewer` role with `reviews` set to the child whose work it checks, or `main` for the main agent's own work.
 
+### Binding a coder to a worktree
+
+In a chat whose workspace is a project's clone ([`dish-workspaces`](../workspaces/)), the main agent makes a worktree with the `worktree` tool and passes it to `delegate` as `worktree`: `<project>/<slug>`, or the path the tool returned.
+- **Crew checks it before anything starts:** the role writes (a reviewer is given the path in its task instead), `dish-workspaces` is running and knows the worktree, the worktree is inside the chat's workspace (a child works in its parent's sandbox, and couldn't write anywhere else), and no running crew child, of any chat, is bound to it.
+- **The child is bound:** its record keeps the worktree's path (`worktree` in `children.json`), and its brief gets a block after the task naming the worktree and its branch, and telling it to work only there.
+- **Follow-ups keep the binding** and add nothing to the text. One that names another worktree is refused, and so is one to a child whose worktree has been merged or removed: start a new coder.
+- **`dishCrew.worktreeBindings(path)`** lists the children bound to a worktree, with whether each is running, for `dish-workspaces`' `list`, `remove` and sweep.
+
 ## crew.yaml
 
 Edit it by asking the main agent, which writes it with `config_write`, and review the change on Settings → History. The shipped file:
@@ -67,19 +75,19 @@ reviewerFamilies: [openai, anthropic]
 - **A provider per family.** `provider` at the top is where every family runs, and it is required. A family may add its own `provider` next to its tiers, for direct API keys, where Claude and GPT come through different providers (the example above). A model override runs on the provider of the family its model is in. When a refusal lists the models, a family with its own provider shows them as `provider/model`, and either form is accepted back as `model`. A model id that equals another model's `provider/model` name is refused when the file is saved.
 - **The reviewer** has no `family`. It takes the first `reviewerFamilies` entry that isn't the reviewed work's family, and that lists no model of the same vendor. That is told by model ids, never by provider names, and it runs on the provider of the family it lands in.
 - **Limits.**
-  - At most `running` children run at once, and at most `writers` of the roles marked `writes: true`. Until per-task worktrees exist (roadmap step 6), children share one directory, so one writer at a time.
+  - At most `running` children run at once, and at most `writers` of the roles marked `writes: true`. Children share the chat's workspace, so one writer at a time; a coder bound to its own worktree is kept to it by its brief, not by the sandbox.
   - A session can start `perSession` children in all. Follow-ups don't count toward it.
 - **Tools.**
   - A role's `tools` are an allow list. Tools the main agent can't pass on are dropped when the child starts; those are the ones on its own scope, not the preset's.
   - Every shipped role lists `ask_judge`, which comes from [`dish-judge`](../judge/). Without that plugin there is no such tool, and the name is dropped like any other missing one: children start with the rest of their tools.
-  - Whatever the file says, a child never gets `delegate`, dsh's delegation and workflow tools, the goal or plan tools, `ask_user_question` or `present`.
+  - Whatever the file says, a child never gets `delegate`, dsh's delegation and workflow tools, the goal or plan tools, `ask_user_question`, `present` or `worktree`.
 
 A role also needs a prompt: `prompts/crew/<role>.md`, or a shipped default.
 
 ## What crew records
 
 In `$XDG_DATA_HOME/dish/crew/`:
-- `sessions/<hash of the session>/children.json` holds each child's role, model, family, what it reviews, its follow-ups and its runs.
+- `sessions/<hash of the session>/children.json` holds each child's role, model, family, what it reviews, the worktree it is bound to, its follow-ups and its runs.
 - `<n>-<role>-<run>.md` in the same folder holds each run's closing message, the child's report.
 - `by-child/` holds pointers, so a child resumed after a restart is filed under the right session.
 
@@ -114,7 +122,7 @@ pnpm --filter dish-crew sync-preset
 - **A start that fails still counts** toward `perSession`, a cancelled one included.
 - **`send_message` isn't checked against the limits.** It can still wake a finished child, and the woken child counts as running from then on. Fix rounds should go through `delegate` with `to`.
 - **The report guard reads length, then holds.** A crew child's first `send_message` over `messageLimit` characters is refused, whatever it says, and from then on every `send_message` of that child is refused until its run ends: it can't tell a report in pieces from a question, so a question a child is blocked on goes in its closing message, and you or the main agent follow up with `delegate` and `to`. A follow-up run starts with `send_message` open. Messages from the main agent and from other plugins' children, and any message sent while crew's record can't be read, are never refused. dsh adds a note to a child's task that tells it to send its result with `send_message` before it finishes; crew puts a note of its own in front of it saying not to, and the guard keeps a child that does anyway from sending a long one.
-- **Children share the main agent's working directory.** dsh 0.2.0-rc.2 has no per-child `cwd`.
+- **Children share the main agent's working directory.** dsh 0.2.0-rc.2 has no per-child `cwd`. A bound coder starts in the chat's workspace too, and may write anywhere in it: its brief, not the sandbox, keeps it to its worktree.
 - **Children can't ask you anything.** dsh runs them with approval policy `never`.
 - **A crew child's approval requests are refused when `dish-judge` isn't loaded.** With `dish-judge`, a child is switched to approval policy `ask` and the judge answers it. If the judge is then disabled, uninstalled or unloaded, a child that had settled still has `ask` in its log, and a follow-up would resume it at `ask`. Without a guard, dsh would show its prompt in the child's own session, where nobody sees it, and nothing times it out. So crew refuses a crew child's request whenever `dish-judge` is absent. Other children, and the main agent, are untouched.
 - **Without `dish-prompts`,** the persona row logs once and `delegate` refuses every call, naming the missing plugin. Nothing refuses at load.

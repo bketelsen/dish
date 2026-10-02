@@ -12,7 +12,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
 
 /** Every name of the never-list, as the plan's Global Constraints spell it. */
-const NEVER_NAMES = ['delegate', 'subagent', 'subagent_fork', 'subagent_codex', 'subagent_claude_code', 'list_subagent_models', 'workflow', 'ralph', 'interrupt_agent', 'list_agents', 'ask_user_question', 'create_goal', 'update_goal', 'exit_plan_mode', 'present']
+const NEVER_NAMES = ['delegate', 'subagent', 'subagent_fork', 'subagent_codex', 'subagent_claude_code', 'list_subagent_models', 'workflow', 'ralph', 'interrupt_agent', 'list_agents', 'ask_user_question', 'create_goal', 'update_goal', 'exit_plan_mode', 'present', 'worktree']
 
 function allowed(roleTools: string[], visible: string[]): string[] {
   const result = allowList(roleTools, new Set(visible))
@@ -30,7 +30,12 @@ function problemOf(roleTools: string[], visible: string[], role?: string): strin
 
 test('NEVER is exactly the never-list: nothing a child must not have is missing, and nothing else is in it', () => {
   assert.deepEqual([...NEVER].sort(), [...NEVER_NAMES].sort())
-  assert.equal(NEVER.size, 15)
+  assert.equal(NEVER.size, 16)
+})
+
+test('worktree, dish-workspaces\' tool for the main agent, is dropped like delegate, and the problem names it among what children never get', () => {
+  assert.deepEqual(allowed(['read', 'worktree', 'delegate'], ['read', 'worktree', 'delegate']), ['read'])
+  assert.match(problemOf(['worktree'], ['worktree', 'read'], 'coder'), /Children never get [^.]*\bworktree\b/)
 })
 
 // --- allowList ------------------------------------------------------------------------------------
