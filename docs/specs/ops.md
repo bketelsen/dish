@@ -127,23 +127,21 @@ dsh treats only loopback pages as "the operator's own machine". On any other pag
 Run it from your workstation:
 
 ```bash
-incus exec dish --project dish -- /home/dish/dish/deploy/update.sh            # dry run: what would change
-incus exec dish --project dish -- /home/dish/dish/deploy/update.sh --apply    # update to origin/main
-incus exec dish --project dish -- /home/dish/dish/deploy/update.sh --apply 4b23ff0   # roll back to a commit
+incus exec dish --project dish -- dish-update                    # dry run: what would change
+incus exec dish --project dish -- dish-update --apply            # update to origin/main
+incus exec dish --project dish -- dish-update --apply 4b23ff0    # roll back to a commit
 ```
 
 Through Minideb, prefix it with `ssh bjk@10.0.1.175`.
 
 ### Who it runs as and how
 
-- **The account** is the owner of the checkout the script sits in (`dish` on the VM).
-- **As root,** which is what `incus exec` gives, it runs itself again as that account, through `runuser -u <account> --`, with a clean environment:
-  - `HOME` (the account's), `USER`, `LOGNAME` and `XDG_RUNTIME_DIR=/run/user/<uid>`;
-  - the unit's `PATH`, read from `Environment=PATH=` in the checkout's unit;
-  - `TMPDIR=/tmp`.
-
-  `XDG_*`, `PNPM_HOME`, `DSH_*` and `NODE_ENV` stay unset, as they are for the unit. That keeps the store-pin contract. Then, as root, it prints the journal tail.
-- **Run as the account itself,** it does the same without `runuser`. It tries to print the journal tail, and says so when the account can't read the journal.
+- **The account** is the owner of the checkout the script sits in (`dish` on the VM). `update.sh` runs **only as that account**, never as root. Run as root, it refuses and points to `dish-update`.
+- **Root's entry point is `dish-update`,** a root-owned wrapper fleet installs at `/usr/local/sbin/dish-update`. It does one thing: `exec runuser -u dish -- env -i HOME=… USER=dish LOGNAME=dish XDG_RUNTIME_DIR=/run/user/<uid> PATH=<the unit's PATH> ~dish/dish/deploy/update.sh "$@"`.
+  - It never reads, sources or runs anything of dish's as root. `runuser` drops privileges first.
+  - **Why (added 2026-10-02 after review):** root running `~dish/dish/deploy/update.sh` directly would execute a file the `dish` account can write. Anything acting as `dish`, such as an approved agent command or a package's install script, could then plant code that root runs at your next update.
+- **The clean environment:** `XDG_*`, `PNPM_HOME`, `DSH_*` and `NODE_ENV` stay unset, as they are for the unit. That keeps the store-pin contract.
+- **The journal:** `systemctl --user` and `journalctl --user -u dish-web.service` work as the account, because `dish` can read its own user journal (checked on the VM).
 - **Any other account:** it refuses.
 - **It updates the file it's running from,** so the body is one function called on the last line, `main "$@"; exit`. bash then reads the whole file before anything changes it.
 - **One at a time.** A second run while one is going is refused (a lock under `~/.local/state/dish/deploy/`).
@@ -184,12 +182,12 @@ Through Minideb, prefix it with `ssh bjk@10.0.1.175`.
 
 ## `deploy/url.sh`
 
-Run it as `incus exec dish --project dish -- /home/dish/dish/deploy/url.sh`.
+Run it as `incus exec dish --project dish -- dish-url`, fleet's root-owned wrapper, which runs `~dish/dish/deploy/url.sh` as `dish` the same way `dish-update` does.
 - **What it prints:** `https://<DISH_TRUSTED_HOST>/?token=<token>`.
   - The token comes from the last `dsh web:` line in the service's journal since its current start.
-  - The start comes from `systemctl --user -M <account>@ show`. The host comes from `deploy.env`.
+  - The start comes from `systemctl --user show`. The host comes from `deploy.env`.
 - **When there's no token:** the service isn't running or hasn't printed one, so it says which and exits 1.
-- **Read access:** it runs as root, so the journal can be read. Run as anyone else, it refuses.
+- **Read access:** it runs only as the checkout's owner, which can read its own user journal. Run as root or anyone else, it refuses.
 - **It prints a secret, on purpose.** It's for your terminal. Don't paste the output anywhere.
 
 ## Fleet (a reviewed PR in `~/projects/fleet`)
@@ -206,6 +204,7 @@ Run it as `incus exec dish --project dish -- /home/dish/dish/deploy/url.sh`.
 **Keep:** first-time provisioning, including cloning `~/dish` when it's missing, enabling linger, and `deploy.env` as it is (one line, `DISH_TRUSTED_HOST`).
 
 **Change:**
+- **Root entry points.** Root-owned wrappers `/usr/local/sbin/dish-update` and `/usr/local/sbin/dish-url` (root:root, 0755). Each only `exec`s `runuser -u dish -- env -i <clean environment> ~dish/dish/deploy/{update,url}.sh "$@"`. See "Who it runs as and how".
 - **`install.env`.** A new template writes `~/.config/dish/install.env` (mode 0600) with `DISH_REMOTE`, `DISH_USER_NAME` and `DISH_USER_EMAIL`, one `NAME=value` line each. `update.sh` reads it; the unit doesn't.
 - **`~/work`.** It's created with the account's other directories.
 - **apt.**
