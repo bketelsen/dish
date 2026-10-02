@@ -495,6 +495,56 @@ test('a store function that throws is the same failure too', async () => {
   })
 })
 
+test('a store that is there but fails gives a degraded catalog; no store, an empty store and a store that answers do not', async () => {
+  await withStore(async (harness) => {
+    let failing = true
+    const reader = readerWith(harness.store, { head: () => failing ? Promise.reject(new Error('the store is on fire')) : harness.store.head() })
+    let present = true
+    const service = serviceFor(harness, { store: () => present ? reader : undefined })
+
+    // There, and failing: the shipped skills, marked, so that whoever caches the answer knows it is a stopgap.
+    const degraded = await service.catalog()
+    assert.equal(degraded.commit, null)
+    assert.equal(degraded.degraded, true)
+    assert.equal(degraded.skills.length, 18)
+    // Each call asks the store again: a stopgap is never remembered.
+    const headsBefore = reader.calls.head
+    await service.catalog()
+    assert.equal(reader.calls.head, headsBefore + 1)
+    // What it returns is the caller's: changing it changes no other answer.
+    delete degraded.degraded
+    assert.equal((await service.catalog()).degraded, true)
+
+    // The store answers, with no skill documents yet: the shipped skills, as an answer.
+    failing = false
+    const empty = await service.catalog()
+    assert.equal(empty.skills.length, 18)
+    assert.equal('degraded' in empty, false)
+
+    // No store at all is an answer too.
+    present = false
+    const none = await service.catalog()
+    assert.equal(none.commit, null)
+    assert.equal('degraded' in none, false)
+
+    // A store with skills, once it answers, and a failure after it.
+    await userWrite(harness.store, 'mine', skillText('mine'))
+    present = true
+    const stored = await service.catalog()
+    assert.deepEqual(names(stored.skills), ['mine'])
+    assert.equal('degraded' in stored, false)
+    failing = true
+    assert.equal((await service.catalog()).degraded, true)
+  })
+})
+
+test('a store function that throws gives a degraded catalog', async () => {
+  await withStore(async (harness) => {
+    const service = serviceFor(harness, { store: () => { throw new Error('no such service') } })
+    assert.equal((await service.catalog()).degraded, true)
+  })
+})
+
 test('defaultText and shipped describe the shipped skills', async () => {
   await withStore(async (harness) => {
     const service = serviceFor(harness)

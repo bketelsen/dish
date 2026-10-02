@@ -1,6 +1,6 @@
 # Spec: dish skills (`dish-skills`)
 
-Status: built 2026-10-02 on branch `skills` (not merged; live checks pending). Implements roadmap step 3a. Builds on the [design](../design.md), the [config store](config-store.md), [prompts](prompts.md) and [crew](crew.md).
+Status: built 2026-10-02 on branch `skills` (not merged). Checked end to end against a scratch dsh profile (see the build notes); your own live pass is still to do. Implements roadmap step 3a. Builds on the [design](../design.md), the [config store](config-store.md), [prompts](prompts.md) and [crew](crew.md).
 
 ## Summary
 
@@ -104,20 +104,24 @@ metadata:
 - Lists every valid skill with `invocation: { modelInvocable: false, userInvocable: <the skill's own> }`.
 - Its job is the `/` menu everywhere, including cold sessions whose lookup scope is a preset. It never lists a skill for a model.
 
-**Agent provider `dish-role`** (one per agent of a configured preset, registered in `agent/created`):
-- Resolves the agent's role once, lazily, in its first `list()`.
-  - A top-level agent gets `presets[presetId]`.
-  - A child gets crew's record role. A failed lookup returns `{ candidates: [], complete: false }`, so the registry retries at the next step.
+**Agent provider `dish-role`** (one per agent, on every agent, registered in `agent/created` and for the agents already live):
+- Works out the agent's role at every `list()` and `get()`, from the agent's preset as it is then (`agentPresets.composedPreset`). dsh can move a blank agent to another preset with no new `agent/created`, so the preset is never remembered.
+  - An agent whose preset isn't in `presets`, or that has none, lists nothing of its own.
+  - A top-level agent on a configured preset gets `presets[presetId]`.
+  - A child gets crew's record role. Only this answer is cached, for the agent's life. A failed lookup returns `{ candidates: [], complete: false }`, so the registry retries at the next step.
   - Anything else has no role and lists nothing.
+  - Without the `agentPresets` service no agent has a role; the provider logs that once.
 - Lists the skills whose roles include the agent's role, with the skill's own invocation flags. Rank 250.
 - A skill outside the role falls through to the global entry: user-invocable, not model-invocable. The `skill` tool refuses it for the model.
-- `get()` returns the body from the catalog the candidate came from (its `locator` is `{ commit, name }`).
+- `get()` returns the current document of that name, from what the provider offers now, whatever commit the candidate was listed at (its `locator` is `{ commit, name }`). The registry drops a definition whose name isn't the candidate's, and a skill that has gone is no skill, never a throw.
 
 **Refresh:** every registered provider's `control.invalidate` is added to the service's change listeners. The service calls them when:
 - `dish-config/changed` names a path under `skills/`;
 - the store appears or goes away.
 
 One call clears the registry's whole cache. Each provider still subscribes, so a disposed global provider doesn't leave agents stale.
+
+**A store that is there but fails to read** (a transient error, not "no store") gives the shipped skills as a stopgap, and the catalog says so (`degraded`). Both providers list them but report the observation incomplete. dsh's registry never caches an incomplete observation, so the next step reads the store again, and the user's own skills are back as soon as it answers. Without that, the shipped skills would be cached as a complete answer, and agents would run on them for the rest of the session, ignoring the user's edits, until the next change under `skills/`. What dsh's `skill` tool does with an incomplete snapshot (`dsh-tool-skill`, `agent/pre-step`): it publishes no new catalog message and keeps the catalog the agent was last shown. An agent that was shown none yet is shown none until the store answers. It can still load the skills its prompt names, by name, because `list` and `get` serve the stopgap meanwhile, so an agent is never left with no skills. A store that is absent, or has no skill documents, is a complete answer.
 
 **Precedence with skills on disk:** a dish-role skill wins over a same-named project or user skill on disk, because the agent layer is nearest. For everything outside dish roles, the disk skill wins over dish's global, menu-only entry.
 
@@ -136,16 +140,19 @@ interface SkillDoc {
   text: string                     // the whole document
 }
 interface Catalog {
-  commit: string | null            // null: shipped defaults, store absent
+  commit: string | null            // null: shipped defaults
+  degraded?: true                  // a store is there but failed to read: the shipped skills as a stopgap. Absent otherwise.
   skills: SkillDoc[]               // valid ones, sorted by name
   problems: { path: string, message: string }[]   // documents that didn't parse (hand edits in git)
 }
 interface DishSkills {
-  catalog(): Promise<Catalog>                       // main now; memoized per commit
+  catalog(): Promise<Catalog>                       // main now; read once per commit; never rejects because of the store
   forRole(role: string): Promise<SkillDoc[]>        // catalog() filtered by role
+  knownRoles(): Promise<string[]>                   // main, then the crew's roles sorted (the shipped roles without crew); never rejects
   defaultText(name: string): string | undefined
   shipped(): string[]                               // names with a default, sorted
-  onChange(listener: () => void): () => void
+  onChange(listener: () => void): () => void        // returns the function that stops it
+  changed(): void                                   // the skills may have changed: forget what was read and call every listener
 }
 ```
 
@@ -197,8 +204,9 @@ Written for dish: the controller is the main agent, the subagents are the crew r
 
 | Document | Adds |
 |---|---|
-| `common.md` | "When a task matches a skill in your skills list, load it with the `skill` tool before you start, and follow it. Your role's skills are named below your role." |
-| `main.md` | A "Skills" section naming its skills by stage: brainstorming → writing-specs/writing-plans (or delegate them to the architect) → subagent-driven-development (or executing-plans) → requesting-code-review → finishing-a-development-branch; plus dispatching-parallel-agents, verification-before-completion, writing-skills. |
+| `common.md` | "When a task matches a skill in your skills list, load it with the `skill` tool before you start, and follow it, unless your brief says not to. Your role's skills are named in your instructions above." |
+| `common.md` (merge rule) | The first house rule now reads "Humans merge. Open pull requests. Never force-push or push to a default branch, and merge only when the user tells you to in so many words." It said never to merge; `finishing-a-development-branch` lets the main agent merge when the user says so, and the two had to agree (see the build notes). |
+| `main.md` | A "Skills" section naming all 14 of its skills. The usual path, in order: `brainstorming`, `writing-specs` and `writing-plans` (when it writes them itself; the architect usually does), `subagent-driven-development` (or `executing-plans` without `delegate`, or for a one- or two-task plan), `requesting-code-review`, `finishing-a-development-branch`. And as they come up: `dispatching-parallel-agents`, `receiving-code-review`, `test-driven-development`, `systematic-debugging`, `verification-before-completion`, `using-git-worktrees`, `writing-skills`. Each with when to load it. |
 | each crew role | One "Skills:" line with that role's skills, per the table. |
 
 ## Configuration
@@ -269,13 +277,14 @@ Remote: Cordis service `dishSkillsRemote`, wire namespace `dishSkills`. Results 
   - the catalog per commit;
   - problems for hand-broken documents;
   - role filtering;
-  - defaults without a store;
+  - defaults without a store, and a degraded catalog for a store that is there but fails;
   - change listeners on `dish-config/changed` and on the store appearing or going.
 - **Providers, against the real registry with scoped contexts (`createScope`, `bindScopeParent`):**
   - The global entry is menu-only.
   - An agent layer offers its role's skills to the model and leaves the rest menu-only.
   - A child's role comes from a stub `dishCrew`.
   - A failed lookup is incomplete and retried.
+  - A degraded catalog is listed but incomplete, and not cached: the next step gets the store's skills once it answers.
   - An invalidate refreshes.
   - `get` returns the body.
   - Agents on other presets get nothing in the agent layer.
@@ -317,3 +326,6 @@ Live (needs you):
 - **The prompts reset note** now defaults to "Reset to the default", and the backlog item is closed.
 - **The ledger lives in the working directory.** `subagent-driven-development` and `executing-plans` keep it at a git-ignored `.worktrees/<plan file name>-ledger.md`. Under dsh's sandbox a write outside the workspace asks for approval every time, so a ledger kept elsewhere would interrupt every task.
 - **`common.md`'s skill rule yields to the brief:** "load it … unless your brief says not to". A pressure-test child, as `writing-skills` runs them, can then be told not to load the skill under test.
+- **Ruling (final review): a store that fails to read gives the shipped skills as incomplete, not as an answer.** Before, a transient failure returned the shipped defaults as a complete catalog, which dsh's registry caches until the next change under `skills/`, so agents ran on the shipped skills for the rest of the session. `Catalog.degraded` now marks it, and both providers report an incomplete observation (see "A store that is there but fails to read" above). The cost if wrong is low: one extra read of the store per step while it fails.
+- **Ruling (final review): the main agent may merge when the user tells it to in so many words.** `common.md` said never to merge, and `finishing-a-development-branch` said to merge when the user says so. The controller ruled for the skill, and `common.md` was amended (see its row above) so the two agree. The cost if wrong is low: the house rule can go back to "humans merge" alone, and the skill's step 6 with it.
+- **Live end-to-end check (2026-10-02).** Real `dsh web` 0.2.0-rc.2 in a scratch profile (scratch XDG and `DSH_HOME`, never the user's store or profile) against a fake OpenAI-compatible model on loopback. The main agent's catalog was exactly its 14 skills. A coder child's was exactly its 5, also after a fix-round resume. The `skill` tool refused skills outside the role.

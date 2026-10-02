@@ -15,7 +15,7 @@ pnpm --filter dish-skills build    # src/client → lib/client.js (the Skills pa
 pnpm dsh plugin --profile web add ./plugins/skills
 ```
 
-- **`dish-config` is optional.** With the store, the plugin claims `skills/`, seeds the shipped skills on its first start (one commit), and serves what the store holds. Without it, the shipped skills are served. If the store is there but can't be read (say another dsh process holds its lock), they are served too, and the plugin logs it.
+- **`dish-config` is optional.** With the store, the plugin claims `skills/`, seeds the shipped skills on its first start (one commit), and serves what the store holds. Without it, the shipped skills are served. A store that another dsh process holds the lock of is never provided at all, which is the same as no store (dish-config logs it). If the store is there but a read fails, the shipped skills are served as a stopgap for that step, the plugin logs it, and the next step reads the store again.
 - **`dish-crew` is optional too.** With it, a delegated child is offered its role's skills, and the roles Settings → Skills knows are `main` plus the roles in `crew.yaml`. Without it the roles are `main`, `architect`, `coder`, `reviewer`, `researcher`, `ops` and `writer`.
 
 ## A skill

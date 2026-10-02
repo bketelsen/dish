@@ -12,7 +12,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import SkillRegistry, { isModelInvocable } from '@deepseek-ai/dsh-skill'
-import type { SkillCandidate, SkillProvider, SkillProviderControl, SkillSummary } from '@deepseek-ai/dsh-skill'
+import type { SkillCandidate, SkillProvider, SkillProviderControl, SkillProviderObservation, SkillSummary } from '@deepseek-ai/dsh-skill'
 import { bindScopeParent, createScope, scopeOf, scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { Scope, ScopeParentBinding } from '@deepseek-ai/dsh-scope'
 import { DEFAULTS } from '../src/defaults.ts'
@@ -534,6 +534,26 @@ test('a preset that can\'t be read is incomplete and told once, and complete onc
   assert.deepEqual(modelNames(snapshot.skills), shippedFor('main'))
 })
 
+test('without the agentPresets service no agent gets role skills, and that is told once, however many agents and steps', async () => {
+  const root = await registryRoot()
+  const skills = registryOf(root)
+  const logs: string[] = []
+  const logger = { warn: (format: string, ...args: unknown[]) => { logs.push([format, ...args].join(' ')) } }
+  await mountWatcher(root, { service: defaultsService(), presets: { dish: 'main' }, logger })
+  const presetKey = mintPreset(root)
+  for (const id of ['np-1', 'np-2']) {
+    const { agent } = mintAgent(root, presetKey, id)
+    await announce(root, agent)
+    for (let step = 0; step < 2; step++) {
+      const snapshot = await skills.snapshot({ scope: agent })
+      assert.equal(snapshot.complete, true)
+      assert.deepEqual(modelNames(snapshot.skills), [])
+    }
+  }
+  assert.equal(logs.length, 1, logs.join('\n'))
+  assert.match(logs[0]!, /agentPresets service isn't there, so no agent gets role skills/)
+})
+
 test('the registrations go when the agent\'s scope is disposed, and so do their change listeners', async () => {
   const root = await registryRoot()
   const skills = registryOf(root)
@@ -774,6 +794,80 @@ test('a catalog that rejects makes the provider\'s list incomplete, never a thro
   const recovered = await skills.snapshot({ scope: agent })
   assert.equal(recovered.complete, true)
   assert.deepEqual(modelNames(recovered.skills), ['alpha', 'bystander-skill'])
+})
+
+test('a degraded catalog (the shipped stopgap for a store that failed) is offered, but incomplete, so the registry asks again at the next step', async () => {
+  const root = await registryRoot()
+  const skills = registryOf(root)
+  const service = fakeService({ commit: null, skills: [doc('alpha', ['main']), doc('beta', ['coder'])], problems: [], degraded: true })
+  let global: SkillProvider | undefined
+  let role: SkillProvider | undefined
+  skills.registerProvider((control) => { global = globalProvider(service)(control); return global })
+  const presetKey = mintPreset(root)
+  const { agent } = mintAgent(root, presetKey, 'main-d')
+  agent.ctx.get('skills')!.registerProvider((control) => { role = roleProvider(service, async () => 'main')(control); return role })
+
+  // The skills are there, for the `skill` tool and the menu...
+  const listed = await global!.list({}) as SkillProviderObservation
+  assert.equal(listed.complete, false)
+  assert.deepEqual(listed.candidates.map(candidate => candidate.name), ['alpha', 'beta'])
+  const own = await role!.list({}) as SkillProviderObservation
+  assert.equal(own.complete, false)
+  assert.deepEqual(own.candidates.map(candidate => candidate.name), ['alpha'])
+  // ...but the snapshot says it is not the whole story, so dsh keeps the catalog it published last and doesn't cache this one.
+  const first = await skills.snapshot({ scope: agent })
+  assert.equal(first.complete, false)
+  assert.deepEqual(modelNames(first.skills), ['alpha'])
+  assert.equal((await skills.get('alpha', { scope: agent }))?.content, 'Do the alpha thing.')
+  const reads = service.reads()
+  await skills.snapshot({ scope: agent })
+  assert.ok(service.reads() > reads, 'an incomplete snapshot is not cached')
+
+  // The store answers: complete, and cached from then on.
+  service.serve({ commit: COMMIT_A, skills: [doc('alpha', ['main']), doc('gamma', ['main'])], problems: [] })
+  const second = await skills.snapshot({ scope: agent })
+  assert.equal(second.complete, true)
+  assert.deepEqual(modelNames(second.skills), ['alpha', 'gamma'])
+  const settled = service.reads()
+  await skills.snapshot({ scope: agent })
+  assert.equal(service.reads(), settled)
+})
+
+test('a store that fails for a moment: the agent keeps its skills, the snapshot is incomplete, and the user\'s edit is back once the store answers', async () => {
+  const root = await registryRoot()
+  const skills = registryOf(root)
+  const edited = skillText('brainstorming', ['main'], 'The user\'s words.')
+  let failing = false
+  const store = {
+    head: async () => { if (failing) throw new Error('the store is busy'); return COMMIT_A },
+    list: async () => [pathFor('brainstorming')],
+    read: async () => edited,
+  }
+  const service = createDishSkills({ store: () => store, crew: () => undefined, logger: silent })
+  skills.registerProvider(globalProvider(service))
+  const presetKey = mintPreset(root)
+  const { agent } = mintAgent(root, presetKey, 'main-e')
+  agent.ctx.get('skills')!.registerProvider(roleProvider(service, async () => 'main'))
+
+  const good = await skills.snapshot({ scope: agent })
+  assert.equal(good.complete, true)
+  assert.deepEqual(modelNames(good.skills), ['brainstorming'])
+  assert.equal((await skills.get('brainstorming', { scope: agent }))?.content, 'The user\'s words.')
+
+  // The store hiccups after a change: the registry's cache is gone, and the answer is the shipped skills, incomplete.
+  service.changed()
+  failing = true
+  const hiccup = await skills.snapshot({ scope: agent })
+  assert.equal(hiccup.complete, false)
+  assert.deepEqual(modelNames(hiccup.skills), shippedFor('main'))
+  assert.equal(byName(hiccup.skills).get('brainstorming')!.source, DEFAULT_SOURCE)
+  // It isn't cached: the next step asks the store again, and gets the user's edit.
+  failing = false
+  const back = await skills.snapshot({ scope: agent })
+  assert.equal(back.complete, true)
+  assert.deepEqual(modelNames(back.skills), ['brainstorming'])
+  assert.equal(byName(back.skills).get('brainstorming')!.source, STORE_SOURCE)
+  assert.equal((await skills.get('brainstorming', { scope: agent }))?.content, 'The user\'s words.')
 })
 
 test('get never throws: a catalog that fails while a skill loads is no skill, told once', async () => {

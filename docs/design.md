@@ -29,7 +29,7 @@ Status: draft, from the brainstorm on 2026-09-30. It records what we decided and
 | Kind | Default | Holds | Versioned |
 |---|---|---|---|
 | Config | `$XDG_CONFIG_HOME/dish/` | `crew.yaml` (roles, model tiers, tools), `prompts/<role>.md`, `skills/<name>/SKILL.md`, `families/<family>/` (direction, repos and gates, approved initiatives) | git repo; every UI save is a commit; history, diff and revert in the UI |
-| Data | `$XDG_DATA_HOME/dish/` | `vault/` (memory, its own git repo pushed to a private GitHub repo), `ledgers/`, initiative status, `workspaces/<org>/<repo>` clones and their worktrees | the vault via git; ledgers append-only |
+| Data | `$XDG_DATA_HOME/dish/` | `vault/` (memory, its own git repo pushed to a private GitHub repo), `ledgers/` (until `orchestrator` (step 7) owns the ledger, the shipped skills keep a plan's ledger at `.worktrees/<plan>-ledger.md` in the repo, git-ignored), initiative status, `workspaces/<org>/<repo>` clones and their worktrees | the vault via git; ledgers append-only |
 | State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs | no |
 | Cache | `$XDG_CACHE_HOME/dish/` | Copilot model catalog cache (currently in `~/.dsh`; it will move), fetched pages | no |
 

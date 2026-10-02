@@ -23,6 +23,13 @@
  * Nothing here throws into dsh: `agent/created` is serial and awaited before the agent runs, and a provider's
  * trouble is an incomplete catalog, which the registry asks for again at the next step.
  *
+ * A store that is there but fails (`Catalog.degraded`) is the same trouble with a stopgap: the shipped skills are
+ * listed, so an agent still has skills to load, but the observation is incomplete. dsh's registry never caches an
+ * incomplete one, so the next step reads the store again and the user's skills are back as soon as it answers; and
+ * the `skill` tool's catalog message (dsh-tool-skill) skips an incomplete snapshot, so an agent keeps the catalog it
+ * was last shown (the user's, if the store answered before) and one that has none yet is shown none until the store
+ * answers. Its prompt names its role's skills, and the `skill` tool loads them from the stopgap meanwhile.
+ *
  * @module dish-skills/providers
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -113,6 +120,8 @@ function unfit(doc: SkillDoc): string | undefined {
 interface Offer {
   commit: string | null
   docs: readonly SkillDoc[]
+  /** The catalog was the shipped stopgap for a store that failed: offered, but not as the whole story. */
+  degraded?: boolean
 }
 
 interface ProviderSpec {
@@ -187,7 +196,9 @@ function provider(service: DishSkills, control: SkillProviderControl, spec: Prov
         rank: spec.rank,
         locator: { commit: offer.commit, name: doc.name } satisfies SkillLocator,
       }))
-      return { candidates, complete: true }
+      // A degraded catalog is listed all the same, so that the `skill` tool and the menu still have the shipped skills,
+      // but it is not complete: the registry doesn't cache it, and dsh's catalog message keeps what it last published.
+      return { candidates, complete: offer.degraded !== true }
     },
     // Whatever the locator's commit, the document of that name now: the registry discards a definition whose name is
     // not the candidate's, and a name that went has none. A failure is no skill rather than a throw: dsh loads a skill
@@ -207,7 +218,7 @@ function provider(service: DishSkills, control: SkillProviderControl, spec: Prov
 /** The catalog's documents, with its commit. */
 async function catalogOffer(service: DishSkills): Promise<Offer> {
   const catalog: Catalog = await service.catalog()
-  return { commit: catalog.commit, docs: catalog.skills }
+  return { commit: catalog.commit, docs: catalog.skills, ...catalog.degraded === true ? { degraded: true } : {} }
 }
 
 /**
@@ -242,7 +253,7 @@ export function roleProvider(service: DishSkills, role: () => Promise<string | u
       const answer: unknown = await role()
       if (typeof answer !== 'string' || answer === '') return { commit: null, docs: [] }
       const offer = await catalogOffer(service)
-      return { commit: offer.commit, docs: offer.docs.filter(doc => offeredTo(doc, answer)) }
+      return { ...offer, docs: offer.docs.filter(doc => offeredTo(doc, answer)) }
     },
     invocation: doc => ({ modelInvocable: doc.modelInvocable, userInvocable: doc.userInvocable }),
   }, logger)
@@ -328,7 +339,12 @@ export function watchAgents(ctx: Context, options: WatchOptions): void {
     return async () => {
       let preset: unknown
       try {
-        preset = ctx.get('agentPresets')?.composedPreset(agentCtx)
+        const presetsService = ctx.get('agentPresets')
+        if (presetsService === undefined) {
+          tellOnce(logger, 'agentPresets', 'the agentPresets service isn\'t there, so no agent gets role skills')
+          return undefined
+        }
+        preset = presetsService.composedPreset(agentCtx)
       } catch (error) {
         throw new Error(`could not tell an agent's preset (${describe(error)})`)
       }

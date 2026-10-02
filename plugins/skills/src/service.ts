@@ -5,6 +5,7 @@
  * call looks the store up when it is made, so a store that appears or goes away is handled call by call, and with
  * none (or one that fails to answer, or one that has no skill documents at all, as before its first seed) the
  * answer is the shipped defaults, at `commit: null`: agents are never left with no skills for want of a seed.
+ * Only the one that fails to answer is a stopgap, and its catalog says so (`degraded`): the others are the answer.
  *
  * - `catalog()` is every skill at `main`: the valid documents, sorted by name, and the ones that don't parse in
  *   `problems`. A document nobody could have saved through the store (a hand edit in git) is a problem and
@@ -37,6 +38,13 @@ export interface SkillDoc extends ParsedSkill {
 export interface Catalog {
   /** The store commit the skills were read at, or `null` when they are the shipped defaults. */
   commit: string | null
+  /**
+   * `true` when a store is there but could not be read just now, so the skills are the shipped ones as a stopgap, not
+   * the user's. Absent otherwise: no store, a store with no skill documents and a store that answered are all answers.
+   * dsh's registry caches a catalog it is told is complete until the next change, so whoever offers this one to the
+   * registry must say it is incomplete, and the next step reads the store again.
+   */
+  degraded?: true
   /** The valid skills, sorted by name. */
   skills: SkillDoc[]
   /** The documents that didn't parse, sorted by path; `message` is one sentence that doesn't repeat the path. */
@@ -44,7 +52,7 @@ export interface Catalog {
 }
 
 export interface DishSkills {
-  /** The skills at `main` now, or the shipped defaults at `commit: null` (no store, a store that fails, or one with no skill documents). Never rejects because of the store. */
+  /** The skills at `main` now, or the shipped defaults at `commit: null` (no store, a store that fails, or one with no skill documents); a store that fails is `degraded`. Never rejects because of the store. */
   catalog(): Promise<Catalog>
   /** `catalog()`'s skills that `role` is offered, sorted by name: those that name it and those that name no role. */
   forRole(role: string): Promise<SkillDoc[]>
@@ -220,13 +228,15 @@ export function createDishSkills(options: ServiceOptions): DishSkills {
       return await read(store, started)
     } catch (error) {
       tell(toldStore, error, 'could not read the skills from the config store, so the shipped skills are used: %s')
-      return defaults()
+      // A new object, marked: the shipped catalog itself is shared, and is the answer for a store that isn't there.
+      return { ...defaults(), degraded: true }
     }
   }
 
   /** `catalog` as a caller gets it: its own arrays. */
   const copy = (catalog: Catalog): Catalog => ({
     commit: catalog.commit,
+    ...catalog.degraded === true ? { degraded: true as const } : {},
     skills: [...catalog.skills],
     problems: catalog.problems.map(problem => ({ ...problem })),
   })

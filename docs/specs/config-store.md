@@ -89,7 +89,7 @@ interface DishConfig {
   /** Atomic multi-document commit to main. Resolves `undefined`, with no commit, when the changes leave main as it is. */
   write(changes: Change[], meta: WriteMeta): Promise<CommitInfo | undefined>
   /** One-time defaults: writes documents that don't exist yet. With `options.replace` (path to the sha256 hashes of that path's earlier defaults), a stored document that still has one of those hashes is replaced too, so unedited earlier defaults move to the new ones; the commit then carries the note "updated to the new defaults". An edited document stays. */
-  seed(defaults: Record<string, string>, owner: string, options?: SeedOptions): Promise<CommitInfo | undefined>
+  seed(defaults: Record<string, string>, owner: string, options?: { replace?: Record<path, sha256[]> }): Promise<CommitInfo | undefined>
   /** New commit restoring what `commit` (a full id on main) changed, via `write` with `base: commit`. `undefined`, with no commit, when nothing is left to restore. The first commit is INVALID. */
   revert(commit: string, meta: Omit<WriteMeta, 'base'>): Promise<CommitInfo | undefined>
 
