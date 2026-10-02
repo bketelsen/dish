@@ -36,11 +36,29 @@ function parseUnit(text: string): { sections: Sections; lines: string[] } {
     }
     const eq = line.indexOf('=')
     assert.ok(eq > 0 && section !== '', `a key line outside any section, or without "=": ${line}`)
-    const key = line.slice(0, eq)
-    const value = line.slice(eq + 1)
+    // systemd ignores white space around the "=", so a key written "Name = value" is the key "Name".
+    const key = line.slice(0, eq).trim()
+    const value = line.slice(eq + 1).trim()
     ;((sections[section] ??= {})[key] ??= []).push(value)
   }
   return { sections, lines }
+}
+
+/** Options that restrict the whole service. Every agent command is a child of it, so none may be set. */
+const SANDBOXING = [
+  'PrivateUsers',
+  'SystemCallFilter',
+  'MemoryDenyWriteExecute',
+  'ProtectSystem',
+  'ProtectHome',
+  'RestrictNamespaces',
+  // It would also stop sudo in escalated agent commands.
+  'NoNewPrivileges',
+]
+
+/** The sandboxing options a unit sets, in any section. Compared by parsed key, so spacing around "=" cannot hide one. */
+function sandboxingSet(sections: Sections): string[] {
+  return SANDBOXING.filter((name) => Object.values(sections).some((keys) => name in keys))
 }
 
 const text = readFileSync(UNIT, 'utf8')
@@ -96,21 +114,19 @@ test('restart and install keys', () => {
 })
 
 test('there are no sandboxing options: every agent command is a child of this service', () => {
-  const forbidden = [
-    'PrivateUsers',
-    'SystemCallFilter',
-    'MemoryDenyWriteExecute',
-    'ProtectSystem',
-    'ProtectHome',
-    'RestrictNamespaces',
-    // It would also stop sudo in escalated agent commands.
-    'NoNewPrivileges',
-  ]
-  for (const line of lines) {
-    for (const name of forbidden) {
-      assert.ok(!line.startsWith(`${name}=`), `a unit line sets ${name}: ${line}`)
-    }
-  }
+  assert.deepEqual(sandboxingSet(sections), [])
+})
+
+test('the checks see settings written with spaces around "=", as systemd reads them', () => {
+  const spaced = text.replace('[Service]\n', '[Service]\nProtectHome = read-only\nEnvironment = FOO=bar\n')
+  assert.notEqual(spaced, text, 'the test unit was not modified')
+  const { sections: spacedSections } = parseUnit(spaced)
+  assert.deepEqual(sandboxingSet(spacedSections), ['ProtectHome'])
+  assert.deepEqual(spacedSections.Service?.ProtectHome, ['read-only'])
+  assert.deepEqual(spacedSections.Service?.Environment, [
+    'FOO=bar',
+    'PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin',
+  ])
 })
 
 test('the sections are exactly Unit, Service and Install', () => {
