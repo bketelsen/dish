@@ -88,14 +88,17 @@ async function scratchHome(dir: string): Promise<string> {
 }
 
 /**
- * The environment for a git a test starts itself: the runner's (minus `GIT_*`, `DSH_*` and credential-shaped names),
+ * The environment for a git a test starts itself: the runner's (minus `GIT_*`, `DSH_*`, credential-shaped names and `SSH_ASKPASS*`),
  * `HOME=<dir>/home` with a test identity in its `.gitconfig`, `XDG_CONFIG_HOME` under it, `GIT_CONFIG_NOSYSTEM=1`,
  * `GIT_CONFIG_GLOBAL=<dir>/home/.gitconfig` and `GIT_TERMINAL_PROMPT=0`.
  */
 export async function scratchGitEnv(dir: string): Promise<Record<string, string>> {
   const home = await scratchHome(dir)
+  // No GUI password prompt either: a desktop's SSH_ASKPASS (with a DISPLAY) would let a test git that tries to prompt
+  // open a dialog. GIT_ASKPASS is already gone with the other GIT_* names.
+  const { SSH_ASKPASS: _askpass, SSH_ASKPASS_REQUIRE: _require, ...rest } = inherited()
   return {
-    ...inherited(),
+    ...rest,
     HOME: home,
     XDG_CONFIG_HOME: join(home, '.config'),
     GIT_CONFIG_NOSYSTEM: '1',
