@@ -33,7 +33,10 @@ export interface DishProjects {
   get(name: string): Promise<Project | undefined>
   /** `name`'s onboarding status; pending at 0 for a project with none. */
   status(name: string): ProjectStatus
-  /** Onboard `name` again. Refused (throws) unless it is failed, or ready with its setup skipped. */
+  /**
+   * Onboard `name` again. Refused (throws) only while its onboarding is queued or running. On a ready project it
+   * onboards again: it adopts the clone, runs setup (on merged code) and registers the workspace again.
+   */
   retry(name: string): Promise<void>
   /** Why the stored `projects.yaml` doesn't parse, or `undefined` when it does (or there is no store). */
   problem(): Promise<string | undefined>
@@ -60,7 +63,7 @@ export type StoreReader = Pick<DishConfigService, 'head' | 'read'>
 export interface ProjectsOptions {
   /** The store as it is now, or `undefined`. Called on every read. */
   store: () => StoreReader | undefined
-  /** The status file's store. The service loads it. */
+  /** The status file's store. The service loads it at once (`loadSync`), so `status()` is right from the start. */
   status: StatusStore
   /** `dishWorkspaces` as it is now, or `undefined`. */
   workspaces: () => WorkspacesDriver | undefined
@@ -126,9 +129,13 @@ export function createDishProjects(options: ProjectsOptions): ProjectsService {
     }
   }
 
-  const loaded: Promise<void> = status.load().catch((error: unknown) => {
+  // At once, not in the background: dish-workspaces checks which projects are ready as soon as it starts, and an empty
+  // store would say none is. The file is small.
+  try {
+    status.loadSync()
+  } catch (error) {
     warn('could not read the onboarding status, so every project starts as pending: %s', describe(error))
-  })
+  }
 
   const onboarding = new Onboarding({ status, workspaces: options.workspaces, emit: options.emitStatus, logger, now })
 
@@ -192,14 +199,11 @@ export function createDishProjects(options: ProjectsOptions): ProjectsService {
   }
 
   async function retry(name: string): Promise<void> {
-    await loaded
     const project = await get(name)
     if (project === undefined) throw new Error(`no project ${name} in projects.yaml`)
-    const current = status.get(project.name)
-    const retryable = current.state === 'failed' || (current.state === 'ready' && current.setupSkipped !== undefined)
-    if (!retryable) {
-      throw new Error(`${project.name} is ${current.state}: only a failed project, or a ready one whose setup was skipped, can be retried`)
-    }
+    const under = onboarding.onboarding(project.name)
+    if (under === 'queued') throw new Error(`${project.name} is queued for onboarding already`)
+    if (under === 'running') throw new Error(`${project.name} is being onboarded`)
     const pending: ProjectStatus = { state: 'pending', at: now() }
     saved(status.set(project.name, pending), project.name)
     emitStatus(project.name, pending)
@@ -231,7 +235,6 @@ export function createDishProjects(options: ProjectsOptions): ProjectsService {
 
   /** One pass (see the module's notes). Never rejects. */
   async function pass(restart: boolean): Promise<void> {
-    await loaded
     if (closed) return
     if (restart) restartOwed = true
     let current: Read | undefined

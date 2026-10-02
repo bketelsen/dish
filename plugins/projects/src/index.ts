@@ -11,7 +11,8 @@
  *   on `retry`; a ready project is only prepared at start. Removing a project aborts its onboarding. Each project's
  *   status is kept in `<state>/projects/status.json` (`<state>` is dish-kit's `xdgPaths('dish').state`).
  * - It emits `dish-projects/changed` (the registry changed) and `dish-projects/status` (a project's status changed).
- * - Nothing in `apply` waits: not the store, not dish-workspaces, not the status file. dsh's start never waits on it.
+ * - Nothing in `apply` waits for the store or dish-workspaces, and dsh's start never waits on onboarding. Only the
+ *   small status file is read at once, so that a ready project reads ready from the first moment.
  *
  * @module dish-projects
  */

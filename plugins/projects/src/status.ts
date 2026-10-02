@@ -13,6 +13,7 @@
  * @module dish-projects/status
  */
 import { randomBytes } from 'node:crypto'
+import { readFileSync, renameSync } from 'node:fs'
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 
@@ -107,23 +108,42 @@ export class StatusStore {
       if (errorCode(error) === 'ENOENT') return
       throw error
     }
+    if (!this.#take(text)) await rename(this.#file, `${this.#file}.corrupt-${Date.now()}`)
+  }
+
+  /**
+   * `load`, at once: the file is small, and a caller that answers `get` from the moment it starts (the plugin, whose
+   * ready projects other plugins check as soon as they start) can't answer from an empty store meanwhile.
+   * @throws as `load` does.
+   */
+  loadSync(): void {
+    let text: string
+    try {
+      text = readFileSync(this.#file, 'utf8')
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return
+      throw error
+    }
+    if (!this.#take(text)) renameSync(this.#file, `${this.#file}.corrupt-${Date.now()}`)
+  }
+
+  /** Take the statuses in `text`, the file's content. `false` when it isn't a store's file at all. */
+  #take(text: string): boolean {
     let projects: Record<string, unknown> | undefined
     try {
       const parsed: unknown = JSON.parse(text)
       if (isRecord(parsed) && isRecord(parsed.projects)) projects = parsed.projects
     } catch {
-      // Not JSON: set aside below.
+      // Not JSON.
     }
-    if (projects === undefined) {
-      await rename(this.#file, `${this.#file}.corrupt-${Date.now()}`)
-      return
-    }
+    if (projects === undefined) return false
     for (const [name, value] of Object.entries(projects)) {
       const status = parseStatus(value)
       if (status === undefined || this.#statuses.has(key(name))) continue
       // What was running when dish stopped isn't running now.
       this.#statuses.set(key(name), TRANSIENT.includes(status.state) ? { state: 'pending', at: status.at } : status)
     }
+    return true
   }
 
   /** `name`'s status (a copy), or pending at 0 when the store has none. */

@@ -152,3 +152,30 @@ test('a file that can\'t be read fails the load; a write that fails rejects, kee
   // No temp file is left.
   assert.deepEqual(await readdir(dir), ['status.json'])
 })
+
+test('loadSync reads the same file at once: statuses, transient ones as pending, a corrupt file set aside, a missing one empty', async () => {
+  const { dir, file } = await where()
+  const empty = new StatusStore(file)
+  empty.loadSync()
+  assert.deepEqual(empty.get('acme/widget'), { state: 'pending', at: 0 })
+
+  const first = await loaded(file)
+  await first.set('Acme/Widget', READY)
+  await first.set('acme/running', { state: 'setup', step: 'setup', at: 7 })
+  const store = new StatusStore(file)
+  store.loadSync()
+  assert.deepEqual(store.get('acme/widget'), READY)
+  assert.deepEqual(store.get('acme/running'), { state: 'pending', at: 7 })
+
+  await writeFile(file, 'not json')
+  const corrupt = new StatusStore(file)
+  corrupt.loadSync()
+  assert.deepEqual(corrupt.get('acme/widget'), { state: 'pending', at: 0 })
+  const names = await readdir(dir)
+  assert.equal(names.length, 1)
+  assert.match(names[0]!, /^status\.json\.corrupt-\d+$/)
+
+  // A file that can't be read throws.
+  await mkdir(file)
+  assert.throws(() => new StatusStore(file).loadSync(), { code: 'EISDIR' })
+})

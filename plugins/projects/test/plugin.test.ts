@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import type { ConfigStoreError } from 'dish-config'
 import * as plugin from '../src/index.ts'
@@ -358,37 +358,55 @@ test('at start, a ready project is prepared and not onboarded, one that failed o
   }
 })
 
-test('retry: refused for an unknown or ready project, accepted for a failed one and for a ready one whose setup was skipped', async () => {
+test('retry: refused for an unknown project and while its onboarding is queued or running; a failed one and a ready one are onboarded again', async () => {
   const run = await start()
   try {
-    const skipped = 'setup didn\'t run outside the sandbox: the checkout isn\'t clean. Run it yourself in /w/acme/skipped: make'
-    await run.write(registry({ 'acme/failed': fields(), 'acme/ready': fields(), 'acme/skipped': fields({ setup: 'make' }) }))
+    await run.write(registry({ 'acme/failed': fields(), 'acme/ready': fields(), 'acme/waiting': fields() }))
     ;(await run.fake.next('onboard', 'acme/failed')).reject(new Error('install the dish App on acme and give it failed'))
-    ;(await run.fake.next('onboard', 'acme/ready')).resolve()
-    ;(await run.fake.next('onboard', 'acme/skipped')).resolve({ setup: { ran: false, reason: skipped } })
-    await waitState(run.service, 'acme/skipped', 'ready')
-    assert.equal(run.service().status('acme/skipped').setupSkipped, skipped)
-
-    await assert.rejects(run.service().retry('acme/ready'), /^Error: acme\/ready is ready: only a failed project, or a ready one whose setup was skipped, can be retried$/)
+    const first = await run.fake.next('onboard', 'acme/ready')
+    await assert.rejects(run.service().retry('acme/ready'), /^Error: acme\/ready is being onboarded$/)
+    await assert.rejects(run.service().retry('ACME/waiting'), /^Error: acme\/waiting is queued for onboarding already$/)
     await assert.rejects(run.service().retry('acme/nothing'), /no project acme\/nothing in projects\.yaml/)
+    first.resolve()
+    ;(await run.fake.next('onboard', 'acme/waiting')).resolve()
+    await waitState(run.service, 'acme/waiting', 'ready')
 
     await run.service().retry('ACME/failed')
     assert.equal(run.service().status('acme/failed').state, 'pending')
     const again = await run.fake.next('onboard', 'acme/failed')
-    // It is on its way already.
-    await assert.rejects(run.service().retry('acme/failed'), /acme\/failed is pending/)
+    await assert.rejects(run.service().retry('acme/failed'), /acme\/failed is being onboarded/)
     again.resolve()
     await waitState(run.service, 'acme/failed', 'ready')
 
-    await run.service().retry('acme/skipped')
-    ;(await run.fake.next('onboard', 'acme/skipped')).resolve({ setup: { ran: true } })
-    await waitFor('the skipped setup to have run', () => run.service().status('acme/skipped').state === 'ready' && run.service().status('acme/skipped').setupSkipped === undefined)
+    // A ready one is onboarded again: dish-workspaces adopts its clone and registers its workspace again.
+    await run.service().retry('acme/ready')
+    assert.equal(run.service().status('acme/ready').state, 'pending')
+    ;(await run.fake.next('onboard', 'acme/ready')).resolve()
+    await waitState(run.service, 'acme/ready', 'ready')
+    await settle()
     assert.deepEqual(run.fake.calls.map(entry => `${entry.kind} ${entry.project.name}`), [
-      'onboard acme/failed', 'onboard acme/ready', 'onboard acme/skipped', 'onboard acme/failed', 'onboard acme/skipped',
+      'onboard acme/failed', 'onboard acme/ready', 'onboard acme/waiting', 'onboard acme/failed', 'onboard acme/ready',
     ])
   } finally {
     await run.stop()
   }
+})
+
+test('a ready project reads ready from the moment the service is provided: the status file is read at once', async () => {
+  const { statusFile } = await freshInstance()
+  await mkdir(dirname(statusFile), { recursive: true })
+  await writeFile(statusFile, JSON.stringify({ projects: { 'acme/widget': { state: 'ready', at: 5, readyAt: 5 } } }))
+  const ctx = new Context()
+  let seen: ProjectStatus | undefined
+  // As soon as the service appears: nothing has had a chance to load in the background.
+  ctx.inject(['dishProjects'], (inner) => {
+    seen ??= (inner.get('dishProjects') as DishProjects).status('Acme/Widget')
+  })
+  const probe = mountProjects(ctx)
+  await probe
+  await waitFor('the service to be seen', () => seen !== undefined)
+  assert.deepEqual(seen, { state: 'ready', at: 5, readyAt: 5 })
+  await probe.dispose()
 })
 
 test('without dish-workspaces a project waits as pending and says why; it is onboarded when dish-workspaces appears, and prepared when it comes back', async () => {
@@ -480,6 +498,11 @@ test('the store going away forgets nothing and aborts nothing, and coming back o
 
     await run.restoreStore()
     await waitFor('the projects to be read again', async () => (await run.service().list()).length === 2)
+    // The claim is taken again with the new store: an agent may only propose.
+    await waitFor('the claim to be taken again', async () => {
+      const refused = await run.ctx.dishConfig.write([{ path: PROJECTS_PATH, text: registry({}) }], { author: AGENT }).then(() => undefined, (error: unknown) => error as ConfigStoreError)
+      return refused?.code === 'FORBIDDEN' ? true : undefined
+    })
     await settle()
     assert.deepEqual(run.fake.calls.map(entry => `${entry.kind} ${entry.project.name}`), ['onboard acme/running', 'onboard acme/widget'])
     assert.equal(run.service().status('acme/widget').state, 'ready')

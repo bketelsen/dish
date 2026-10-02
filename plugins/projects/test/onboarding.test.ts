@@ -16,22 +16,26 @@ const READY: ProjectStatus = { state: 'ready', at: 1, readyAt: 1 }
 const settle = () => new Promise(resolve => setTimeout(resolve, 20))
 
 /** An onboarding queue over a fresh status store, the fake driver, a clock the test sets, and what it emitted and logged. */
-async function harness(options: { file?: string } = {}) {
+async function harness(options: { file?: string, abortGraceMs?: number } = {}) {
   const status = new StatusStore(options.file ?? join(await tempDir(), 'projects', 'status.json'))
   await status.load().catch(() => {})
   const fake = fakeDriver()
-  const state: { driver: WorkspacesDriver | undefined, clock: number } = { driver: fake.driver, clock: 100 }
+  const state: { driver: WorkspacesDriver | undefined, clock: number, onEmit?: (name: string, value: ProjectStatus) => void } = { driver: fake.driver, clock: 100 }
   const events: Array<[string, ProjectStatus]> = []
   const logs: string[] = []
   const onboarding = new Onboarding({
     status,
     workspaces: () => state.driver,
-    emit: (name, value) => { events.push([name, value]) },
+    emit: (name, value) => {
+      events.push([name, value])
+      state.onEmit?.(name, value)
+    },
     logger: {
       info: (...args: [string, ...unknown[]]) => { logs.push(`info: ${format(...args)}`) },
       warn: (...args: [string, ...unknown[]]) => { logs.push(`warn: ${format(...args)}`) },
     },
     now: () => state.clock,
+    ...options.abortGraceMs === undefined ? {} : { abortGraceMs: options.abortGraceMs },
   })
   return { status, fake, state, events, logs, onboarding }
 }
@@ -318,4 +322,139 @@ test('a status that can\'t be written is logged, and onboarding goes on', async 
   await settle()
   assert.equal(status.get('acme/a').state, 'ready')
   assert.ok(logs.some(line => /^warn: could not save the onboarding status/.test(line)), logs.join('\n'))
+})
+
+test('an interrupt that comes while a job records its end undoes nothing: ready stays ready, failed stays failed', async () => {
+  const { fake, onboarding, status, state } = await harness()
+  // dish-workspaces goes away just as the end is being written: the job is still the running one then.
+  state.onEmit = (_name, value) => {
+    if (value.state === 'ready' || value.state === 'failed') onboarding.interrupt()
+  }
+  onboarding.enqueue(project('acme/a'), 'onboard')
+  const a = await fake.next('onboard', 'acme/a')
+  a.progress('setup')
+  a.resolve()
+  await onboarding.idle()
+  assert.deepEqual(status.get('acme/a'), { state: 'ready', at: 100, readyAt: 100 })
+
+  onboarding.enqueue(project('acme/b'), 'onboard')
+  ;(await fake.next('onboard', 'acme/b')).reject(new Error('install the dish App on acme and give it b'))
+  await onboarding.idle()
+  assert.equal(status.get('acme/b').state, 'failed')
+})
+
+test('an AbortError that dish-projects didn\'t cause is dish-workspaces closing: an onboarding is pending, a prepare stays ready, never failed', async () => {
+  const abort = () => new DOMException('The operation was aborted.', 'AbortError')
+  const { fake, onboarding, status, events } = await harness()
+  // dish-workspaces' close rejects the work while the service is still there.
+  onboarding.enqueue(project('acme/a'), 'onboard')
+  const a = await fake.next('onboard', 'acme/a')
+  a.progress('clone')
+  a.reject(abort())
+  await onboarding.idle()
+  assert.deepEqual(status.get('acme/a'), { state: 'pending', message: 'dish-workspaces isn\'t running', at: 100 })
+
+  await status.set('acme/b', READY)
+  onboarding.enqueue(project('acme/b'), 'prepare')
+  ;(await fake.next('prepare', 'acme/b')).reject(abort())
+  await onboarding.idle()
+  assert.deepEqual(status.get('acme/b'), READY)
+  assert.ok(events.every(([, value]) => value.state !== 'failed'))
+})
+
+test('a prepare abandoned by dish-workspaces leaves the project ready, whichever comes first: the service gone, or the rejection', async () => {
+  const { fake, onboarding, status, state, events } = await harness()
+  await status.set('acme/a', READY)
+  // The service is gone first, then the work fails with whatever it says.
+  onboarding.enqueue(project('acme/a'), 'prepare')
+  const first = await fake.next('prepare', 'acme/a')
+  state.driver = undefined
+  first.reject(new Error('dish-workspaces is closing'))
+  await onboarding.idle()
+  assert.deepEqual(status.get('acme/a'), READY)
+
+  // The interrupt first (the service went), then the rejection.
+  state.driver = fake.driver
+  onboarding.enqueue(project('acme/a'), 'prepare')
+  const second = await fake.next('prepare', 'acme/a')
+  onboarding.interrupt()
+  state.driver = undefined
+  second.reject(new Error('dish-workspaces is closing'))
+  await onboarding.idle()
+  assert.deepEqual(status.get('acme/a'), READY)
+  assert.deepEqual(events, [])
+})
+
+test('only the steps dish knows are recorded; anything else the driver reports is ignored', async () => {
+  const { fake, onboarding, status, events } = await harness()
+  onboarding.enqueue(project('acme/a'), 'onboard')
+  const a = await fake.next('onboard', 'acme/a')
+  a.progress('clone')
+  for (const odd of ['constructor', '__proto__', '../../x', `token ${TOKEN}`, 'Clone', '']) a.progress(odd)
+  a.progress(42 as unknown as string)
+  assert.deepEqual(status.get('acme/a'), { state: 'cloning', step: 'clone', at: 100 })
+  a.reject(new Error('git clone failed (exit 128)'))
+  await onboarding.idle()
+  assert.equal(status.get('acme/a').step, 'clone')
+  assert.deepEqual(events.map(([, value]) => value.step ?? '-'), ['clone', 'clone'])
+})
+
+test('an aborted job that doesn\'t settle within the grace is logged once and left behind, and the queue goes on', async () => {
+  const { fake, onboarding, status, logs } = await harness({ abortGraceMs: 60 })
+  onboarding.enqueue(project('acme/a'), 'onboard')
+  onboarding.enqueue(project('acme/b'), 'onboard')
+  const a = await fake.next('onboard', 'acme/a')
+  a.progress('setup')
+  // The driver ignores the signal.
+  onboarding.cancel('acme/a')
+  await settle()
+  assert.equal(fake.calls.length, 1)
+  const b = await fake.next('onboard', 'acme/b')
+  const told = logs.filter(line => line.startsWith('warn: onboarding acme/a didn\'t stop within'))
+  assert.equal(told.length, 1, logs.join('\n'))
+  // The one left behind ends at last: nothing is recorded, and b is still the running job.
+  a.resolve()
+  await settle()
+  assert.equal(status.get('acme/a').state, 'setup')
+  assert.equal(onboarding.onboarding('acme/b'), 'running')
+  onboarding.cancel('acme/b')
+  assert.equal(b.signal!.aborted, true)
+  b.reject(new DOMException('The operation was aborted.', 'AbortError'))
+  await onboarding.idle()
+
+  // The same after an interrupt, and after close; a job that settles in time is not logged.
+  onboarding.enqueue(project('acme/c'), 'onboard')
+  const c = await fake.next('onboard', 'acme/c')
+  onboarding.interrupt()
+  await onboarding.idle()
+  assert.equal(logs.filter(line => line.includes('acme/c didn\'t stop')).length, 1)
+  c.resolve()
+  onboarding.enqueue(project('acme/d'), 'onboard')
+  const d = await fake.next('onboard', 'acme/d')
+  onboarding.close()
+  d.reject(new DOMException('The operation was aborted.', 'AbortError'))
+  await onboarding.idle()
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(logs.filter(line => line.includes('acme/b didn\'t stop') || line.includes('acme/d didn\'t stop')).length, 0)
+})
+
+test('onboarding(name) says whether an onboarding is queued or running; a prepare or an aborted one doesn\'t count', async () => {
+  const { fake, onboarding, status } = await harness()
+  await status.set('acme/p', READY)
+  onboarding.enqueue(project('acme/a'), 'onboard')
+  onboarding.enqueue(project('acme/b'), 'onboard')
+  onboarding.enqueue(project('acme/p'), 'prepare')
+  const a = await fake.next('onboard', 'acme/a')
+  assert.equal(onboarding.onboarding('ACME/A'), 'running')
+  assert.equal(onboarding.onboarding('acme/b'), 'queued')
+  assert.equal(onboarding.onboarding('acme/p'), undefined)
+  assert.equal(onboarding.onboarding('acme/none'), undefined)
+  onboarding.cancel('acme/a')
+  assert.equal(onboarding.onboarding('acme/a'), undefined)
+  a.reject(new DOMException('The operation was aborted.', 'AbortError'))
+  ;(await fake.next('onboard', 'acme/b')).resolve()
+  const p = await fake.next('prepare', 'acme/p')
+  assert.equal(onboarding.onboarding('acme/p'), undefined)
+  p.resolve()
+  await onboarding.idle()
 })
