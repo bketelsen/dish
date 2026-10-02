@@ -10,7 +10,7 @@ import { test } from 'node:test'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import { createAppCard, canTest } from '../src/client/controller.ts'
 import type { AppCardController, PageState } from '../src/client/controller.ts'
-import { APP_ID_MAX, KEY_MAX, appIdValue, hiding, privateKeyValue } from '../src/client/input.ts'
+import { APP_ID_MAX, KEY_MAX, appIdValue, privateKeyValue } from '../src/client/input.ts'
 import { relativeTime, selectionText, sourceLabel } from '../src/client/format.ts'
 import { unexpectedNotice } from '../src/client/outcome.ts'
 import type { CredentialView, CredentialsCalls, WorkspacesApi } from '../src/client/remote.ts'
@@ -187,6 +187,35 @@ test('opened again, it reads both at once, and a read already out is not repeate
   await r.card.face.open()
   assert.deepEqual(r.app.calls, ['status'])
   assert.equal(r.credentials.calls.length, 1)
+})
+
+test('opened again, a draft that was never saved is gone: the store outlives the mount, and a key left in the field must not come back', async () => {
+  const r = rig()
+  await r.card.face.open()
+  r.card.face.setInput('appId', '4321')
+  r.card.face.setInput('privateKey', PEM)
+  await r.card.face.open()
+  assert.equal(r.state().appId.input, '')
+  assert.equal(r.state().privateKey.input, '')
+  assert.ok(!JSON.stringify(r.state()).includes(BODY[0]!))
+})
+
+test('opened while a save is out, open leaves that field alone and still empties the other', async () => {
+  const r = rig()
+  await r.card.face.open()
+  const held = gate()
+  r.credentials.gates.set('set', held)
+  r.card.face.setInput('appId', APP_ID)
+  const saving = r.card.face.save('appId')
+  await tick()
+  r.card.face.setInput('privateKey', PEM)
+  await r.card.face.open()
+  assert.equal(r.state().appId.busy, 'save', 'the save is still out')
+  assert.equal(r.state().privateKey.input, '')
+  held.release()
+  await saving
+  assert.equal(r.state().appId.configured, true)
+  assert.equal(r.state().appId.notice?.tone, 'success')
 })
 
 test('a status that can\'t be read is an error with a way to try again, and the credentials wait for the names', async () => {
@@ -419,6 +448,43 @@ test('dsh taking the value and reporting none set for the name is said', async (
   assert.match(r.state().appId.notice!.text, /reports none set/)
 })
 
+test('a change dsh reports while the save reads back does not turn a saved value into "none set"', async () => {
+  const r = rig()
+  await r.card.face.open()
+  const own = gate()
+  r.credentials.gates.set('describe', own)
+  r.card.face.setInput('appId', APP_ID)
+  const saving = r.card.face.save('appId')
+  await tick()
+  // dsh's event arrives while the save's own read is out; its read is the later one, and it is slow.
+  const later = gate()
+  r.credentials.gates.set('describe', later)
+  r.card.credentialChanged(NAMES.appId)
+  await tick()
+  own.release()
+  await saving
+  assert.equal(r.state().appId.notice?.tone, 'success', JSON.stringify(r.state().appId.notice))
+  later.release()
+  await tick()
+  await tick()
+  assert.equal(r.state().appId.configured, true)
+  assert.equal(r.state().appId.notice?.tone, 'success')
+})
+
+test('dsh that can\'t be asked after a save is said, and is not "none set": the value was sent', async () => {
+  const r = rig()
+  await r.card.face.open()
+  r.credentials.down = true
+  await set(r, 'appId', APP_ID)
+  assert.deepEqual(r.credentials.sets, [{ ref: NAMES.appId, value: APP_ID }])
+  const notice = r.state().appId.notice!
+  assert.equal(notice.tone, 'info')
+  assert.match(notice.text, /sent to dsh/)
+  assert.doesNotMatch(notice.text, /none set/)
+  assert.equal(r.state().credentials.load, 'error')
+  assert.equal(r.state().appId.busy, undefined)
+})
+
 // --- removing ------------------------------------------------------------------------------------
 
 test('removing unsets the name in dsh and reads again', async () => {
@@ -562,17 +628,6 @@ test('the face has no member the settings shell\'s props could shadow, and nothi
 })
 
 // --- the helpers ---------------------------------------------------------------------------------
-
-test('hiding takes a value out in the forms it can take', () => {
-  const hide = hiding(PEM)
-  assert.equal(hide(`x ${PEM.trim()} y`), 'x … y')
-  assert.equal(hide(`x ${PEM} y`), 'x …\n y', 'the final line break is not part of the key')
-  assert.ok(!hide(JSON.stringify(PEM)).includes(BODY[1]!))
-  assert.ok(!hide(encodeURIComponent(PEM)).includes(encodeURIComponent(BODY[1]!)))
-  assert.equal(hide(`only ${BODY[2]} here`), 'only … here', 'a line of it alone')
-  assert.equal(hiding('abc')('abc stays'), 'abc stays', 'too short to tell from other text')
-  assert.equal(hiding(APP_ID)(`app ${APP_ID}`), 'app …')
-})
 
 test('the wording: time, installations, the source of a credential, a failure', () => {
   assert.equal(relativeTime(1_000, 1_000), 'just now')

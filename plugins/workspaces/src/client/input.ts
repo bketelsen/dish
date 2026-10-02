@@ -1,6 +1,6 @@
 /**
- * What the person types into the card, checked before it is sent to dsh, and the way a failure's text is cleaned of it
- * afterwards. Plain TypeScript with no DOM or React in it, so `node --test` can load it.
+ * What the person types into the card, checked before it is sent to dsh. (The failure's text is cleaned of it afterwards by
+ * `../hiding.ts`, which the server uses too.) Plain TypeScript with no DOM or React in it, so `node --test` can load it.
  *
  * Every message here is fixed text: none quotes what was typed, so a refusal can't put a key on the screen.
  * @module dish-workspaces/client/input
@@ -48,22 +48,4 @@ export function privateKeyValue(text: string): Prepared {
     return { ok: false, problem: 'The private key is cut short: it should end with an "-----END … PRIVATE KEY-----" line.' }
   }
   return { ok: true, value: `${value}\n` }
-}
-
-/**
- * A function that takes `secret` out of a text, in every form it can take there (as it is, JSON-escaped, URL-encoded), and
- * each long line of it too: for what a failure says, which must not carry a key back to the screen. A value too short to tell
- * from other text is left, as it would turn every letter that is the same into noise.
- */
-export function hiding(secret: string): (text: string) => string {
-  const pieces = new Set<string>()
-  const add = (value: string, shortest: number): void => {
-    if (value.length < shortest) return
-    for (const form of [value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value)]) pieces.add(form)
-  }
-  add(secret.trim(), 4)
-  for (const line of secret.split(/\r?\n/)) add(line.trim(), 16)
-  // The longest first: the whole before its lines.
-  const ordered = [...pieces].sort((a, b) => b.length - a.length)
-  return text => ordered.reduce((hidden, piece) => hidden.split(piece).join('…'), text)
 }

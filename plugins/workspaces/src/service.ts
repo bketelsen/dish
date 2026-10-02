@@ -53,6 +53,7 @@ import type { CloneDeps } from './clone.ts'
 import { shown } from './git.ts'
 import { GITHUB_API, GITHUB_WEB, GitHubApp, GitHubError, botIdentity } from './github.ts'
 import type { AppCredentials, GitHubClientOptions, PullSummary } from './github.ts'
+import { hiding } from './hiding.ts'
 import { KeyedLock } from './locks.ts'
 import { appIdentity, onboardProject } from './onboard.ts'
 import type { OnboardDeps, OnboardResult, OnboardStep } from './onboard.ts'
@@ -177,6 +178,9 @@ interface CrewReader {
 
 type Identity = { name: string, email: string }
 
+/** The most bots (one per App slug) whose lookup is kept. */
+const MAX_BOTS = 16
+
 /** The longest error text a log line carries. */
 const LOGGED_CHARS = 300
 
@@ -242,27 +246,6 @@ function mergeOwners(current: ReadonlyMap<string, OwnerRepos>, extra: ReadonlyMa
   return merged
 }
 
-/**
- * A function that takes the App's ID, its key and each long line of the key out of a text (as they are, JSON-escaped and
- * URL-encoded), for what GitHub or a failure says: the masks know the shapes of tokens and PEM blocks, and not these. A value
- * too short to tell from other text is left (an ID under 4 characters), as is a line of the key under 16.
- */
-function hiding(credentials: AppCredentials | undefined): (text: string) => string {
-  if (credentials === undefined) return text => text
-  const pieces = new Set<string>()
-  const add = (value: string, shortest: number): void => {
-    const plain = value.trim()
-    if (plain.length < shortest) return
-    for (const form of [plain, JSON.stringify(plain).slice(1, -1), encodeURIComponent(plain)]) pieces.add(form)
-  }
-  add(credentials.appId, 4)
-  add(credentials.privateKey, 16)
-  for (const line of credentials.privateKey.split(/\r?\n/)) add(line, 16)
-  // The longest first: the whole key before its lines.
-  const ordered = [...pieces].sort((a, b) => b.length - a.length)
-  return text => ordered.reduce((hidden, piece) => hidden.split(piece).join('…'), text)
-}
-
 class Service implements WorkspacesService {
   readonly #ctx: Context
   readonly #config: WorkspacesConfig
@@ -301,6 +284,11 @@ class Service implements WorkspacesService {
   #lastApp: AppStatus | undefined
   #appTest: Promise<AppStatus> | undefined
   #credentialsGeneration = 0
+  /**
+   * The bots looked up, by the App's slug. `GET /users/<slug>[bot]` is public and costs the address's 60 an hour, which
+   * onboarding spends too; a bot's id never changes, so a slug is asked once (a failure is not kept), whatever else changes.
+   */
+  readonly #bots = new Map<string, { id: number, login: string }>()
   #roundTimer: unknown
   #round: Promise<void> | undefined
 
@@ -815,11 +803,22 @@ class Service implements WorkspacesService {
   /** The bot identity, looked up once per service life (and again after a credential change, or a failure). */
   #botIdentity(): Promise<Identity> {
     if (this.#identity === undefined) {
-      const asked = appIdentity(this.#app)
+      const asked = appIdentity({ app: () => this.#app.app(), botUser: slug => this.#botUser(this.#app, slug) })
       this.#identity = asked
       asked.catch(() => { if (this.#identity === asked) this.#identity = undefined })
     }
     return this.#identity
+  }
+
+  /** The bot of `slug` (public, no credential): from memory when it has been looked up, else asked with `app` and kept. */
+  async #botUser(app: Pick<GitHubApp, 'botUser'>, slug: string): Promise<{ id: number, login: string }> {
+    const known = this.#bots.get(slug)
+    if (known !== undefined) return { ...known }
+    const bot = await app.botUser(slug)
+    this.#bots.set(slug, { id: bot.id, login: bot.login })
+    // A handful of Apps in a life; the oldest goes if there are ever more.
+    if (this.#bots.size > MAX_BOTS) this.#bots.delete(this.#bots.keys().next().value!)
+    return bot
   }
 
   /** The App's ID and private key, read from dsh's credential store now; `undefined` when either (or the store) is missing. Kept by nobody. */
@@ -868,7 +867,7 @@ class Service implements WorkspacesService {
       if (unreadable !== undefined) throw unreadable
       return credentials
     }, this.#appOptions)
-    const hide = hiding(credentials)
+    const hide = hiding(credentials === undefined ? [] : [credentials.appId, credentials.privateKey])
     const errors: string[] = []
     const fail = (error: unknown): void => { errors.push(shown(hide(messageOf(error)), LOGGED_CHARS)) }
 
@@ -887,7 +886,7 @@ class Service implements WorkspacesService {
         fail(error)
       }
       try {
-        const bot = await app.botUser(slug)
+        const bot = await this.#botUser(app, slug)
         status.bot = { login: bot.login, email: botIdentity(slug, bot.id).email }
       } catch (error) {
         fail(error)

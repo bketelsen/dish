@@ -24,9 +24,10 @@
 
 import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
+import { hiding } from '../hiding.ts'
 import type { AppStatus } from '../protocol.ts'
 import { sourceLabel } from './format.ts'
-import { appIdValue, hiding, privateKeyValue } from './input.ts'
+import { appIdValue, privateKeyValue } from './input.ts'
 import type { Prepared } from './input.ts'
 import { unexpectedNotice } from './outcome.ts'
 import type { Notice } from './outcome.ts'
@@ -94,9 +95,9 @@ export interface PageState {
 export interface AppCardActions {
   hooks: { page: ObservableSnapshot<PageState> }
   /**
-   * The card was shown: read the status and the credentials. (There is no `hide` to match: nothing here runs while the card
-   * is hidden. And no member may be called `close`: the settings shell hands every section a `close` prop of its own, which
-   * wins over a face's.)
+   * The card was shown: empty the fields (a draft must not come back with the card) and read the status and the credentials.
+   * (There is no `hide` to match: nothing here runs while the card is hidden. And no member may be called `close`: the settings
+   * shell hands every section a `close` prop of its own, which wins over a face's.)
    */
   open(): Promise<void>
   /** Read both again. */
@@ -212,26 +213,35 @@ export function createAppCard(api: WorkspacesApi, credentials?: CredentialsCalls
 
   // --- the credentials ------------------------------------------------------------------------------
 
-  async function loadCredentials(): Promise<void> {
+  /**
+   * Ask dsh about the two names. Gives what dsh said, for the caller that wants to decide on its own read (a save checking its
+   * value arrived): a read that a newer one has replaced still gives its answer, and changes nothing on the page. `undefined`
+   * when dsh couldn't be asked.
+   */
+  async function loadCredentials(): Promise<Record<string, CredentialView> | undefined> {
     const calls = credentialCalls
     if (calls === undefined) {
       patchCredentials({ load: 'unavailable', error: undefined })
-      return
+      return undefined
     }
     const names = namesOf()
-    if (names === undefined || disposed) return
+    if (names === undefined || disposed) return undefined
     askedNames = `${names.appId} ${names.privateKey}`
     const generation = ++credentialsGeneration
     patchCredentials({ load: get().credentials.load === 'ready' ? 'ready' : 'loading', error: undefined })
     const result = await settle(() => calls.describe([...new Set([names.appId, names.privateKey])]), DSH)
-    if (disposed || generation !== credentialsGeneration) return
+    if (disposed) return undefined
+    const current = generation === credentialsGeneration
     if (!result.ok) {
-      patchCredentials({ load: 'error', error: result.notice })
-      return
+      if (current) patchCredentials({ load: 'error', error: result.notice })
+      return undefined
     }
-    patchField('appId', described(result.value[names.appId]))
-    patchField('privateKey', described(result.value[names.privateKey]))
-    patchCredentials({ load: 'ready', error: undefined })
+    if (current) {
+      patchField('appId', described(result.value[names.appId]))
+      patchField('privateKey', described(result.value[names.privateKey]))
+      patchCredentials({ load: 'ready', error: undefined })
+    }
+    return result.value
   }
 
   /** What a credential action needs and may do: the calls, the name, and no other action of this field under way. */
@@ -241,9 +251,10 @@ export function createAppCard(api: WorkspacesApi, credentials?: CredentialsCalls
     return { calls: credentialCalls, name: names[kind] }
   }
 
-  /** After dsh took a change: read what it says now, and what dish-workspaces makes of it. */
-  const afterChange = async (): Promise<void> => {
-    await Promise.all([loadCredentials(), refreshStatus()])
+  /** After dsh took a change: read what it says now, and what dish-workspaces makes of it. Gives dsh's answer (see `loadCredentials`). */
+  const afterChange = async (): Promise<Record<string, CredentialView> | undefined> => {
+    const [views] = await Promise.all([loadCredentials(), refreshStatus()])
+    return views
   }
 
   const save = async (kind: CredentialKind): Promise<void> => {
@@ -261,19 +272,25 @@ export function createAppCard(api: WorkspacesApi, credentials?: CredentialsCalls
     }
     // The input is emptied now, before anything is sent or answered, so no snapshot after this click holds the value.
     patchField(kind, { input: '', busy: 'save', notice: undefined })
-    const result = await settle(() => target.calls.set(target.name, prepared.value), DSH, hiding(prepared.value))
+    const result = await settle(() => target.calls.set(target.name, prepared.value), DSH, hiding([prepared.value]))
     if (disposed) return
     if (!result.ok) {
       patchField(kind, { busy: undefined, notice: { tone: 'error', text: `${LABEL[kind]} was not saved.`, detail: result.notice.detail ?? result.notice.text } })
       return
     }
     patchField(kind, { busy: undefined })
-    await afterChange()
+    // dsh is the only authority on whether the value now exists, and the save decides on its own read of it: a change dsh
+    // reports meanwhile starts a read that replaces this one on the page, and the page may not have caught up when this looks.
+    let views = await afterChange()
     if (disposed) return
-    // dsh is the only authority on whether the value now exists.
-    patchField(kind, get()[kind].configured
-      ? { notice: { tone: 'success', text: `${LABEL[kind]} was saved.` } }
-      : { notice: { tone: 'error', text: `dsh took the value but reports none set for ${target.name}. Check where the credential comes from.` } })
+    if (views === undefined) views = await loadCredentials()
+    if (disposed) return
+    const view = views?.[target.name]
+    patchField(kind, view === undefined
+      ? { notice: { tone: 'info', text: `${LABEL[kind]} was sent to dsh, but dsh could not be asked whether it is set.` } }
+      : view.configured
+        ? { notice: { tone: 'success', text: `${LABEL[kind]} was saved.` } }
+        : { notice: { tone: 'error', text: `dsh took the value but reports none set for ${target.name}. Check where the credential comes from.` } })
   }
 
   const unset = async (kind: CredentialKind): Promise<void> => {
@@ -333,12 +350,25 @@ export function createAppCard(api: WorkspacesApi, credentials?: CredentialsCalls
     await Promise.all([refreshStatus(), get().status.value === undefined ? Promise.resolve() : loadCredentials()])
   }
 
+  /**
+   * The card was shown. The store outlives a mount (it lives as long as the scope that made it), so a draft left in a field when
+   * the card was hidden would come back with it, and a key is not something to leave on a page: both fields are emptied (one
+   * that is being saved already is, and is left alone), and then everything is read again.
+   */
+  const open = async (): Promise<void> => {
+    for (const kind of KINDS) {
+      const field = get()[kind]
+      if (field.busy === undefined && field.input !== '') patchField(kind, { input: '' })
+    }
+    await refresh()
+  }
+
   // --- the face ---------------------------------------------------------------------------------------
 
   const face: AppCardActions = {
     // A store to read and subscribe to, not the one the controller writes.
     hooks: { page: { getSnapshot: store.getSnapshot, subscribe: store.subscribe } },
-    open: refresh,
+    open,
     refresh,
     runTest,
     setInput(kind, text) {

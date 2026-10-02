@@ -130,7 +130,7 @@ test('status: the last test\'s result from memory, with no new request; a fresh 
     const first = await rig.remote.status()
     assert.equal(first.error, null)
     assert.equal(first.installations.length, 1, 'nothing in memory: a fresh test')
-    assert.equal(rig.requests().length, 3)
+    assert.equal(rig.requests().length, 3, 'the App, its installations and the bot')
     rig.forget()
     const again = await rig.remote.status()
     assert.deepEqual(again, first)
@@ -139,7 +139,7 @@ test('status: the last test\'s result from memory, with no new request; a fresh 
     rig.world.github.installations.set('frost', { id: 88, account: 'Frost', repos: 'all' })
     const tested = await rig.remote.test()
     assert.equal(tested.installations.length, 2)
-    assert.equal(rig.requests().length, 3)
+    assert.equal(rig.requests().length, 2, 'the App and its installations: the bot is known')
     rig.forget()
     assert.deepEqual(await rig.remote.status(), tested)
     assert.deepEqual(rig.requests(), [])
@@ -161,7 +161,7 @@ test('a change to either credential forgets the memory; another reference does n
       updated(rig, ref)
       rig.forget()
       const fresh = await rig.remote.status()
-      assert.equal(rig.requests().length, 3, `${ref} changed: the next status asks GitHub`)
+      assert.equal(rig.requests().length, 2, `${ref} changed: the next status asks GitHub (the App and its installations; the bot is known)`)
       assert.equal(fresh.installations.length, 1)
     }
   })
@@ -174,7 +174,7 @@ test('a test that was under way when a credential changed leaves nothing in memo
     await slow
     rig.forget()
     await rig.remote.status()
-    assert.equal(rig.requests().length, 3, 'the answer of the old test was not kept')
+    assert.equal(rig.requests().length, 2, 'the answer of the old test was not kept (the App and its installations: the bot is known)')
   })
 })
 
@@ -294,6 +294,32 @@ test('the bot lookup failing leaves the App and its installations, and the error
     assert.equal(status.bot, null)
     assert.equal(status.installations.length, 1)
     assert.match(status.error ?? '', /answered HTTP 404/)
+  })
+})
+
+test('the bot of a slug is looked up once: the public /users quota (60 an hour per address) is onboarding\'s too', async () => {
+  await withRemote(async (rig) => {
+    const users = (): number => rig.world.github.requests.filter(request => request.path.startsWith('/users/')).length
+    const first = await rig.remote.test()
+    const second = await rig.remote.test()
+    assert.equal(users(), 1, 'two tests, one lookup')
+    assert.deepEqual(second.bot, first.bot)
+    assert.equal(first.bot?.login, 'dish-test[bot]')
+    // A changed credential gives the same App again: the same bot, and nothing new to ask.
+    updated(rig, PRIVATE_KEY_NAME)
+    assert.deepEqual((await rig.remote.test()).bot, first.bot)
+    assert.equal(users(), 1)
+    assert.equal(rig.requests().filter(request => request.startsWith('GET /app ')).length, 3, 'the App itself is asked every time')
+  })
+})
+
+test('a bot lookup that failed is not remembered', async () => {
+  await withRemote(async (rig) => {
+    rig.world.github.failNext('/users/dish-test%5Bbot%5D', 500, { message: 'oops' })
+    assert.equal((await rig.remote.test()).bot, null)
+    updated(rig, PRIVATE_KEY_NAME)
+    assert.equal((await rig.remote.test()).bot?.login, 'dish-test[bot]')
+    assert.equal(rig.world.github.requests.filter(request => request.path.startsWith('/users/')).length, 2)
   })
 })
 

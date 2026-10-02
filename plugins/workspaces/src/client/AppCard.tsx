@@ -133,6 +133,9 @@ function CredentialField(props: {
   }
   const submit = (event: FormEvent): void => {
     event.preventDefault()
+    // Save is disabled the moment the field is emptied, and a focused button that is disabled drops focus to the page: the field
+    // takes it first.
+    document.getElementById(fieldId)?.focus()
     send()
   }
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -175,6 +178,10 @@ function CredentialField(props: {
                   spellCheck={false}
                   data-1p-ignore="true"
                   data-lpignore="true"
+                  data-bwignore="true"
+                  data-gramm="false"
+                  data-gramm_editor="false"
+                  data-enable-grammarly="false"
                   value={field.input}
                   readOnly={busy}
                   placeholder={placeholder}
@@ -193,6 +200,10 @@ function CredentialField(props: {
                   spellCheck={false}
                   data-1p-ignore="true"
                   data-lpignore="true"
+                  data-bwignore="true"
+                  data-gramm="false"
+                  data-gramm_editor="false"
+                  data-enable-grammarly="false"
                   value={field.input}
                   readOnly={busy}
                   placeholder={placeholder}

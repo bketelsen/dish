@@ -109,6 +109,13 @@ test('the card keeps the key in a text area it never fills back, and takes no st
   assert.equal((card.match(/<textarea/g) ?? []).length, 1, 'one text area, for the key')
   assert.equal((card.match(/<Input/g) ?? []).length, 1, 'one input, for the ID')
   assert.equal((card.match(/\bvalue=\{field\.input\}/g) ?? []).length, 2, 'a field shows what was typed in it, nothing else')
+  // Both fields tell the browser, the password managers and the writing helpers to leave them alone.
+  for (const attribute of [
+    'spellCheck={false}', 'autoComplete="off"', 'data-1p-ignore="true"', 'data-lpignore="true"', 'data-bwignore="true"',
+    'data-gramm="false"', 'data-gramm_editor="false"', 'data-enable-grammarly="false"',
+  ]) {
+    assert.equal(card.split(attribute).length - 1, 2 + (attribute === 'autoComplete="off"' ? 1 : 0), `${attribute}: one on each field`)
+  }
   assert.ok(!/dangerouslySetInnerHTML|innerHTML|insertAdjacentHTML|outerHTML/.test(card), 'a string is never taken for markup')
   for (const file of ['AppCard.tsx', 'index.tsx', 'controller.ts', 'input.ts']) {
     const source = readFileSync(fileURLToPath(new URL(`../src/client/${file}`, import.meta.url)), 'utf8')

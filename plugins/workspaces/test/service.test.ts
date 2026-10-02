@@ -215,6 +215,21 @@ test('without a registry onboarding skips the workspace; a registry that appears
   }
 })
 
+test('the bot a test of the App looked up is the one onboarding uses: one /users call between them', async () => {
+  const run = await setup()
+  try {
+    const users = (): number => run.world.github.requests.filter(request => request.path.startsWith('/users/')).length
+    const status = await run.service.appStatus(true)
+    assert.equal(status.bot?.login, 'dish-test[bot]')
+    assert.equal(users(), 1)
+    await run.service.onboard(widget)
+    assert.equal(users(), 1, 'onboarding\'s identity came from the lookup the test made')
+    assert.equal((await runOk('git', ['-C', join(run.world.workRoot, 'acme', 'widget'), 'config', 'user.email'], { env: run.world.env })).trim(), `${run.world.github.bot.id}+dish-test[bot]@users.noreply.github.com`)
+  } finally {
+    await teardown(run)
+  }
+})
+
 test('prepare configures before it fetches: a helper path from an older checkout is put back, the fetch is recorded, and the identity is asked once', async () => {
   const run = await setup()
   try {
