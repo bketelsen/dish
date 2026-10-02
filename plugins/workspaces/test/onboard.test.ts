@@ -1,12 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { appendFile, readFile, realpath, stat } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { workRoot } from 'dish-kit'
-import { internals } from '../src/clone.ts'
+import { fetchClone, internals } from '../src/clone.ts'
 import { NO_REGISTRY, OnboardError, onboardProject } from '../src/onboard.ts'
 import type { OnboardDeps, OnboardResult, OnboardStep } from '../src/onboard.ts'
-import { cloneStateFile, setupLogFile, tokensDir } from '../src/paths.ts'
+import { cloneStateFile, helperValue, setupLogFile, tokensDir } from '../src/paths.ts'
 import { skipReason } from '../src/setup.ts'
 import { readCloneState } from '../src/state.ts'
 import { FILE_PERMISSIONS } from '../src/tokens.ts'
@@ -282,4 +282,44 @@ test('a registry that fails fails the workspace step, with its message', async (
   run.deps.registry = () => broken
   const error = await failsAt(onboard(run), 'workspace')
   assert.match(error.message, /the registry is broken/)
+})
+
+test('a helper in dish\'s shape planted in a clone never runs: adopting replaces it unrun, and an unconfigured clone is never fetched', async () => {
+  const run = await prepare({ registry: false })
+  const { world } = run
+  const env = await scratchGitEnv(world.dir)
+  // A script named like dish's helper, which leaves a marker if anything runs it.
+  const marker = join(world.dir, 'planted-ran')
+  const planted = join(world.dir, 'planted', 'git-credential-dish')
+  await mkdir(join(world.dir, 'planted'))
+  await writeFile(planted, `#!/bin/sh\necho ran >> '${marker}'\n`)
+  await chmod(planted, 0o755)
+  const value = helperValue(planted, tokensDir(world.state), world.git.origin)
+  const web = world.git.origin
+  const path = join(world.workRoot, 'acme', 'widget')
+  const plant = async (): Promise<void> => {
+    await runOk('git', ['-C', path, 'config', '--unset-all', `credential.${web}.helper`], { env }).catch(() => {})
+    await runOk('git', ['-C', path, 'config', '--add', `credential.${web}.helper`, ''], { env })
+    await runOk('git', ['-C', path, 'config', '--add', `credential.${web}.helper`, value], { env })
+    await runOk('git', ['-C', path, 'config', '--replace-all', `credential.${web}.useHttpPath`, 'true'], { env })
+  }
+  await runOk('git', ['clone', '-q', `file://${world.bare}`, path], { env })
+  await runOk('git', ['-C', path, 'remote', 'set-url', 'origin', `${web}/acme/widget.git`], { env })
+  await plant()
+
+  // Onboarding adopts it, and replaces the pair before any git that would ask a helper.
+  const result = await onboard(run)
+  assert.equal(result.adopted, true)
+  assert.equal(await exists(marker), false, 'the planted helper ran while onboarding')
+  const helpers = await runOk('git', ['-C', path, 'config', '--get-all', `credential.${web}.helper`], { env })
+  assert.deepEqual(helpers.split('\n').slice(0, -1), ['', helperValue(HELPER, tokensDir(world.state), web)])
+
+  // Planted again after configuring (before the next start's prepare): a fetch refuses the clone without reaching the server.
+  await plant()
+  const requests = world.git.requests.length
+  await withEnv(run.home, async () => {
+    await assert.rejects(fetchClone(path, project(), run.deps), /credential helper/)
+  })
+  assert.equal(world.git.requests.length, requests, 'the fetch reached the server')
+  assert.equal(await exists(marker), false, 'the planted helper ran on a fetch')
 })

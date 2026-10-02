@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { appendFile, mkdir, readdir, readFile, realpath, rename, stat, symlink, writeFile } from 'node:fs/promises'
+import { appendFile, link, mkdir, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   CLONE_TIMEOUT_MS, OnboardError, cloneOrAdopt, configureClone, defaultBranch, fetchClone, httpsUrl, internals, originMatches,
@@ -368,6 +368,28 @@ test('anything else at the path is refused with what was found, and left byte fo
   }
 })
 
+test('an owner directory that leads out of the work root is refused, with nothing written there or outside', async () => {
+  for (const withClone of [true, false]) {
+    const deps = await adoptDeps()
+    const outside = join(deps.dir, 'outside')
+    if (withClone) {
+      // A clone dish would adopt, but outside the work root: <work root>/acme is a link to where it is.
+      await existingClone(deps, 'https://github.com/acme/widget.git')
+      await rename(join(deps.workRoot, 'acme'), outside)
+    } else {
+      await mkdir(outside, { recursive: true })
+      await mkdir(deps.workRoot, { recursive: true })
+    }
+    await symlink(outside, join(deps.workRoot, 'acme'))
+    const before = { root: await listing(deps.workRoot), outside: await listing(outside) }
+    await withEnv(await dishHome(deps.dir), async () => {
+      const error = await refusedAt(cloneOrAdopt(project(), deps), 'clone')
+      assert.match(error.message, /outside the work root/, error.message)
+    })
+    assert.deepEqual({ root: await listing(deps.workRoot), outside: await listing(outside) }, before, `with a clone: ${withClone}`)
+  }
+})
+
 // --- configuring ----------------------------------------------------------------------------------------------------
 
 test('configureClone writes nothing through a .git/config that is a symbolic link', async () => {
@@ -391,6 +413,111 @@ test('configureClone refuses a clone whose config has a key dish refuses, naming
     const error = await refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure')
     assert.match(error.message, /filter\.lfs\.smudge/)
   })
+})
+
+/**
+ * Run `body` with `internals.beforeWrite` set to `swap` for the first write to `target` (then cleared): the moment
+ * between dish's read of a file of the clone's and its write back, where an agent racing dish would swap it.
+ */
+async function racing<T>(target: string, swap: () => Promise<void>, body: () => Promise<T>): Promise<T> {
+  let swapped = false
+  internals.beforeWrite = async (file: string) => {
+    if (swapped || file !== target) return
+    swapped = true
+    await swap()
+  }
+  try {
+    const result = await body()
+    assert.ok(swapped, `nothing was about to write ${target}`)
+    return result
+  } finally {
+    delete internals.beforeWrite
+  }
+}
+
+test('a .git/config swapped for a link (or a hard link) between dish\'s read and its write is refused, and the other file is untouched', async () => {
+  const swaps: Array<[string, (config: string, outside: string) => Promise<void>]> = [
+    ['a symbolic link', async (config, outside) => { await rm(config); await symlink(outside, config) }],
+    ['a hard link', async (config, outside) => { await rm(config); await link(outside, config) }],
+  ]
+  for (const [name, swap] of swaps) {
+    const deps = await adoptDeps()
+    const path = await existingClone(deps, 'https://github.com/acme/widget.git')
+    // Another repository's config the account can write (the config store's, say).
+    const outside = join(deps.dir, 'store-config')
+    await writeFile(outside, '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@example.invalid:store.git\n')
+    const before = await listing(outside)
+    const config = join(path, '.git', 'config')
+    await withEnv(await dishHome(deps.dir), async () => {
+      const error = await racing(config, () => swap(config, outside), () => refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure'))
+      assert.match(error.message, /\.git\/config/, `${name}: ${error.message}`)
+    })
+    // Its content and mode as they were (a hard link's ctime moves with the link count, so not that).
+    const [after] = await listing(outside)
+    assert.equal(after!.split(' ').filter((_, i) => i !== 5).join(' '), before[0]!.split(' ').filter((_, i) => i !== 5).join(' '), name)
+  }
+})
+
+test('a .git/config replaced by another file between dish\'s read and its write is refused, and that file is left as it is', async () => {
+  const deps = await adoptDeps()
+  const path = await existingClone(deps, 'https://github.com/acme/widget.git')
+  const config = join(path, '.git', 'config')
+  const theirs = '[core]\n\tbare = false\n[remote "origin"]\n\turl = https://github.com/acme/widget.git\n'
+  await withEnv(await dishHome(deps.dir), async () => {
+    const error = await racing(config, async () => {
+      const fresh = join(deps.dir, 'fresh-config')
+      await writeFile(fresh, theirs)
+      await rename(fresh, config)
+    }, () => refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure'))
+    assert.match(error.message, /\.git\/config was replaced/)
+  })
+  assert.equal(await readFile(config, 'utf8'), theirs)
+})
+
+test('a .git swapped for a link between dish\'s read and its write is refused, and the linked-to config is untouched', async () => {
+  const deps = await adoptDeps()
+  const path = await existingClone(deps, 'https://github.com/acme/widget.git')
+  const outside = join(deps.dir, 'store-git')
+  await mkdir(outside)
+  await writeFile(join(outside, 'config'), '[core]\n\tbare = false\n')
+  const before = await listing(outside)
+  const config = join(path, '.git', 'config')
+  await withEnv(await dishHome(deps.dir), async () => {
+    const error = await racing(config, async () => {
+      await rename(join(path, '.git'), join(path, '.git-real'))
+      await symlink(outside, join(path, '.git'))
+    }, () => refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure'))
+    assert.match(error.message, /\.git/)
+  })
+  assert.deepEqual(await listing(outside), before)
+})
+
+test('a .git/config with another hard link is refused before anything is written', async () => {
+  const deps = await adoptDeps()
+  const path = await existingClone(deps, 'https://github.com/acme/widget.git')
+  const other = join(deps.dir, 'other-link')
+  await link(join(path, '.git', 'config'), other)
+  const before = await readFile(other, 'utf8')
+  await withEnv(await dishHome(deps.dir), async () => {
+    const error = await refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure')
+    assert.match(error.message, /hard link/)
+  })
+  assert.equal(await readFile(other, 'utf8'), before)
+})
+
+test('a .git/info/exclude swapped for a link before dish appends to it is refused, and the target is untouched', async () => {
+  const deps = await adoptDeps()
+  const path = await existingClone(deps, 'https://github.com/acme/widget.git')
+  const outside = join(deps.dir, 'outside-file')
+  await writeFile(outside, 'mine\n')
+  const before = await listing(outside)
+  const exclude = join(path, '.git', 'info', 'exclude')
+  await withEnv(await dishHome(deps.dir), async () => {
+    const error = await racing(exclude, async () => { await rm(exclude); await symlink(outside, exclude) },
+      () => refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure'))
+    assert.match(error.message, /exclude/)
+  })
+  assert.deepEqual(await listing(outside), before)
 })
 
 // --- fetching -------------------------------------------------------------------------------------------------------
@@ -465,4 +592,16 @@ test('a failed fetch is recorded, masked, and thrown; a clone that fails the che
     assert.match((await readCloneState(file))?.lastFetch?.message ?? '', /core\.fsmonitor/)
   })
   for (const line of world.lines) assert.ok(!line.includes('ghs_'), line)
+})
+
+test('an origin/HEAD an agent repointed is put back by the next fetch', async () => {
+  const { deps, clone, env, home } = await cloned()
+  const head = (await runOk('git', ['-C', clone, 'rev-parse', 'HEAD'], { env })).trim()
+  await runOk('git', ['-C', clone, 'update-ref', 'refs/remotes/origin/agent', head], { env })
+  await runOk('git', ['-C', clone, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/agent'], { env })
+  await withEnv(home, async () => {
+    assert.equal(await defaultBranch(clone), 'agent')
+    await fetchClone(clone, project(), deps)
+    assert.equal(await defaultBranch(clone), 'main')
+  })
 })

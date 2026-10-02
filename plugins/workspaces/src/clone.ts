@@ -7,22 +7,35 @@
  *   was: nothing in it is written, moved or removed. With nothing there, the repo is cloned into a temporary directory
  *   beside it (`.<repo>.cloning-<8 hex>`, made by dish), with the credential helper given only as `-c` flags of the
  *   clone command, then renamed into place. A failed or aborted clone removes that temporary directory, and only it.
- * - **Configure.** The contract's keys, written with `git config --file <clone>/.git/config` from `/` with no system
- *   or global config, so nothing of the clone's runs while dish writes: the credential pair (an empty helper, which
- *   drops any helper from the global config for the URL, then dish's), `useHttpPath`, `credential.interactive=false`,
- *   the App's bot identity, the HTTPS `origin`, and `.worktrees/` in `.git/info/exclude` once. The credential keys are
- *   replaced before the check, so a clone whose helper path is from an older checkout (before a `dish-update`) passes;
- *   then `checkClone` with every expectation. It runs again at every start, so a changed key is put back.
+ * - **The owner directory** (`<work root>/<owner>`) must be the work root's own: one that leads elsewhere (a link) is
+ *   refused before anything else, so neither a clone nor its workspace lands outside the work root.
+ * - **Configure.** The contract's keys: the credential pair (an empty helper, which drops any helper from the global
+ *   config for the URL, then dish's), `useHttpPath`, `credential.interactive=false`, the App's bot identity, the HTTPS
+ *   `origin`, and `.worktrees/` in `.git/info/exclude` once. The credential keys are replaced before the check, so a
+ *   clone whose helper path is from an older checkout (before a `dish-update`) passes; then `checkClone` with every
+ *   expectation. It runs again at every start, so a changed key is put back.
+ * - **Writing a clone's files** (its `.git/config`, its exclude file, and adopt's switch of `origin`): agents can swap
+ *   any of them, or `.git` itself, for a link to another repository's (the config store's, say), and git's own
+ *   `git config --file` writes through a link to its target. So dish pins `.git` (by `lstat`: a directory, its device and
+ *   inode), reads the file through a handle that follows no link and refuses one with another hard link, edits a
+ *   private copy under dish's state directory with `git config --file <copy>` (from `/`, no system or global config:
+ *   nothing of the clone's runs), and writes the result back through one handle that follows no link, only if it is
+ *   still the file it read (device, inode, one link) and `.git` is still the directory it pinned. A config the edit
+ *   doesn't change isn't written.
  * - **Fetch.** `checkClone` first, then `git fetch --prune origin +refs/heads/*:refs/remotes/origin/*`: the refspec on
  *   the command line, so a refspec written into the config can't fetch elsewhere or keep a hand-written origin ref
- *   alive. Records `lastFetch` in the clone state.
+ *   alive. Then `git remote set-head origin --auto` every time, so an `origin/HEAD` an agent repointed is GitHub's again
+ *   before `defaultBranch` reads it. Records `lastFetch` in the clone state.
  *
  * No token is ever in an argument, a URL, an environment variable or a config value: git asks the helper, which reads
  * the token file. Every message is masked.
  *
  * Known limits:
- * - as the spec's (an agent racing dish): a `.git/config` swapped for a link between the check here and
- *   `git config --file` is written through; the clone check and the next git command are two steps;
+ * - `.git` is checked by path just before the file is opened again to write it: an agent that swaps `.git` for a link
+ *   and back within the microseconds between those two steps, having done the same while dish read the file, could
+ *   still get the edited config written into the file it linked to. A sub-millisecond window, closed fully only when
+ *   dish's work in a clone runs inside the sandbox (6c's sandboxed runner); likewise the spec's race between the clone
+ *   check and the next git command;
  * - a temporary directory left by a crash (dish killed mid-clone) stays: dish can't tell it from one it didn't make.
  *   It is `.<repo>.cloning-<8 hex>` beside the clone, for the user to remove.
  *
@@ -31,14 +44,14 @@
 
 import { randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, realpath, rename, rm, stat } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type { Project } from 'dish-projects/registry'
 import { maskSecrets } from 'dish-kit'
 import { git, gitOk, maskUrlPasswords } from './git.ts'
 import type { GitResult } from './git.ts'
-import { cloneStateFile, clonePath, helperValue, tokensDir } from './paths.ts'
+import { cloneStateFile, clonePath, helperValue, projectStateDir, tokensDir } from './paths.ts'
 import { ORIGIN_FETCH, checkClone } from './safety.ts'
 import { readCloneState, writeCloneState } from './state.ts'
 import type { CloneState } from './state.ts'
@@ -54,13 +67,17 @@ const CONFIG_TIMEOUT_MS = 10_000
 const CONFIG_ENV: Readonly<Record<string, string>> = Object.freeze({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' })
 /** The line `.git/info/exclude` gets. */
 const EXCLUDE_LINE = '.worktrees/'
-/** The most of `.git/info/exclude` that is read. */
-const MAX_EXCLUDE_BYTES = 1024 * 1024
+/** The most of a clone's `.git/config` or `.git/info/exclude` that is read. */
+const MAX_CLONE_FILE_BYTES = 1024 * 1024
 /** The most characters of something from outside (a URL, git's stderr) a message shows. */
 const MAX_SHOWN = 200
 
-/** For tests only, never set by dish: put on top of the environment of the network gits here (a test's `GIT_CONFIG_NOSYSTEM`). */
-export const internals: { gitEnv?: Record<string, string> } = {}
+/**
+ * For tests only, never set by dish: `gitEnv` is put on top of the environment of the network gits here (a test's
+ * `GIT_CONFIG_NOSYSTEM`); `beforeWrite` is called with a clone's file just before dish's last checks and its write
+ * back, where a test plays an agent swapping the file.
+ */
+export const internals: { gitEnv?: Record<string, string>, beforeWrite?: (file: string) => Promise<void> | void } = {}
 
 // --- the error --------------------------------------------------------------------------------------------------------
 
@@ -202,10 +219,138 @@ async function configValues(file: string, key: string): Promise<string[]> {
 }
 
 /** Write with `git config --file`; `ok` are the exit codes that aren't failures. */
-async function configWrite(file: string, args: readonly string[], ok: readonly number[] = [0]): Promise<void> {
+async function configWrite(file: string, args: readonly string[], ok: readonly number[], step: OnboardStep): Promise<void> {
   const result = await configGit(file, args)
   if (ok.includes(result.code) && !result.timedOut && !result.aborted) return
-  throw new OnboardError('configure', `git config ${args[0]} ${args[1] ?? ''} failed (exit ${result.code}): ${gitFailure(result)}`)
+  throw new OnboardError(step, `git config ${args[0]} ${args[1] ?? ''} failed (exit ${result.code}): ${gitFailure(result)}`)
+}
+
+// --- writing a clone's files ------------------------------------------------------------------------------------------
+
+/** What a directory or file was when dish looked: whether it is still the same one. */
+interface Identity { dev: bigint, ino: bigint }
+
+function codeOf(error: unknown): string {
+  return (error as NodeJS.ErrnoException).code ?? messageOf(error)
+}
+
+/** `dir` (not followed if a link) as a directory: its identity. */
+async function pinDirectory(dir: string, name: string, step: OnboardStep): Promise<Identity> {
+  let stats
+  try {
+    stats = await lstat(dir, { bigint: true })
+  } catch (error) {
+    throw new OnboardError(step, codeOf(error) === 'ENOENT' ? `${name} is missing` : `${name} can't be read (${codeOf(error)})`)
+  }
+  if (!stats.isDirectory()) throw new OnboardError(step, `${name} is not a directory (a link, or something else)`)
+  return { dev: stats.dev, ino: stats.ino }
+}
+
+/** `dir` is still the directory pinned; else nothing is written. */
+async function stillDirectory(dir: string, pinned: Identity, name: string, step: OnboardStep): Promise<void> {
+  const now = await pinDirectory(dir, name, step)
+  if (now.dev !== pinned.dev || now.ino !== pinned.ino) {
+    throw new OnboardError(step, `${name} was replaced while dish was configuring the clone; dish wrote nothing`)
+  }
+}
+
+/**
+ * A clone's file, read through a handle that follows no link and doesn't wait on a FIFO: its bytes and identity, or
+ * `undefined` when it is missing. Refused unless it is a regular file with one link: a hard link to another file would
+ * have dish's write land there too.
+ */
+async function readPinned(file: string, name: string, step: OnboardStep): Promise<{ bytes: Buffer, id: Identity } | undefined> {
+  let handle: FileHandle
+  try {
+    handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  } catch (error) {
+    if (codeOf(error) === 'ENOENT') return undefined
+    throw new OnboardError(step, codeOf(error) === 'ELOOP' ? `${name} is a symbolic link` : `${name} can't be read (${codeOf(error)})`)
+  }
+  try {
+    const stats = await handle.stat({ bigint: true })
+    if (!stats.isFile()) throw new OnboardError(step, `${name} is not a regular file`)
+    if (stats.nlink !== 1n) throw new OnboardError(step, `${name} has another hard link; dish won't write through it`)
+    if (stats.size > BigInt(MAX_CLONE_FILE_BYTES)) throw new OnboardError(step, `${name} is too large`)
+    return { bytes: await handle.readFile(), id: { dev: stats.dev, ino: stats.ino } }
+  } finally {
+    await handle.close()
+  }
+}
+
+/** Write through one handle that follows no link, only if it is still the file read (`id`) with one link. */
+async function writePinned(file: string, id: Identity, name: string, step: OnboardStep, write: (handle: FileHandle) => Promise<void>, append = false): Promise<void> {
+  const replaced = new OnboardError(step, `${name} was replaced while dish was configuring the clone; dish wrote nothing`)
+  let handle: FileHandle
+  try {
+    handle = await open(file, constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | (append ? constants.O_APPEND : 0))
+  } catch {
+    throw replaced
+  }
+  try {
+    const stats = await handle.stat({ bigint: true })
+    if (!stats.isFile() || stats.nlink !== 1n || stats.dev !== id.dev || stats.ino !== id.ino) throw replaced
+    await write(handle)
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+/** All of `bytes` at `position` (or appended), however the writes split it. */
+async function writeAll(handle: FileHandle, bytes: Buffer, position: number | null): Promise<void> {
+  let done = 0
+  while (done < bytes.length) {
+    const { bytesWritten } = await handle.write(bytes, done, bytes.length - done, position === null ? null : position + done)
+    done += bytesWritten
+  }
+}
+
+/**
+ * Edit a clone's `.git/config` with `git config --file` on a private copy under dish's state directory, and write the
+ * result back as the module says (`.git` pinned, the file read and written through handles that follow no link, the
+ * write only to the file read). Nothing is written when the edits change nothing.
+ */
+async function editConfig(clone: string, project: Project, deps: CloneDeps, step: OnboardStep, edits: ReadonlyArray<{ args: readonly string[], ok?: readonly number[] }>): Promise<void> {
+  const dotGit = join(clone, '.git')
+  const file = join(dotGit, 'config')
+  const pinned = await pinDirectory(dotGit, '.git', step)
+  const read = await readPinned(file, '.git/config', step)
+  if (read === undefined) throw new OnboardError(step, '.git/config is missing')
+  await stillDirectory(dotGit, pinned, '.git', step)
+
+  const scratch = projectStateDir(deps.state, project.owner, project.repo)
+  await mkdir(scratch, { recursive: true, mode: 0o700 })
+  const copy = join(scratch, `.config-edit-${randomBytes(6).toString('hex')}`)
+  try {
+    await writeFile(copy, read.bytes, { flag: 'wx', mode: 0o600 })
+    for (const edit of edits) await configWrite(copy, edit.args, edit.ok ?? [0], step)
+    const edited = await readFile(copy)
+    if (edited.equals(read.bytes)) return
+    await internals.beforeWrite?.(file)
+    await stillDirectory(dotGit, pinned, '.git', step)
+    await writePinned(file, read.id, '.git/config', step, async handle => {
+      await handle.truncate(0)
+      await writeAll(handle, edited, 0)
+    })
+  } finally {
+    await rm(copy, { force: true }).catch(() => {})
+    await rm(`${copy}.lock`, { force: true }).catch(() => {})
+  }
+}
+
+/** Why `<work root>/<owner>`, when it is there, isn't the work root's own directory (a link out of it, say). */
+async function ownerProblem(workRoot: string, owner: string): Promise<string | undefined> {
+  if (await kindOf(owner) === 'missing') return undefined
+  let real: string
+  let root: string
+  try {
+    real = await realpath(owner)
+    root = await realpath(workRoot)
+  } catch (error) {
+    return `can't be resolved (${codeOf(error)})`
+  }
+  return real === join(root, basename(owner)) ? undefined : `leads outside the work root (to ${shown(real)})`
 }
 
 /** A helper value in dish's shape (`!/bin/sh '<…/git-credential-dish>' '<tokens>' '<web>'`), whatever its paths. */
@@ -220,6 +365,10 @@ function isDishHelper(value: string, web: string): boolean {
 export async function cloneOrAdopt(project: Project, deps: CloneDeps, signal?: AbortSignal): Promise<{ clone: string, adopted: boolean }> {
   if (signal?.aborted) throw abortError(`cloning ${project.name}`)
   const path = clonePath(deps.workRoot, project.owner, project.repo)
+  // Before anything else: a clone found, or made, through a link would be outside the work root, and so its workspace.
+  const owner = dirname(path)
+  const problem = await ownerProblem(deps.workRoot, owner)
+  if (problem !== undefined) throw new OnboardError('clone', `${owner} ${problem}; dish leaves it as it is and clones nothing there`)
   if (await kindOf(path) !== 'missing') return { clone: await adopt(path, project, deps), adopted: true }
   return { clone: await cloneFresh(path, project, deps, signal), adopted: false }
 }
@@ -260,9 +409,7 @@ async function adopt(path: string, project: Project, deps: CloneDeps): Promise<s
 
   const url = httpsUrl(web, project.owner, project.repo)
   if (origin !== url) {
-    await configWrite(config, ['--replace-all', 'remote.origin.url', url]).catch((error: unknown) => {
-      throw new OnboardError('clone', messageOf(error))
-    })
+    await editConfig(path, project, deps, 'clone', [{ args: ['--replace-all', 'remote.origin.url', url] }])
     deps.logger.info('adopted the clone at %s; its origin is now %s', path, url)
   } else {
     deps.logger.info('adopted the clone at %s', path)
@@ -279,6 +426,8 @@ async function cloneFresh(path: string, project: Project, deps: CloneDeps, signa
   } catch (error) {
     throw new OnboardError('clone', `${owner} can't hold the clone: ${messageOf(error)}`)
   }
+  const problem = await ownerProblem(deps.workRoot, owner)
+  if (problem !== undefined) throw new OnboardError('clone', `${owner} ${problem}; dish clones nothing there`)
   let dropped: string[]
   try {
     ({ dropped } = await deps.tokens.ensureFileToken(project.owner))
@@ -322,28 +471,36 @@ async function cloneFresh(path: string, project: Project, deps: CloneDeps, signa
 
 // --- step 3: configure ------------------------------------------------------------------------------------------------
 
-/** Append `.worktrees/` to `.git/info/exclude` unless it has the line; never through a link. */
-async function excludeWorktrees(dotGit: string): Promise<void> {
+/** Append `.worktrees/` to `.git/info/exclude` unless it has the line, as `editConfig` writes: never through a link, only to the file read. */
+async function excludeWorktrees(clone: string, step: OnboardStep): Promise<void> {
+  const dotGit = join(clone, '.git')
   const info = join(dotGit, 'info')
-  const kind = await kindOf(info)
-  if (kind === 'missing') await mkdir(info, { mode: 0o755 })
-  else if (kind !== 'directory') throw new OnboardError('configure', '.git/info is not a directory')
   const file = join(info, 'exclude')
+  const pinned = await pinDirectory(dotGit, '.git', step)
+  if (await kindOf(info) === 'missing') await mkdir(info, { mode: 0o755 })
+  const pinnedInfo = await pinDirectory(info, '.git/info', step)
+  await stillDirectory(dotGit, pinned, '.git', step)
+  const read = await readPinned(file, '.git/info/exclude', step)
+  const text = read?.bytes.toString('utf8') ?? ''
+  if (text.split(/\r?\n/).some(line => line === EXCLUDE_LINE)) return
+  const addition = Buffer.from(`${text === '' || text.endsWith('\n') ? '' : '\n'}${EXCLUDE_LINE}\n`)
+  await internals.beforeWrite?.(file)
+  await stillDirectory(dotGit, pinned, '.git', step)
+  await stillDirectory(info, pinnedInfo, '.git/info', step)
+  if (read !== undefined) {
+    await writePinned(file, read.id, '.git/info/exclude', step, handle => writeAll(handle, addition, null), true)
+    return
+  }
+  // There was none: a new one, never through a link or over one that appeared meanwhile.
   let handle: FileHandle
   try {
-    handle = await open(file, constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o644)
+    handle = await open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o644)
   } catch (error) {
-    throw new OnboardError('configure', `.git/info/exclude can't be opened: ${(error as NodeJS.ErrnoException).code ?? messageOf(error)}`)
+    throw new OnboardError(step, `.git/info/exclude can't be made (${codeOf(error)}); dish wrote nothing`)
   }
   try {
-    const stats = await handle.stat()
-    if (!stats.isFile()) throw new OnboardError('configure', '.git/info/exclude is not a regular file')
-    if (stats.size > MAX_EXCLUDE_BYTES) throw new OnboardError('configure', '.git/info/exclude is too large')
-    const buffer = Buffer.alloc(stats.size)
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
-    const text = buffer.subarray(0, bytesRead).toString('utf8')
-    if (text.split(/\r?\n/).some(line => line === EXCLUDE_LINE)) return
-    await handle.write(`${text === '' || text.endsWith('\n') ? '' : '\n'}${EXCLUDE_LINE}\n`)
+    await writeAll(handle, addition, 0)
+    await handle.sync()
   } finally {
     await handle.close()
   }
@@ -356,26 +513,26 @@ export async function configureClone(clone: string, project: Project, identity: 
       throw new OnboardError('configure', `the bot identity's ${what} is empty or not one line`)
     }
   }
-  const layout = await layoutProblem(clone)
-  if (layout !== undefined) throw new OnboardError('configure', `${clone}: ${layout}`)
   const web = originOf(deps.web)
   const helper = helperOf(deps)
   const url = httpsUrl(web, project.owner, project.repo)
-  const config = join(clone, '.git', 'config')
 
   // Single keys first, replaced where they are; the credential section last, removed and written again (git drops
-  // the emptied section), so a second run leaves the file byte for byte as the first did.
-  await configWrite(config, ['--replace-all', 'credential.interactive', 'false'])
-  await configWrite(config, ['--replace-all', 'user.name', identity.name])
-  await configWrite(config, ['--replace-all', 'user.email', identity.email])
-  await configWrite(config, ['--replace-all', 'remote.origin.url', url])
-  // Exit 5: there was none.
-  await configWrite(config, ['--unset-all', `credential.${web}.helper`], [0, 5])
-  await configWrite(config, ['--unset-all', `credential.${web}.usehttppath`], [0, 5])
-  await configWrite(config, ['--add', `credential.${web}.helper`, ''])
-  await configWrite(config, ['--add', `credential.${web}.helper`, helper])
-  await configWrite(config, ['--add', `credential.${web}.useHttpPath`, 'true'])
-  await excludeWorktrees(join(clone, '.git'))
+  // the emptied section), so a second run leaves the file byte for byte as the first did. The credential pair is
+  // replaced before the check below, so a helper path from an older checkout passes.
+  await editConfig(clone, project, deps, 'configure', [
+    { args: ['--replace-all', 'credential.interactive', 'false'] },
+    { args: ['--replace-all', 'user.name', identity.name] },
+    { args: ['--replace-all', 'user.email', identity.email] },
+    { args: ['--replace-all', 'remote.origin.url', url] },
+    // Exit 5: there was none.
+    { args: ['--unset-all', `credential.${web}.helper`], ok: [0, 5] },
+    { args: ['--unset-all', `credential.${web}.usehttppath`], ok: [0, 5] },
+    { args: ['--add', `credential.${web}.helper`, ''] },
+    { args: ['--add', `credential.${web}.helper`, helper] },
+    { args: ['--add', `credential.${web}.useHttpPath`, 'true'] },
+  ])
+  await excludeWorktrees(clone, 'configure')
 
   const checked = await checkClone(clone, { url, helper, web })
   if (!checked.ok) throw new OnboardError('configure', `dish won't work in ${clone}: ${checked.problem}`)
@@ -383,7 +540,7 @@ export async function configureClone(clone: string, project: Project, identity: 
 
 // --- fetch ------------------------------------------------------------------------------------------------------------
 
-/** `git fetch --prune origin +refs/heads/*:refs/remotes/origin/*` (the refspec on the command line, so a refspec an agent wrote in the config can't keep a hand-written origin ref alive), and `git remote set-head origin --auto` when origin/HEAD is missing. Records lastFetch. */
+/** `git fetch --prune origin +refs/heads/*:refs/remotes/origin/*` (the refspec on the command line, so a refspec an agent wrote in the config can't keep a hand-written origin ref alive), then `git remote set-head origin --auto` (every time: an agent can repoint origin/HEAD). Records lastFetch. */
 export async function fetchClone(clone: string, project: Project, deps: CloneDeps, signal?: AbortSignal): Promise<void> {
   const at = Date.now()
   try {
@@ -407,9 +564,8 @@ async function fetchNow(clone: string, project: Project, deps: CloneDeps, signal
   if (!checked.ok) throw new Error(`dish won't fetch in ${clone}: ${checked.problem}`)
   const options = { timeoutMs: FETCH_TIMEOUT_MS, signal, env: { ...internals.gitEnv } }
   await gitOk(['-C', clone, 'fetch', '--prune', '--quiet', 'origin', ORIGIN_FETCH], options)
-  const head = await git(['-C', clone, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], options)
-  if (head.aborted) throw abortError(`fetching ${project.name}`)
-  if (head.code !== 0) await gitOk(['-C', clone, 'remote', 'set-head', 'origin', '--auto'], options)
+  // Every time, not only when it is missing: an agent can repoint origin/HEAD, and defaultBranch reads it.
+  await gitOk(['-C', clone, 'remote', 'set-head', 'origin', '--auto'], options)
 }
 
 /** `lastFetch` into the clone state (a missing or corrupt one is started over). Never throws: a state that can't be saved is logged. */
