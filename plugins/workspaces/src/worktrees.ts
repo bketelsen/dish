@@ -42,7 +42,7 @@ import { clonePath, projectStateDir, worktreeRecordFile, worktreeSetupLogFile, w
 import { checkClone, checkWorktree } from './safety.ts'
 import type { CloneExpectations } from './safety.ts'
 import { skipReason } from './setup.ts'
-import type { GitHubDefault, SetupResult } from './setup.ts'
+import type { GitHubDefault, SetupOutcome } from './setup.ts'
 import { checkMerged, defaultBranchOf, githubWord } from './sweep.ts'
 
 /** A worktree's name: its folder under `.worktrees/` and its branch `dish/<slug>`. (`.cache`, 6c's, can't be one.) */
@@ -51,13 +51,6 @@ export const SLUG = /^[a-z0-9][a-z0-9-]{0,39}$/
 export const RECENT_RESOLVE_MS = 300_000
 /** Why setup doesn't run in a new worktree (see `worktreeSetup`). */
 export const WORKTREE_SETUP_SKIPPED = 'a worktree picks up config from the clone, which agents can change'
-
-/**
- * What setup did: the plan's `SetupOutcome`, which it puts in setup.ts. Task 6 didn't export it there, and Task 7a (in
- * parallel) needs it too, so it is spelled out here rather than added to setup.ts; when both have landed, this becomes
- * an import of setup.ts's.
- */
-type SetupOutcome = { ran: false, reason: string } | ({ ran: true } & SetupResult)
 
 /**
  * For tests only, never set by dish: `gitEnv` goes on top of the environment of this module's git (a test's
