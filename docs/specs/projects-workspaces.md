@@ -1,6 +1,6 @@
 # Spec: projects and workspaces (`dish-projects`, `dish-workspaces`)
 
-Status: approved 2026-10-02; revised before the plan by its checks (what changed, and the evidence, is under [Checks](#checks-2026-10-02)). Two findings need your decision ([Awaiting your decision](#awaiting-your-decision)); the plan follows the recommendation for each. This is roadmap step 6b. It builds on [ops](ops.md) (step 6a: prod and dev, and the `~/work` root), the [config store](config-store.md), [crew](crew.md) and the [design](../design.md) ("Project families", "Plugins and contracts"). The plan is [docs/plans/2026-10-02-projects.md](../plans/2026-10-02-projects.md).
+Status: approved 2026-10-02; revised before the plan by its checks (what changed, and the evidence, is under [Checks](#checks-2026-10-02)). Two findings were then decided by you, both as recommended ([Decided after the checks](#decided-after-the-checks)). This is roadmap step 6b. It builds on [ops](ops.md) (step 6a: prod and dev, and the `~/work` root), the [config store](config-store.md), [crew](crew.md) and the [design](../design.md) ("Project families", "Plugins and contracts"). The plan is [docs/plans/2026-10-02-projects.md](../plans/2026-10-02-projects.md).
 
 ## Summary
 
@@ -21,10 +21,10 @@ You register repos as **projects**, and dish gets them ready to work on.
 | 4 | Registry | `projects.yaml` in the config store. Edited on Settings → Projects, or by agent proposals you accept. |
 | 5 | Project fields | `owner/name`, `family`, `role`, `gate`, `gateTimeout`, and optional `setup`, `setupTimeout` and `gateEnv` (see the [gates spec](gates.md)). |
 | 6 | Who makes worktrees | The main agent, with the `worktree` tool. `delegate` takes a worktree and binds the coder to it (crew records the binding, for gates in 6c). |
-| 7 | GitHub | A GitHub App with Contents read/write, Pull requests read/write and Metadata read, installed on `bketelsen` (selected repos) and `frostyard`. Dev uses a separate dish-dev App, installed only on test repos. |
+| 7 | GitHub | A GitHub App, read-only in 6b (Contents, Pull requests and Metadata read; write comes in step 7, [below](#decided-after-the-checks)), installed on `bketelsen` (selected repos) and `frostyard`. Dev uses a separate dish-dev App, installed only on test repos. |
 | 8 | Where the App key lives | dsh's credential store, entered on a settings card (like the TypeSafe key). Dev has its own card and its own App. |
 | 9 | Who can push | Only the harness (step 7). Agents' git gets read-only tokens. |
-| 10 | `setup` | Runs as `dish` outside dsh's sandbox, like a CI job (the command is yours, from the registry), with a timeout and saved output. |
+| 10 | `setup` | Runs as `dish` outside dsh's sandbox, like a CI job (the command is yours, from the registry), with a timeout and saved output, but only on code a human merged ([below](#decided-after-the-checks)). |
 | 11 | Cleanup | Automatic: a sweep on every fetch and hourly removes worktrees whose branch is merged, along with their local branches. GitHub's "automatically delete head branches" setting handles the remote branch. |
 | 12 | Plugins | Two: `dish-projects` (registry, page, onboarding) and `dish-workspaces` (clones, worktrees, credentials, the tool, the sweep). |
 | 13 | Projects page | List with clone status; add, edit and remove; retry a failed clone. A per-project worktree view may come with step 7. |
@@ -82,7 +82,7 @@ A project is onboarded when it appears in `projects.yaml`, at startup for each p
    - `.worktrees/` added to `.git/info/exclude`.
 
    This step runs again at every start for each ready project, so the helper's path follows the checkout and a changed key is put back.
-4. **Setup:** run `setup` in the clone, if there is one. It runs as `dish` with `setupTimeout`, outside dsh's sandbox, in the environment described under [Setup](#setup). The last 64 KB of its output is saved to `$XDG_STATE_HOME/dish/workspaces/<owner>/<repo>/setup.log`. A failed setup fails the project, and the page shows the tail. (When it runs at all is [awaiting your decision](#awaiting-your-decision): the plan runs it only on code a human merged.)
+4. **Setup:** run `setup` in the clone, if there is one. It runs as `dish` with `setupTimeout`, outside dsh's sandbox, in the environment described under [Setup](#setup). The last 64 KB of its output is saved to `$XDG_STATE_HOME/dish/workspaces/<owner>/<repo>/setup.log`. A failed setup fails the project, and the page shows the tail. It runs only on code a human merged ([Decided after the checks](#decided-after-the-checks)).
 5. **Register the workspace:** create it with `ctx.workspaceRegistry.create(<clone path>, "<owner>/<repo>")`. dsh reuses an existing record for the path and keeps its title. dish records that it registered the project's workspace, so one you remove stays removed until you press Retry. In a profile without a workspace registry (anything but `web`), the project is ready with no workspace, and is registered when a registry appears.
 
 A project is **ready** once all five succeed, and dish records that in its state directory: a ready project isn't onboarded again at the next start, only configured (step 3) and fetched. Onboarding runs one project at a time and never blocks dsh's start.
@@ -123,7 +123,7 @@ Agents in a project's workspace can write anything inside the clone, `.git` incl
 - **dish's own API reads** (pull request state for the sweep, the bot user) use a second installation token with `{ metadata: read, pull_requests: read }`, kept in memory only. The file token stays as narrow as above.
 - **The credential helper:** each clone's helper is a small `sh` script shipped with `dish-workspaces`, configured in the clone as `credential.https://github.com.helper` (after an empty entry that drops any helper from your global config for that URL), with `useHttpPath=true` and two arguments: the token directory and `https://github.com`. The script's path and the token directory are absolute, and rewritten at every start. It answers git's `get` for `https://github.com` with `username=x-access-token` and the current read token for the URL's owner, says `quit=true` when it has none, and ignores `store` and `erase`. Agents' `fetch` and `pull` therefore work, and `push` fails (403).
 - **Write tokens:** made in memory by the harness for its own pushes, in step 7. They never touch disk.
-- **Exposure:** agents can read any file the `dish` account can, including the read-token file. That's accepted: it's read-only, lasts an hour, and covers only the projects' repos. They can also read dsh's credential file, which holds the App's private key: see [Awaiting your decision](#awaiting-your-decision).
+- **Exposure:** agents can read any file the `dish` account can, including the read-token file. That's accepted: it's read-only, lasts an hour, and covers only the projects' repos. They can also read dsh's credential file, which holds the App's private key, so the Apps are read-only in 6b ([Decided after the checks](#decided-after-the-checks)).
 
 ## Worktrees
 
@@ -133,7 +133,7 @@ It's a global tool, like the config tools: it refuses any caller that isn't a to
 
 | Action | Input | What it does |
 |---|---|---|
-| `create` | `project`, `slug`, optional `base` | Refused unless the project is ready and the calling chat's workspace is that project's clone: crew's children work in the chat's sandbox, which is its workspace, so a coder of another chat couldn't write there. Fetches the clone. Makes `<clone>/.worktrees/<slug>` on a new branch `dish/<slug>` from `base`, which defaults to `origin/<default branch>`, and records it (its base commit included) in dish's state directory. Runs `setup` in it (when, is [awaiting your decision](#awaiting-your-decision)). Returns the absolute path, the branch, the base commit, and what setup did. Refuses a slug that's in use or isn't `[a-z0-9][a-z0-9-]*` (at most 40 characters). |
+| `create` | `project`, `slug`, optional `base` | Refused unless the project is ready and the calling chat's workspace is that project's clone: crew's children work in the chat's sandbox, which is its workspace, so a coder of another chat couldn't write there. Fetches the clone. Makes `<clone>/.worktrees/<slug>` on a new branch `dish/<slug>` from `base`, which defaults to `origin/<default branch>`, and records it (its base commit included) in dish's state directory. Runs `setup` in it if its base is on `origin/<default>` ([Decided after the checks](#decided-after-the-checks)). Returns the absolute path, the branch, the base commit, and what setup did. Refuses a slug that's in use or isn't `[a-z0-9][a-z0-9-]*` (at most 40 characters). |
 | `list` | optional `project` | Each worktree: path, branch, ahead and behind the default branch, dirty or clean, merged or not, whether dish made it, and the crew child bound to it, if any. |
 | `remove` | `project`, `slug`, optional `force` | Removes a worktree dish made, and its local branch. Refuses one that's unmerged or dirty unless `force`. `force` is refused while a running coder is bound to it. Never touches a worktree dish didn't make. |
 
@@ -249,20 +249,20 @@ interface Worktree {
 
 I'll give exact steps in the plan: create each App (no webhook yet), set the permissions above, install it on the owners and repos, and paste the App ID and the private key file's contents into the card.
 
-## Awaiting your decision
+## Decided after the checks
 
-Two findings of the checks change what decisions 7, 9 and 10 promise. The plan follows the recommendation for each; say if you want the other.
+Two findings of the checks changed what decisions 7, 9 and 10 promise. You decided both as recommended (2026-10-02): setup runs unsandboxed only on merged code (1), and both Apps are read-only in 6b (2).
 
 1. **Setup can run code an agent wrote, outside the sandbox.** Decision 10 runs `setup` unsandboxed because the command is yours. What it runs is the repo's own code (`pnpm install` runs `package.json`'s lifecycle scripts), and that isn't always yours:
    - a worktree cut from a local branch (`base: dish/plan-x`, the pipeline's usual case) holds coders' unmerged commits;
    - Retry, or adopting a clone, runs it in a main checkout that agents in that workspace can change without asking.
 
    An agent that wanted out of the sandbox would only need to commit a `preinstall` script and ask for a worktree from its branch.
-   - **Recommended:** run setup outside the sandbox only on code a human merged: a fresh clone; an adopted or retried clone whose checkout is clean and whose `HEAD` is on `origin/<default>`; a worktree whose base is on `origin/<default>`. Anywhere else the step is skipped, and the page or the tool's answer says so and gives the command, for the agent to run in its own sandbox. 6c builds a sandboxed runner (dsh's shell service, caches inside the clone) for the gate, and can take over this case.
-   - **The other way:** run every worktree's setup in dsh's sandbox now, confined to the clone, with its caches inside the clone like 6c's gate (a pnpm store per clone, and dsh's 10-minute cap).
+   - **Decided:** run setup outside the sandbox only on code a human merged: a fresh clone; an adopted or retried clone whose checkout is clean and whose `HEAD` is on `origin/<default>`; a worktree whose base is on `origin/<default>`. Anywhere else the step is skipped, and the page or the tool's answer says so and gives the command, for the agent to run in its own sandbox. 6c builds a sandboxed runner (dsh's shell service, caches inside the clone) for the gate, and can take over this case.
+   - **Not chosen:** run every worktree's setup in dsh's sandbox now, confined to the clone, with its caches inside the clone like 6c's gate (a pnpm store per clone, and dsh's 10-minute cap).
 2. **The App's private key is readable by agents.** dsh's credential file (`~/.dsh/.credentials.yaml`) belongs to the `dish` account, and dsh's sandbox mounts the whole filesystem read-only, so an agent's shell can read it, as it can the Copilot token and the TypeSafe key there today. With the key, an agent could mint a token with Contents write and push. Agents' git is read-only, and the key is never shown, logged or put in the config store, but "only the harness pushes" (decision 9) holds against mistakes, not against an agent set on it.
-   - **Recommended:** create both Apps with read permissions only for now (Contents read, Pull requests read, Metadata read). Nothing in 6b writes, so a key read by an agent can't push anything. Step 7, which brings the pushes, adds write (GitHub asks each installation to accept it, one click) together with a way to keep the key from agents, such as a token broker under another account. The code is the same either way: dish only ever asks for read tokens in 6b.
-   - **The other way:** give the Apps write now, as decision 7 says, accept the exposure as it is accepted for the Copilot token, and protect each onboarded repo's default branch with a ruleset that requires a pull request, so a misused key can't change `main`.
+   - **Decided:** create both Apps with read permissions only for now (Contents read, Pull requests read, Metadata read). Nothing in 6b writes, so a key read by an agent can't push anything. Step 7, which brings the pushes, adds write (GitHub asks each installation to accept it, one click) together with a way to keep the key from agents, such as a token broker under another account. The code is the same either way: dish only ever asks for read tokens in 6b.
+   - **Not chosen:** give the Apps write now, as decision 7 says, accept the exposure as it is accepted for the Copilot token, and protect each onboarded repo's default branch with a ruleset that requires a pull request, so a misused key can't change `main`.
 
 ## Checks (2026-10-02)
 
