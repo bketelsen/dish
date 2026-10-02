@@ -23,8 +23,9 @@
  * - **A nested repository inside an ignored folder** (a clone under `node_modules/` or another ignored path) is an
  *   ignored file to git and to `dirty`, so it is deleted with the worktree, its history and uncommitted edits included.
  * - **`.worktrees` swapped for a link** between `create`'s check of it and `git worktree add`: git then makes the
- *   worktree wherever the link points. `create` sees it afterwards (the new path isn't canonical), removes what git
- *   just made there, and refuses; the check and the add are still two steps.
+ *   worktree wherever the link points. `create` sees it afterwards (git's record of the new worktree, or the path
+ *   itself, isn't canonical), removes what git just made where git put it, and refuses; if that removal fails, it says
+ *   so and keeps the branch and the record. The check and the add are still two steps.
  *
  * Nothing here takes the project's lock: the service runs `create`, `remove` and the sweep under it.
  *
@@ -60,9 +61,10 @@ type SetupOutcome = { ran: false, reason: string } | ({ ran: true } & SetupResul
 
 /**
  * For tests only, never set by dish: `gitEnv` goes on top of the environment of this module's git (a test's
- * `GIT_CONFIG_NOSYSTEM`); `beforeAdd` runs between `create`'s check of `.worktrees` and its `git worktree add`.
+ * `GIT_CONFIG_NOSYSTEM`); `beforeAdd` runs between `create`'s check of `.worktrees` and its `git worktree add`, and
+ * `afterAdd` right after the add.
  */
-export const internals: { gitEnv?: Record<string, string>, beforeAdd?: () => Promise<void> } = {}
+export const internals: { gitEnv?: Record<string, string>, beforeAdd?: () => Promise<void>, afterAdd?: () => Promise<void> } = {}
 
 /** git()'s cap on stdout: a listing this long may have been cut. */
 const GIT_OUTPUT_CAP = 4 * 1024 * 1024
@@ -215,13 +217,11 @@ export class Worktrees {
       await rm(file, { force: true }).catch(() => {})
       throw new Error(`${project.name}: couldn't make worktree ${slug}: ${messageOf(error)}`, { cause: error })
     }
-    const landed = await realpath(path).catch(() => undefined)
-    if (landed !== path) {
-      // `.worktrees` changed under git (a link swapped in): what git just made is dish's, wherever it went. Undo it.
-      await gitOk(['-C', clone, 'worktree', 'remove', '--force', path], this.#options()).catch(() => {})
-      await gitOk(['-C', clone, 'update-ref', '-d', `refs/heads/${record.branch}`, commit], this.#options()).catch(() => {})
-      await rm(file, { force: true }).catch(() => {})
-      throw new Error(`${project.name}: worktree ${slug} landed at ${shown(landed ?? 'an unreadable path', 200)}, not ${path} (.worktrees changed while it was made); dish removed it`)
+    await internals.afterAdd?.()
+    // Where git put it, by git's own record (the real path it wrote), and what `path` is now.
+    const landed = (await worktreeEntries(clone)).find(entry => entry.branch === `refs/heads/${record.branch}`)?.path
+    if (landed !== path || await realpath(path).catch(() => undefined) !== path) {
+      await this.#undo(project, clone, record, landed, path)
     }
     return { project: project.name, slug, branch: record.branch, path, clone, base: commit, setup: worktreeSetup(project, path) }
   }
@@ -397,7 +397,10 @@ export class Worktrees {
     const path = resolve(state.path)
     const entries = await worktreeEntries(clone)
     const inner = nestedWorktree(entries, path)
-    if (inner !== undefined) throw new Error(`worktree ${record.slug} holds another worktree (${shown(inner, 200)}); dish won't remove it, even with force`)
+    if (inner !== undefined) {
+      const shownInner = shown(inner, 200)
+      throw new Error(`worktree ${record.slug} holds another worktree (${shownInner}); dish won't remove it, even with force: remove it first (\`git worktree remove ${shownInner}\`), then try again`)
+    }
     const other = entries.find(entry => entry.branch === `refs/heads/${record.branch}` && !entry.at(path))
     if (other !== undefined) {
       throw new Error(`${record.branch} is checked out in ${shown(other.path, 200)}; dish keeps the branch, worktree ${record.slug} and its record`)
@@ -414,6 +417,31 @@ export class Worktrees {
     await rm(this.#recordFile(project, record.slug), { force: true })
     await rm(worktreeSetupLogFile(this.#deps.state, project.owner, project.repo, record.slug), { force: true })
     this.#resolved.delete(path)
+  }
+
+  /**
+   * `create`'s worktree didn't land at its canonical path (`.worktrees` changed under git: a link swapped in, maybe
+   * swapped back since). What git made is dish's, so it is removed where git put it: `checkWorktree` on that real path,
+   * then `git worktree remove --force` there; only if that worked are the branch and the record removed too. Always
+   * throws, saying which happened.
+   */
+  async #undo(project: Project, clone: string, record: WorktreeRecord, landed: string | undefined, path: string): Promise<never> {
+    const where = `worktree ${record.slug} landed at ${shown(landed ?? 'a path git has no record of', 200)}, not ${path} (.worktrees changed while it was made)`
+    let failure: string | undefined
+    if (landed === undefined) {
+      failure = `git has no worktree on ${record.branch}`
+    } else {
+      const check = await checkWorktree(clone, landed)
+      if (!check.ok) failure = check.problem
+      else failure = await gitOk(['-C', clone, 'worktree', 'remove', '--force', landed], this.#options()).then(() => undefined, (error: unknown) => messageOf(error))
+    }
+    if (failure === undefined) {
+      await gitOk(['-C', clone, 'update-ref', '-d', `refs/heads/${record.branch}`, record.base], this.#options()).catch(() => {})
+      await rm(this.#recordFile(project, record.slug), { force: true }).catch(() => {})
+      throw new Error(`${project.name}: ${where}; dish removed it`)
+    }
+    const by = landed === undefined ? '' : `: git -C ${clone} worktree remove --force ${shown(landed, 200)}, then git -C ${clone} branch -D ${record.branch}`
+    throw new Error(`${project.name}: ${where}, and dish couldn't remove it there (${shown(failure, 200)}), so its branch ${record.branch} and its record are kept; remove it yourself${by}`)
   }
 
   #now(): number {

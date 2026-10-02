@@ -200,23 +200,57 @@ test('create: a .worktrees that is a link is refused', async () => {
   assert.deepEqual(await recordNames(f), [])
 })
 
-test('create: a .worktrees swapped for a link just before git makes the worktree: what git made is removed, and it is refused', async () => {
-  const f = await worktreeFixture()
-  await create(f, 'first')
+/** `create` with `.worktrees` swapped for a link to a fresh directory just before `git worktree add`, and `after` run right after it. */
+async function createThroughLink(f: WorktreeFixture, slug: string, after?: (elsewhere: string) => Promise<void>): Promise<{ elsewhere: string, error: Error }> {
   const elsewhere = await tempDir()
   internals.beforeAdd = async () => {
-    await rm(join(f.clone, '.worktrees'), { recursive: true, force: true })
+    await rm(join(f.clone, '.worktrees'), { recursive: true, force: true }) // empty: create just made it
     await symlink(elsewhere, join(f.clone, '.worktrees'))
   }
+  internals.afterAdd = after === undefined ? undefined : () => after(elsewhere)
   try {
-    await assert.rejects(create(f, 'two'), /landed at/)
+    await create(f, slug)
+  } catch (error) {
+    return { elsewhere, error: error as Error }
   } finally {
     internals.beforeAdd = undefined
+    internals.afterAdd = undefined
   }
+  assert.fail('create should have refused')
+}
+
+test('create: a .worktrees swapped for a link just before git makes the worktree: what git made is removed where it landed, and it is refused', async () => {
+  const f = await worktreeFixture()
+  const { elsewhere, error } = await createThroughLink(f, 'two')
+  assert.match(error.message, /landed at .*dish removed it$/)
   assert.deepEqual(await readdir(elsewhere), [], 'the worktree git made through the link is gone')
   assert.ok(!await hasBranch(f, 'dish/two'))
-  assert.ok(!(await recordNames(f)).includes('two.json'))
+  assert.deepEqual(await recordNames(f), [])
   assert.ok(!(await f.git(['worktree', 'list', '--porcelain'])).includes('/two\n'))
+})
+
+test('create: the undo goes by where git put it, so a link swapped back to a directory before it still works', async () => {
+  const f = await worktreeFixture()
+  const { elsewhere, error } = await createThroughLink(f, 'two', async () => {
+    await rm(join(f.clone, '.worktrees'))
+    await mkdir(join(f.clone, '.worktrees'))
+  })
+  assert.match(error.message, /landed at .*dish removed it$/)
+  assert.deepEqual(await readdir(elsewhere), [])
+  assert.ok(!await hasBranch(f, 'dish/two'))
+  assert.deepEqual(await recordNames(f), [])
+})
+
+test("create: when the undo fails, it says so, and the branch and the record are kept", async () => {
+  const f = await worktreeFixture()
+  const { elsewhere, error } = await createThroughLink(f, 'two', async there => {
+    await f.git(['worktree', 'lock', join(there, 'two')])
+  })
+  assert.match(error.message, /couldn't remove it there .*locked.*branch dish\/two and its record are kept; remove it yourself/)
+  assert.ok(!/dish removed it/.test(error.message))
+  assert.ok(await exists(join(elsewhere, 'two', 'README.md')))
+  assert.ok(await hasBranch(f, 'dish/two'))
+  assert.deepEqual(await recordNames(f), ['two.json'])
 })
 
 test("create: a project without a clone is refused", async () => {
@@ -391,7 +425,7 @@ test('remove: a worktree holding another worktree is refused, with and without f
   await f.git(['worktree', 'add', '-q', '-b', 'mine', inner])
   await writeFile(join(inner, 'work.txt'), 'uncommitted\n')
   await assert.rejects(remove(f, 'outer'), /another worktree/)
-  await assert.rejects(remove(f, 'outer', true), /another worktree/)
+  await assert.rejects(remove(f, 'outer', true), /another worktree .*remove it first \(`git worktree remove [^`]*\/\.worktrees\/inner`\), then try again/)
   assert.equal(await readFile(join(inner, 'work.txt'), 'utf8'), 'uncommitted\n')
   assert.ok(await hasBranch(f, 'dish/outer'))
   const [info] = (await f.call(() => f.worktrees().list(f.project))).filter(item => item.slug === 'outer')
