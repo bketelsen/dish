@@ -172,7 +172,15 @@ export async function apply(ctx: Context, config: Config) {
       return running
     },
   }
-  ctx.provide('copilotCatalog', catalog)
+  // After the awaits, not before: `llm-pi-ai` waits for the service, so it
+  // mounts only once the cached additions are in the catalog.
+  try {
+    ctx.provide('copilotCatalog', catalog)
+  } catch (error) {
+    // Unloaded while it was reading the catalog or the cache: the plugin is going away, and didn't fail.
+    if (unloaded(error)) return
+    throw error
+  }
 
   if (config.refreshOnStart) {
     ctx.inject(['credentials', 'settings'], (child) => {
@@ -375,4 +383,9 @@ export async function writeCache(file: string, cache: Cache): Promise<void> {
 
 function byId(a: string, b: string): number {
   return a.localeCompare(b, 'en', { numeric: true })
+}
+
+/** Whether `error` is cordis refusing an effect because the plugin has been unloaded: a plugin that is going away didn't fail. */
+function unloaded(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === 'INACTIVE_EFFECT'
 }
