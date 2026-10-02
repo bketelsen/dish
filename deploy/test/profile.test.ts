@@ -409,6 +409,7 @@ test('wrong arguments exit 2 and write nothing', async () => {
     ['no --user-name', without('--user-name')],
     ['no --user-email', without('--user-email')],
     ['an empty --remote', [...without('--remote'), '--remote', '']],
+    ['--remote and --no-remote', [...full, '--no-remote']],
     ['a multi-line --user-name', [...without('--user-name'), '--user-name', 'two\nlines']],
     ['an empty --preset', [...full, '--preset', '']],
     ['an unknown option', [...full, '--force']],
@@ -424,8 +425,46 @@ test('wrong arguments exit 2 and write nothing', async () => {
 })
 
 test('options that cannot be written as one line are refused by the library too', () => {
-  assert.throws(() => writeDishRows('', { ...OPTIONS, remote: '' }), /remote/)
+  assert.throws(() => writeDishRows('', { ...OPTIONS, remote: ' ' }), /remote/)
   assert.throws(() => writeDishRows('', { ...OPTIONS, userName: 'a\nb' }), /userName/)
   assert.throws(() => writeDishRows('', { ...OPTIONS, userEmail: '  ' }), /userEmail/)
   assert.throws(() => writeDishRows('', { ...OPTIONS, preset: '' }), /preset/)
+})
+
+test('a value an anchor covers is refused, since an alias in another row would change with it', async () => {
+  const cases = new Map([
+    ['an anchored value', `- id: dish-config\n  name: dish-config\n  config:\n    remote: &r git@old.example.invalid:a/b.git\n- id: other\n  config:\n    mirror: *r\n`],
+    ['an anchored config', `- id: dish-config\n  name: dish-config\n  config: &c\n    remote: old\n- id: other\n  config: *c\n`],
+    ['an anchored row', `- &row\n  id: dish-config\n  name: dish-config\n- insert:\n    - *row\n`],
+    ['an anchored selectedDefault', `- id: agent-preset-registry\n  name: "@deepseek-ai/dsh-agent-preset-registry"\n  config:\n    default: standard\n    selectedDefault: &s standard\n- id: other\n  config:\n    x: *s\n`],
+  ])
+  for (const [why, content] of cases) {
+    assert.throws(() => writeDishRows(content, OPTIONS), /anchor|&/, why)
+    const path = await patchFile(content)
+    const result = await cli(path)
+    assert.equal(result.code, 1, why)
+    assert.equal(await readFile(path, 'utf8'), content, why)
+  }
+  const right = DISH_ROWS.replace('remote: git@', 'remote: &r git@') + '- id: other\n  config:\n    mirror: *r\n'
+  assert.equal(writeDishRows(right, OPTIONS), right, 'an anchored value that is already right is left alone')
+})
+
+test('--no-remote writes an empty remote, which keeps the store local; a later --remote sets it', async () => {
+  const path = await patchFile()
+  const first = await run(['--patch', path, '--no-remote', '--user-name', OPTIONS.userName, '--user-email', OPTIONS.userEmail])
+  assert.deepEqual({ code: first.code, stdout: first.stdout.trim() }, { code: 0, stdout: 'updated' })
+  assert.equal(rows(await readFile(path, 'utf8'))[0].config.remote, '')
+  assert.equal((await cli(path)).stdout.trim(), 'updated')
+  assert.equal(rows(await readFile(path, 'utf8'))[0].config.remote, OPTIONS.remote)
+  const back = await run(['--patch', path, '--no-remote', '--user-name', OPTIONS.userName, '--user-email', OPTIONS.userEmail])
+  assert.equal(back.stdout.trim(), 'updated')
+  assert.equal(rows(await readFile(path, 'utf8'))[0].config.remote, '')
+})
+
+test('a parse error names the position, not the file\'s lines', async () => {
+  const path = await patchFile('- id: llm\n  config:\n    token: fake-not-a-secret\n    token: again\n')
+  const result = await cli(path)
+  assert.equal(result.code, 1)
+  assert.match(result.stderr, /Map keys must be unique at line 4, column 5/)
+  assert.doesNotMatch(result.stderr, /fake-not-a-secret|again/)
 })

@@ -14,7 +14,7 @@
  * Rows are matched the way that editor matches them too: the last row with the id, no `insert` key, and no `name` or
  * the same `name`.
  *
- *   node deploy/profile.ts --patch <path> --remote <url> --user-name <name> --user-email <email> [--preset dish]
+ *   node deploy/profile.ts --patch <path> (--remote <url> | --no-remote) --user-name <name> --user-email <email> [--preset dish]
  *
  * Prints `unchanged` or `updated` and exits 0. A file that cannot be read, or is not a YAML sequence of rows, exits
  * non-zero and is not written.
@@ -23,7 +23,7 @@
 import { randomBytes } from 'node:crypto'
 import { chmod, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { parseArgs } from 'node:util'
-import { isMap, isScalar, isSeq, parseDocument } from 'yaml'
+import { isCollection, isMap, isScalar, isSeq, parseDocument } from 'yaml'
 import type { Document, ParsedNode, YAMLMap, YAMLSeq } from 'yaml'
 
 /** The `dish-config` row: plugins/config/cordis.patch.yml inserts it with this id and name. */
@@ -38,7 +38,7 @@ export const FALLBACK_DEFAULT = 'standard'
 export const DEFAULT_PRESET = 'dish'
 
 export interface DishRowsOptions {
-  /** The store's git remote, set on the `dish-config` row. */
+  /** The store's git remote, set on the `dish-config` row. `''` keeps the store local (the schema's default). */
   remote: string
   userName: string
   userEmail: string
@@ -55,7 +55,8 @@ type Doc = Document.Parsed<ParsedNode, true>
 
 function parse(text: string): Doc {
   const doc = parseDocument(text, { customTags: [JS_TAG] })
-  if (doc.errors[0] !== undefined) throw doc.errors[0]
+  // Only the message and position: yaml's pretty error quotes the file's lines, and this output reaches Ansible's log.
+  if (doc.errors[0] !== undefined) throw new Error(doc.errors[0].message.split('\n')[0]!.replace(/:$/, ''))
   return doc
 }
 
@@ -69,7 +70,7 @@ function requireLine(name: string, value: unknown): string {
 /** The options, checked, with the preset's default filled in. */
 function normalize(options: DishRowsOptions): Required<DishRowsOptions> {
   return {
-    remote: requireLine('remote', options.remote),
+    remote: options.remote === '' ? '' : requireLine('remote', options.remote),
     userName: requireLine('userName', options.userName),
     userEmail: requireLine('userEmail', options.userEmail),
     preset: requireLine('preset', options.preset ?? DEFAULT_PRESET),
@@ -92,6 +93,13 @@ function hasText(node: unknown): boolean {
   return isScalar(node) && typeof node.value === 'string' && node.value !== ''
 }
 
+/** Refuse to change a node that carries an anchor: an alias elsewhere in the file would change with it. */
+function unshared(...nodes: unknown[]): void {
+  for (const node of nodes) {
+    if ((isScalar(node) || isCollection(node)) && node.anchor !== undefined) throw new Error(`&${node.anchor} covers a value dish writes; another row may alias it, so edit it by hand`)
+  }
+}
+
 /** Edits one document and remembers whether anything changed. */
 class Editor {
   changed = false
@@ -108,6 +116,7 @@ class Editor {
     if (config !== undefined && !(isScalar(config) && config.value === null)) {
       throw new Error(`the ${id} row's config is not a mapping`)
     }
+    unshared(row, config)
     const made = this.doc.createNode({})
     row.set('config', made)
     this.changed = true
@@ -115,10 +124,11 @@ class Editor {
   }
 
   /** Set `key` to the string `value`. A plain string value keeps its quoting and comments. */
-  set(map: YAMLMap, key: string, value: string): void {
+  set(row: YAMLMap, map: YAMLMap, key: string, value: string): void {
     const previous = map.get(key, true)
+    if (isScalar(previous) && previous.tag === undefined && typeof previous.value === 'string' && previous.value === value) return
+    unshared(row, map, previous)
     if (isScalar(previous) && previous.tag === undefined && typeof previous.value === 'string') {
-      if (previous.value === value) return
       previous.value = value
     } else {
       if (map.items.length === 0) map.flow = false
@@ -159,9 +169,9 @@ export function writeDishRows(text: string, options: DishRowsOptions): string {
     editor.append(seq, { id: CONFIG_ROW_ID, name: CONFIG_ROW_NAME, config: { remote, userName, userEmail } })
   } else {
     const config = editor.config(configRow, CONFIG_ROW_ID)
-    editor.set(config, 'remote', remote)
-    editor.set(config, 'userName', userName)
-    editor.set(config, 'userEmail', userEmail)
+    editor.set(configRow, config, 'remote', remote)
+    editor.set(configRow, config, 'userName', userName)
+    editor.set(configRow, config, 'userEmail', userEmail)
   }
 
   const presetRow = findRow(seq, PRESET_ROW_ID, PRESET_ROW_NAME)
@@ -171,8 +181,8 @@ export function writeDishRows(text: string, options: DishRowsOptions): string {
     })
   } else {
     const config = editor.config(presetRow, PRESET_ROW_ID)
-    if (!hasText(config.get('default', true))) editor.set(config, 'default', FALLBACK_DEFAULT)
-    editor.set(config, 'selectedDefault', preset)
+    if (!hasText(config.get('default', true))) editor.set(presetRow, config, 'default', FALLBACK_DEFAULT)
+    editor.set(presetRow, config, 'selectedDefault', preset)
   }
 
   return editor.changed ? String(doc) : text
@@ -205,7 +215,7 @@ export async function updatePatchFile(path: string, options: DishRowsOptions): P
   return 'updated'
 }
 
-const USAGE = 'usage: node deploy/profile.ts --patch <path> --remote <url> --user-name <name> --user-email <email> [--preset dish]'
+const USAGE = 'usage: node deploy/profile.ts --patch <path> (--remote <url> | --no-remote) --user-name <name> --user-email <email> [--preset dish]'
 
 /** The CLI. Returns the exit code: 0 done, 1 the file could not be read or written, 2 the arguments are wrong. */
 export async function main(argv: string[]): Promise<number> {
@@ -217,20 +227,24 @@ export async function main(argv: string[]): Promise<number> {
       options: {
         patch: { type: 'string' },
         remote: { type: 'string' },
+        'no-remote': { type: 'boolean' },
         'user-name': { type: 'string' },
         'user-email': { type: 'string' },
         preset: { type: 'string' },
       },
     }))
-    for (const name of ['patch', 'remote', 'user-name', 'user-email'] as const) {
+    for (const name of ['patch', 'user-name', 'user-email'] as const) {
       if (values[name] === undefined) throw new Error(`--${name} is required`)
     }
+    // `--no-remote` says on purpose what an empty `--remote "$UNSET"` would say by accident.
+    if ((values.remote === undefined) === (values['no-remote'] !== true)) throw new Error('give one of --remote or --no-remote')
+    if (values.remote === '') throw new Error('--remote must not be empty; use --no-remote to keep the store local')
   } catch (error) {
     console.error(`profile.ts: ${(error as Error).message}\n${USAGE}`)
     return 2
   }
   const options: DishRowsOptions = {
-    remote: values.remote as string,
+    remote: values['no-remote'] === true ? '' : values.remote as string,
     userName: values['user-name'] as string,
     userEmail: values['user-email'] as string,
     ...values.preset === undefined ? {} : { preset: values.preset },
