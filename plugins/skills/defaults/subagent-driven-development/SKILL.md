@@ -30,11 +30,11 @@ You are the controller. You don't write the code: you brief, check, rule, and ke
 
 ### Each task
 
-1. **Record BASE** and make the task's worktree with `worktree` (action `create`, a slug for the task, `base` the plan branch). Setup runs only on merged code, so on the plan branch it's usually skipped: keep the command from the answer. That needs a registered project (your chat's workspace is a clone dish set up: `git config --get-regexp '^credential\..*\.helper$'` names `git-credential-dish`); in any other repo, `using-git-worktrees` has the git steps.
+1. **Record BASE** and make the task's worktree with `worktree` (action `create`, a slug for the task, `base` the plan branch). `worktree` doesn't run setup in a worktree: run the command from its answer yourself, in the worktree, escalated (`sandbox_permissions: "danger-full-access"`, a `justification` saying it runs the branch's install scripts outside the sandbox), so the user approves it, before you delegate. That needs a registered project (your chat's workspace is a clone dish set up: `git config --get-regexp '^credential\..*\.helper$'` names `git-credential-dish`); in any other repo, `using-git-worktrees` has the git steps.
 2. **Delegate to a fresh `coder`,** with `delegate`'s `worktree` set to that path: it binds the coder, and crew adds the path and branch to its prompt. It can't see this conversation, so the brief stands alone:
    - where the task fits in the project;
    - the task's full text, pasted, plus the plan and spec paths;
-   - the Global Constraints, the worktree path and branch, the setup command if it was skipped, and the gate command;
+   - the Global Constraints, the worktree path and branch (its setup already run), and the gate command;
    - the interfaces it uses from earlier tasks, and the rulings that touch it;
    - the report: what changed, the gate output and exit code, the commit sha, concerns, and its rulings as `Ruling: what — why — cost if wrong`;
    - to ask with `send_message` when blocked, not guess.
