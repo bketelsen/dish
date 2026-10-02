@@ -8,7 +8,9 @@
  *   propose changes) and seeds the shipped defaults, which never overwrites an edit: a stored default is only
  *   replaced when its text is one of an earlier shipped version that nobody has edited since (`defaults/previous.json`).
  *   While the store isn't there, or has no skill documents yet, every answer is the shipped defaults;
- * - a change under `skills/` in the store, and the store coming or going, is told to the service's listeners.
+ * - a change under `skills/` in the store, and the store coming or going, is told to the service's listeners;
+ * - the skills are offered to agents through dsh's skill registry (see `providers.ts`): every skill in the `/` menu,
+ *   and to each agent of a configured preset (`presets`), its role's skills for the model to load;
  * - the Skills page's server half is the `dishSkillsRemote` Typert remote (see `remote.ts`), served by the
  *   gateway when there is one and idle otherwise.
  *
@@ -19,6 +21,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs } from 'dish-kit'
 import { defaultsByPath, replaceMap } from './defaults.ts'
+import { globalProvider, watchAgents } from './providers.ts'
 import { SkillsRemote } from './remote.ts'
 import { createDishSkills } from './service.ts'
 import type { CrewReader } from './service.ts'
@@ -111,6 +114,11 @@ export function apply(ctx: Context, config: Config): void {
   ctx.provide('dishSkills', service)
   // The Skills page's remote: a child plugin that needs `dishSkills`, so it goes when the service does.
   ctx.plugin(SkillsRemote)
+
+  // The skills for agents (see providers.ts): all of them in the / menu, from the global layer while dsh's registry is
+  // there, and to each agent of a configured preset its role's, from the agent's own layer.
+  ctx.inject(['skills'], (inner) => { inner.skills.registerProvider(globalProvider(service, logger)) })
+  watchAgents(ctx, { service, presets: config.presets, logger })
 
   ctx.on('dish-config/changed', (paths) => {
     if (paths.some(path => path.startsWith(SKILLS_PREFIX))) service.changed()
