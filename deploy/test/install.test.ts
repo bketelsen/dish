@@ -228,6 +228,17 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(await readFile(patch, 'utf8'), patchText)
   assert.deepEqual(await readdir(scratch.tmp), [])
 
+  // The first install made `dish` the default preset. A default chosen in the UI afterwards is kept by the next install.
+  assert.match(patchText, /^ {4}default: standard\n {4}selectedDefault: dish\n/m)
+  const chosenText = patchText.replace('    selectedDefault: dish\n', '    selectedDefault: standard\n')
+  assert.notEqual(chosenText, patchText)
+  await writeFile(patch, chosenText)
+  const third = await run(INSTALL, [], scratch)
+  assert.equal(third.code, 0, third.stderr)
+  assert.match(third.stdout, /install: dish rows \(.*\): unchanged/)
+  assert.match(third.stdout, /install: no changes to the profile/)
+  assert.equal(await readFile(patch, 'utf8'), chosenText, "the UI's choice is kept")
+
   // pnpm's store is the account's own, not the throwaway one: a profile that records another store cannot be worked on
   // later (ERR_PNPM_UNEXPECTED_STORE), by `plugin add` or by the plugin manager inside dsh web.
   const store = (await run('pnpm', ['store', 'path'], scratch)).stdout.trim()
@@ -260,7 +271,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.doesNotMatch(dump.stderr, /not found/, 'no row is left without its bundle')
   for (const bundle of BUNDLES) assert.match(dump.stdout, new RegExp(`^# == ${bundle}\\b`, 'm'), `${bundle} is in the profile`)
   assert.match(dump.stdout, new RegExp(`^# == dish-config, patched by .*cordis\\.patch\\.yml\\n- id: dish-config\\n  name: dish-config\\n  config:\\n    remote: ${REMOTE.replaceAll('.', '\\.')}\\n    userName: ${USER_NAME}\\n    userEmail: ${USER_EMAIL.replaceAll('.', '\\.')}\\n`, 'm'))
-  assert.match(dump.stdout, /^- id: agent-preset-registry\n {2}name: '@deepseek-ai\/dsh-agent-preset-registry'\n {2}config:\n {4}default: standard\n {4}selectedDefault: dish\n/m)
+  assert.match(dump.stdout, /^- id: agent-preset-registry\n {2}name: '@deepseek-ai\/dsh-agent-preset-registry'\n {2}config:\n {4}default: standard\n {4}selectedDefault: standard\n/m, "the UI's choice is what the profile composes")
 
   await assertNoStore(scratch)
 })

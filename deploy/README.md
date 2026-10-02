@@ -41,7 +41,7 @@ Its steps, in order:
 2. **The profile.** If `$DSH_HOME/profiles/$DISH_PROFILE` is missing, dsh creates it. For `web` that is its shipped profile; any other name is copied from `web`.
 3. **The rows.** `profile.ts` writes dish's rows into the profile's `cordis.patch.yml`:
    - **The `dish-config` row** gets `remote`, `userName` and `userEmail`, and nothing else.
-   - **The `agent-preset-registry` row** makes the `dish` preset the default for new tasks.
+   - **The `agent-preset-registry` row** makes the `dish` preset the default for new tasks, when no default is chosen yet.
    - Other rows, comments and key order stay as they are. A file that is already right is not rewritten.
 4. **The bundles.** For copilot, config, prompts, crew and judge, in that order, `pnpm dsh plugin --profile <profile> add ./plugins/<name>`, only when the profile doesn't link it yet.
 
@@ -51,7 +51,7 @@ It prints what it did, and its last line is `install: no changes to the profile`
 
 **The store-pin contract.** pnpm records the store a profile was first used with, and refuses to work on it with any other store. So `install.sh` looks up the store pnpm would use (`pnpm store path`) and hands it to each dsh command, instead of letting the throwaway directory pick a new one. dsh's plugin manager inside `dsh web` works the store out again, from the unit's environment. Both must give the same store, so `HOME`, `XDG_DATA_HOME` and `PNPM_HOME` have to be the same for `install.sh` and for the unit. Set none of them for just one of the two.
 
-**The default preset.** Each run sets the `dish` preset again, so a different default chosen in the UI lasts until the next update.
+**The default preset.** The `dish` preset is set as the default on the first install only. A default chosen in Settings → Agent presets is kept by every later update.
 
 ### What the unit expects
 

@@ -76,9 +76,10 @@ Ownership follows the nsl builder's split ([fleet's nsl builder doc](../../../fl
        - `userName` and `userEmail` (yours, passed in by fleet);
        - and nothing else.
      - **Other rows** that dsh or the copilot catalog maintain are left as they are.
-  4. sets the dish preset as the default for new tasks. This is the same write the UI's "Set as new task default" makes: an `agent-preset-registry` row in the profile's own patch file (`$DSH_HOME/profiles/web/cordis.patch.yml`), with `config: { default: standard, selectedDefault: dish }`.
+  4. sets the dish preset as the default for new tasks, on the first install only. This is the same write the UI's "Set as new task default" makes: an `agent-preset-registry` row in the profile's own patch file (`$DSH_HOME/profiles/web/cordis.patch.yml`), with `config: { default: standard, selectedDefault: dish }`.
      - A patch replaces a row's whole `config`, so `default` is restated.
      - It goes in the profile's file, not the home patch, so that a later choice made in the UI still works.
+     - It is written only when the row is missing or has no `selectedDefault`. A `selectedDefault` that is already there, whatever its value, is a choice: it is left as it is, with the row's `default`, and a later run never resets it.
 - **`deploy/dish-web.service`** is a systemd user unit:
   - It runs `pnpm dsh web --host 127.0.0.1 --port 3080 --no-open --trusted-host dish.<tailnet>.ts.net` from `~/dish`, with `Restart=on-failure`.
   - The tailnet name is a unit setting that fleet fills in.

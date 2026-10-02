@@ -181,7 +181,7 @@ test('rows in the middle of the file: only their own lines change', () => {
   name: "@deepseek-ai/dsh-agent-preset-registry"
   config:
     default: custom-preset
-    selectedDefault: dish
+    selectedDefault: standard
 - id: ui-settings-general
   name: "@deepseek-ai/dsh-client-ui-settings-general"
   config:
@@ -235,50 +235,109 @@ test('a !!js expression where a value is written is replaced by the plain value,
   assert.ok(!out.includes('FAKE_REMOTE') && !out.includes('!!js'), out)
 })
 
-test('an existing preset row keeps its default, and only selectedDefault changes', () => {
-  const input = `- id: agent-preset-registry
-  name: "@deepseek-ai/dsh-agent-preset-registry"
-  config:
-    default: custom-preset
-    selectedDefault: standard
-`
-  const out = writeDishRows(input, OPTIONS)
-  assert.deepEqual(rows(out)[0], {
+/** A preset row as dish writes it, or the UI does, with these `config` lines. */
+function presetRow(...configLines: string[]): string {
+  return `- id: agent-preset-registry\n  name: "@deepseek-ai/dsh-agent-preset-registry"\n  config:\n${configLines.map((line) => `    ${line}\n`).join('')}`
+}
+
+/** The preset row of a patch file's text. */
+function presetOf(text: string): Record<string, any> | undefined {
+  return rows(text).find((row) => row.id === 'agent-preset-registry')
+}
+
+/** The `dish-config` row, as a profile with nothing of dish's gets it. */
+const DISH_CONFIG_ROW = DISH_ROWS.slice(0, DISH_ROWS.indexOf('- id: agent-preset-registry'))
+
+test('a missing preset row is added with default standard and selectedDefault dish', () => {
+  const out = writeDishRows(DISH_CONFIG_ROW, OPTIONS)
+  assert.equal(out, DISH_ROWS)
+  assert.deepEqual(presetOf(out), {
     id: 'agent-preset-registry',
     name: '@deepseek-ai/dsh-agent-preset-registry',
-    config: { default: 'custom-preset', selectedDefault: 'dish' },
+    config: { default: 'standard', selectedDefault: 'dish' },
   })
-  const dishConfigRow = DISH_ROWS.slice(0, DISH_ROWS.indexOf('- id: agent-preset-registry'))
-  assert.equal(out, input.replace('selectedDefault: standard', 'selectedDefault: dish') + dishConfigRow)
 })
 
-test('a preset row with no default is given standard, and a !!js default is kept', () => {
-  const none = `- id: agent-preset-registry\n  name: "@deepseek-ai/dsh-agent-preset-registry"\n  config:\n    selectedDefault: standard\n`
-  assert.deepEqual(rows(writeDishRows(none, OPTIONS)).find((row) => row.id === 'agent-preset-registry')?.config, {
-    default: 'standard', selectedDefault: 'dish',
-  })
-  const bare = `- id: agent-preset-registry\n  name: "@deepseek-ai/dsh-agent-preset-registry"\n`
-  assert.deepEqual(rows(writeDishRows(bare, OPTIONS)).find((row) => row.id === 'agent-preset-registry')?.config, {
-    default: 'standard', selectedDefault: 'dish',
-  })
-  const js = `- id: agent-preset-registry
-  name: "@deepseek-ai/dsh-agent-preset-registry"
-  config:
-    default: !!js "process.env.FAKE_PRESET ?? 'standard'"
-    selectedDefault: dish
-- id: dish-config
-  name: dish-config
-  config:
-    remote: git@github-dish-config:example/store.git
-    userName: Test User
-    userEmail: test@example.invalid
-`
-  assert.equal(writeDishRows(js, OPTIONS), js, 'already right: untouched')
+test('a default chosen in the UI is kept: selectedDefault standard stays, and so does the rest of the row', async () => {
+  const input = presetRow('default: custom-preset', 'selectedDefault: standard')
+  const out = writeDishRows(input, OPTIONS)
+  assert.equal(out, input + DISH_CONFIG_ROW, 'only the dish-config row is added')
+  assert.deepEqual(presetOf(out)?.config, { default: 'custom-preset', selectedDefault: 'standard' })
+
+  // With the dish-config row right as well, the whole run is a no-op: the same text, and no write.
+  const settled = DISH_CONFIG_ROW + input
+  assert.equal(writeDishRows(settled, OPTIONS), settled)
+  const path = await patchFile(settled)
+  const past = new Date(Date.now() - 3_600_000)
+  await utimes(path, past, past)
+  const before = await stat(path)
+  const result = await cli(path)
+  assert.deepEqual({ code: result.code, stdout: result.stdout.trim() }, { code: 0, stdout: 'unchanged' })
+  assert.equal(await readFile(path, 'utf8'), settled)
+  assert.equal((await stat(path)).mtimeMs, before.mtimeMs, 'not written')
 })
 
-test('the preset is an option', () => {
+test('an existing selectedDefault is kept whatever its value, and --preset does not replace it', () => {
+  for (const line of [
+    'selectedDefault: standard',
+    'selectedDefault: "dish"',
+    'selectedDefault: some-removed-preset',
+    "selectedDefault: ''",
+    "selectedDefault: !!js \"process.env.FAKE_PRESET ?? 'standard'\"",
+    'selectedDefault: &s standard # anchored, so not ours to change',
+  ]) {
+    for (const preset of [undefined, 'dish', 'other']) {
+      const input = presetRow('default: standard', line)
+      const options = preset === undefined ? OPTIONS : { ...OPTIONS, preset }
+      assert.equal(writeDishRows(input, options), input + DISH_CONFIG_ROW, `${line} with ${preset}`)
+    }
+  }
+})
+
+test('its default is kept too: restated and changed by no one, and not added when it is missing', () => {
+  const lone = presetRow('selectedDefault: standard')
+  assert.equal(writeDishRows(lone, OPTIONS), lone + DISH_CONFIG_ROW, 'a selectedDefault with no default is left as it is')
+  const js = presetRow("default: !!js \"process.env.FAKE_PRESET ?? 'standard'\"", 'selectedDefault: standard')
+  assert.equal(writeDishRows(js, OPTIONS), js + DISH_CONFIG_ROW)
+})
+
+test('a preset row with a default but no selectedDefault gains selectedDefault dish, and keeps its default', () => {
+  const input = presetRow('default: custom-preset')
+  const out = writeDishRows(input, OPTIONS)
+  assert.deepEqual(presetOf(out)?.config, { default: 'custom-preset', selectedDefault: 'dish' })
+  assert.equal(out, input + '    selectedDefault: dish\n' + DISH_CONFIG_ROW)
+  const js = presetRow("default: !!js \"process.env.FAKE_PRESET ?? 'standard'\" # from the environment")
+  assert.equal(writeDishRows(js, OPTIONS), js + '    selectedDefault: dish\n' + DISH_CONFIG_ROW, 'a !!js default is kept as it is')
+})
+
+test('a preset row with neither, or with no config at all, is given both', () => {
+  const both = { default: 'standard', selectedDefault: 'dish' }
+  for (const input of [
+    '- id: agent-preset-registry\n  name: "@deepseek-ai/dsh-agent-preset-registry"\n',
+    '- id: agent-preset-registry\n  name: "@deepseek-ai/dsh-agent-preset-registry"\n  config:\n',
+    '- id: agent-preset-registry\n  name: "@deepseek-ai/dsh-agent-preset-registry"\n  config: {}\n',
+    presetRow('modeSelectionEnabled: true'),
+  ]) {
+    const config = presetOf(writeDishRows(input, OPTIONS))?.config
+    assert.deepEqual(config, { ...both, ...input.includes('modeSelectionEnabled') ? { modeSelectionEnabled: true } : {} }, input)
+  }
+})
+
+test('the other rows are untouched when a UI choice is kept, and when one is added', () => {
+  const ui = presetRow('default: standard', 'selectedDefault: standard')
+  const before = HEADER + DSH_ROWS + '# chosen in Settings\n' + ui + '- id: ui-settings-general-2\n  config:\n    x: 1\n'
+  assert.equal(writeDishRows(before, OPTIONS), before + DISH_CONFIG_ROW, 'a kept choice: dish-config is the only addition')
+
+  const bare = HEADER + DSH_ROWS + '# chosen in Settings\n' + presetRow('default: standard') + '- id: after\n  config:\n    x: 1\n'
+  const out = writeDishRows(bare, OPTIONS)
+  const wanted = bare.replace('    default: standard\n', '    default: standard\n    selectedDefault: dish\n') + DISH_CONFIG_ROW
+  assert.equal(out, wanted, 'an added choice: one line inside the row, and the rest as it was')
+})
+
+test('the preset is an option, for a profile with no choice yet', () => {
   const out = rows(writeDishRows('', { ...OPTIONS, preset: 'other' }))
   assert.equal(out[1].config.selectedDefault, 'other')
+  assert.equal(presetOf(writeDishRows(presetRow('default: standard'), { ...OPTIONS, preset: 'other' }))?.config.selectedDefault, 'other')
 })
 
 test('rows are matched as dsh\'s config editor matches them: the last one, never an insert, only by name', () => {
@@ -312,7 +371,9 @@ test('a flow-style list is accepted', () => {
 })
 
 test('a second run changes nothing: the same text back, and no write', async () => {
-  for (const input of ['', HEADER, FIXTURE]) {
+  for (const input of [
+    '', HEADER, FIXTURE, presetRow('default: standard'), presetRow('selectedDefault: standard'), presetRow('default: standard', 'selectedDefault: other'),
+  ]) {
     const once = writeDishRows(input, OPTIONS)
     assert.equal(writeDishRows(once, OPTIONS), once)
   }
@@ -351,10 +412,17 @@ test('an existing file is replaced with mode 0600', async () => {
   assert.deepEqual(await readdir(join(path, '..')), ['cordis.patch.yml'])
 })
 
-test('the CLI takes --preset', async () => {
+test('the CLI takes --preset, which is the default to set when none is chosen yet', async () => {
   const path = await patchFile()
   assert.equal((await cli(path, ['--preset', 'other'])).code, 0)
   assert.equal(rows(await readFile(path, 'utf8'))[1].config.selectedDefault, 'other')
+  // The choice is made now. A later run, with the same flag or another, leaves it.
+  const chosen = await readFile(path, 'utf8')
+  for (const preset of ['other', 'dish']) {
+    const result = await cli(path, ['--preset', preset])
+    assert.deepEqual({ code: result.code, stdout: result.stdout.trim() }, { code: 0, stdout: 'unchanged' })
+    assert.equal(await readFile(path, 'utf8'), chosen)
+  }
 })
 
 test('a file that is not valid YAML, or not a list of rows, is refused and left as it is', async () => {
@@ -436,7 +504,7 @@ test('a value an anchor covers is refused, since an alias in another row would c
     ['an anchored value', `- id: dish-config\n  name: dish-config\n  config:\n    remote: &r git@old.example.invalid:a/b.git\n- id: other\n  config:\n    mirror: *r\n`],
     ['an anchored config', `- id: dish-config\n  name: dish-config\n  config: &c\n    remote: old\n- id: other\n  config: *c\n`],
     ['an anchored row', `- &row\n  id: dish-config\n  name: dish-config\n- insert:\n    - *row\n`],
-    ['an anchored selectedDefault', `- id: agent-preset-registry\n  name: "@deepseek-ai/dsh-agent-preset-registry"\n  config:\n    default: standard\n    selectedDefault: &s standard\n- id: other\n  config:\n    x: *s\n`],
+    ['an anchored preset config that needs selectedDefault', `- id: agent-preset-registry\n  name: "@deepseek-ai/dsh-agent-preset-registry"\n  config: &p\n    default: standard\n- id: other\n  config: *p\n`],
   ])
   for (const [why, content] of cases) {
     assert.throws(() => writeDishRows(content, OPTIONS), /anchor|&/, why)
@@ -447,6 +515,8 @@ test('a value an anchor covers is refused, since an alias in another row would c
   }
   const right = DISH_ROWS.replace('remote: git@', 'remote: &r git@') + '- id: other\n  config:\n    mirror: *r\n'
   assert.equal(writeDishRows(right, OPTIONS), right, 'an anchored value that is already right is left alone')
+  const chosen = presetRow('default: standard', 'selectedDefault: &s standard') + '- id: other\n  config:\n    x: *s\n'
+  assert.equal(writeDishRows(chosen, OPTIONS), chosen + DISH_CONFIG_ROW, 'an anchored selectedDefault is a choice, which is never written, so it is left alone')
 })
 
 test('--no-remote writes an empty remote, which keeps the store local; a later --remote sets it', async () => {

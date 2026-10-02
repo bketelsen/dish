@@ -2,9 +2,11 @@
  * Writes dish's rows into a dsh profile's own patch file (`$DSH_HOME/profiles/<profile>/cordis.patch.yml`):
  *
  * - the `dish-config` row: `remote`, `userName` and `userEmail` on its config, and nothing else;
- * - the `agent-preset-registry` row: `{ default, selectedDefault: <preset> }`, the same write the UI's "Set as new task
- *   default" makes. A patch replaces a row's whole `config`, and `default` is required, so it is always restated: the
- *   row's own `default` when it has one, else `standard`.
+ * - the `agent-preset-registry` row, on the first install only: `{ default, selectedDefault: <preset> }`, the same write
+ *   the UI's "Set as new task default" makes. A patch replaces a row's whole `config`, and `default` is required, so it
+ *   is restated: the row's own `default` when it has one, else `standard`. A row that already has a `selectedDefault`,
+ *   whatever its value, is a choice (made in the UI, or by hand) and is left exactly as it is, `default` included. So
+ *   `--preset` is the default to set when none is chosen yet, and a later run never resets it.
  *
  * Everything else in the file stays as it is: other rows, comments, key order and `!!js` tags. That is the reason for
  * the `yaml` Document API, and for parsing the `!!js` tag the way dsh's config editor does. A row that is already right
@@ -15,6 +17,8 @@
  * the same `name`.
  *
  *   node deploy/profile.ts --patch <path> (--remote <url> | --no-remote) --user-name <name> --user-email <email> [--preset dish]
+ *
+ * `--preset` is the default preset to set when none is chosen yet (default `dish`); a default already chosen is kept.
  *
  * Prints `unchanged` or `updated` and exits 0. A file that cannot be read, or is not a YAML sequence of rows, exits
  * non-zero and is not written.
@@ -42,7 +46,7 @@ export interface DishRowsOptions {
   remote: string
   userName: string
   userEmail: string
-  /** The preset id made the default for new tasks. Defaults to `dish`. */
+  /** The preset id made the default for new tasks when none is chosen yet. Defaults to `dish`. A chosen one is kept. */
   preset?: string
 }
 
@@ -181,8 +185,12 @@ export function writeDishRows(text: string, options: DishRowsOptions): string {
     })
   } else {
     const config = editor.config(presetRow, PRESET_ROW_ID)
-    if (!hasText(config.get('default', true))) editor.set(presetRow, config, 'default', FALLBACK_DEFAULT)
-    editor.set(presetRow, config, 'selectedDefault', preset)
+    // A `selectedDefault` is a choice, whoever made it, and what it holds is not ours to judge. Nor is the `default`
+    // that goes with it. dish only fills in a row that has none yet.
+    if (!config.has('selectedDefault')) {
+      if (!hasText(config.get('default', true))) editor.set(presetRow, config, 'default', FALLBACK_DEFAULT)
+      editor.set(presetRow, config, 'selectedDefault', preset)
+    }
   }
 
   return editor.changed ? String(doc) : text
@@ -215,7 +223,10 @@ export async function updatePatchFile(path: string, options: DishRowsOptions): P
   return 'updated'
 }
 
-const USAGE = 'usage: node deploy/profile.ts --patch <path> (--remote <url> | --no-remote) --user-name <name> --user-email <email> [--preset dish]'
+const USAGE = [
+  'usage: node deploy/profile.ts --patch <path> (--remote <url> | --no-remote) --user-name <name> --user-email <email> [--preset dish]',
+  '  --preset  the default preset to set when none is chosen yet (default dish); a default already chosen is kept',
+].join('\n')
 
 /** The CLI. Returns the exit code: 0 done, 1 the file could not be read or written, 2 the arguments are wrong. */
 export async function main(argv: string[]): Promise<number> {
