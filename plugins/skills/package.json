@@ -64,9 +64,5 @@
     "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
     "@types/js-yaml": "^4.0.9",
     "@types/react": "~18.3.1"
-  },
-  "scripts": {
-    "build": "node ../../packages/dish-kit/scripts/build-client.mjs",
-    "dev": "node ../../packages/dish-kit/scripts/build-client.mjs --watch"
   }
 }

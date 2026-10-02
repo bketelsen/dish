@@ -127,6 +127,23 @@ function split(text: string): { frontmatter: string, rest: string } {
   return { frontmatter: lines.slice(1, end).join('\n'), rest: lines.slice(end + 1).join('\n') }
 }
 
+/**
+ * Refuse a value that is reachable twice. YAML aliases let a few hundred bytes say a cyclic value, or one that
+ * is a billion entries when written out, and everything downstream (the store, the page, JSON) would walk it.
+ * Each list and mapping is visited once, so this takes time in proportion to the document.
+ */
+function noAliases(root: unknown): void {
+  const seen = new Set<object>()
+  const pending: unknown[] = [root]
+  while (pending.length > 0) {
+    const value = pending.pop()
+    if (typeof value !== 'object' || value === null) continue
+    if (seen.has(value)) refuse('the frontmatter reuses a value through a YAML alias; write it out')
+    seen.add(value)
+    pending.push(...Object.values(value))
+  }
+}
+
 /** The mapping the frontmatter says. */
 function frontmatterOf(frontmatter: string): Record<string, unknown> {
   let data: unknown
@@ -140,6 +157,7 @@ function frontmatterOf(frontmatter: string): Record<string, unknown> {
     refuse(`the frontmatter isn't valid YAML: ${truncate(error.reason.replace(/\s+/g, ' '), REASON)}${line}`)
   }
   if (!isMapping(data)) refuse('the frontmatter must be a mapping of keys to values')
+  noAliases(data)
   return data
 }
 
@@ -175,8 +193,11 @@ function parse(path: string, text: string): ParsedSkill {
   const description = own(data, 'description')
   if (description === undefined) refuse('description is missing')
   if (typeof description !== 'string') refuse(`description must be a string (got ${shown(description)})`)
-  if (description.trim() === '') refuse('description is blank')
-  if (description.length > MAX_DESCRIPTION) refuse(`description is ${description.length} characters; the most is ${MAX_DESCRIPTION}`)
+  // Trimmed once, so the blank check, the length check and what is stored all see the same text: a folded block
+  // scalar keeps a trailing newline that is not part of the description.
+  const trimmed = description.trim()
+  if (trimmed === '') refuse('description is blank')
+  if (trimmed.length > MAX_DESCRIPTION) refuse(`description is ${trimmed.length} characters; the most is ${MAX_DESCRIPTION}`)
 
   const body = rest.trim()
   if (body === '') refuse('the instructions are empty; write them after the frontmatter')
@@ -192,7 +213,7 @@ function parse(path: string, text: string): ParsedSkill {
 
   return {
     name,
-    description: description.trim(),
+    description: trimmed,
     roles: parseRoles(metadata ?? {}),
     modelInvocable: disabled !== true,
     userInvocable: userInvocable !== false,

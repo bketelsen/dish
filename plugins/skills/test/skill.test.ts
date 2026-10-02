@@ -173,6 +173,15 @@ test('parseSkill reads YAML block scalars and quoted values in the description',
   assert.equal(skillOf(doc(['name: x', 'description: "Use when: a colon"'])).description, 'Use when: a colon')
 })
 
+test('parseSkill measures the description after trimming: a folded block of 1024 characters is accepted, 1025 refused', () => {
+  // A folded block scalar keeps one trailing newline, so the raw value is one longer than what is stored.
+  const folded = (length: number) => doc(['name: x', 'description: >', `  ${'a'.repeat(length)}`])
+  assert.equal(skillOf(folded(1024)).description, 'a'.repeat(1024))
+  assert.equal(problemOf(folded(1025)), `${PATH}: description is 1025 characters; the most is 1024`)
+  // Padding in a quoted value is trimmed first too.
+  assert.equal(skillOf(doc(['name: x', `description: "  ${'a'.repeat(1024)}  "`])).description.length, 1024)
+})
+
 test('parseSkill trims the description', () => {
   assert.equal(skillOf(doc(['name: x', 'description: "  Use when padded.  "'])).description, 'Use when padded.')
 })
@@ -252,6 +261,34 @@ test('parseSkill uses no custom YAML types', () => {
     const problem = problemOf(doc(['name: x', 'description: d', `extra: ${tag}`]))
     assert.match(problem, /isn't valid YAML/, tag)
   }
+})
+
+test('parseSkill refuses a YAML alias that makes a cycle', () => {
+  const expected = `${PATH}: the frontmatter reuses a value through a YAML alias; write it out`
+  assert.equal(problemOf(doc(['name: x', 'description: d', 'metadata: &m {self: *m}'])), expected)
+  assert.equal(problemOf(doc(['name: x', 'description: d', 'extra: &e [*e]'])), expected)
+})
+
+test('parseSkill refuses any reused value, cyclic or not', () => {
+  const expected = `${PATH}: the frontmatter reuses a value through a YAML alias; write it out`
+  assert.equal(problemOf(doc(['name: x', 'description: d', 'a: &a [1]', 'b: *a'])), expected)
+  assert.equal(problemOf(doc(['name: x', 'description: d', 'metadata:', '  one: &r {k: v}', '  two: *r'])), expected)
+  // An alias of a plain string is no shared object.
+  assert.equal(skillOf(doc(['name: x', 'description: &d Use when aliasing.', 'note: *d'])).description, 'Use when aliasing.')
+})
+
+test('parseSkill refuses a small alias bomb quickly', () => {
+  // Nine levels of ten references each: a billion entries if anything walks it out. A document of about 600 bytes.
+  const levels = 'abcdefghi'
+  const lines = ['x0: &l0 [z, z, z, z, z, z, z, z, z, z]']
+  for (let i = 1; i < levels.length; i++) lines.push(`x${i}: &l${i} [${Array(10).fill(`*l${i - 1}`).join(', ')}]`)
+  const text = doc(['name: x', 'description: d', ...lines])
+  assert.ok(text.length < 1000, `${text.length} bytes`)
+  const started = performance.now()
+  assert.equal(problemOf(text), `${PATH}: the frontmatter reuses a value through a YAML alias; write it out`)
+  assert.ok(performance.now() - started < 2000, 'refused in linear time')
+  // The same through the namespace validator, which is what the store calls.
+  assert.equal(validate(PATH, text), 'the frontmatter reuses a value through a YAML alias; write it out')
 })
 
 test('parseSkill reads dates and timestamps as the plain strings they are', () => {
@@ -434,6 +471,14 @@ test('checkSkill measures the document as it was written, not as it parses', () 
   const text = head + 'a'.repeat(WARN_CHARS - head.length + 1)
   assert.equal(text.length, WARN_CHARS + 1)
   assert.equal(checkSkill(PATH, text, SHIPPED_ROLES).warnings.length, 1)
+  // The BOM counts as well: 8000 characters with it is 7999 without, and 8001 with it warns.
+  const bomHead = '---\nname: x\ndescription: d\n---\n'
+  const atLimit = `\uFEFF${bomHead}${'a'.repeat(WARN_CHARS - 1 - bomHead.length)}`
+  assert.equal(atLimit.length, WARN_CHARS)
+  assert.deepEqual(checkSkill(PATH, atLimit, SHIPPED_ROLES).warnings, [])
+  assert.equal(checkSkill(PATH, `${atLimit}a`, SHIPPED_ROLES).warnings.length, 1)
+  // Without a BOM the same body would still be exactly at the limit, not over it.
+  assert.deepEqual(checkSkill(PATH, `${bomHead}${'a'.repeat(WARN_CHARS - bomHead.length)}`, SHIPPED_ROLES).warnings, [])
 })
 
 // --- offeredTo --------------------------------------------------------------------------------
