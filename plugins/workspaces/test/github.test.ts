@@ -154,6 +154,31 @@ describe('GitHubApp against the fake', () => {
     assert.deepEqual(fake.requests.map(r => [r.method, r.path, r.auth]), [['POST', '/app/installations/77/access_tokens', 'jwt']])
   })
 
+  it('createToken() refuses a token GitHub granted more than read, and returns none', async () => {
+    const { fake, app } = await setup()
+    fake.installations.set('acme', { id: 77, account: 'Acme', repos: new Set(['widget']) })
+    const token = `ghs_${'W'.repeat(36)}`
+    fake.failNext('/app/installations/77/access_tokens', 201, {
+      token,
+      expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      permissions: { contents: 'write', metadata: 'read' },
+      repositories: [{ name: 'widget' }],
+    })
+    let returned: unknown
+    let thrown: unknown
+    try {
+      returned = await app.createToken(77, ['widget'], { contents: 'read', metadata: 'read' })
+    } catch (error) {
+      thrown = error
+    }
+    assert.equal(returned, undefined)
+    assert.ok(thrown instanceof GitHubError, String(thrown))
+    assert.equal(thrown.kind, 'other')
+    assert.match(thrown.message, /more than read/)
+    assert.ok(!thrown.message.includes(token))
+    assert.ok(!String(thrown.stack).includes(token))
+  })
+
   it('botUser() looks up <slug>[bot] with a token', async () => {
     const { fake, app } = await setup()
     fake.installations.set('acme', { id: 77, account: 'Acme', repos: new Set(['widget']) })
@@ -257,6 +282,7 @@ describe('errors', () => {
     [401, {}, 'auth'],
     [403, {}, 'auth'],
     [403, { 'x-ratelimit-remaining': '0' }, 'rate-limited'],
+    [403, { 'retry-after': '60' }, 'rate-limited'],
     [429, {}, 'rate-limited'],
     [404, {}, 'not-found'],
     [422, {}, 'unprocessable'],

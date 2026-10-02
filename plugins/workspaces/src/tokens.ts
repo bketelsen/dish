@@ -107,6 +107,16 @@ function reposKey(repos: readonly string[]): string {
   return repos.join('\n')
 }
 
+/** Remove `file` if it is a file (never a directory or what a link points at); gone already is fine. */
+async function removeIfFile(file: string): Promise<void> {
+  try {
+    if (!(await lstat(file)).isFile()) return
+    await rm(file, { force: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
 /** An error's message, masked, on one line, cut short: what a log line may say. */
 function describe(error: unknown): string {
   const text = maskSecrets(error instanceof Error ? error.message : String(error)).replace(/[\s\x00-\x1f\x7f]+/g, ' ').trim()
@@ -123,6 +133,8 @@ export class TokenManager {
   readonly #owners = new Map<string, OwnerState>()
   /** Every token file this manager has written (and not removed since). */
   readonly #written = new Set<string>()
+  /** The writes in progress, which `close` waits for. */
+  readonly #writes = new Set<Promise<void>>()
   #closed = false
   #closing: Promise<void> | undefined
 
@@ -147,7 +159,9 @@ export class TokenManager {
       const repos = [...new Set(entry.repos)].sort()
       const given = reposKey(repos)
       const current = this.#owners.get(owner)
-      if (current !== undefined && current.given === given && current.installation === entry.installation) continue
+      // Unchanged, and nothing dropped: nothing to do. A repo dropped after a 422 is tried again at every recompute (the 422
+      // path drops it again if the installation still lacks it), so one given back to the App is read again without a restart.
+      if (current !== undefined && current.given === given && reposKey(current.repos) === given && current.installation === entry.installation) continue
       const state: OwnerState = current ?? { owner, installation: entry.installation, given, repos, file: undefined, api: undefined, timer: undefined, lastError: undefined }
       state.installation = entry.installation
       state.given = given
@@ -186,7 +200,11 @@ export class TokenManager {
     })
   }
 
-  /** At start: remove token files of owners not in `owners` (and temporary files a crash left). Owners this manager holds keep theirs. */
+  /**
+   * At start: remove token files of owners not in `owners`, and temporary files a crash left. Owners this manager holds
+   * keep their token file; their leftovers are removed under the owner's lock, which every write of theirs holds, so
+   * none is a write in progress.
+   */
   async prune(owners: readonly string[]): Promise<void> {
     const keep = new Set(owners.map(owner => owner.toLowerCase()))
     let names: string[]
@@ -199,26 +217,30 @@ export class TokenManager {
     for (const name of names) {
       const leftover = LEFTOVER.exec(name)
       const owner = leftover?.[1] ?? (TOKEN_FILE.test(name) ? name : undefined)
-      if (owner === undefined || this.#owners.has(owner)) continue
-      if (leftover === null && keep.has(owner)) continue
+      if (owner === undefined) continue
       const file = join(this.#directory, name)
-      try {
-        if (!(await lstat(file)).isFile()) continue
-        await rm(file, { force: true })
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      if (leftover !== null && this.#owners.has(owner)) {
+        await this.#lock.run(owner, () => removeIfFile(file))
+        continue
       }
+      if (this.#owners.has(owner) || (leftover === null && keep.has(owner))) continue
+      await removeIfFile(file)
     }
   }
 
-  /** Remove every token file this manager wrote, clear its timers. Safe to call twice. */
+  /**
+   * Remove every token file this manager wrote, clear its timers. Safe to call twice. A write in progress is waited for
+   * (no write starts once it is called), so nothing of it is on disk when this resolves.
+   */
   close(): Promise<void> {
     if (this.#closing !== undefined) return this.#closing
     this.#closed = true
     for (const state of this.#owners.values()) this.#clearTimer(state)
-    this.#closing = Promise.all([...this.#written].map(file => rm(file, { force: true }).catch(() => {}))).then(() => {
+    this.#closing = (async () => {
+      await Promise.allSettled([...this.#writes])
+      await Promise.all([...this.#written].map(file => rm(file, { force: true }).catch(() => {})))
       this.#written.clear()
-    })
+    })()
     return this.#closing
   }
 
@@ -350,8 +372,17 @@ export class TokenManager {
     this.#written.delete(file)
   }
 
-  /** `<token>\n` to the owner's file, 0600, atomically, in a 0700 directory. */
-  async #write(owner: string, token: string): Promise<void> {
+  /** `<token>\n` to the owner's file, 0600, atomically, in a 0700 directory. Tracked, so `close` can wait for it; refused once closed. */
+  #write(owner: string, token: string): Promise<void> {
+    if (this.#closed) return Promise.reject(new Error('the token manager is closed'))
+    const job = this.#writeNow(owner, token)
+    this.#writes.add(job)
+    const settled = () => { this.#writes.delete(job) }
+    job.then(settled, settled)
+    return job
+  }
+
+  async #writeNow(owner: string, token: string): Promise<void> {
     const directory = this.#directory
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const info = await lstat(directory)
@@ -361,7 +392,5 @@ export class TokenManager {
     const file = join(directory, owner)
     this.#written.add(file)
     await writeFileAtomic(file, `${token}\n`, 0o600)
-    // Closed while it was written: `close` may have removed the file before the rename put it back.
-    if (this.#closed) await rm(file, { force: true })
   }
 }

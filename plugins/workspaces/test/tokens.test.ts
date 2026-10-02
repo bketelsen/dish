@@ -242,9 +242,21 @@ describe('TokenManager', () => {
     assert.equal(await readFile(join(directory, 'acme'), 'utf8'), `${fake.minted[1]!.token}\n`)
     assert.ok(lines.some(line => line.startsWith('warn') && line.includes('acme/gadget')), lines.join('\n'))
     assert.ok(fake.requests.some(request => request.path === '/repos/acme/gadget/installation' && request.status === 404))
-    // It stays dropped: the next mint asks for widget only, and the same set given again changes nothing.
+    // The same set given again tries gadget again: still missing, it is dropped again, and widget's token is minted.
+    const asked = fake.requests.length
     await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget', 'gadget'] } }))
-    assert.equal(fake.minted.length, 2)
+    assert.equal(fake.minted.length, 3)
+    assert.deepEqual(fake.minted[2]!.repositories, ['widget'])
+    assert.ok(fake.requests.slice(asked).some(request => request.path === '/app/installations/77/access_tokens' && request.status === 422))
+    assert.equal(await readFile(join(directory, 'acme'), 'utf8'), `${fake.minted[2]!.token}\n`)
+    // Given back to the App: the next recompute's token covers it again.
+    fake.installations.set('acme', { id: 77, account: 'Acme', repos: new Set(['widget', 'gadget']) })
+    await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget', 'gadget'] } }))
+    assert.equal(fake.minted.length, 4)
+    assert.deepEqual([...fake.minted[3]!.repositories].sort(), ['gadget', 'widget'])
+    // Nothing dropped now: the same set again changes nothing.
+    await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget', 'gadget'] } }))
+    assert.equal(fake.minted.length, 4)
     await manager.close()
     await assertNoTokenLeaks(fake, dir, directory, lines)
   })
@@ -305,6 +317,16 @@ describe('TokenManager', () => {
     await manager.close()
   })
 
+  it("prune removes a held owner's leftover temporary file, under its lock, and keeps its token file", async () => {
+    const { fake, directory, manager } = await setup()
+    await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget'] } }))
+    await writeFile(join(directory, '.acme.0123456789ab.tmp'), 'x\n')
+    await manager.prune(['acme'])
+    assert.deepEqual(await readdir(directory), ['acme'])
+    assert.equal(await readFile(join(directory, 'acme'), 'utf8'), `${fake.minted[0]!.token}\n`)
+    await manager.close()
+  })
+
   it('prune with no directory is fine', async () => {
     const { manager } = await setup()
     await manager.prune(['acme'])
@@ -348,6 +370,43 @@ describe('TokenManager', () => {
     release()
     await done
     await assert.rejects(readFile(join(directory, 'acme'), 'utf8'), { code: 'ENOENT' })
+    await manager.close()
+  })
+
+  it('nothing is on disk the moment close resolves, wherever a write was when it was called', async () => {
+    const fake = await startFakeGitHub({ publicKey: keys.publicKey })
+    fake.installations.set('acme', { id: 77, account: 'Acme', repos: new Set(['widget']) })
+    const real = new GitHubApp(async () => ({ appId: String(fake.app.id), privateKey: keys.privateKeyPem }), { api: fake.api })
+    const { token, expiresAt, permissions, repositories } = await real.createToken(77, ['widget'], FILE_PERMISSIONS)
+    // A token at once, so close lands at every step of the write as the ticks go by.
+    const app = {
+      createToken: async () => ({ token, expiresAt, permissions, repositories }),
+      installationFor: async () => undefined,
+    }
+    const dir = await tempDir()
+    for (let ticks = 0; ticks < 40; ticks++) {
+      const directory = join(dir, String(ticks))
+      const manager = new TokenManager({ directory, app, logger: { warn() {}, info() {} } })
+      const set = manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget'] } }))
+      for (let tick = 0; tick < ticks; tick++) await new Promise(resolve => setImmediate(resolve))
+      await manager.close()
+      const left = await readdir(directory).catch(() => [])
+      assert.deepEqual(left, [], `after ${ticks} ticks, close left ${left.join(', ')}`)
+      await set
+      assert.deepEqual(await readdir(directory).catch(() => []), [], `after ${ticks} ticks, a write landed after close`)
+    }
+  })
+
+  it('its refresh timers do not keep the process alive (unref)', async () => {
+    const fake = await startFakeGitHub({ publicKey: keys.publicKey })
+    fake.installations.set('acme', { id: 77, account: 'Acme', repos: new Set(['widget']) })
+    const app = new GitHubApp(async () => ({ appId: String(fake.app.id), privateKey: keys.privateKeyPem }), { api: fake.api })
+    const dir = await tempDir()
+    const manager = new TokenManager({ directory: tokensDir(join(dir, 'state')), app, logger: { warn() {}, info() {} } })
+    const timeouts = () => process.getActiveResourcesInfo().filter(kind => kind === 'Timeout').length
+    const before = timeouts()
+    await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget'] } }))
+    assert.equal(timeouts(), before)
     await manager.close()
   })
 
