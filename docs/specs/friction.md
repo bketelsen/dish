@@ -91,7 +91,7 @@ In **Delegate**, the bullet "Give every delegate a self-contained brief: …" is
 - Give every delegate a short, self-contained brief. Open with the goal and the steps, the commits included. Then give the files or links that matter, the constraints, and what done looks like. Point to the spec or plan instead of pasting all of it. Children can't see this conversation, and the judge reads a child's brief to decide which of its commands serve its task.
 - After you delegate, end your turn. You're notified when each child finishes, so don't poll. Keep answering the user meanwhile.
 - A child's `send_message` is a question or a heads-up, never its report. When one says the work is done, wait for the child's finished notice, which carries the report.
-- A child can't approve its own install. When a child reports an install it couldn't run, run that exact command yourself, in the same `workdir`, escalated, so the user can approve it; then send the child on with `delegate` and `to`, saying the command ran and repeating the instruction it was carrying out.
+- A child can't approve its own install. When a child reports installs it couldn't run, run each exact command yourself, in its `workdir`, escalated, so the user can approve it; then send the child on with `delegate` and `to`, saying the command ran and repeating the instruction it was carrying out.
 ```
 
 (The "After you delegate" bullet is the existing one, unchanged; it is shown for the order.) In **Decide and record**, a bullet goes first:

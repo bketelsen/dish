@@ -455,8 +455,11 @@ function promptText(event: unknown): string | undefined {
   return message?.source.kind === 'user' ? joined(message.texts) : undefined
 }
 
-/** A mask `maskSecrets` puts where a secret was: `‹secret: <kind>›`. */
-const SECRET_MASK = /‹secret: ([^›]*)›/g
+/**
+ * A mask `maskSecrets` puts where a secret was: `‹secret: <kind>›`. The kind is bounded (dish-kit's longest is 27
+ * characters): unbounded, every `‹secret: ` with no `›` after it scanned to the end, quadratic in a message's length.
+ */
+const SECRET_MASK = /‹secret: ([^›]{0,64})›/g
 
 /**
  * One message of the task, as it is sent: its secrets masked, and then cut in the middle to `max`.

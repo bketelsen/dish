@@ -857,6 +857,17 @@ test('a token that a cut goes through is masked before the cut, so none of it re
   assert.equal(taskOf(agentOf({ events: [userEvent(1, `push with ${GH_TOKEN} please`)] }), true), 'push with [a GitHub token, left out] please')
 })
 
+test('the marker regex is bounded: unclosed mask openings cost linear time, and only a short kind becomes a marker', () => {
+  // Unbounded, every \u2039secret: with no \u203a after it scanned to the end: 16,000 of them took ~770 ms per command.
+  const forged = '\u2039secret: '.repeat(16_000)
+  const started = performance.now()
+  taskOf(agentOf({ events: [userEvent(1, forged)] }), true)
+  assert.ok(performance.now() - started < 400, 'unclosed openings must not take quadratic time')
+  // A kind past 64 characters isn't one of dish-kit's, so it is left as written, not turned into a marker.
+  const long = `\u2039secret: ${'k'.repeat(65)}\u203a`
+  assert.equal(taskOf(agentOf({ events: [userEvent(1, `a ${long} b`)] }), true), `a ${long} b`)
+})
+
 test('a child\'s brief is the first text block of its first prompt, clipped in the middle: the 5.8k brief keeps its commit instructions', () => {
   assert.equal(LONG_BRIEF.length, 5_853)
   const task = taskOf(agentOf({ child: true, events: [userEvent(1, [LONG_BRIEF, CREW_NOTE, DSH_NOTE]), otherEvent(2)] }), false)
