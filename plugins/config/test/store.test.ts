@@ -388,6 +388,21 @@ describe('seed replace', () => {
     assert.equal('note' in info, false)
   })
 
+  test('a stored text already equal to the new default is not a replacement: no change to it, and no note', async () => {
+    const store = await openStore({ claims: [ns('prompts/', 'write', 'prompts')] })
+    await store.seed({ 'prompts/a.md': 'A v2' }, 'prompts')
+    const info = await store.seed(
+      { 'prompts/a.md': 'A v2', 'prompts/b.md': 'B' },
+      'prompts',
+      { replace: { 'prompts/a.md': [sha256('A v2')] } },
+    )
+    assert.ok(info)
+    assert.deepEqual(info.paths, ['prompts/b.md'])
+    assert.equal(info.note, undefined)
+    assert.equal(info.message, 'prompts/b.md: prompts defaults\n\nDish-Author-Kind: system\n')
+    assert.equal(await store.read('prompts/a.md'), 'A v2')
+  })
+
   test('a hash replaces only its own path, and the stored text is hashed as UTF-8, byte for byte', async () => {
     const store = await openStore({ claims: [ns('prompts/', 'write', 'prompts')] })
     const odd = 'caf\u00e9 \u{1F600}\r\n  trailing space \n\n'
