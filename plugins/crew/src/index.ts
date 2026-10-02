@@ -29,6 +29,7 @@
  * @module dish-crew
  */
 
+import { realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -78,10 +79,11 @@ export interface DishCrew {
   /** The `ctx.subagents` provider the crew's children are created on: the `subagentProvider` setting. The preset row can't see the host's config. */
   readonly subagentProvider: string
   /**
-   * The crew children bound to `worktree` (an absolute, canonical path, compared exactly), across sessions, oldest first,
-   * with whether each is running: dsh's agent registry (`ctx.get('agents')`) says so, or the record says running and the
-   * agent exists, which is `delegate`'s rule; with no registry, the record's `last === 'running'`. Rejects only if the
-   * record can't be read.
+   * The crew children bound to `worktree`, across sessions, oldest first. `worktree` is an absolute path, made canonical
+   * with `realpath` (taken as it is when that fails, as for a worktree that is gone) and compared exactly with the
+   * canonical paths the record holds. Each says whether it is running: dsh's agent registry (`ctx.get('agents')`) says
+   * so, or the record says running and the agent exists, which is `delegate`'s rule; with no registry, the record's
+   * `last === 'running'`. Rejects only if the record can't be read.
    */
   worktreeBindings(worktree: string): Promise<WorktreeBinding[]>
 }
@@ -410,9 +412,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     warn('could not prune the crew\'s old records in %s: %s', directory, describe(error))
   }
 
-  /** `DishCrew.worktreeBindings`. The registry is a sibling's service, read on each call. */
+  /**
+   * `DishCrew.worktreeBindings`. A caller may reach the worktree through a link (`/home` to `/var/home`, a linked
+   * `DSH_DISH_HOME`), and the record holds canonical paths. The registry is a sibling's service, read on each call.
+   */
   const worktreeBindings = async (worktree: string): Promise<WorktreeBinding[]> => {
-    const found = await records.boundTo(worktree)
+    const found = await records.boundTo(await realpath(worktree).catch(() => worktree))
     const agents = lookup.get('agents') as LiveAgents | undefined
     return found.map(({ sessionId, record }) => ({ child: record.id, sessionId, role: record.role, title: record.title, running: isRunning(record, agents) }))
   }

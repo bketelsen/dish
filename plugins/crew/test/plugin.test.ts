@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -135,6 +135,28 @@ test('worktreeBindings names the children bound to a worktree, across sessions, 
     await registry.dispose()
     assert.equal(ctx.get('agents'), undefined)
     assert.deepEqual((await ctx.dishCrew.worktreeBindings(TREE)).map(binding => [binding.child, binding.running]), [['stepping', true], ['done', false], ['crashed', true]])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('worktreeBindings finds a binding by a path that reaches the worktree through a link, and takes a path that isn\'t there as it is', async () => {
+  const where = await dirs()
+  const real = join(where.root, 'work', 'o', 'r', '.worktrees', 'fix-1')
+  await mkdir(real, { recursive: true })
+  const canonical = await realpath(real)
+  await symlink(join(where.root, 'work'), join(where.root, 'linked-work'))
+  const linked = join(where.root, 'linked-work', 'o', 'r', '.worktrees', 'fix-1')
+  const ctx = new Context()
+  const handle = mountCrew(ctx, where.data)
+  await handle
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1', { worktree: canonical }))
+    assert.deepEqual((await ctx.dishCrew.worktreeBindings(linked)).map(binding => binding.child), ['c1'])
+    assert.deepEqual((await ctx.dishCrew.worktreeBindings(canonical)).map(binding => binding.child), ['c1'])
+    // Gone from disk: the path as given, which is what the record holds.
+    await rm(real, { recursive: true })
+    assert.deepEqual((await ctx.dishCrew.worktreeBindings(canonical)).map(binding => binding.child), ['c1'])
   } finally {
     await handle.dispose()
   }

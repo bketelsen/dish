@@ -1,4 +1,4 @@
-import { mkdir, realpath, symlink } from 'node:fs/promises'
+import { mkdir, realpath, rm, symlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -1630,6 +1630,36 @@ test('a worktree outside the calling chat\'s workspace is refused, where a coder
   assert.equal((await w.records.children('session-linked'))[0]!.worktree, tree.path)
 })
 
+test('the path resolve gives is made canonical: a worktree reached through a link is recorded, briefed and found by its real path', async () => {
+  const w = await world()
+  const tree = await w.makeWorktree('fix-1')
+  const links = await tempDir()
+  await symlink(w.workspace, join(links, 'clone'))
+  const linked = { ...tree, path: join(links, 'clone', '.worktrees', 'fix-1'), clone: join(links, 'clone') }
+  w.worktrees.set('frostyard/snosi/fix-1', linked)
+  const started = await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  assert.equal((await w.records.lookup(started.child))?.record.worktree, tree.path)
+  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: brief(tree.path, 'dish/fix-1') })
+  assert.deepEqual((await w.records.boundTo(tree.path)).map(({ record }) => record.id), [started.child])
+  assert.deepEqual(await w.records.boundTo(linked.path), [])
+})
+
+test('inside the workspace means under it: a sibling directory that shares its name\'s start, and the workspace itself, are refused', async () => {
+  const w = await world()
+  const sibling = `${w.workspace}-x`
+  try {
+    const beside = await w.makeWorktree('fix', sibling)
+    assert.equal(beside.path, `${w.workspace}-x/.worktrees/fix`)
+    assert.match(await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix' })), /is outside this chat's workspace/)
+    w.worktrees.set('frostyard/snosi/whole', { project: 'frostyard/snosi', slug: 'whole', branch: 'dish/whole', path: w.workspace, clone: w.workspace, base: 'a'.repeat(40) })
+    assert.match(await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/whole' })), /is outside this chat's workspace/)
+    assert.equal(w.starts.length, 0)
+    assert.deepEqual(await w.records.children(SESSION), [])
+  } finally {
+    await rm(sibling, { recursive: true, force: true })
+  }
+})
+
 test('a worktree bound to a running child is refused, naming it; once that child has finished, it can be bound again', async () => {
   const w = await world()
   const tree = await w.makeWorktree('fix-1')
@@ -1708,6 +1738,10 @@ test('a follow-up naming another worktree is refused, and so is binding a child 
   const unbound = await w.delegate({ ...CODER, title: 'unbound' })
   await finish(w, unbound.child)
   assert.match(await refusal(w.delegate({ ...CODER, task: 'Bind.', to: unbound.child, worktree: 'frostyard/snosi/fix-2' })), /isn't bound to a worktree, and a follow-up can't bind one/)
+  // That is the reason whatever dish-workspaces could say: it isn't asked.
+  const asked = w.resolveAsked.length
+  assert.match(await refusal(w.delegate({ ...CODER, task: 'Bind.', to: unbound.child, worktree: 'frostyard/snosi/nope' })), /isn't bound to a worktree/)
+  assert.equal(w.resolveAsked.length, asked)
   // A worktree nobody knows is refused as for a start.
   assert.match(await refusal(w.delegate({ ...CODER, task: 'x', to: bound.child, worktree: 'frostyard/snosi/nope' })), /no worktree `frostyard\/snosi\/nope`/)
   assert.equal(w.sends.length, 0)
@@ -1729,6 +1763,12 @@ test('a follow-up to a child whose worktree is gone is refused, and so is one wh
   await records.endRun(bound.id, { stopReason: 'completed', closing: 'x' })
   const without = await world({ workspaces: false, records })
   assert.match(await refusal(without.delegate({ ...CODER, task: 'Fix it.', to: 'c1' })), /dish-workspaces plugin is not running/)
+  // A child that was never bound is told so, not that the plugin is missing.
+  await records.addChild(SESSION, { id: 'c2', role: 'coder', title: 't', model: 'claude-sonnet-5.5', family: 'anthropic' })
+  await records.endRun('c2', { stopReason: 'completed', closing: 'x' })
+  const unbound = await refusal(without.delegate({ ...CODER, task: 'Bind.', to: 'c2', worktree: tree.path }))
+  assert.match(unbound, /child c2 isn't bound to a worktree, and a follow-up can't bind one/)
+  assert.doesNotMatch(unbound, /dish-workspaces/)
   assert.equal(without.sends.length, 0)
 })
 

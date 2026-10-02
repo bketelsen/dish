@@ -455,10 +455,11 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     const again = `start a new ${call.role}`
     if (call.worktree !== undefined) {
       enforceWrites(call)
-      const given = await knownWorktree(workspaces(), call.worktree)
+      // Before dish-workspaces is asked: this is the reason, whatever it would say.
       if (target.worktree === undefined) {
         throw new Error(`child ${target.id} isn't bound to a worktree, and a follow-up can't bind one. Leave worktree out, or ${again} with it.`)
       }
+      const given = await knownWorktree(workspaces(), call.worktree)
       if (given.path !== target.worktree) {
         throw new Error(`child ${target.id} is bound to worktree \`${target.worktree}\`, and a follow-up can't move it to \`${given.path}\`. Leave worktree out, or ${again} with it.`)
       }
