@@ -175,7 +175,7 @@ A settings section, built like Prompts and Skills: a framework-free controller, 
 - **List:** each project with its family, role, onboarding status (pending, cloning, setup, ready, failed with message), last fetch, and its workspace.
 - **Add and edit:** a form for the fields above, which writes `projects.yaml` as you, with the usual conflict check.
 - **Remove:** asks to confirm, and says the clone and workspace stay.
-- **Retry:** for a failed project.
+- **Retry:** for any project that isn't queued or onboarding. On a ready one it onboards again: it adopts the clone, runs setup (on merged code), and registers the workspace, which brings back one you removed.
 - **Proposals** for `projects.yaml` show a count, and are accepted on History, as with prompts.
 
 ## Services
