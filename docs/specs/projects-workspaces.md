@@ -18,7 +18,7 @@ You register repos as **projects**, and dish gets them ready to work on.
 | 2 | Clone layout | `<work root>/<owner>/<repo>`. Prod's work root is `~/work`, dev's is `<checkout>/.dev/work` (6a's launcher sets `DISH_WORK_ROOT`). An existing clone at that path is adopted, not cloned again. |
 | 3 | Worktrees | `<clone>/.worktrees/<slug>` on branch `dish/<slug>`. The `.worktrees/` folder is git-ignored through the clone's `.git/info/exclude`, so no repo change is needed. |
 | 4 | Registry | `projects.yaml` in the config store. Edited on Settings → Projects, or by agent proposals you accept. |
-| 5 | Project fields | `owner/name`, `family`, `role`, `gate`, `gateTimeout`, and optional `setup` and `setupTimeout`. |
+| 5 | Project fields | `owner/name`, `family`, `role`, `gate`, `gateTimeout`, and optional `setup`, `setupTimeout` and `gateEnv` (see the [gates spec](gates.md)). |
 | 6 | Who makes worktrees | The main agent, with the `worktree` tool. `delegate` takes a worktree and binds the coder to it (crew records the binding, for gates in 6c). |
 | 7 | GitHub | A GitHub App with Contents read/write, Pull requests read/write and Metadata read, installed on `bketelsen` (selected repos) and `frostyard`. Dev uses a separate dish-dev App, installed only on test repos. |
 | 8 | Where the App key lives | dsh's credential store, entered on a settings card (like the TypeSafe key). Dev has its own card and its own App. |
