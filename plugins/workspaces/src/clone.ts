@@ -16,12 +16,20 @@
  *   expectation. It runs again at every start, so a changed key is put back.
  * - **Writing a clone's files** (its `.git/config`, its exclude file, and adopt's switch of `origin`): agents can swap
  *   any of them, or `.git` itself, for a link to another repository's (the config store's, say), and git's own
- *   `git config --file` writes through a link to its target. So dish pins `.git` (by `lstat`: a directory, its device and
- *   inode), reads the file through a handle that follows no link and refuses one with another hard link, edits a
- *   private copy under dish's state directory with `git config --file <copy>` (from `/`, no system or global config:
- *   nothing of the clone's runs), and writes the result back through one handle that follows no link, only if it is
- *   still the file it read (device, inode, one link) and `.git` is still the directory it pinned. A config the edit
- *   doesn't change isn't written.
+ *   `git config --file` writes through a link to its target. So dish:
+ *   - pins `.git` (by `lstat`: a directory, its device and inode), and reads the file through a handle that follows no
+ *     link, checked through Linux's `/proc/self/fd` to be where dish expects (no link anywhere on the way);
+ *   - edits a private copy under dish's state directory with `git config --file <copy>` (from `/`, no system or global
+ *     config: nothing of the clone's runs); writes nothing if the edit changes nothing;
+ *   - writes the result into a new file beside the old one (git's own `config.lock` for the config, so an agent's
+ *     `git config` and dish's wait for each other), created never through a link nor over a file that is there,
+ *     checked through `/proc/self/fd` too, with the old file's mode, and synced;
+ *   - just before renaming it over the old file, checks `.git` is the directory it pinned and the old file is the one it
+ *     read (device, inode, one link). A crash at any point leaves the old file whole; a failure removes the new file
+ *     (where `/proc/self/fd` says it is, and only it).
+ *   A file replaced meanwhile by another regular file (an agent's `git config`), or a `config.lock` held, is tried once
+ *   more from the read; a second change, or a link, is refused. A file with another hard link (a dedup tool's) is
+ *   refused only when dish has something to write to it.
  * - **Fetch.** `checkClone` first, then `git fetch --prune origin +refs/heads/*:refs/remotes/origin/*`: the refspec on
  *   the command line, so a refspec written into the config can't fetch elsewhere or keep a hand-written origin ref
  *   alive. Then `git remote set-head origin --auto` every time, so an `origin/HEAD` an agent repointed is GitHub's again
@@ -31,11 +39,11 @@
  * the token file. Every message is masked.
  *
  * Known limits:
- * - `.git` is checked by path just before the file is opened again to write it: an agent that swaps `.git` for a link
- *   and back within the microseconds between those two steps, having done the same while dish read the file, could
- *   still get the edited config written into the file it linked to. A sub-millisecond window, closed fully only when
- *   dish's work in a clone runs inside the sandbox (6c's sandboxed runner); likewise the spec's race between the clone
- *   check and the next git command;
+ * - the spec's check-then-act race: the last checks and the rename are two steps (as are the clone check and the next
+ *   git command), so an agent swapping `.git` for a link in the microseconds between them could have the rename land
+ *   in the directory it linked to. Closed fully only when dish's work in a clone runs inside the sandbox (6c's
+ *   sandboxed runner);
+ * - the location checks read Linux's `/proc/self/fd`: elsewhere they refuse, and dish configures no clone;
  * - a temporary directory left by a crash (dish killed mid-clone) stays: dish can't tell it from one it didn't make.
  *   It is `.<repo>.cloning-<8 hex>` beside the clone, for the user to remove.
  *
@@ -44,7 +52,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, readlink, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import type { Project } from 'dish-projects/registry'
@@ -74,10 +82,15 @@ const MAX_SHOWN = 200
 
 /**
  * For tests only, never set by dish: `gitEnv` is put on top of the environment of the network gits here (a test's
- * `GIT_CONFIG_NOSYSTEM`); `beforeWrite` is called with a clone's file just before dish's last checks and its write
- * back, where a test plays an agent swapping the file.
+ * `GIT_CONFIG_NOSYSTEM`); `beforeWrite` is called with a clone's file once dish has written the new one beside it,
+ * just before its last checks and the rename, where a test plays an agent swapping the file (or dish crashing).
  */
-export const internals: { gitEnv?: Record<string, string>, beforeWrite?: (file: string) => Promise<void> | void } = {}
+export const internals: {
+  gitEnv?: Record<string, string>
+  beforeWrite?: (file: string) => Promise<void> | void
+  /** Called before the second try after a benign change, with the file. */
+  onRetry?: (file: string) => Promise<void> | void
+} = {}
 
 // --- the error --------------------------------------------------------------------------------------------------------
 
@@ -230,6 +243,18 @@ async function configWrite(file: string, args: readonly string[], ok: readonly n
 /** What a directory or file was when dish looked: whether it is still the same one. */
 interface Identity { dev: bigint, ino: bigint }
 
+/** A clone's file as dish read it. */
+interface Read { bytes: Buffer, id: Identity, nlink: bigint, mode: number }
+
+/**
+ * A benign change by someone else while dish was writing (the file replaced by another regular file, as an agent's
+ * `git config` does, or `config.lock` held): the edit is tried once more from the read. Anything else is refused.
+ */
+class Changed extends OnboardError {}
+
+/** Between a change and the second try, for an agent's `git config` to finish. */
+const RETRY_DELAY_MS = 100
+
 function codeOf(error: unknown): string {
   return (error as NodeJS.ErrnoException).code ?? messageOf(error)
 }
@@ -255,11 +280,24 @@ async function stillDirectory(dir: string, pinned: Identity, name: string, step:
 }
 
 /**
- * A clone's file, read through a handle that follows no link and doesn't wait on a FIFO: its bytes and identity, or
- * `undefined` when it is missing. Refused unless it is a regular file with one link: a hard link to another file would
- * have dish's write land there too.
+ * The file `handle` has open is `expected` (a real path): Linux's `/proc/self/fd` names where the kernel found it, so a
+ * link anywhere on the way (`.git` swapped for one, say) shows. Else refused, never retried.
  */
-async function readPinned(file: string, name: string, step: OnboardStep): Promise<{ bytes: Buffer, id: Identity } | undefined> {
+async function verifyAt(handle: FileHandle, expected: string, name: string, step: OnboardStep): Promise<void> {
+  let actual: string
+  try {
+    actual = await readlink(`/proc/self/fd/${handle.fd}`)
+  } catch {
+    actual = ''
+  }
+  if (actual !== expected) throw new OnboardError(step, `${name} is not where dish expects it (a link on the way); dish wrote nothing`)
+}
+
+/**
+ * A clone's file, read through a handle that follows no link and doesn't wait on a FIFO, from where dish expects it
+ * (`real`, checked through `/proc/self/fd`): its bytes, identity, link count and mode; `undefined` when it is missing.
+ */
+async function readPinned(file: string, real: string, name: string, step: OnboardStep): Promise<Read | undefined> {
   let handle: FileHandle
   try {
     handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
@@ -270,73 +308,172 @@ async function readPinned(file: string, name: string, step: OnboardStep): Promis
   try {
     const stats = await handle.stat({ bigint: true })
     if (!stats.isFile()) throw new OnboardError(step, `${name} is not a regular file`)
-    if (stats.nlink !== 1n) throw new OnboardError(step, `${name} has another hard link; dish won't write through it`)
     if (stats.size > BigInt(MAX_CLONE_FILE_BYTES)) throw new OnboardError(step, `${name} is too large`)
-    return { bytes: await handle.readFile(), id: { dev: stats.dev, ino: stats.ino } }
+    await verifyAt(handle, real, name, step)
+    return { bytes: await handle.readFile(), id: { dev: stats.dev, ino: stats.ino }, nlink: stats.nlink, mode: Number(stats.mode & 0o7777n) }
   } finally {
     await handle.close()
   }
 }
 
-/** Write through one handle that follows no link, only if it is still the file read (`id`) with one link. */
-async function writePinned(file: string, id: Identity, name: string, step: OnboardStep, write: (handle: FileHandle) => Promise<void>, append = false): Promise<void> {
-  const replaced = new OnboardError(step, `${name} was replaced while dish was configuring the clone; dish wrote nothing`)
-  let handle: FileHandle
-  try {
-    handle = await open(file, constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | (append ? constants.O_APPEND : 0))
-  } catch {
-    throw replaced
-  }
-  try {
-    const stats = await handle.stat({ bigint: true })
-    if (!stats.isFile() || stats.nlink !== 1n || stats.dev !== id.dev || stats.ino !== id.ino) throw replaced
-    await write(handle)
-    await handle.sync()
-  } finally {
-    await handle.close()
-  }
+/** A file dish is about to write must have one link: a hard link would keep the old content under another name, or have been one to another repository's file. */
+function oneLink(read: Read | undefined, name: string, step: OnboardStep): void {
+  if (read !== undefined && read.nlink !== 1n) throw new OnboardError(step, `${name} has another hard link; dish won't write it`)
 }
 
-/** All of `bytes` at `position` (or appended), however the writes split it. */
-async function writeAll(handle: FileHandle, bytes: Buffer, position: number | null): Promise<void> {
+/** All of `bytes` from `position`, however the writes split it. */
+async function writeAll(handle: FileHandle, bytes: Buffer, position: number): Promise<void> {
   let done = 0
   while (done < bytes.length) {
-    const { bytesWritten } = await handle.write(bytes, done, bytes.length - done, position === null ? null : position + done)
+    const { bytesWritten } = await handle.write(bytes, done, bytes.length - done, position + done)
     done += bytesWritten
   }
 }
 
+/** The file dish made, removed where it is now (checked to be the same file just before); left if that can't be told. */
+async function removeOwn(handle: FileHandle): Promise<void> {
+  try {
+    const where = await readlink(`/proc/self/fd/${handle.fd}`)
+    const [mine, there] = await Promise.all([handle.stat({ bigint: true }), lstat(where, { bigint: true })])
+    if (mine.dev === there.dev && mine.ino === there.ino) await rm(where)
+  } catch {
+    // Gone already, or nowhere dish can name: left as it is.
+  }
+}
+
+/** A directory's entries on disk: best effort, as `writeFileAtomic` does. */
+async function syncDirectory(dir: string): Promise<void> {
+  try {
+    const handle = await open(dir, constants.O_RDONLY | constants.O_DIRECTORY)
+    try {
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    // The rename is done either way.
+  }
+}
+
+interface Replacement {
+  step: OnboardStep
+  /** The directories on the way, still the ones pinned just before the rename. */
+  dirs: ReadonlyArray<{ path: string, pinned: Identity, name: string }>
+  /** The file as the clone's path spells it (for the test hook), and its real path. */
+  target: string
+  realTarget: string
+  name: string
+  /** What the file was when read; `undefined`: it was missing. */
+  read: Read | undefined
+  /** The new file beside it: its real path and its name in messages. */
+  realTemp: string
+  tempName: string
+  bytes: Buffer
+}
+
 /**
- * Edit a clone's `.git/config` with `git config --file` on a private copy under dish's state directory, and write the
- * result back as the module says (`.git` pinned, the file read and written through handles that follow no link, the
- * write only to the file read). Nothing is written when the edits change nothing.
+ * Replace a clone's file whole: `bytes` into a new file beside it (created, never through a link or over one that is
+ * there: `O_EXCL`; for `.git/config` it is git's own `config.lock`, so an agent's `git config` and dish's wait for each
+ * other), checked to be where dish expects (`/proc/self/fd`), with the old file's mode, synced; then, just before the
+ * rename, the directories on the way still the ones pinned and the file still the one read (same device and inode, one
+ * link; or still missing); then renamed over it, and the directory synced. A crash at any point leaves the old file
+ * whole. On failure, the new file is removed where it is, and only it.
+ */
+async function replaceFile(o: Replacement): Promise<void> {
+  const mode = o.read?.mode ?? 0o644
+  let handle: FileHandle
+  try {
+    handle = await open(o.realTemp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode)
+  } catch (error) {
+    if (codeOf(error) === 'EEXIST') throw new Changed(o.step, `${o.tempName} is held (a git config at work?); dish wrote nothing`)
+    throw new OnboardError(o.step, `${o.tempName} can't be made (${codeOf(error)}); dish wrote nothing`)
+  }
+  let renamed = false
+  try {
+    await verifyAt(handle, o.realTemp, o.tempName, o.step)
+    await handle.chmod(mode)
+    await writeAll(handle, o.bytes, 0)
+    await handle.sync()
+    await internals.beforeWrite?.(o.target)
+    for (const dir of o.dirs) await stillDirectory(dir.path, dir.pinned, dir.name, o.step)
+    await stillTheFile(o)
+    await verifyAt(handle, o.realTemp, o.tempName, o.step)
+    await rename(o.realTemp, o.realTarget)
+    renamed = true
+  } finally {
+    if (!renamed) await removeOwn(handle)
+    await handle.close().catch(() => {})
+  }
+  await syncDirectory(dirname(o.realTarget))
+}
+
+/** The file is still the one read: a link is refused; another regular file (or one gone, or one that appeared) is a change, tried once more. */
+async function stillTheFile(o: Replacement): Promise<void> {
+  let stats
+  try {
+    stats = await lstat(o.realTarget, { bigint: true })
+  } catch (error) {
+    if (codeOf(error) !== 'ENOENT') throw new OnboardError(o.step, `${o.name} can't be read (${codeOf(error)}); dish wrote nothing`)
+    if (o.read === undefined) return
+    throw new Changed(o.step, `${o.name} was removed while dish was configuring the clone; dish wrote nothing`)
+  }
+  if (stats.isSymbolicLink()) throw new OnboardError(o.step, `${o.name} was replaced by a symbolic link; dish wrote nothing`)
+  if (!stats.isFile()) throw new OnboardError(o.step, `${o.name} is not a regular file; dish wrote nothing`)
+  if (stats.nlink !== 1n) throw new OnboardError(o.step, `${o.name} has another hard link; dish wrote nothing`)
+  if (o.read === undefined) throw new Changed(o.step, `${o.name} appeared while dish was configuring the clone; dish wrote nothing`)
+  if (stats.dev !== o.read.id.dev || stats.ino !== o.read.id.ino) {
+    throw new Changed(o.step, `${o.name} was replaced while dish was configuring the clone; dish wrote nothing`)
+  }
+}
+
+/** `attempt`, and once more after a benign change (`Changed`); a second change is the error. */
+async function onceMore(file: string, attempt: () => Promise<void>): Promise<void> {
+  try {
+    await attempt()
+    return
+  } catch (error) {
+    if (!(error instanceof Changed)) throw error
+  }
+  await internals.onRetry?.(file)
+  await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
+  await attempt()
+}
+
+/**
+ * Edit a clone's `.git/config` with `git config --file` on a private copy under dish's state directory, and replace
+ * the file with the result (`replaceFile`, through `config.lock`). Nothing is written when the edits change nothing.
+ * A benign change meanwhile starts it once more from the read.
  */
 async function editConfig(clone: string, project: Project, deps: CloneDeps, step: OnboardStep, edits: ReadonlyArray<{ args: readonly string[], ok?: readonly number[] }>): Promise<void> {
   const dotGit = join(clone, '.git')
   const file = join(dotGit, 'config')
-  const pinned = await pinDirectory(dotGit, '.git', step)
-  const read = await readPinned(file, '.git/config', step)
-  if (read === undefined) throw new OnboardError(step, '.git/config is missing')
-  await stillDirectory(dotGit, pinned, '.git', step)
-
-  const scratch = projectStateDir(deps.state, project.owner, project.repo)
-  await mkdir(scratch, { recursive: true, mode: 0o700 })
-  const copy = join(scratch, `.config-edit-${randomBytes(6).toString('hex')}`)
-  try {
-    await writeFile(copy, read.bytes, { flag: 'wx', mode: 0o600 })
-    for (const edit of edits) await configWrite(copy, edit.args, edit.ok ?? [0], step)
-    const edited = await readFile(copy)
-    if (edited.equals(read.bytes)) return
-    await internals.beforeWrite?.(file)
+  await onceMore(file, async () => {
+    const realGit = join(await realpath(clone), '.git')
+    const pinned = await pinDirectory(dotGit, '.git', step)
+    const read = await readPinned(file, join(realGit, 'config'), '.git/config', step)
+    if (read === undefined) throw new OnboardError(step, '.git/config is missing')
     await stillDirectory(dotGit, pinned, '.git', step)
-    await writePinned(file, read.id, '.git/config', step, async handle => {
-      await handle.truncate(0)
-      await writeAll(handle, edited, 0)
+
+    const scratch = projectStateDir(deps.state, project.owner, project.repo)
+    await mkdir(scratch, { recursive: true, mode: 0o700 })
+    const copy = join(scratch, `.config-edit-${randomBytes(6).toString('hex')}`)
+    let edited: Buffer
+    try {
+      await writeFile(copy, read.bytes, { flag: 'wx', mode: 0o600 })
+      for (const edit of edits) await configWrite(copy, edit.args, edit.ok ?? [0], step)
+      edited = await readFile(copy)
+    } finally {
+      await rm(copy, { force: true }).catch(() => {})
+      await rm(`${copy}.lock`, { force: true }).catch(() => {})
+    }
+    if (edited.equals(read.bytes)) return
+    oneLink(read, '.git/config', step)
+    await replaceFile({
+      step, dirs: [{ path: dotGit, pinned, name: '.git' }],
+      target: file, realTarget: join(realGit, 'config'), name: '.git/config', read,
+      realTemp: join(realGit, 'config.lock'), tempName: '.git/config.lock', bytes: edited,
     })
-  } finally {
-    await rm(copy, { force: true }).catch(() => {})
-    await rm(`${copy}.lock`, { force: true }).catch(() => {})
-  }
+  })
 }
 
 /** Why `<work root>/<owner>`, when it is there, isn't the work root's own directory (a link out of it, say). */
@@ -471,39 +608,30 @@ async function cloneFresh(path: string, project: Project, deps: CloneDeps, signa
 
 // --- step 3: configure ------------------------------------------------------------------------------------------------
 
-/** Append `.worktrees/` to `.git/info/exclude` unless it has the line, as `editConfig` writes: never through a link, only to the file read. */
+/** Add `.worktrees/` to `.git/info/exclude` unless it has the line, replacing the file as `editConfig` does (a new file beside it, then a rename). */
 async function excludeWorktrees(clone: string, step: OnboardStep): Promise<void> {
   const dotGit = join(clone, '.git')
   const info = join(dotGit, 'info')
   const file = join(info, 'exclude')
-  const pinned = await pinDirectory(dotGit, '.git', step)
-  if (await kindOf(info) === 'missing') await mkdir(info, { mode: 0o755 })
-  const pinnedInfo = await pinDirectory(info, '.git/info', step)
-  await stillDirectory(dotGit, pinned, '.git', step)
-  const read = await readPinned(file, '.git/info/exclude', step)
-  const text = read?.bytes.toString('utf8') ?? ''
-  if (text.split(/\r?\n/).some(line => line === EXCLUDE_LINE)) return
-  const addition = Buffer.from(`${text === '' || text.endsWith('\n') ? '' : '\n'}${EXCLUDE_LINE}\n`)
-  await internals.beforeWrite?.(file)
-  await stillDirectory(dotGit, pinned, '.git', step)
-  await stillDirectory(info, pinnedInfo, '.git/info', step)
-  if (read !== undefined) {
-    await writePinned(file, read.id, '.git/info/exclude', step, handle => writeAll(handle, addition, null), true)
-    return
-  }
-  // There was none: a new one, never through a link or over one that appeared meanwhile.
-  let handle: FileHandle
-  try {
-    handle = await open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o644)
-  } catch (error) {
-    throw new OnboardError(step, `.git/info/exclude can't be made (${codeOf(error)}); dish wrote nothing`)
-  }
-  try {
-    await writeAll(handle, addition, 0)
-    await handle.sync()
-  } finally {
-    await handle.close()
-  }
+  await onceMore(file, async () => {
+    const realInfo = join(await realpath(clone), '.git', 'info')
+    const pinned = await pinDirectory(dotGit, '.git', step)
+    if (await kindOf(info) === 'missing') await mkdir(info, { mode: 0o755 })
+    const pinnedInfo = await pinDirectory(info, '.git/info', step)
+    await stillDirectory(dotGit, pinned, '.git', step)
+    const read = await readPinned(file, join(realInfo, 'exclude'), '.git/info/exclude', step)
+    const text = read?.bytes.toString('utf8') ?? ''
+    if (text.split(/\r?\n/).some(line => line === EXCLUDE_LINE)) return
+    oneLink(read, '.git/info/exclude', step)
+    const temp = `.exclude.dish-${randomBytes(6).toString('hex')}`
+    await replaceFile({
+      step,
+      dirs: [{ path: dotGit, pinned, name: '.git' }, { path: info, pinned: pinnedInfo, name: '.git/info' }],
+      target: file, realTarget: join(realInfo, 'exclude'), name: '.git/info/exclude', read,
+      realTemp: join(realInfo, temp), tempName: `.git/info/${temp}`,
+      bytes: Buffer.from(`${text}${text === '' || text.endsWith('\n') ? '' : '\n'}${EXCLUDE_LINE}\n`),
+    })
+  })
 }
 
 /** Step 3. The contract's keys (helper entries replaced as a pair, never accumulated), the identity, the exclude line once, all written with `git config --file <clone>/.git/config` (never `-C <clone>`, so nothing of the clone's runs before the check); then checkClone with the expectations. Idempotent. */

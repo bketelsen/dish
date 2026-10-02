@@ -416,19 +416,20 @@ test('configureClone refuses a clone whose config has a key dish refuses, naming
 })
 
 /**
- * Run `body` with `internals.beforeWrite` set to `swap` for the first write to `target` (then cleared): the moment
- * between dish's read of a file of the clone's and its write back, where an agent racing dish would swap it.
+ * Run `body` with `internals.beforeWrite` set to `swap` for the first `times` writes to `target` (then cleared): the
+ * moment after dish has written its new file and before its last checks and the rename, where an agent racing dish
+ * would swap the file.
  */
-async function racing<T>(target: string, swap: () => Promise<void>, body: () => Promise<T>): Promise<T> {
-  let swapped = false
+async function racing<T>(target: string, swap: () => Promise<void>, body: () => Promise<T>, times = 1): Promise<T> {
+  let swapped = 0
   internals.beforeWrite = async (file: string) => {
-    if (swapped || file !== target) return
-    swapped = true
+    if (swapped >= times || file !== target) return
+    swapped++
     await swap()
   }
   try {
     const result = await body()
-    assert.ok(swapped, `nothing was about to write ${target}`)
+    assert.equal(swapped, times, `not as many writes to ${target} as swaps`)
     return result
   } finally {
     delete internals.beforeWrite
@@ -458,20 +459,99 @@ test('a .git/config swapped for a link (or a hard link) between dish\'s read and
   }
 })
 
-test('a .git/config replaced by another file between dish\'s read and its write is refused, and that file is left as it is', async () => {
+test('a .git/config another git replaced between dish\'s read and its write is read again once; replaced twice, it is refused and left as it is', async () => {
   const deps = await adoptDeps()
   const path = await existingClone(deps, 'https://github.com/acme/widget.git')
   const config = join(path, '.git', 'config')
-  const theirs = '[core]\n\tbare = false\n[remote "origin"]\n\turl = https://github.com/acme/widget.git\n'
+  const env = await scratchGitEnv(deps.dir)
+  /** What an agent's `git config pull.rebase <value>` does: a new file renamed over the old one. */
+  const theirs = (value: string) => async () => {
+    const fresh = join(deps.dir, 'fresh-config')
+    await writeFile(fresh, `${await readFile(config, 'utf8')}[pull]\n\trebase = ${value}\n`)
+    await rename(fresh, config)
+  }
   await withEnv(await dishHome(deps.dir), async () => {
-    const error = await racing(config, async () => {
-      const fresh = join(deps.dir, 'fresh-config')
-      await writeFile(fresh, theirs)
-      await rename(fresh, config)
-    }, () => refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure'))
+    await racing(config, theirs('true'), () => configureClone(path, project(), IDENTITY, deps))
+    // Their change is kept, and dish's keys are there.
+    assert.equal((await runOk('git', ['config', '--file', config, 'pull.rebase'], { env })).trim(), 'true')
+    assert.equal((await runOk('git', ['config', '--file', config, 'user.name'], { env })).trim(), 'dish-test[bot]')
+
+    await runOk('git', ['config', '--file', config, 'user.name', 'someone'], { env })
+    const error = await racing(config, theirs('merges'), () => refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure'), 2)
     assert.match(error.message, /\.git\/config was replaced/)
   })
-  assert.equal(await readFile(config, 'utf8'), theirs)
+  assert.equal((await runOk('git', ['config', '--file', config, 'user.name'], { env })).trim(), 'someone')
+  assert.deepEqual((await readdir(join(path, '.git'))).filter(name => name.endsWith('.lock')), [])
+})
+
+test('a crash after dish wrote its new config, before the rename, leaves .git/config byte for byte as it was and no lock', async () => {
+  const deps = await adoptDeps()
+  const path = await existingClone(deps, 'https://github.com/acme/widget.git')
+  const config = join(path, '.git', 'config')
+  const before = await listing(config)
+  await withEnv(await dishHome(deps.dir), async () => {
+    internals.beforeWrite = async (file: string) => {
+      assert.equal(await readFile(join(path, '.git', 'config.lock'), 'utf8') !== '', true, 'the new config is in the lock')
+      if (file === config) throw new Error('simulated crash')
+    }
+    try {
+      await assert.rejects(configureClone(path, project(), IDENTITY, deps), /simulated crash/)
+    } finally {
+      delete internals.beforeWrite
+    }
+  })
+  assert.deepEqual(await listing(config), before)
+  assert.equal(await exists(join(path, '.git', 'config.lock')), false)
+})
+
+test('a config.lock an agent holds: dish tries once more, and refuses without touching the lock if it is still held', async () => {
+  const deps = await adoptDeps()
+  const path = await existingClone(deps, 'https://github.com/acme/widget.git')
+  const config = join(path, '.git', 'config')
+  const lock = join(path, '.git', 'config.lock')
+  const before = await readFile(config, 'utf8')
+  await writeFile(lock, 'an agent\'s git config at work\n')
+  await withEnv(await dishHome(deps.dir), async () => {
+    const error = await refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure')
+    assert.match(error.message, /config\.lock/)
+    assert.equal(await readFile(lock, 'utf8'), 'an agent\'s git config at work\n')
+    assert.equal(await readFile(config, 'utf8'), before)
+
+    // Released before the second try: dish goes on.
+    let retried = 0
+    internals.onRetry = async () => {
+      retried++
+      await rm(lock)
+    }
+    try {
+      await configureClone(path, project(), IDENTITY, deps)
+    } finally {
+      delete internals.onRetry
+    }
+    assert.equal(retried, 1)
+    assert.notEqual(await readFile(config, 'utf8'), before)
+  })
+})
+
+test('files a dedup tool hard-linked across clones are fine while dish has nothing to write to them', async () => {
+  const deps = await adoptDeps()
+  const path = await existingClone(deps, 'https://github.com/acme/widget.git')
+  const env = await scratchGitEnv(deps.dir)
+  await withEnv(await dishHome(deps.dir), async () => {
+    await configureClone(path, project(), IDENTITY, deps)
+    const others = { config: join(deps.dir, 'dedup-config'), exclude: join(deps.dir, 'dedup-exclude') }
+    await link(join(path, '.git', 'config'), others.config)
+    await link(join(path, '.git', 'info', 'exclude'), others.exclude)
+    const before = { config: await readFile(others.config, 'utf8'), exclude: await readFile(others.exclude, 'utf8') }
+    await configureClone(path, project(), IDENTITY, deps)
+    assert.deepEqual({ config: await readFile(others.config, 'utf8'), exclude: await readFile(others.exclude, 'utf8') }, before)
+    // Once there is something to write, the link is refused.
+    await runOk('git', ['config', '--file', join(path, '.git', 'config'), 'user.name', 'someone'], { env })
+    await rm(others.config)
+    await link(join(path, '.git', 'config'), others.config)
+    const error = await refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure')
+    assert.match(error.message, /hard link/)
+  })
 })
 
 test('a .git swapped for a link between dish\'s read and its write is refused, and the linked-to config is untouched', async () => {
