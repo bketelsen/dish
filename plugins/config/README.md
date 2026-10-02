@@ -15,7 +15,11 @@ pnpm --filter dish-config build    # src/client → lib/client.js (the History p
 pnpm dsh plugin --profile web add ./plugins/config
 ```
 
-The bundle loads the plugin with no remote, on purpose: a remote is per machine. To back the store up, create the repo once and set `remote` on this machine's `dish-config` row in `~/.dsh/profiles/web/cordis.patch.yml`:
+The bundle loads the plugin with no remote, on purpose: a remote is per machine, and only the VM has one, so that one machine pushes. `deploy/install.sh` writes `remote` on the `dish-config` row of the profile's `cordis.patch.yml`, from `DISH_REMOTE`:
+- **On the VM,** `~/.dsh/profiles/web/cordis.patch.yml`, with the remote from fleet's `install.env`.
+- **In dev,** `.dev/dsh/profiles/web/cordis.patch.yml`. `pnpm dev` gives `install.sh` an empty `DISH_REMOTE`, so it resets dev's remote to none on every run.
+
+A remote set by hand in either profile is replaced at the next install. The repo was created once, and the VM's row points at it:
 
 ```sh
 gh repo create bketelsen/dish-config --private
@@ -25,7 +29,7 @@ gh repo create bketelsen/dish-config --private
 - id: dish-config
   name: dish-config
   config:
-    remote: git@github.com:bketelsen/dish-config.git
+    remote: git@github-dish-config:bketelsen/dish-config.git
 ```
 
 The push uses the machine's own git auth (SSH key or credential helper) and never prompts. A push that would need an answer (host key, passphrase) fails and shows on the History page instead of hanging.

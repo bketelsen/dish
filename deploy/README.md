@@ -7,7 +7,7 @@ The design is in the [deploy spec](../docs/specs/deploy.md) and the [ops spec](.
 ## What the VM runs
 
 - **The service.** `dsh web`, as `dish-web.service`: a systemd user unit of the unprivileged `dish` account, which has linger on. Its one sudo right is fleet's apt wrapper (see [Security notes](#security-notes)).
-- **The binary.** The unit runs the checkout's own dsh, `~/dish/node_modules/.bin/dsh`, not `pnpm dsh`. Root package scripts go through the launcher, which defaults to dev (see [Prod and dev](#prod-and-dev)). The service is prod because it never goes through the launcher.
+- **The binary.** The unit runs the checkout's own dsh, `~/dish/node_modules/.bin/dsh`, not `pnpm dsh`. Only `pnpm dsh` goes through the launcher, which defaults to dev (see [Prod and dev](#prod-and-dev)). `pnpm dev` runs `scripts/dev.ts`, which is dev only, and `pnpm test`, `build` and `typecheck` use neither. The service is prod because it never goes through the launcher.
 - **The working directory** is `~/work`. A chat opened with no workspace starts there, not in the live checkout.
 - **The port.** It listens on `127.0.0.1:3080` only. Nothing listens on the VM's own address.
 - **The address.** `tailscale serve` puts it at `https://dish.<tailnet>.ts.net`, with a tailnet certificate. The tailnet needs HTTPS certificates enabled in the admin console first.
@@ -64,7 +64,7 @@ It prints what it did, and its last line is `install: no changes to the profile`
 - **`~/.config/dish/install.env`.** Written by fleet, mode 0600, and read by `update.sh` only. The unit never loads it. It holds `install.sh`'s inputs, `DISH_REMOTE`, `DISH_USER_NAME` and `DISH_USER_EMAIL`, one `NAME=value` line each, the value taken verbatim. Blank lines and `#` lines are ignored, each name appears once, and none may be empty. They live apart from `deploy.env` so that they never reach an agent's shell: an agent's own `install.sh` run that left out `DISH_REMOTE` would otherwise pick up the real remote and make a second pusher.
 - **`~/work`, with no `.env`.** `update.sh` creates it (mode 0700). Without it the unit fails to start with `200/CHDIR`, which is wanted: it says the account was never set up. dsh loads a `.env` from its working directory, and the names in it reach the service and every agent shell (dsh refuses only `PATH`, `DSH_*`, `XDG_*` and its launch variables from it). So keep `~/work` free of one.
 - **The checkout at `~/dish`.** Fleet clones it once. From then on `update.sh` moves it and runs `install.sh`.
-- **`bubblewrap`,** installed before the first start. It is dsh's sandbox, and without it, or Landlock, dsh refuses every agent shell command. dsh caches that verdict, so restart the unit after fixing it.
+- **`bubblewrap`,** installed before the first start. It is dsh's sandbox, and without it, or Landlock, dsh refuses every agent shell command. dsh caches that verdict, so restart the unit after fixing it ([Restarting by hand](#restarting-by-hand)).
 - **No hardening options.** The unit has no `PrivateUsers=`, `SystemCallFilter=` or the like on purpose. Every agent command is a child of the unit, and those options would break the sandbox. `NoNewPrivileges=` would also stop sudo in escalated agent commands.
 
 ## Updating
@@ -77,7 +77,7 @@ incus exec minideb:dish --project dish -- dish-update --apply          # update 
 incus exec minideb:dish --project dish -- dish-update --apply <ref>    # roll back to a commit or tag
 ```
 
-`minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`.
+`minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`. The scripts' own hints, such as `run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)`, give that form for Minideb itself; from the desktop, add the `minideb:` remote.
 
 ### Who runs it
 
@@ -94,7 +94,7 @@ incus exec minideb:dish --project dish -- dish-update --apply <ref>    # roll ba
 2. **Fetches** `origin`.
 3. **Finds the target:** `origin/main`, or the ref you give. A target without `deploy/update.sh`, `deploy/install.sh` or the unit is refused, so a rollback to before `update.sh` existed can't happen.
 4. **Reports** what it would do (below), and whether the service would restart.
-5. **Checks the checkout.** It refuses local changes, listing up to 10 paths; ignored files such as `node_modules` and `.dev/` don't count. With no ref, it must be on `main` (or detached after a rollback), and `main` must fast-forward to `origin/main`. It never resets anything.
+5. **Checks the checkout.** It refuses local changes, listing up to 10 paths; ignored files such as `node_modules` and `.dev/` don't count. With no ref, it must be on `main` (or detached after a rollback), and `main` must fast-forward to `origin/main`. It refuses to leave commits behind on a detached HEAD, ones that no branch or tag has. It never resets anything.
 
    The dry run stops here. Every refusal comes before the first change, so a dry run that passes means `--apply` can start, and a dry run that finds a refusal exits 1.
 6. **Moves the checkout:** `git merge --ff-only` on `main`, switching back to `main` first after a rollback, or `git switch --detach <ref>`.
@@ -110,7 +110,7 @@ incus exec minideb:dish --project dish -- dish-update --apply <ref>    # roll ba
 
 ### What it prints
 
-Every line on stdout starts with `update: `. The report, which the dry run and `--apply` both print:
+Every line `update.sh` writes itself starts with `update: `, and the lines listed under one, such as the commits or the journal's lines, are indented. `install.sh`'s output passes through as it is. Under `--pty` (see [Who runs it](#who-runs-it)), stderr arrives on stdout too. The report, which the dry run and `--apply` both print:
 
 | Line | Values |
 |---|---|
@@ -139,19 +139,32 @@ A restart makes a new access token, but your browser's sign-in carries over (see
 
 At the restart, `dish-prompts` and `dish-skills` look at their documents in the config store. One that is still an earlier shipped default moves to the new text, in one commit with the note "updated to the new defaults" (Settings → History shows it). One you edited stays as it is.
 
+### Restarting by hand
+
+`dish-update --apply` doesn't restart a service that is active and answers when nothing it tracks has changed. For a change it doesn't see, such as `bubblewrap` installed after the first start, restart the unit yourself, then get a fresh link:
+
+```sh
+incus exec minideb:dish --project dish -- systemctl --user -M dish@ restart dish-web.service
+incus exec minideb:dish --project dish -- dish-url
+```
+
+`--user -M dish@` reaches `dish`'s own user manager, which linger keeps running, from root (systemd 248 or later; the VM's Debian 13 has 257). The record of the last start still matches, so the next `dish-update --apply` doesn't restart it again. If `dish-url` says dsh hasn't printed its sign-in line yet, try again in a few seconds.
+
 ### The first update (once, October 2026)
 
 Until 6a, fleet's guest play updated the checkout, ran `install.sh` and restarted the unit. The VM's checkout predates `update.sh`, so the hand-over runs once, in this order:
 
 1. **`ops` reaches `main`, as one merge.** The unit that runs dsh directly must land with the launcher that `pnpm dsh` now goes through. With the old unit's `pnpm dsh web`, the VM would come up on an empty dev store.
-2. **The fleet PR ([bketelsen/fleet#38](https://github.com/bketelsen/fleet/pull/38)) merges.** Run the guest play one last time: preview, apply and rerun, with the secrets left out. Expect `install.env`, `~dish/work`, `/usr/local/sbin/dish-apt-get` with its sudoers file, `/usr/local/sbin/dish-update` and `/usr/local/sbin/dish-url`, and `/usr/local/bin/mise`. Expect no change to `~dish/dish`, the profile or the unit. The rerun reports no changes.
-3. **Fast-forward the checkout once by hand,** so that `update.sh` is there. This changes no running code:
+2. **The fleet PR, [bketelsen/fleet#38](https://github.com/bketelsen/fleet/pull/38) (merged, fleet c5bb7f6).** Its docs follow-up is [bketelsen/fleet#39](https://github.com/bketelsen/fleet/pull/39). Run the guest play one last time: preview, apply and rerun, with the secrets left out. Expect `install.env`, `~dish/work`, `/usr/local/sbin/dish-apt-get` with its sudoers file, `/usr/local/sbin/dish-update` and `/usr/local/sbin/dish-url`, and `/usr/local/bin/mise`. Expect no change to `~dish/dish`, the profile or the unit. The rerun reports no changes.
+3. **Fast-forward the checkout once by hand,** so that `update.sh` is there. This changes no running code. It must be a clean checkout first: before 6a, chats with no workspace started in `~dish/dish`, so agents may have left files there. Then `dish-update` would refuse with "local changes", and the old unit would keep running against the new launcher, the very window step 4 avoids. So the command pulls only when `git status` lists nothing:
 
    ```sh
-   incus exec minideb:dish --project dish -- su - dish -c 'git -C ~/dish pull --ff-only origin main'
+   incus exec minideb:dish --project dish -- su - dish -c 'test -z "$(git -C ~/dish status --porcelain)" && git -C ~/dish pull --ff-only origin main'
    # or, through Minideb:
-   ssh bjk@10.0.1.175 "incus exec dish --project dish -- su - dish -c 'git -C ~/dish pull --ff-only origin main'"
+   ssh bjk@10.0.1.175 "incus exec dish --project dish -- su - dish -c 'test -z \"\$(git -C ~/dish status --porcelain)\" && git -C ~/dish pull --ff-only origin main'"
    ```
+
+   The single quotes keep `$(…)` and `~` for `dish`'s shell to expand. If it prints nothing and fails, run `git -C ~/dish status` as `dish` (`incus exec minideb:dish --project dish -- su - dish -c 'git -C ~/dish status'`), clear what it lists, and run it again.
 4. **Right away, the dry run and the update.** Run steps 3 and 4 back to back: the old unit still runs `pnpm dsh web` from the checkout, so a restart between them (a crash, `Restart=on-failure`) would start it through the new launcher, on an empty dev store.
 
    ```sh
@@ -166,7 +179,11 @@ Until 6a, fleet's guest play updated the checkout, ran `install.sh` and restarte
    - A new chat with no workspace starts in `/home/dish/work`.
    - Settings → Prompts, Skills and History show the VM's store.
    - An agent's `printenv DISH_REMOTE DISH_ENV DSH_DISH_HOME` prints nothing.
-6. **Clean up** when it has proved itself: the play's old record of the last start, `~dish/.local/state/fleet-dish`. Nothing reads it any more.
+6. **Clean up** when it has proved itself: the play's old record of the last start, `~dish/.local/state/fleet-dish`. Nothing reads it any more. Remove it as `dish`, not as root, since the account can write that tree:
+
+   ```sh
+   incus exec minideb:dish --project dish -- su - dish -c 'rm -rf ~/.local/state/fleet-dish'
+   ```
 
 Run from your desktop's terminal, `dish-update` takes the `--pty` path, so the script's stderr arrives on stdout. That `incus exec` gives it a controlling terminal was checked on 2026-10-02: `incus exec minideb:dish --project dish -- sh -c '(: </dev/tty) && echo ctty'` printed `ctty`.
 
@@ -182,7 +199,8 @@ Through Minideb, it's `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish
 
 - **What it prints.** Exactly one line on stdout, `https://<DISH_TRUSTED_HOST>/?token=<token>`, and nothing else. The host comes from `deploy.env`. The token comes from the last `dsh web:` line in the service's journal since its current start, which `systemctl --user show` gives.
 - **When it can't,** it says why on stderr, never with the token, and exits 1: the service isn't running (`url: dish-web.service isn't running; start it with dish-update --apply`), dsh hasn't printed its sign-in line since it started (`url: dsh hasn't printed its sign-in line since it started at <time>; try again in a few seconds`), or `deploy.env` is missing or unusable.
-- **Who runs it.** Only the account, like `update.sh`. Any argument, or any user but the account, root included, exits 2: `url: run dish-url as root (incus exec dish --project dish -- dish-url), or this script as dish`.
+- **Who runs it.** Only the account, like `update.sh`. Any user but the account, root included, exits 2 with `url: run dish-url as root (incus exec dish --project dish -- dish-url), or this script as dish`.
+- **No arguments.** Any argument exits 2 with `url: takes no arguments`.
 - **It prints a secret, on purpose.** It's for your terminal. Don't paste the output anywhere.
 
 Open the link once, on the tailnet name. dsh then sets a cookie for that name, which lasts 30 days and survives restarts: it is signed with a secret kept in dsh's credential file, not with the token. You need the link only for a new browser, or every 30 days. If 30 days is too short, change `cookieMaxAgeDays` on the `connection` row.
@@ -197,7 +215,7 @@ It allows no request that was refused before: anyone who passes the Host check w
 
 ### Fallback: a tunnel
 
-If Settings pages still say "settings are unavailable in this browser" on the tailnet name, `dish-web` isn't marking the page. It is turned off (`enabled: false` on its row of the profile), its `hosts` list leaves the tailnet name out, or a dsh upgrade changed what it relies on (its pin test is there to catch that first). Until that's fixed, open a tunnel from your desktop to the VM's `127.0.0.1:3080`, through Minideb, as fleet's `docs/dish.md` reaches the guest:
+If Settings → Models still says "settings are unavailable in this browser" on the tailnet name, or Work details doesn't survive a reload, `dish-web` isn't marking the page. It is turned off (`enabled: false` on its row of the profile), its `hosts` list leaves the tailnet name out, or a dsh upgrade changed what it relies on (its pin test is there to catch that first). Until that's fixed, open a tunnel from your desktop to the VM's `127.0.0.1:3080`, through Minideb, as fleet's `docs/dish.md` reaches the guest:
 
 ```sh
 ssh -i ~/.ssh/semaphore-fleet-hosts \
@@ -220,7 +238,7 @@ dish has two configurations. Only the VM's service is prod; everything else is d
 
 | | prod | dev (default) |
 |---|---|---|
-| Who | the `dish-web` service only | `pnpm dev`, `pnpm dsh …` and agents |
+| Who | the `dish-web` service only | `pnpm dev` and `pnpm dsh …`, run by you or by an agent |
 | dsh home | `~/.dsh` | `<checkout>/.dev/dsh` |
 | dish's config, state, data, cache | the account's XDG directories | `<checkout>/.dev/{config,state,data,cache}/dish` |
 | port | 3080, behind `tailscale serve` | 3090, loopback only |
@@ -230,7 +248,8 @@ dish has two configurations. Only the VM's service is prod; everything else is d
 - **The launcher,** `scripts/env.ts`, runs `pnpm dsh …`. In dev it sets `DSH_HOME=<checkout>/.dev/dsh`, `DSH_DISH_HOME=<checkout>/.dev` and `DISH_ENV=dev`, replacing inherited values, and puts the checkout's `node_modules/.bin` first on `PATH`. `DISH_ENV=prod` passes the environment through. It sets no `XDG_*` variable and nothing of pnpm's: dsh passes its environment on to every agent shell, and those would move `gh`'s and git's configuration and pnpm's store.
 - **`DSH_DISH_HOME`** moves all four of dish's directories at once (dish-kit's `xdgPaths`), ahead of `XDG_*`. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands.
 - **The service is prod** because its unit runs dsh's binary directly, with the account's defaults. It sets no `DISH_ENV`: dsh would pass it on, and every agent's `pnpm dsh` would be prod.
-- **`pnpm dev`** installs dish into dev's profile with `install.sh`, with `DISH_REMOTE=''` whatever the environment says, then serves it on `127.0.0.1:3090` and prints `dev: open <url>`. It refuses `DISH_ENV=prod`. The [README](../README.md#setup) has how to use and stop it.
+- **Where the guarantee stops.** Dev is the default for `pnpm dsh` (the launcher) and `pnpm dev` only. dsh gives every agent shell the running dsh's own `DSH_HOME` (`dsh-shell-env`), and on the VM that is prod's `~/.dsh`. So `deploy/install.sh`, `pnpm exec dsh` or `node_modules/.bin/dsh`, run directly in an agent's shell on the VM, use prod's profile, and, with `DSH_DISH_HOME` dropped from agent shells, prod's `~/.config/dish` too. The environment doesn't stop that. What stops a write there is the sandbox: `~/.dsh` and `~/.config/dish` lie outside the workspace, so the command needs dsh's write escalation, which asks you (or the judge, for a crew child). A guard is a non-goal ([ops spec](../docs/specs/ops.md#the-boundary-of-the-guarantee), decision 1).
+- **`pnpm dev`** installs dish into dev's profile with `install.sh`, with `DISH_REMOTE=''` whatever the environment says, then serves it on `127.0.0.1:3090` and prints `dev: open <url>`. Its dsh, and so every agent shell under it, gets none of `install.sh`'s inputs: `DISH_REMOTE`, `DISH_USER_*` and `DISH_PROFILE` are removed, and `DISH_ENV=dev` is set. It refuses `DISH_ENV=prod`. The [README](../README.md#setup) has how to use and stop it.
 - **Dev on the VM** listens on the VM's loopback, like the service. Reach it with a tunnel to `127.0.0.1:3090`, the same way as the [fallback tunnel](#fallback-a-tunnel), then open the link `pnpm dev` printed:
 
   ```sh
@@ -245,18 +264,9 @@ Only one machine may push to `bketelsen/dish-config`, and since October 2026 tha
 
 ## Running install.sh by hand
 
-For development, use `pnpm dev`, which runs `install.sh` into dev's profile. By hand, on a fresh machine, from a checkout with Node 24 and pnpm on `PATH`:
+For development, use `pnpm dev`, which runs `install.sh` into dev's profile. On the VM, `dish-update` runs it, with `install.env`'s inputs. By hand anywhere else, from a checkout with Node 24 and pnpm on `PATH`, give it `DISH_REMOTE=''`: only one machine may push to `bketelsen/dish-config`, the VM's service, and the real remote would make this machine's `dsh web` a second pusher.
 
-```sh
-DISH_REMOTE='git@github-dish-config:bketelsen/dish-config.git' \
-DISH_USER_NAME='Your Name' \
-DISH_USER_EMAIL='you@example.com' \
-./deploy/install.sh
-```
-
-Don't give it the real remote on any machine but the VM: that remote makes the machine's `dsh web` a second pusher.
-
-To try it out with nothing real touched, use an empty remote and a scratch `DSH_HOME`. Read the profile with `pnpm exec dsh`, dsh's own binary: `pnpm dsh` goes through the launcher, which would replace `DSH_HOME` with dev's.
+To try it out with nothing real touched, use the empty remote and a scratch `DSH_HOME` (the default is `~/.dsh`). Read the profile with `pnpm exec dsh`, dsh's own binary: `pnpm dsh` goes through the launcher, which would replace `DSH_HOME` with dev's.
 
 ```sh
 scratch=$(mktemp -d)

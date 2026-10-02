@@ -66,7 +66,7 @@ At startup, after each sign-in, and on **Refresh models**, the catalog plugin:
    - Name, context window, output limit and vision come from the live listing.
    - Headers, compat switches and reasoning levels are cloned from the nearest catalog sibling: the same vendor, then the closest version, then the closest name. So `gpt-6.1-sol` comes from `gpt-6-sol`, and `claude-sonnet-5.5` from `claude-opus-5.5` rather than the older `claude-sonnet-5`, whose way of turning thinking off the 5.5 models reject.
 3. Sets the `github-copilot` route's `models` to exactly what your account can use. Per-model fields you've configured are kept.
-4. Caches the result in `$XDG_CACHE_HOME/dish/copilot-models.json` (`~/.cache/dish/` by default). A cache at the old location, `~/.dsh/dish-copilot-models.json`, is read while the new file doesn't exist yet, i.e. until the first successful refresh writes it.
+4. Caches the result as `copilot-models.json` in dish's cache directory: `.dev/cache/dish/` in dev, `$XDG_CACHE_HOME/dish/` (`~/.cache/dish/` by default) on the VM. A cache at the old location, `$DSH_HOME/dish-copilot-models.json` (`.dev/dsh` in dev, `~/.dsh` on the VM), is read while the new file doesn't exist yet, i.e. until the first successful refresh writes it.
 
 `llm-pi-ai` reads the catalog when its config changes, not per request. So this bundle patches the `llm-pi-ai` row with `inject: [copilotCatalog]`. The adapter mounts only after the cached additions are back in place, and they resolve from the first request after a restart.
 
@@ -76,7 +76,7 @@ At startup, after each sign-in, and on **Refresh models**, the catalog plugin:
 
 ## Configuration
 
-Set in `~/.dsh/profiles/web/cordis.patch.yml`.
+Set in the profile's `cordis.patch.yml`: `.dev/dsh/profiles/web/` in dev, `~/.dsh/profiles/web/` on the VM.
 
 `dish-copilot` row:
 
@@ -93,7 +93,7 @@ Set in `~/.dsh/profiles/web/cordis.patch.yml`.
 | Field | Default | |
 |---|---|---|
 | `cacheFile` | `$XDG_CACHE_HOME/dish/copilot-models.json` | Where the last refresh is cached. |
-| `legacyCacheFile` | `~/.dsh/dish-copilot-models.json` (set by the bundle) | Read while `cacheFile` doesn't exist yet; never written or deleted. |
+| `legacyCacheFile` | `$DSH_HOME/dish-copilot-models.json` (set by the bundle) | Read while `cacheFile` doesn't exist yet; never written or deleted. |
 | `refreshOnStart` | `true` | Refresh at startup when signed in. |
 | `updateRoute` | `true` | Rewrite the route's model list to match the account. |
 | `terminal` | `true` | Print this plugin's messages to the terminal. |
