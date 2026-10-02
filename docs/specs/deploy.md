@@ -76,9 +76,10 @@ Ownership follows the nsl builder's split ([fleet's nsl builder doc](../../../fl
        - `userName` and `userEmail` (yours, passed in by fleet);
        - and nothing else.
      - **Other rows** that dsh or the copilot catalog maintain are left as they are.
-  4. sets the dish preset as the default for new tasks. This is the same write the UI's "Set as new task default" makes: an `agent-preset-registry` row in the profile's own patch file (`$DSH_HOME/profiles/web/cordis.patch.yml`), with `config: { default: standard, selectedDefault: dish }`.
+  4. sets the dish preset as the default for new tasks, on the first install only. This is the same write the UI's "Set as new task default" makes: an `agent-preset-registry` row in the profile's own patch file (`$DSH_HOME/profiles/web/cordis.patch.yml`), with `config: { default: standard, selectedDefault: dish }`.
      - A patch replaces a row's whole `config`, so `default` is restated.
      - It goes in the profile's file, not the home patch, so that a later choice made in the UI still works.
+     - It is written only when the row is missing or has no `selectedDefault`. A `selectedDefault` that is already there, whatever its value, is a choice: it is left as it is, with the row's `default`, and a later run never resets it.
 - **`deploy/dish-web.service`** is a systemd user unit:
   - It runs `pnpm dsh web --host 127.0.0.1 --port 3080 --no-open --trusted-host dish.<tailnet>.ts.net` from `~/dish`, with `Restart=on-failure`.
   - The tailnet name is a unit setting that fleet fills in.
@@ -87,7 +88,7 @@ Ownership follows the nsl builder's split ([fleet's nsl builder doc](../../../fl
 ## Reaching it
 
 - **The address** is `https://dish.<tailnet>.ts.net`, from any device on your tailnet.
-- **Signing in.** dsh makes a new random access token each time it starts, and it can't be pinned; it prints the URL with the token on stdout. On the VM that line goes to the unit's journal: `ssh dish@… journalctl --user -u dish-web | grep 'dsh web:'`.
+- **Signing in.** dsh makes a new random access token each time it starts, and it can't be pinned; it prints the URL with the token on stdout. On the VM that line goes to the unit's journal, which you read as root through the guest's admin user `fleet` (the `dish` account has no SSH login): `sudo journalctl _UID="$(id -u dish)" _SYSTEMD_USER_UNIT=dish-web.service | grep 'dsh web:'`.
   - Open it once on the tailnet name, `https://dish.<tailnet>.ts.net/?token=…`. dsh then sets a browser cookie for that name, which lasts 30 days.
   - The cookie survives restarts: it is signed with a secret dsh keeps in its credential file, not with the token. A restart therefore doesn't sign you out, and the token is needed only for a new browser, or every 30 days.
   - The lifetime is `cookieMaxAgeDays` on the `connection` row, if 30 days proves short.
@@ -131,7 +132,9 @@ Once the VM is up and its first fleet run has passed, in this order:
 
 - **dsh's token** is new on every start, but signing in once lasts 30 days across restarts. A new browser needs the token from the journal.
 - **The credential file** (`~dish/.dsh/.credentials.yaml`) holds the Copilot sign-in, the TypeSafe key and the browser-session secret. It is in the nightly backup, so the NAS copy is as sensitive as the VM.
-- **dsh's Linux sandbox** may need packages or kernel features in the guest (bubblewrap, user namespaces). The plan finds this out from `dsh-sandbox` before the guest role is written.
+- **dsh's Linux sandbox needs `bubblewrap`** (Debian's package; no sysctl). It falls back to Landlock, and with neither, refuses every agent shell command ([host research](../research/2026-10-01-dsh-linux-host.md)). Install it before the unit's first start, since dsh caches the verdict.
+- **The sandbox confines writes, not reads.** An agent's shell can read anything the `dish` account can, the deploy keys and `~/.dsh/.credentials.yaml` (the Copilot sign-in, the TypeSafe key, the browser-session secret) included. That is already so on the desktop. The judge's gate is the guard: reading a credential file doesn't serve a coding task, so it asks you or is refused for a child, and secrets are masked in the log and in what is sent to TypeSafe.
+- **The tailnet must have HTTPS certificates enabled** before the guest play runs (admin console), or `tailscale serve --https` stops for an interactive prompt.
 - **Disk.** 40 GiB is fine for dsh, sessions and logs. Step 6's workspaces will need more, which is an OpenTofu change then.
 - **The desktop and the VM must not both push.** Step 1 of the move comes before the VM's first start.
 - **Agent safety on an always-on host.** Agents run as `dish`, with no sudo, behind the judge's gate. The deploy keys are the most sensitive thing on the box:

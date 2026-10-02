@@ -6,13 +6,14 @@
   "scripts": {
     "dsh": "dsh",
     "web": "dsh web",
-    "test": "node --test --test-timeout=60000 'packages/*/test/*.test.ts' 'plugins/*/test/*.test.ts'",
+    "test": "node --test --test-timeout=60000 'packages/*/test/*.test.ts' 'plugins/*/test/*.test.ts' 'deploy/test/*.test.ts'",
     "typecheck": "tsc -p tsconfig.json --noEmit && pnpm -r --if-present typecheck",
     "build": "pnpm -r --if-present build"
   },
   "devDependencies": {
     "@deepseek-ai/dsh": "0.2.0-rc.2",
     "typescript": "^6.0.0",
-    "@types/node": "^24.0.0"
+    "@types/node": "^24.0.0",
+    "yaml": "2.9.1"
   }
 }

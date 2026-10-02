@@ -42,6 +42,10 @@ Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, termin
 | [`crew`](plugins/crew) | The crew the main agent delegates to: a `delegate` tool with roles, model tiers and a reviewer that never shares the reviewed work's model family, `crew.yaml` in the config store, saved reports and role-named finish notices. Ships the **dish** preset for the main agent. |
 | [`judge`](plugins/judge) | TypeSafe's Jev in front of every agent's risky edges: a gate on each shell command (read-only, reversible or irreversible, and does it serve the task), an answerer for crew children's approvals, a screen on web and MCP results for injected instructions, `ask_judge` for every agent, and Settings → Judge with the key, thresholds and a decision log. |
 
+## Deploying
+
+dish also runs on its own VM, reachable on your tailnet only. [`deploy/`](deploy) holds the install script and the systemd unit, and [`deploy/README.md`](deploy/README.md) says what the VM runs, how to update it, how to sign in and the one-time steps. The design is in the [deploy spec](docs/specs/deploy.md).
+
 ## Writing another plugin
 
 1. `mkdir -p plugins/<name>/src`, then copy `plugins/copilot/package.json` and `cordis.patch.yml` as a starting point. Rename the package and the row `id`.
