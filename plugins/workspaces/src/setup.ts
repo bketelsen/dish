@@ -3,8 +3,10 @@
  * whether it may run there at all.
  *
  * - **runSetup** runs `bash -c <setup>` in a clone or a new worktree: stdin closed, the environment `childEnvironment()`
- *   gives dish's own children (dsh's scrub, no `GIT_*` name, `GIT_TERMINAL_PROMPT=0`), its own process group, and a time
- *   limit. A timeout or an abort sends the group TERM, then KILL after `KILL_GRACE_MS`; so does bash's exit, for anything
+ *   gives dish's own children (dsh's scrub, no `GIT_*` name, `GIT_TERMINAL_PROMPT=0`) plus `SAFE_FLAGS`' settings as
+ *   `GIT_CONFIG_*` and `GIT_GRAFT_FILE=/dev/null`, so any git setup or its tools run (a pnpm git dependency,
+ *   `git submodule update`) is protected from a clone agents can write as dish's own git is; its own process group,
+ *   and a time limit. A timeout or an abort sends the group TERM, then KILL after `KILL_GRACE_MS`; so does bash's exit, for anything
  *   it left running (nothing setup starts outlives it in its group). The last 64 KB of its output, masked, is the log.
  * - **onMergedCode** is the spec's decision 1, as hardened on 2026-10-02 (option A, then Task 6's review): setup runs
  *   outside the sandbox only on code a human merged, and only in a checkout dish has just made (its own fresh clone, or
@@ -28,7 +30,7 @@ import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { maskSecrets } from 'dish-kit'
 import { childEnvironment } from './env.ts'
-import { git, maskUrlPasswords } from './git.ts'
+import { SAFE_FLAGS, git, maskUrlPasswords } from './git.ts'
 import type { GitResult } from './git.ts'
 import { writeFileAtomic } from './paths.ts'
 
@@ -53,8 +55,47 @@ const NO_COMMIT_GRAPH: readonly string[] = ['-c', 'core.commitGraph=false']
 /** The start of every reason that comes from not hearing GitHub's word. */
 const UNCONFIRMED = "couldn't confirm the default branch with GitHub"
 
-/** For tests only, never set by dish: put on top of the environment of this module's git (a test's `GIT_CONFIG_NOSYSTEM`). */
+/**
+ * Settings `projects`' SAFE_FLAGS has (Tasks 3a's and 3b's reviews) that this branch's copy may lack. Each is added to
+ * setup's git config unless SAFE_FLAGS already sets its key; once SAFE_FLAGS carries both, this list can go.
+ */
+const SAFE_SETTINGS_TO_COME: ReadonlyArray<readonly [string, string]> = [['credential.interactive', 'false'], ['core.commitGraph', 'false']]
+
+/** What SAFE_FLAGS sets, as `[key, value]` pairs (the one list both dish's git and setup's draw from), and the settings to come. */
+function safeSettings(): Array<[string, string]> {
+  const pairs: Array<[string, string]> = []
+  for (let index = 0; index < SAFE_FLAGS.length; index += 2) {
+    const setting = SAFE_FLAGS[index + 1]
+    const equals = setting?.indexOf('=') ?? -1
+    if (SAFE_FLAGS[index] !== '-c' || setting === undefined || equals <= 0) throw new Error('SAFE_FLAGS must be -c key=value pairs')
+    pairs.push([setting.slice(0, equals), setting.slice(equals + 1)])
+  }
+  for (const [key, value] of SAFE_SETTINGS_TO_COME) {
+    if (!pairs.some(([known]) => known.toLowerCase() === key.toLowerCase())) pairs.push([key, value])
+  }
+  return pairs
+}
+
+/** For tests only, never set by dish: put on top of the environment of this module's git and of setup's (a test's `GIT_CONFIG_NOSYSTEM`). */
 export const internals: { gitEnv?: Record<string, string> } = {}
+
+/**
+ * setup's environment: `childEnvironment(env)`, then SAFE_FLAGS' settings as `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`
+ * and `GIT_CONFIG_VALUE_<n>` (git gives these the precedence of `-c`, so no config file of the clone's can undo them)
+ * and `GIT_GRAFT_FILE=/dev/null`. The scrub has dropped every inherited `GIT_*` name, so none of these can be steered
+ * from outside.
+ */
+function setupEnvironment(env: NodeJS.ProcessEnv | undefined): Record<string, string> {
+  const child: Record<string, string> = { ...childEnvironment(env), ...internals.gitEnv }
+  const settings = safeSettings()
+  child.GIT_CONFIG_COUNT = String(settings.length)
+  settings.forEach(([key, value], index) => {
+    child[`GIT_CONFIG_KEY_${index}`] = key
+    child[`GIT_CONFIG_VALUE_${index}`] = value
+  })
+  child.GIT_GRAFT_FILE = '/dev/null'
+  return child
+}
 
 export interface SetupOptions {
   /** The project's `setup`, run by `bash -c`. */
@@ -88,7 +129,8 @@ export interface SetupResult {
 }
 
 /**
- * `bash -c <command>` in `cwd`, detached, stdin closed, env childEnvironment(options.env). Output (both streams,
+ * `bash -c <command>` in `cwd`, detached, stdin closed, env childEnvironment(options.env) plus SAFE_FLAGS' settings as
+ * `GIT_CONFIG_*` and `GIT_GRAFT_FILE=/dev/null` (so every git it runs is protected as dish's own is). Output (both streams,
  * interleaved as read) keeps its last LOG_TAIL_BYTES, masked, written to `log` (0600) when it ends. A timeout or abort
  * sends TERM to the group, then KILL after KILL_GRACE_MS; when bash exits, whatever it left in its group is ended the
  * same way. `tail` is the log's last 40 lines. Never throws for the command's failure (one that can't even start is a
@@ -159,7 +201,7 @@ function runGroup(options: SetupOptions): Promise<GroupRun> {
     try {
       child = spawn('bash', ['-c', options.command], {
         cwd: options.cwd,
-        env: childEnvironment(options.env),
+        env: setupEnvironment(options.env),
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       })

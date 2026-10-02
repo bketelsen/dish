@@ -2,15 +2,18 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { access, chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { childEnvironment } from '../src/env.ts'
+import { SAFE_FLAGS } from '../src/git.ts'
 import { KILL_GRACE_MS, LOG_TAIL_BYTES, internals, onMergedCode, runSetup, skipReason } from '../src/setup.ts'
 import type { MergedCheck, SetupOptions, SetupResult } from '../src/setup.ts'
-import { NOSYSTEM, dishHome, makeClone, run, runOk, scratchGitEnv, tempDir, withEnv } from './helpers.ts'
+import { NOSYSTEM, dishHome, makeBare, makeClone, run, runOk, scratchGitEnv, tempDir, withEnv } from './helpers.ts'
 import type { Clone } from './helpers.ts'
 
 /** Shaped like a GitHub installation token (`ghs_` and 40 letters and digits); not one. */
 const TOKEN = `ghs_${'Ab1Cd2Ef3G'.repeat(4)}`
 
-// The code's own git drops every GIT_* name of process.env; this gives it no system config, as every test git has.
+// The code's own git, and setup's, drop every GIT_* name they are given; this gives them no system config, as every
+// test git has.
 internals.gitEnv = NOSYSTEM
 
 async function exists(file: string): Promise<boolean> {
@@ -71,7 +74,8 @@ async function pidsIn(file: string): Promise<number[]> {
 
 /**
  * The environment a test gives setup's bash: a scratch HOME and HISTFILE, the runner's PATH and nothing else of it.
- * (`GIT_CONFIG_NOSYSTEM` is given too, as to every test process; setup's scrub drops it, and no command here runs git.)
+ * (`GIT_CONFIG_NOSYSTEM` is given too, as to every test process; setup's scrub drops it, and `internals.gitEnv` puts it
+ * back for setup's git.)
  */
 async function bashEnv(dir: string, extra: Record<string, string> = {}): Promise<NodeJS.ProcessEnv> {
   const home = join(dir, 'home')
@@ -127,8 +131,8 @@ test('exit 0 and exit 3 are results; the log holds both streams, is 0600, in a d
 
 test("the command runs in cwd, with childEnvironment's scrub of the env it is given", async () => {
   const dir = await tempDir()
-  const env = await bashEnv(dir, { FOO_TOKEN: 'x', DSH_HOME: '/x', GIT_DIR: '/x', BAR: 'bar', GIT_TERMINAL_PROMPT: '1' })
-  const result = await setupIn(dir, 'echo "${FOO_TOKEN-unset} ${DSH_HOME-unset} ${GIT_DIR-unset} ${GIT_CONFIG_NOSYSTEM-unset} ${BAR-unset} ${GIT_TERMINAL_PROMPT-unset}"; pwd; echo "$HOME"', { env })
+  const env = await bashEnv(dir, { FOO_TOKEN: 'x', DSH_HOME: '/x', GIT_DIR: '/x', GIT_WS_T: 'x', BAR: 'bar', GIT_TERMINAL_PROMPT: '1' })
+  const result = await setupIn(dir, 'echo "${FOO_TOKEN-unset} ${DSH_HOME-unset} ${GIT_DIR-unset} ${GIT_WS_T-unset} ${BAR-unset} ${GIT_TERMINAL_PROMPT-unset}"; pwd; echo "$HOME"', { env })
   assert.equal(result.exitCode, 0)
   assert.equal(result.tail, `unset unset unset unset bar 0\n${dir}\n${join(dir, 'home')}`)
 })
@@ -309,6 +313,109 @@ test('skipReason says why and gives the command to run', () => {
     "setup didn't run outside the sandbox: it has a nested repository. Run it yourself in /w: make",
   )
 })
+
+// --- setup's own git gets dish's git's protection --------------------------------------------------------------------
+
+/** What SAFE_FLAGS sets (as `key`, `value`), plus the two settings `projects`' SAFE_FLAGS adds, unless it has them. */
+function protectedSettings(): Array<[string, string]> {
+  const pairs: Array<[string, string]> = []
+  for (let index = 0; index < SAFE_FLAGS.length; index += 2) {
+    const setting = SAFE_FLAGS[index + 1]!
+    pairs.push([setting.slice(0, setting.indexOf('=')), setting.slice(setting.indexOf('=') + 1)])
+  }
+  for (const [key, value] of [['credential.interactive', 'false'], ['core.commitGraph', 'false']] as const) {
+    if (!pairs.some(([known]) => known.toLowerCase() === key.toLowerCase())) pairs.push([key, value])
+  }
+  return pairs
+}
+
+/** A clone with a worktree `.worktrees/x` on `dish/x`, made by a scratch git before anything is planted. */
+async function cloneWithWorktree(): Promise<Clone & { dir: string, worktree: string }> {
+  const dir = await tempDir()
+  const made = await makeClone(dir)
+  const worktree = join(made.clone, '.worktrees', 'x')
+  await runOk('git', ['-C', made.clone, 'worktree', 'add', '-q', '-b', 'dish/x', worktree, 'origin/main'], { env: made.env })
+  return { ...made, dir, worktree }
+}
+
+/** `command` run by plain bash, with only childEnvironment's scrub (no system config): what setup's git did before. */
+async function unprotected(dir: string, cwd: string, command: string): Promise<void> {
+  const env = { ...childEnvironment(await bashEnv(dir)), GIT_CONFIG_NOSYSTEM: '1' }
+  await runOk('bash', ['-c', command], { cwd, env })
+}
+
+/** A script that appends a line to the returned marker when run. */
+async function markerScript(dir: string, name: string): Promise<{ script: string, marker: string }> {
+  const script = join(dir, `${name}.sh`)
+  const marker = join(dir, `${name}-ran`)
+  await writeFile(script, `#!/bin/sh\necho ran >> '${marker}'\n`)
+  await chmod(script, 0o755)
+  return { script, marker }
+}
+
+test("every setting SAFE_FLAGS carries reaches setup's git, over the clone's own config, and grafts are off", async () => {
+  const f = await cloneWithWorktree()
+  for (const [key, value] of [['core.hooksPath', '.hooks'], ['submodule.recurse', 'true'], ['core.commitGraph', 'true'], ['credential.interactive', 'true']]) {
+    await runOk('git', ['-C', f.clone, 'config', key!, value!], { env: f.env })
+  }
+  const settings = protectedSettings()
+  assert.ok(settings.length >= 9)
+  const command = `${settings.map(([key]) => `git config --get ${key}`).join('; ')}; echo "$GIT_GRAFT_FILE"`
+  const result = await setupIn(f.dir, command, { cwd: f.worktree, env: await bashEnv(f.dir) })
+  assert.equal(result.exitCode, 0, result.tail)
+  assert.equal(result.tail, [...settings.map(([, value]) => value), '/dev/null'].join('\n'))
+})
+
+test("a post-checkout hook planted in the clone's shared .git/hooks doesn't run on setup's git checkout in a worktree (and does without the protection)", async () => {
+  const f = await cloneWithWorktree()
+  const { script, marker } = await markerScript(f.dir, 'hook')
+  const hook = join(f.clone, '.git', 'hooks', 'post-checkout')
+  await writeFile(hook, await readFile(script))
+  await chmod(hook, 0o755)
+  const result = await setupIn(f.dir, 'git checkout -q -b other', { cwd: f.worktree, env: await bashEnv(f.dir) })
+  assert.equal(result.exitCode, 0, result.tail)
+  assert.equal(await exists(marker), false, "the planted hook ran under setup's git")
+  await unprotected(f.dir, f.worktree, 'git checkout -q -b other-plain')
+  assert.equal(await exists(marker), true, 'the fixture is real: the hook runs without the protection')
+})
+
+test("a core.fsmonitor planted in the clone's config doesn't run on setup's git status (and does without the protection)", async () => {
+  const f = await cloneWithWorktree()
+  const { script, marker } = await markerScript(f.dir, 'fsmonitor')
+  await runOk('git', ['-C', f.clone, 'config', 'core.fsmonitor', script], { env: f.env })
+  const result = await setupIn(f.dir, 'git status --porcelain >/dev/null', { cwd: f.worktree, env: await bashEnv(f.dir) })
+  assert.equal(result.exitCode, 0, result.tail)
+  assert.equal(await exists(marker), false, "the planted fsmonitor ran under setup's git")
+  await unprotected(f.dir, f.worktree, 'git status --porcelain >/dev/null')
+  assert.equal(await exists(marker), true, 'the fixture is real: the fsmonitor runs without the protection')
+})
+
+test('an explicit git submodule update inside setup still works', async () => {
+  const dir = await tempDir()
+  const env = await scratchGitEnv(dir)
+  // git refuses file:// submodules unless allowed; GitHub's https needs no such setting.
+  await runOk('git', ['config', '--global', 'protocol.file.allow', 'always'], { env })
+  const sub = await makeBare(join(dir, 'sub.git'), { 's.txt': 'from the submodule\n' })
+  const work = join(dir, 'work')
+  await runOk('git', ['init', '-q', '-b', 'main', work], { env })
+  await writeFile(join(work, 'README.md'), '# super\n')
+  await runOk('git', ['-C', work, 'submodule', 'add', '-q', `file://${sub}`, 'vendor/sub'], { env })
+  await runOk('git', ['-C', work, 'commit', '-q', '-am', 'with a submodule'], { env })
+  await runOk('git', ['clone', '-q', '--bare', work, join(dir, 'super.git')], { env })
+  const clone = join(dir, 'clone')
+  await runOk('git', ['clone', '-q', `file://${join(dir, 'super.git')}`, clone], { env })
+  const worktree = join(clone, '.worktrees', 'x')
+  await runOk('git', ['-C', clone, 'worktree', 'add', '-q', '-b', 'dish/x', worktree, 'origin/main'], { env })
+  assert.deepEqual(await readdirOf(join(worktree, 'vendor', 'sub')), [], 'the new worktree leaves the gitlink empty')
+  const result = await setupIn(dir, 'git submodule update --init -q && cat vendor/sub/s.txt', { cwd: worktree, env: await bashEnv(dir) })
+  assert.equal(result.exitCode, 0, result.tail)
+  assert.equal(result.tail, 'from the submodule')
+})
+
+async function readdirOf(path: string): Promise<string[]> {
+  const { readdir } = await import('node:fs/promises')
+  return readdir(path)
+}
 
 // --- onMergedCode ------------------------------------------------------------------------------------------------------
 
