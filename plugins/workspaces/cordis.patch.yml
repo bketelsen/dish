@@ -1,7 +1,8 @@
 # The mechanics behind dish's projects (the dishWorkspaces service): clones
 # under the work root, the GitHub App (read tokens and the credential helper),
 # setup on merged code, workspace registration, the scratch workspace, task
-# worktrees and the sweep, and the `worktree` tool. Depends on dish-projects.
+# worktrees and the sweep, and the `worktree` tool. It imports dish-projects'
+# `Project` type; neither plugin waits for the other at load.
 # Config rows: `appIdName` (the credential's env-var name for the App ID;
 # DISH_GITHUB_APP_ID by default), `privateKeyName` (the same for the App's
 # private key; DISH_GITHUB_APP_PRIVATE_KEY by default) and `terminal` (print
