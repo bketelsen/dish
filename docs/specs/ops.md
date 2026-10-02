@@ -1,12 +1,12 @@
 # Spec: dish ops (prod and dev, updates)
 
-Status: draft 2026-10-02, for review. Revised the same day by the plan's checks: what changed, and the evidence, is under [Checks](#checks-2026-10-02). This is roadmap step 6a, the first part of step 6. It builds on the [deploy spec](deploy.md), whose rollout notes describe today's setup. The plan is [docs/plans/2026-10-02-ops.md](../plans/2026-10-02-ops.md).
+Status: built on branch `ops`, 2026-10-02; awaiting review and the rollout. Revised before the plan by its checks (what changed, and the evidence, is under [Checks](#checks-2026-10-02)), and during the build (see [Notes from the build](#notes-from-the-build)). This is roadmap step 6a, the first part of step 6. It builds on the [deploy spec](deploy.md), whose rollout notes describe today's setup. The plan is [docs/plans/2026-10-02-ops.md](../plans/2026-10-02-ops.md).
 
 ## Summary
 
 dish runs like any web app: a **prod** configuration, which only the VM's service uses, and a **dev** configuration, which is the default for everything else.
 - **Dev data.** It lives in a git-ignored `.dev/` folder inside the checkout. Nothing run by hand, by `pnpm dev`, by a test or by an agent can reach prod's data unless it says `DISH_ENV=prod`.
-- **Updates.** You run them yourself with a script on the VM, `deploy/update.sh`, through `incus exec`. A second script, `deploy/url.sh`, prints the sign-in link when your cookie expires.
+- **Updates.** You run them yourself with a script on the VM, `deploy/update.sh`, through `incus exec` and fleet's root entry point, `dish-update`. A second script, `deploy/url.sh`, run through `dish-url`, prints the sign-in link when your cookie expires.
 - **Fleet.** It goes back to provisioning only.
 - **Default chat folder.** The service starts in `~/work`, so a chat opened without a workspace no longer lands in the live checkout.
 
@@ -15,7 +15,7 @@ dish runs like any web app: a **prod** configuration, which only the VM's servic
 | # | Topic | Decision |
 |---|---|---|
 | 1 | Protecting dish from itself | No guards in dish. Separate prod and dev data, keep the live checkout out of every chat, and deploy only by hand. |
-| 2 | Who deploys | Only you, with `deploy/update.sh` through `incus exec`. Agents don't deploy dish. |
+| 2 | Who deploys | Only you, with `deploy/update.sh` through `incus exec` (fleet's `dish-update`). Agents don't deploy dish. |
 | 3 | Prod and dev | `DISH_ENV` is `prod` or `dev`, and dev is the default. Only the service is prod. It gets there by running dsh directly, with the account's defaults, and not by setting `DISH_ENV`: dsh passes its environment on to every agent shell, so a `DISH_ENV=prod` on the service would make every agent's `pnpm dsh` prod. |
 | 4 | Where dev data lives | `<checkout>/.dev/` (git-ignored) holds dev's dsh home and dish's config, state, data and cache. pnpm's store stays the account's, for prod and dev alike ([Checks](#checks-2026-10-02)). A dev run then writes only inside the checkout, apart from pnpm's shared store and caches. |
 | 5 | Fleet | Provisioning only: the VM, packages, Node and pnpm, the account, Tailscale and `tailscale serve`, the keys, the first clone, `deploy.env`, and the install inputs (`install.env`). Fleet stops updating the checkout, running the install, and installing or restarting the unit. dish owns its unit. |
@@ -124,20 +124,20 @@ dsh treats only loopback pages as "the operator's own machine". On any other pag
 
 ## `deploy/update.sh`
 
-Run it from your workstation:
+Run it from your workstation, through its Incus remote for Minideb:
 
 ```bash
-incus exec dish --project dish -- dish-update                    # dry run: what would change
-incus exec dish --project dish -- dish-update --apply            # update to origin/main
-incus exec dish --project dish -- dish-update --apply 4b23ff0    # roll back to a commit
+incus exec minideb:dish --project dish -- dish-update                    # dry run: what would change
+incus exec minideb:dish --project dish -- dish-update --apply            # update to origin/main
+incus exec minideb:dish --project dish -- dish-update --apply 4b23ff0    # roll back to a commit
 ```
 
-Through Minideb, prefix it with `ssh bjk@10.0.1.175`.
+Without the remote, go through Minideb: `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-update`.
 
 ### Who it runs as and how
 
 - **The account** is the owner of the checkout the script sits in (`dish` on the VM). `update.sh` runs **only as that account**, never as root. Run as root, it refuses and points to `dish-update`.
-- **Root's entry point is `dish-update`,** a root-owned wrapper fleet installs at `/usr/local/sbin/dish-update`. It does one thing: `exec runuser -u dish -- env -i HOME=… USER=dish LOGNAME=dish XDG_RUNTIME_DIR=/run/user/<uid> PATH=<the unit's PATH> ~dish/dish/deploy/update.sh "$@"`.
+- **Root's entry point is `dish-update`,** a root-owned wrapper fleet installs at `/usr/local/sbin/dish-update`. It does one thing: `exec runuser --pty|--no-pty -u dish -- env -i HOME=… USER=dish LOGNAME=dish XDG_RUNTIME_DIR=/run/user/<uid> PATH=<the unit's PATH> ~dish/dish/deploy/update.sh "$@"`, with `--pty` only when the caller has a controlling terminal (see [Notes from the build](#notes-from-the-build)).
   - It never reads, sources or runs anything of dish's as root. `runuser` drops privileges first.
   - **Why (added 2026-10-02 after review):** root running `~dish/dish/deploy/update.sh` directly would execute a file the `dish` account can write. Anything acting as `dish`, such as an approved agent command or a package's install script, could then plant code that root runs at your next update.
 - **The clean environment:** `XDG_*`, `PNPM_HOME`, `DSH_*` and `NODE_ENV` stay unset, as they are for the unit. That keeps the store-pin contract.
@@ -176,13 +176,13 @@ Through Minideb, prefix it with `ssh bjk@10.0.1.175`.
    - the new HEAD;
    - the unit's state;
    - the last 15 journal lines with every token-bearing line removed;
-   - the hint to run `url.sh` for a fresh link.
+   - the hint to run `dish-url` for a fresh link.
 
 **Exit codes:** 0 for done or nothing to do, 1 for a failed step (named on stderr, as `install.sh` does), and 2 for usage or the wrong account.
 
 ## `deploy/url.sh`
 
-Run it as `incus exec dish --project dish -- dish-url`, fleet's root-owned wrapper, which runs `~dish/dish/deploy/url.sh` as `dish` the same way `dish-update` does.
+Run it as `incus exec minideb:dish --project dish -- dish-url`, fleet's root-owned wrapper, which runs `~dish/dish/deploy/url.sh` as `dish` the same way `dish-update` does.
 - **What it prints:** `https://<DISH_TRUSTED_HOST>/?token=<token>`.
   - The token comes from the last `dsh web:` line in the service's journal since its current start.
   - The start comes from `systemctl --user show`. The host comes from `deploy.env`.
@@ -222,18 +222,20 @@ Run it as `incus exec dish --project dish -- dish-url`, fleet's root-owned wrapp
 
 The order matters. A dish whose `pnpm dsh` goes through the launcher, started by the old unit's `pnpm dsh web`, would come up on an empty dev store.
 1. Merge 6a in dish, as one merge. The new unit, which runs dsh directly, ships in the same merge that routes `pnpm dsh` through the launcher.
-2. Merge the fleet PR. Run the guest play one last time: preview, apply, rerun.
-   - It writes `install.env`, `~/work`, the apt rule and mise.
+2. Merge the fleet PR ([bketelsen/fleet#38](https://github.com/bketelsen/fleet/pull/38)). Run the guest play one last time: preview, apply, rerun.
+   - It writes `install.env`, `~/work`, the apt rule, mise, and root's entry points, `/usr/local/sbin/dish-update` and `/usr/local/sbin/dish-url`.
    - It touches nothing of dish's checkout, profile or unit.
-3. Fast-forward the VM's checkout once by hand. It predates `update.sh`: `incus exec dish --project dish -- su - dish -c 'git -C ~/dish pull --ff-only origin main'`. This changes no running code.
-4. Run `update.sh`, then `update.sh --apply`. It installs, copies the new unit, restarts once (there is no stamp yet), and writes its stamp.
+3. Fast-forward the VM's checkout once by hand. It predates `update.sh`: `incus exec minideb:dish --project dish -- su - dish -c 'git -C ~/dish pull --ff-only origin main'`. This changes no running code.
+4. Right after it, run `dish-update`, then `dish-update --apply`. It installs, copies the new unit, restarts once (there is no stamp yet), and writes its stamp. Steps 3 and 4 run back to back: the old unit still runs `pnpm dsh web` from the checkout, so a restart between them (a crash, then `Restart=on-failure`) would start it through the new launcher, on an empty dev store.
 5. Check:
    - over `https://<tailnet name>`, Settings → General → Work details survives a reload, and Settings → Models loads (`dish-web`);
    - a new chat opened with no workspace starts in `~/work`;
-   - `url.sh` prints a link that signs you in;
+   - `dish-url` prints a link that signs you in;
    - Settings shows prod's data;
    - an agent's shell sees no `DISH_REMOTE`.
 6. Move to `pnpm dev` on the desktop.
+
+Checked already (2026-10-02): from the workstation, `incus exec minideb:dish --project dish -- sh -c '(: </dev/tty) && echo ctty'` prints `ctty`, so an interactive `dish-update` takes the `--pty` path.
 
 ## Testing
 
@@ -254,6 +256,7 @@ The order matters. A dish whose `pnpm dsh` goes through the launcher, started by
 - **The unit file:** `WorkingDirectory`, the `ExecStart` path, the `PATH` line, and no `DISH_ENV` and no install inputs.
 - **dish-copilot:** the status reports the route; the footer card shows only while there's none.
 - **By hand, with scratch `HOME` and `XDG_*`:** `pnpm dev` starts on 3090 with nothing written outside `.dev/`. Compare a listing of the scratch home before and after.
+- **No test finds the real home.** Every process a test or a live check spawns gets a scratch `HOME`, and an interactive shell a scratch `HISTFILE` too. Without them, bash and other tools fall back to the passwd home (see [Notes from the build](#notes-from-the-build)).
 
 ## Checks (2026-10-02)
 
@@ -292,3 +295,31 @@ These replace the open items. Each was run against a scratch `DSH_HOME` and scra
   - brew on Linux wants `/home/linuxbrew`, set up with sudo, and keeps itself current, which fleet's "nothing updates on its own" rules out.
   - mise's shims aren't on the unit's `PATH` in 6a, so agents run tools with `mise exec`. Adding the shims is step 6b's call.
 - **Disk.** No per-checkout store, so this open item is gone.
+
+## Notes from the build
+
+- **Root never runs dish's scripts.** The plan had `update.sh` and `url.sh` run as root and drop to the account themselves. Review found that root would then run a file the `dish` account, and so any agent, can write. Both now run only as the account, and exit 2 for root or anyone else, naming the entry point. Fleet's root-owned `dish-update` and `dish-url` are root's way in ("Who it runs as and how", above). Both scripts read the account's own user manager and user journal, which `dish` can read (checked on the VM).
+- **The entry points pass `--pty` only with a controlling terminal.** `runuser -u` never calls `setsid()`, so without `--pty` the account's process would share root's session and terminal. There it could push input into root's shell (`TIOCSTI`), or, left running, read what root types next. With a terminal the entry points pass `--pty`, and the script's stderr then arrives on stdout, with CRLF line ends. Without one, as through `ssh` without `-t`, they pass `--no-pty`, and the two streams stay apart.
+- **The apt wrapper names packages exactly and removes nothing.** It runs `apt-get -o APT::Cmd::Pattern-Only=true install --yes --no-install-recommends --no-remove <names>`. Without `Pattern-Only`, apt-get reads a name that is not a package as a regex, so `ripgre.` would also install `ripgrep-all`. Without `--no-remove`, `--yes` could remove an installed package (`sudo`, `tailscale`, `bubblewrap`) to make room. It also refuses a name ending in `-`, which `apt-get install` reads as "remove".
+- **`update.sh`, beyond the steps above:**
+  - `install.sh` and the Node and pnpm version checks get the `PATH` of the target's unit, read from git before the checkout moves, so an update installs with the tools of the service it starts. The script's own commands use the unit as it was checked out when it started.
+  - A target without `deploy/update.sh`, `deploy/install.sh` or the unit is refused, so a rollback can't leave a checkout that `dish-update` can't run in.
+  - A user manager that doesn't answer is refused before any change, and `deploy.env` must pass `url.sh`'s rule: exactly one `DISH_TRUSTED_HOST` line, with a bare host. A dry run that finds a refusal exits 1.
+  - `daemon-reload` runs whenever the user manager may hold another definition: the file changed, the stamp's unit differs or there is no stamp, or the manager reports `NeedDaemonReload`. A reload that failed is so done again before the next restart.
+  - A service that the run didn't restart, and that doesn't answer, gets one restart and a second wait before the run fails.
+  - Every line it prints that mentions a token is left out, not only the journal's: commit subjects and `install.sh`'s output too. `install.sh`'s stderr appears on `update.sh`'s stdout. The journal tail's header is "credential lines removed".
+  - Both scripts turn off `xtrace` first: a shell trace from the environment (`SHELLOPTS`, `BASH_ENV`) would print the journal's lines, token included.
+  - Once the checkout has moved, a failure says where it is, whether the service was restarted, and the command to go on or to go back.
+  - `DISH_UPDATE_CLEAN`, its own marker for the clean re-run, is refused when the environment holds any name besides the clean ones.
+- **`url.sh`** reads the journal as the account (`journalctl --user`), resolves its own symlinks to find the checkout, and refuses a `deploy.env` with more than one `DISH_TRUSTED_HOST` line.
+- **`dish-web` was added during the build,** at your request (decision 10, Task 10 of the plan). It is `install.sh`'s seventh bundle, after judge. A live check in a scratch profile, with a trusted-host name, showed Settings → Models loading with it and failing without it. Its pin test reads the `dsh-client-connection` that dsh itself serves, so bumping dsh alone can't leave it reading an old copy.
+- **`pnpm dev` owns dsh's signals.** dsh handles SIGINT and SIGTERM only. A SIGHUP kills it without its shutdown, which can leave agent commands running, and a second signal during its shutdown makes it force-exit.
+  - So `pnpm dev` starts dsh detached, in a session of its own, and only `pnpm dev` signals it: every Ctrl-C as SIGINT (a second one forces dsh out, as dsh does itself), and SIGTERM, SIGHUP and SIGQUIT (Ctrl-\) as one SIGTERM. A closed terminal hangs up twice, so once dsh has been signalled, those are dropped.
+  - The client watchers get a process group of their own, because pnpm passes no signal on to the scripts it starts.
+  - Ctrl-Z stops only `pnpm dev`. A SIGKILL leaves dsh and the watchers running.
+  - The exit code is 128+n after signal n. `scripts/dev.ts`'s header has the rest.
+- **The launcher leaves SIGINT to the terminal, and turns SIGHUP into SIGTERM.** A terminal's Ctrl-C already reaches the command in the launcher's foreground group, so a forwarded copy would be dsh's second. It forwards SIGTERM, and SIGHUP as SIGTERM. A real terminal hangup, or a SIGTERM to the launcher's whole group, still reaches the command twice, and its header says so: SIGTERM the node process, not the group. It exits 1 when `.dev/` can't be made, and 127 when the command can't start.
+- **Copilot's first sign-in card** was seen live in a scratch profile. With Add model provider → `github-copilot` open on a fresh profile, the page shows two Sign in buttons, the draft's card and the footer's. That's cosmetic.
+- **Tests clear `DSH_DISH_HOME`.** It beats `XDG_*`, so a parent environment that had it sent five plugin tests, which steer dish's directories with `XDG_*`, to that instance's directories. Their `withEnv` helpers now clear it for the test's body.
+- **Tests never find the real home.** On 2026-10-02 a `pnpm dev` test ran an interactive bash on a pseudo-terminal with no `HOME` or `HISTFILE`. bash fell back to the passwd home and, at the hangup, saved its history over your real `~/.bash_history`. Those tests now give every process they spawn a scratch `HOME`, and the shell a scratch `HISTFILE`. That is the rule for every test now ("Testing", above).
+- **Fleet pins mise 2026.10.0,** the latest stable release on 2026-10-02. Check for a newer 2026.10.x build for linux-x64 before the rollout.
