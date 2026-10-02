@@ -28,7 +28,7 @@ export const OWNER = /^(?=.{1,39}$)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/
 /** GitHub's repository names: 1 to 100 of letters, digits, `.`, `_` and `-`. `.`, `..` and names ending in `.git` are refused separately. */
 export const REPO = /^[A-Za-z0-9._-]{1,100}$/
 
-/** The names dsh's own environment scrub drops (`KEY`, `PASSWORD`, `SECRET`, `TOKEN`). dish-workspaces' env test pins its copy of this to dsh. */
+/** The names dsh's environment scrub drops (`KEY`, `PASSWORD`, `SECRET`, `TOKEN`). Pinned to dsh's pattern by dish-workspaces' env test. */
 export const SECRET_NAME = /KEY|PASSWORD|SECRET|TOKEN/i
 
 /** What a gate may take, in milliseconds. dsh's shell service caps a run at 10 minutes. */
@@ -38,12 +38,10 @@ export const SETUP_TIMEOUT = { min: 10_000, max: 3_600_000, fallback: '15m' } as
 
 /** The longest a name from the document is shown in a message. */
 const SHOWN = 64
-/** The longest a YAML parser's own reason is shown. */
-const REASON = 160
 
 /** What a variable in `gateEnv` may be called. */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
-/** dsh keeps names starting with this for itself; its scrub removes them from every agent shell. */
+/** The prefix of dsh's own variables, which its scrub removes from every agent shell. Pinned to dsh's `DSH_ENV_PREFIX` by dish-workspaces' env test. */
 const DSH_PREFIX = 'DSH_'
 
 const DURATION = /^([0-9]+)([smh])$/
@@ -220,8 +218,8 @@ function readEnv(data: Record<string, unknown>): Record<string, string> | undefi
     if (!ENV_NAME.test(name)) {
       refuse(`gateEnv names a variable ${quote(name)} that isn't a name (letters, digits and underscores, not starting with a digit)`)
     }
-    if (name.toUpperCase().startsWith(DSH_PREFIX)) refuse(`gateEnv can't set ${name}: dsh reserves names starting with DSH_`)
-    if (SECRET_NAME.test(name)) refuse(`gateEnv can't set ${name}: a name with KEY, PASSWORD, SECRET or TOKEN in it looks like a secret`)
+    if (name.toUpperCase().startsWith(DSH_PREFIX)) refuse(`gateEnv can't set ${quote(name)}: dsh reserves names starting with DSH_`)
+    if (SECRET_NAME.test(name)) refuse(`gateEnv can't set ${quote(name)}: a name with KEY, PASSWORD, SECRET or TOKEN in it looks like a secret`)
     if (typeof text !== 'string') refuse(`gateEnv.${name} must be a string`)
     if (/[\r\n]/.test(text)) refuse(`gateEnv.${name} must be one line`)
     noNul(`gateEnv.${name}`, text)
@@ -280,22 +278,21 @@ export function fieldsProblem(name: string, fields: unknown): string | undefined
 
 // --- the document -----------------------------------------------------------------------------
 
-/** The YAML in `text`: the core schema, so nothing in it is code (no timestamps, binary or custom tags). */
+/**
+ * The YAML in `text`: the core schema, so nothing in it is code (no timestamps, binary or custom tags). A parse
+ * error is reported by its line only: the parser's own reason can quote the document (an alias, a tag, a tag
+ * handle), and a value in this document could be a secret.
+ */
 function loadDocument(text: string): unknown {
   try {
     return load(text, { schema: JSON_SCHEMA })
   } catch (error) {
     if (error instanceof YAMLException) {
       const line = error.mark === undefined ? '' : ` (line ${error.mark.line + 1})`
-      refuse(`isn't valid YAML: ${truncateReason(error.reason)}${line}`)
+      refuse(`isn't valid YAML${line}`)
     }
     throw error
   }
-}
-
-function truncateReason(reason: string): string {
-  const flat = reason.replace(/\s+/g, ' ')
-  return flat.length > REASON ? `${flat.slice(0, REASON)}…` : flat
 }
 
 function projectOf(name: string, fields: ProjectFields): Project {

@@ -26,7 +26,8 @@ import {
 import type { Project, ProjectFields } from '../src/registry.ts'
 
 // Nothing here may read the real ~/.gitconfig: the store test below starts git, which reads $HOME.
-const saved = { HOME: process.env.HOME, NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM, XDG: process.env.XDG_CONFIG_HOME }
+const GIT_ENV = ['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM'] as const
+const saved = Object.fromEntries(GIT_ENV.map(name => [name, process.env[name]]))
 const made: string[] = []
 
 async function tempDir(): Promise<string> {
@@ -40,16 +41,17 @@ before(async () => {
   process.env.HOME = home
   process.env.XDG_CONFIG_HOME = join(home, '.config')
   process.env.GIT_CONFIG_NOSYSTEM = '1'
+  // dish-config's git passes these two through, so a caller's own would win over the scratch HOME.
+  process.env.GIT_CONFIG_GLOBAL = join(home, '.gitconfig')
+  process.env.GIT_CONFIG_SYSTEM = '/dev/null'
 })
 
 after(async () => {
-  const restore = (name: string, value: string | undefined) => {
+  for (const name of GIT_ENV) {
+    const value = saved[name]
     if (value === undefined) delete process.env[name]
     else process.env[name] = value
   }
-  restore('HOME', saved.HOME)
-  restore('GIT_CONFIG_NOSYSTEM', saved.NOSYSTEM)
-  restore('XDG_CONFIG_HOME', saved.XDG)
   await Promise.all(made.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
 })
 
@@ -205,13 +207,33 @@ test('a document that isn\'t a mapping with one key, projects, is refused', () =
 test('YAML that doesn\'t parse is one sentence with the line, and quotes none of the text', () => {
   const text = `projects:\n  acme/widget:\n    gate: "${TOKEN}\n   bad: [\n`
   const problem = problemOf(text)
-  assert.match(problem, /^projects\.yaml: isn't valid YAML: .+ \(line \d+\)$/)
+  assert.match(problem, /^projects\.yaml: isn't valid YAML \(line \d+\)$/)
   assert.ok(!problem.includes(TOKEN))
-  assert.ok(!problem.includes('\n'))
   // Two documents, a duplicated key, a tag a plain loader can't build.
-  assert.match(problemOf('projects: {}\n---\nprojects: {}\n'), /isn't valid YAML/)
-  assert.match(problemOf('projects: {}\nprojects: {}\n'), /isn't valid YAML/)
-  assert.match(problemOf('projects: !!js/function "function(){}"\n'), /isn't valid YAML/)
+  assert.match(problemOf('projects: {}\n---\nprojects: {}\n'), /^projects\.yaml: isn't valid YAML/)
+  assert.match(problemOf('projects: {}\nprojects: {}\n'), /^projects\.yaml: isn't valid YAML/)
+  assert.match(problemOf('projects: !!js/function "function(){}"\n'), /^projects\.yaml: isn't valid YAML/)
+})
+
+test('a YAML error never repeats an alias, a tag or a tag handle from the document', () => {
+  const word = 'hunter2Secret'
+  const gate = (value: string) => `projects:\n  acme/widget:\n    family: a\n    role: r\n    gate: ${value}\n    gateTimeout: 5m\n`
+  const documents = {
+    'an alias nothing defines': gate(`*${word}`),
+    'a local tag': gate(`!${word} make`),
+    'a verbatim tag': gate(`!<tag:example.test,2024:${word}> make`),
+    'a tag handle nothing declares': gate(`!${word}!x make`),
+    'a declared tag handle with a tag nothing builds': `%TAG !h! tag:example.test,2024:\n---\n${gate(`!h!${word} make`)}`,
+    'a secondary tag': gate(`!!${word} make`),
+    'an alias that resembles an anchor': `a: &${word} 1\nb: *${word}x\n`,
+  }
+  for (const [what, text] of Object.entries(documents)) {
+    const problem = problemOf(text)
+    assert.match(problem, /^projects\.yaml: isn't valid YAML( \(line \d+\))?$/, what)
+    assert.ok(!problem.includes(word), `${what}: ${problem}`)
+  }
+  // The line it reports is the document's own.
+  assert.equal(problemOf(gate(`*${word}`)), 'projects.yaml: isn\'t valid YAML (line 5)')
 })
 
 test('a document nested past what the parser can follow is a problem, not a crash', () => {
@@ -451,7 +473,7 @@ test('gateEnv refuses names starting with DSH_, in any case', () => {
   for (const name of ['DSH_HOME', 'DSH_X', 'dsh_home', 'Dsh_Anything', 'DSH_']) {
     assert.equal(
       problemOf(one({ gateEnv: { [name]: 'x' } })),
-      `projects.yaml: acme/widget: gateEnv can't set ${name}: dsh reserves names starting with DSH_`,
+      `projects.yaml: acme/widget: gateEnv can't set "${name}": dsh reserves names starting with DSH_`,
       name,
     )
   }
@@ -461,9 +483,18 @@ test('gateEnv refuses names that look like secrets, in any case', () => {
   for (const name of ['GH_TOKEN', 'API_KEY', 'KEY', 'DB_PASSWORD', 'MY_SECRET', 'token', 'apikey', 'PassWord', 'Secret_X', 'MONKEY', 'NPM_TOKEN_X', 'AWS_SECRET_ACCESS_KEY']) {
     assert.equal(
       problemOf(one({ gateEnv: { [name]: 'x' } })),
-      `projects.yaml: acme/widget: gateEnv can't set ${name}: a name with KEY, PASSWORD, SECRET or TOKEN in it looks like a secret`,
+      `projects.yaml: acme/widget: gateEnv can't set "${name}": a name with KEY, PASSWORD, SECRET or TOKEN in it looks like a secret`,
       name,
     )
+  }
+})
+
+test('a long variable name is cut where it is shown, as every name is', () => {
+  for (const name of [`DSH_${'x'.repeat(200)}`, `${'x'.repeat(200)}_TOKEN`, 'A'.repeat(200).replace(/^A/, '1')]) {
+    const problem = problemOf(one({ gateEnv: { [name]: 'x' } }))
+    assert.ok(problem.length < 300, `${problem.length}`)
+    assert.ok(problem.includes('…'), problem)
+    assert.ok(!problem.includes('x'.repeat(100)), problem)
   }
 })
 
