@@ -1,6 +1,6 @@
 # Spec: dish skills (`dish-skills`)
 
-Status: draft 2026-10-02, written while you were away. Implements roadmap step 3a. Builds on the [design](../design.md), the [config store](config-store.md), [prompts](prompts.md) and [crew](crew.md).
+Status: built 2026-10-02 on branch `skills` (not merged; live checks pending). Implements roadmap step 3a. Builds on the [design](../design.md), the [config store](config-store.md), [prompts](prompts.md) and [crew](crew.md).
 
 ## Summary
 
@@ -172,7 +172,7 @@ Written for dish: the controller is the main agent, the subagents are the crew r
 
 | Skill | Roles | Adapted from | Core |
 |---|---|---|---|
-| `brainstorming` | main | brainstorming | Talk before specs. Explore context, ask one question at a time, offer 2–3 approaches with a recommendation, agree section by section. Write or delegate the spec only when the user says go. Spike, bounded and architectural paths. |
+| `brainstorming` | main | brainstorming | Talk before specs. Explore context, a few numbered questions per round, with a playback, offer 2–3 approaches with a recommendation, agree section by section. Write or delegate the spec only when the user says go. Spike, bounded and architectural paths. |
 | `writing-specs` | architect, main | brainstorming (spec part) | dish's spec shape: status, summary, decisions table, non-goals, design with constraints checked in code, testing, open items. Self-review for placeholders and contradictions. |
 | `writing-plans` | architect, main | writing-plans | `docs/plans/YYYY-MM-DD-<topic>.md`: header, global constraints, review focus, file map. Tasks a fresh coder can do from the task text alone: files, interfaces, failing test first, gate, done condition, commit. No placeholders. Self-review. |
 | `subagent-driven-development` | main | subagent-driven-development | Run a plan with the crew. Ledger, pre-flight conflict scan, BASE per task, a self-contained brief to a fresh coder, gate, cross-family reviewer (`reviews`). Fix rounds: 1–3 `to` the same coder, 4 a fresh stronger coder, 5 you rule. Then a final whole-branch review. Don't ask to continue; stop only for the four stop conditions; list rulings at the end. |
@@ -299,3 +299,20 @@ Live (needs you):
 - Should shipped skills be deletable, which needs a tombstone list (decision 7)?
 - Pressure tests for the discipline skills (TDD, verification, debugging), following `writing-skills`.
 - `orchestrator` (step 7) may take over the main agent's pipeline skills and the ledger.
+
+## Notes from the build
+
+- **`agent.ctx.skills` throws in real dsh.** The agent loop doesn't inject `skills` into an agent's context, so a property read fails. The role provider registers through `agent.ctx.get('skills')`, which returns the service bound to the agent's own context, so the provider still lands in the agent's layer.
+- **One malformed candidate would break the catalog for every provider.** `dsh-skill` runs `validateCandidate` outside the provider's own `try`, so a candidate it dislikes rejects the whole lookup. The providers drop any document that isn't fit (and log it) before they list.
+- **The preset is read again on every lookup.** Switching the preset on a blank session rebinds the agent without a new `agent/created`. So the role provider is registered on every agent, not only those that start on a configured preset, and it checks the agent's preset when it lists.
+- **Parsing is stricter than the spec's list.**
+  - A YAML alias or anchor that reuses a value is refused ("write it out"), because a few hundred bytes of aliases can say a cyclic value, or one that is a billion entries once written out.
+  - Booleans are strict: only `true` and `false`, never `yes` or a string.
+  - The description is trimmed, then must be at most 1024 characters. The name is at most 64.
+- **A pathological document can't take the catalog or the page down.** The service builds the catalog one document at a time, and the remote isolates each document too. A document that throws becomes a problem of its own, and the rest still serves.
+- **Ruling: a store with no skill documents (and no problems) serves the shipped defaults,** at commit `null` — so agents are never left without skills for want of a seed, which covers a store before its first seed and one whose seed failed. A store whose documents are all problems doesn't: that is an answer, and the page shows the problems. The cost if wrong is low: agents see the shipped skills where the store would show none.
+- **Seeding.** `seed(..., { replace })` and `defaults/previous.json` are as above. The content commits were squashed before `previous.json` was generated, so it lists only texts that shipped, not drafts. Prompts' `previous.json` lists the earlier shipped prompt texts, so the VM's unedited prompts move to the new ones at its next start.
+- **`dish-skills/skill` is exported** (`package.json` exports `./skill`) for dish-prompts' test of skill mentions. It parses the shipped skills, checks their roles, and finds their directory through this export, without loading the plugin.
+- **The prompts reset note** now defaults to "Reset to the default", and the backlog item is closed.
+- **The ledger lives in the working directory.** `subagent-driven-development` and `executing-plans` keep it at a git-ignored `.worktrees/<plan file name>-ledger.md`. Under dsh's sandbox a write outside the workspace asks for approval every time, so a ledger kept elsewhere would interrupt every task.
+- **`common.md`'s skill rule yields to the brief:** "load it … unless your brief says not to". A pressure-test child, as `writing-skills` runs them, can then be told not to load the skill under test.

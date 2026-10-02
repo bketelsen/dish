@@ -244,4 +244,4 @@ Roles, models and limits live in `crew.yaml`, not here.
   - fix rounds to the same coder, including after a dsh restart.
 
   The records, reports and labels were as specified. It also found a `dish-copilot` catalog bug: Sonnet 5.5 was copied from Sonnet 5 and rejected every request. That's fixed by preferring the closest version of the same vendor.
-- **Small follow-up:** the Prompts remote's `reset` should default its note to "Reset to the default" itself, as the page does. Resets made through the remote without a note read as edits in History.
+- **Small follow-up, done in the skills step:** the Prompts remote's `reset` defaults its note to "Reset to the default" itself, as the page does. Before, a reset made through the remote without a note read as an edit in History.
