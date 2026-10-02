@@ -14,7 +14,7 @@ import type { CommitInfo as StoreCommit, ConfigEvent as StoreEvent, FileDiff as 
 import type { ConfigRemote } from '../../config/src/remote.ts'
 import { MAX_SKILL_NAME, SKILL_NAME_PATTERN, nameProblem } from '../src/client/names.ts'
 import { skillsRemote } from '../src/client/remote.ts'
-import type { ConfigCalls, ConfigEvent } from '../src/client/remote.ts'
+import type { ConfigCalls, ConfigEvent, SkillsApi } from '../src/client/remote.ts'
 import type { CommitInfo } from '../src/protocol.ts'
 import { SkillsRemote } from '../src/remote.ts'
 import { MAX_NAME, SKILL_NAME } from '../src/skill.ts'
@@ -46,6 +46,27 @@ export type CallsMatchTheRemote = [
   Check<Same<Called<'history'>, Served<'history'>>>,
   Check<Same<Called<'commit'>, Served<'commit'>>>,
   Check<Same<Called<'revert'>, Served<'revert'>>>,
+]
+
+/**
+ * The same for the page's own calls: each of `SkillsApi`'s must take what `SkillsRemote`'s method takes and give the same
+ * value inside the `Outcome`, so a change to a server signature is a type error here and not a wrong call in the browser.
+ */
+type ServedBy<K extends keyof SkillsApi> = Value<Awaited<ReturnType<SkillsRemote[K]>>>
+type CalledOn<K extends keyof SkillsApi> = Value<Value<Awaited<ReturnType<SkillsApi[K]>>>>
+export type ApiMatchesTheSkillsRemote = [
+  Check<Same<Parameters<SkillsApi['skills']>, Parameters<SkillsRemote['skills']>>>,
+  Check<Same<Parameters<SkillsApi['read']>, Parameters<SkillsRemote['read']>>>,
+  Check<Same<Parameters<SkillsApi['check']>, Parameters<SkillsRemote['check']>>>,
+  Check<Same<Parameters<SkillsApi['save']>, Parameters<SkillsRemote['save']>>>,
+  Check<Same<Parameters<SkillsApi['reset']>, Parameters<SkillsRemote['reset']>>>,
+  Check<Same<Parameters<SkillsApi['remove']>, Parameters<SkillsRemote['remove']>>>,
+  Check<Same<CalledOn<'skills'>, ServedBy<'skills'>>>,
+  Check<Same<CalledOn<'read'>, ServedBy<'read'>>>,
+  Check<Same<CalledOn<'check'>, ServedBy<'check'>>>,
+  Check<Same<CalledOn<'save'>, ServedBy<'save'>>>,
+  Check<Same<CalledOn<'reset'>, ServedBy<'reset'>>>,
+  Check<Same<CalledOn<'remove'>, ServedBy<'remove'>>>,
 ]
 
 /** The gateway's source-mode reading of a method's parameter names: the text between its first parentheses, split on commas. */

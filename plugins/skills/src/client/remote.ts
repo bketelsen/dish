@@ -13,7 +13,7 @@
  */
 
 import type {
-  InvocationDescriptor, InvocationParameterDescriptor, RemoteResult, RemoteStreamHandle, TypertRemoteContribution,
+  InvocationParameterDescriptor, RemoteResult, RemoteStreamHandle, TypertRemoteContribution,
 } from '@deepseek-ai/dsh-typert-protocol'
 import { jsonCodec, remoteContribution, remoteDescriptor } from 'dish-kit/client'
 import type { FileDiff } from 'dish-kit/ui/diff'
@@ -71,8 +71,8 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
 
 const parameter = (name: string): InvocationParameterDescriptor => ({ name, wire: name, source: 'json', codec: jsonCodec })
 
-const descriptor = (method: string, parameters: string[] = [], extra: Partial<InvocationDescriptor> = {}) =>
-  remoteDescriptor('dish-skills', NAMESPACE, method, { parameters: parameters.map(parameter), ...extra })
+const descriptor = (method: string, parameters: string[] = []) =>
+  remoteDescriptor('dish-skills', NAMESPACE, method, { parameters: parameters.map(parameter) })
 
 export const skillsRemote: TypertRemoteContribution = remoteContribution('dish-skills', [
   descriptor('skills'),

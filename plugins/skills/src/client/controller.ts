@@ -574,14 +574,53 @@ export function createSkills(api: SkillsApi, config?: ConfigCalls, options: Skil
     return true
   }
 
-  /** The selected skill is gone from the store: a page with nothing to lose lets it go; one with edits keeps them. */
-  const goneElsewhere = (name: string): void => {
-    if (get().dirty) {
-      patch({ notice: { tone: 'error', text: `${name} was deleted elsewhere. Your text is still in the editor.` } })
+  /**
+   * A read, or a write that the store answered, says the selected skill has no document. Either it was deleted, or the store
+   * went away (a skill you added is not served without one), or it was deleted and has come back. Which, the list says.
+   *
+   * - **No store:** nothing changes but the notice; what is shown is as it was.
+   * - **Deleted, and the page has nothing to lose** (or the person was deleting it): it closes.
+   * - **Deleted, and the draft has edits:** the draft becomes a new skill. The store counts a deletion as a change, so a save
+   *   over the old commit would be a `CONFLICT` for ever, with nothing to reload; saving it over the list's commit is the
+   *   one thing that works, and it creates the skill again.
+   * - **Back again:** left alone. The next save is a `CONFLICT`, and that shows what is there.
+   * @param verb - `delete` when it was the person's delete that found it gone: it closes whatever the draft says.
+   */
+  const goneElsewhere = async (name: string, verb?: 'delete'): Promise<void> => {
+    const chosen = selection
+    const skills = await refreshSkills()
+    // The person moved on while the list was read, or something else already dealt with it.
+    if (chosen !== selection || get().selected !== name || get().creating) return
+    // Without the list there is no telling which it is, and listError says so.
+    if (skills === undefined) return
+    const state = get()
+    if (state.commit === '') {
+      patch({ readOnly: true, notice: { tone: 'error', text: `The config store isn't running, so ${name} can't be read right now.` } })
       return
     }
-    closeSkill()
-    patch({ notice: { tone: 'info', text: `${name} was deleted elsewhere.` } })
+    if (skills.some(skill => skill.name === name)) return
+    if (verb === 'delete' || !state.dirty) {
+      closeSkill()
+      patch({ notice: { tone: 'info', text: verb === 'delete' ? `${name} was deleted already — nothing to do` : `${name} was deleted elsewhere.` } })
+      return
+    }
+    // A read of the document that began before this is older than it.
+    documentGeneration++
+    historyGeneration++
+    patch({
+      creating: true,
+      saved: { text: '', commit: state.commit },
+      shipped: false,
+      defaultText: '',
+      missing: false,
+      readOnly: false,
+      conflict: undefined,
+      confirm: null,
+      dirty: true,
+      history: undefined,
+      notice: { tone: 'info', text: `${name} was deleted elsewhere; Save creates it again.` },
+    })
+    ensureTab()
   }
 
   /**
@@ -602,7 +641,7 @@ export function createSkills(api: SkillsApi, config?: ConfigCalls, options: Skil
       const state = get()
       // A new skill isn't stored yet, so there is nothing to find. Any other that isn't there is gone.
       if (result.code === 'NOT_FOUND') {
-        if (!state.creating) goneElsewhere(name)
+        if (!state.creating) await goneElsewhere(name)
         return
       }
       // A refresh that failed leaves what is shown alone, unless nothing is.
@@ -618,8 +657,10 @@ export function createSkills(api: SkillsApi, config?: ConfigCalls, options: Skil
       await Promise.all([adopt(read), loadMissingTab()])
     } else if (read.text !== state.saved?.text) {
       patch({ conflict: { theirs: read.text, commit: read.commit }, readOnly: read.commit === '' })
-    } else if (state.conflict !== undefined) {
-      patch({ conflict: undefined })
+    } else {
+      // The document says what the page loaded, so the draft is still over the right text, and it can be saved over this commit
+      // from now on. (A page that loaded it with no store has no commit to save over: it is `''` until this.)
+      patch({ saved: { text: read.text, commit: read.commit }, readOnly: read.commit === '', conflict: undefined })
     }
   }
 
@@ -647,6 +688,7 @@ export function createSkills(api: SkillsApi, config?: ConfigCalls, options: Skil
       } else {
         const kept = get().dirty ? {} : { draft: before.draft, note: before.note, dirty: before.dirty, conflict: before.conflict }
         patch({ ...kept, notice: { tone: 'error', ...result.notice } })
+        if (result.code === 'NOT_FOUND' && !get().creating) await goneElsewhere(name)
       }
       return
     }
@@ -671,7 +713,9 @@ export function createSkills(api: SkillsApi, config?: ConfigCalls, options: Skil
       roles,
       listLoaded: true,
       listError: undefined,
-      readOnly: commit === '',
+      // A document that is open says whether there is a store for itself, with the commit it was read at; a list that says
+      // otherwise first would leave a draft that was loaded with no store looking savable, over a base of nothing.
+      ...(state.document === 'ready' || state.document === 'loading' ? {} : { readOnly: commit === '' }),
       // What the list says of the open skill is the word on whether it is shipped.
       ...(entry !== undefined && !state.creating ? { shipped: entry.shipped } : {}),
     })
@@ -799,14 +843,19 @@ export function createSkills(api: SkillsApi, config?: ConfigCalls, options: Skil
     } else {
       patch({ notice: { tone: 'error', text: `Couldn't ${verb} ${name}`, detail: failure.message ?? failure.notice.text } })
     }
+    // The store has no document to write over or delete: the skill is gone.
+    let gone = failure.code === 'NOT_FOUND'
     if (failure.code === 'CONFLICT' && chosen === selection) {
       // Like any read of the document, this one is dropped if a newer one (an event's, say) has been started since.
       const generation = ++documentGeneration
       const theirs = await settle(() => api.read(name))
-      if (theirs.ok && generation === documentGeneration && chosen === selection) {
-        patch({ conflict: { theirs: theirs.value.text, commit: theirs.value.commit } })
+      if (generation === documentGeneration && chosen === selection) {
+        if (theirs.ok) patch({ conflict: { theirs: theirs.value.text, commit: theirs.value.commit } })
+        // A deletion is a change too: the write was refused as a conflict with it, and there is nothing to show of "theirs".
+        else if (theirs.code === 'NOT_FOUND') gone = true
       }
     }
+    if (gone && chosen === selection && !get().creating) await goneElsewhere(name, verb === 'delete' ? 'delete' : undefined)
     await settleEvents()
   }
 

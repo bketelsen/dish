@@ -57,6 +57,10 @@ class FakeSkills {
   /** The text of every `check`, in order. */
   checked: string[] = []
   gates = new Map<string, Gate>()
+  /** The commit at which each deleted document was deleted. A write over a base older than that is a `CONFLICT`, as in the store. */
+  tombstones = new Map<string, number>()
+  /** Names the list leaves out, as a list read before they existed would. */
+  hidden = new Set<string>()
   readDown = false
   checkDown = false
   skillsDown = false
@@ -81,6 +85,7 @@ class FakeSkills {
   externalDelete(name: string): string {
     this.head++
     this.docs.delete(name)
+    this.tombstones.set(name, this.head)
     return id(this.head)
   }
 
@@ -122,7 +127,9 @@ class FakeSkills {
     }
     if (text.trim() === '') return refused('INVALID', `${pathOf(name)}: a skill can't be empty`)
     const doc = this.docs.get(name)
-    if (base !== '' && doc !== undefined && doc.changedAt > number(base)) return refused('CONFLICT', `${pathOf(name)} changed since ${base.slice(0, 7)}`)
+    // The store counts a deletion as a change of the path, as it counts a write.
+    const changedAt = doc?.changedAt ?? this.tombstones.get(name) ?? 0
+    if (base !== '' && changedAt > number(base)) return refused('CONFLICT', `${pathOf(name)} changed since ${base.slice(0, 7)}`)
     if (doc?.text === text) return ok(null)
     this.head++
     this.docs.set(name, { text, changedAt: this.head })
@@ -135,7 +142,7 @@ class FakeSkills {
       await this.wait('skills')
       if (this.skillsDown) return carrierDown()
       const names = this.up ? new Set([...this.docs.keys(), ...Object.keys(DEFAULTS)]) : new Set(Object.keys(DEFAULTS))
-      const skills = [...names].sort().map(name => this.info(name))
+      const skills = [...names].filter(name => !this.hidden.has(name)).sort().map(name => this.info(name))
       const result: SkillsResult = { commit: this.up ? id(this.head) : '', skills, roles: ROLES }
       return ok(result)
     },
@@ -193,7 +200,10 @@ class FakeSkills {
       if (base !== '' && doc.changedAt > number(base)) return refused('CONFLICT', `${pathOf(name)} changed since ${base.slice(0, 7)}`)
       this.head++
       this.docs.delete(name)
-      return ok(this.commitInfo(name, note))
+      this.tombstones.set(name, this.head)
+      const answer = ok(this.commitInfo(name, note))
+      await this.wait('remove answer')
+      return answer
     },
   }
 }
@@ -494,7 +504,8 @@ test('check runs 300 ms after the last edit: several edits make one call', async
 
 test('check with the real timers goes off after the pause', async () => {
   const fake = new FakeSkills()
-  const page = createSkills(fake.api)
+  // The pause is shortened so that the test does not wait the 300 ms out; the default is checked with the fake timer above.
+  const page = createSkills(fake.api, undefined, { delay: 1 })
   await page.face.open()
   const before = fake.checked.length
   page.face.edit('typed')
@@ -1112,7 +1123,7 @@ test('shipped comes from the list: the Default tab is for shipped skills only, a
   assert.equal(state().tab, 'edit', 'a tab that is not there can\'t be opened')
 })
 
-test('a skill the list has not seen is shipped when its read says it has a default', async () => {
+test('a skill the list has not seen is not shipped when its read has no default', async () => {
   const { fake, page, state } = await opened()
   // The list was read before this one existed, so it does not know the skill.
   fake.docs.set('late', { text: 'LATE\n', changedAt: 0 })
@@ -1120,6 +1131,28 @@ test('a skill the list has not seen is shipped when its read says it has a defau
   assert.equal(state().shipped, false)
   assert.equal(state().defaultText, '')
   assert.deepEqual(visibleTabs(state()), ['edit', 'history'])
+})
+
+test('a shipped skill the list has not seen is shipped when its read has a default, and has the Default tab', async () => {
+  const { fake, page, state } = await opened()
+  // A list read before dish shipped (or the store listed) this skill: the read still carries its default.
+  fake.hidden.add('writing-plans')
+  await page.face.open()
+  assert.equal(state().skills.some(skill => skill.name === 'writing-plans'), false, 'the list does not have it')
+  await page.face.select('writing-plans')
+  assert.equal(state().selected, 'writing-plans')
+  assert.equal(state().shipped, true)
+  assert.equal(state().defaultText, DEFAULTS['writing-plans'])
+  assert.deepEqual(visibleTabs(state()), ['edit', 'default', 'history'])
+  assert.deepEqual(defaultView(state()), { kind: 'same' })
+  assert.equal(state().tab, 'edit')
+  await page.face.setTab('default')
+  assert.equal(state().tab, 'default')
+  // And it can be reset, but not deleted.
+  page.face.askDelete()
+  assert.equal(state().confirm, null)
+  page.face.askReset()
+  assert.equal(state().confirm, 'reset')
 })
 
 test('defaultView: the same text is "same", a different one is a diff from the default to what is saved, and no default is none', async () => {
@@ -1352,25 +1385,182 @@ test('a delete while the store is not running says so', async () => {
   assert.equal(state().selected, 'mine')
 })
 
-test('an event for a skill deleted elsewhere clears a clean page, and warns one with edits', async () => {
-  const clean = await opened()
-  await clean.page.face.select('mine')
-  const commit = clean.fake.externalDelete('mine')
-  await clean.page.onConfigEvent({ kind: 'changed', commit, paths: [pathOf('mine')] })
-  assert.equal(clean.state().selected, undefined)
-  assert.equal(clean.state().notice?.tone, 'info')
-  assert.match(clean.state().notice?.text ?? '', /mine was deleted/)
-  assert.deepEqual(names(clean.state()), ['brainstorming', 'writing-plans'])
+test('an event for a skill deleted elsewhere closes a clean page, with the list read again', async () => {
+  const { fake, page, state } = await opened()
+  await page.face.select('mine')
+  const commit = fake.externalDelete('mine')
+  await page.onConfigEvent({ kind: 'changed', commit, paths: [pathOf('mine')] })
+  assert.equal(state().selected, undefined)
+  assert.equal(state().document, 'idle')
+  assert.equal(state().notice?.tone, 'info')
+  assert.match(state().notice?.text ?? '', /mine was deleted elsewhere/)
+  assert.deepEqual(names(state()), ['brainstorming', 'writing-plans'])
+})
 
-  const dirty = await opened()
-  await dirty.page.face.select('mine')
-  dirty.page.face.edit('still here\n')
-  const gone = dirty.fake.externalDelete('mine')
-  await dirty.page.onConfigEvent({ kind: 'changed', commit: gone, paths: [pathOf('mine')] })
-  assert.equal(dirty.state().selected, 'mine')
-  assert.equal(dirty.state().draft, 'still here\n')
-  assert.equal(dirty.state().notice?.tone, 'error')
-  assert.match(dirty.state().notice?.text ?? '', /mine was deleted/)
+test('a draft of a skill deleted elsewhere becomes a new skill that Save creates again (live event)', async () => {
+  const { fake, page, state, timer } = await opened()
+  await page.face.select('mine')
+  page.face.edit('my edit\n')
+  page.face.setNote('why')
+  const commit = fake.externalDelete('mine')
+  await page.onConfigEvent({ kind: 'changed', commit, paths: [pathOf('mine')] })
+  assert.equal(state().selected, 'mine')
+  assert.equal(state().creating, true)
+  assert.deepEqual(state().saved, { text: '', commit })
+  assert.equal(state().draft, 'my edit\n')
+  assert.equal(state().note, 'why')
+  assert.equal(state().dirty, true)
+  assert.equal(state().shipped, false)
+  assert.equal(state().defaultText, '')
+  assert.equal(state().missing, false)
+  assert.equal(state().conflict, undefined)
+  assert.equal(state().notice?.tone, 'info')
+  assert.match(state().notice?.text ?? '', /mine was deleted elsewhere; Save creates it again/)
+  assert.deepEqual(names(state()), ['brainstorming', 'writing-plans'], 'the list no longer has it')
+  assert.deepEqual(visibleTabs(state()), ['edit'])
+  assert.equal(state().history, undefined)
+
+  await checked({ timer, state })
+  await page.face.save()
+  assert.ok(fake.calls.includes(`save mine ${commit.slice(0, 7)} why`), fake.calls.join(', '))
+  assert.equal(state().creating, false)
+  assert.equal(state().dirty, false)
+  assert.match(state().notice?.text ?? '', /^Created mine as /)
+  assert.equal(fake.docs.get('mine')?.text, 'my edit\n')
+  assert.ok(names(state()).includes('mine'))
+})
+
+test('a draft of a skill deleted elsewhere becomes a new skill when its Save is the first to find out (no stream)', async () => {
+  const { fake, page, state, timer } = await opened({ config: false })
+  await page.face.select('mine')
+  page.face.edit('my edit\n')
+  await checked({ timer, state })
+  fake.externalDelete('mine')
+  await page.face.save()
+  // The store refused the save on the old commit, as a conflict with the deletion; the read of "theirs" found nothing.
+  assert.ok(fake.calls.includes(`save mine ${id(0).slice(0, 7)} -`), fake.calls.join(', '))
+  assert.equal(state().selected, 'mine')
+  assert.equal(state().creating, true)
+  assert.deepEqual(state().saved, { text: '', commit: id(1) })
+  assert.equal(state().conflict, undefined, 'there is no "theirs" to show')
+  assert.equal(state().draft, 'my edit\n')
+  assert.equal(state().notice?.tone, 'info')
+  assert.match(state().notice?.text ?? '', /mine was deleted elsewhere; Save creates it again/)
+  assert.equal(state().busy, undefined)
+
+  await page.face.save()
+  assert.ok(fake.calls.includes(`save mine ${id(1).slice(0, 7)} -`), fake.calls.join(', '))
+  assert.equal(state().creating, false)
+  assert.match(state().notice?.text ?? '', /^Created mine as /)
+  assert.equal(fake.docs.get('mine')?.text, 'my edit\n')
+})
+
+test('a clean page finds a skill deleted elsewhere by opening or reloading, and closes it (no stream)', async () => {
+  for (const how of ['open', 'reload'] as const) {
+    const { fake, page, state } = await opened({ config: false })
+    await page.face.select('mine')
+    fake.externalDelete('mine')
+    await (how === 'open' ? page.face.open() : page.face.reload())
+    assert.equal(state().selected, undefined, how)
+    assert.match(state().notice?.text ?? '', /mine was deleted elsewhere/, how)
+  }
+})
+
+test('a Reload that finds the skill deleted turns a draft into a new skill, too', async () => {
+  const { fake, page, state } = await opened({ config: false })
+  await page.face.select('mine')
+  page.face.edit('my edit\n')
+  fake.externalDelete('mine')
+  await page.face.reload()
+  assert.equal(state().creating, true)
+  assert.equal(state().draft, 'my edit\n')
+  assert.deepEqual(state().saved, { text: '', commit: id(1) })
+})
+
+test('a skill that was deleted and has come back is left alone: the next save is a conflict that shows what is there', async () => {
+  const { fake, page, state, timer } = await opened()
+  await page.face.select('mine')
+  page.face.edit('my edit\n')
+  await checked({ timer, state })
+  const commit = fake.externalDelete('mine')
+  // The list is read after the document is found missing, and by then somebody has written the skill again.
+  const held = gate()
+  fake.gates.set('skills', held)
+  const event = page.onConfigEvent({ kind: 'changed', commit, paths: [pathOf('mine')] })
+  await until('the document to be found missing', () => count(fake.calls, 'read mine') === 2)
+  fake.external('mine', 'WRITTEN AGAIN\n')
+  held.release()
+  await event
+  assert.equal(state().creating, false, 'it exists: it is not turned into a new skill over somebody else\'s')
+  assert.equal(state().selected, 'mine')
+  assert.equal(state().draft, 'my edit\n')
+  await page.face.save()
+  assert.deepEqual(state().conflict, { theirs: 'WRITTEN AGAIN\n', commit: id(2) })
+  assert.equal(fake.docs.get('mine')?.text, 'WRITTEN AGAIN\n', 'nothing was overwritten')
+})
+
+test('a skill you added that can\'t be read while the store is down is not "deleted elsewhere"', async () => {
+  for (const edit of [false, true]) {
+    const { fake, page, state } = await opened()
+    await page.face.select('mine')
+    if (edit) page.face.edit('my edit\n')
+    fake.up = false
+    await page.onConfigEvent({ kind: 'changed', commit: id(1), paths: [pathOf('mine')] })
+    assert.equal(state().selected, 'mine', `edit ${edit}`)
+    assert.equal(state().creating, false, `edit ${edit}`)
+    assert.equal(state().draft, edit ? 'my edit\n' : MINE, `edit ${edit}`)
+    assert.equal(state().notice?.tone, 'error', `edit ${edit}`)
+    assert.match(state().notice?.text ?? '', /config store isn't running/, `edit ${edit}`)
+    assert.doesNotMatch(state().notice?.text ?? '', /deleted/, `edit ${edit}`)
+    assert.equal(state().readOnly, true, `edit ${edit}`)
+  }
+})
+
+test('a page whose list could not be read can\'t tell a deleted skill from one it can\'t reach, and changes nothing', async () => {
+  const { fake, page, state } = await opened()
+  await page.face.select('mine')
+  page.face.edit('my edit\n')
+  fake.externalDelete('mine')
+  fake.skillsDown = true
+  await page.face.open()
+  assert.equal(state().creating, false)
+  assert.equal(state().draft, 'my edit\n')
+  assert.notEqual(state().listError, undefined)
+})
+
+// --- a store that appears under a draft ------------------------------------------------------------
+
+test('a store that appears while the draft has edits, with the text the page loaded, gives it a commit to save over', async () => {
+  const { fake, page, state, timer } = setup()
+  fake.up = false
+  await page.face.open()
+  assert.equal(state().readOnly, true)
+  assert.equal(state().saved?.commit, '')
+  page.face.edit('BRAIN, edited\n')
+  await checked({ timer, state })
+  // The store starts, holding what the page showed (the shipped default), and some commits besides.
+  fake.up = true
+  fake.head = 3
+  await page.onConfigEvent({ kind: 'remote', status: { pending: 0 } }, true)
+  assert.equal(state().readOnly, false)
+  assert.deepEqual(state().saved, { text: DEFAULTS.brainstorming, commit: id(3) })
+  assert.equal(state().draft, 'BRAIN, edited\n')
+  assert.equal(state().conflict, undefined)
+  await page.face.save()
+  assert.ok(fake.calls.includes(`save brainstorming ${id(3).slice(0, 7)} -`), `saved over the new commit, not over nothing: ${fake.calls.join(', ')}`)
+  assert.equal(state().notice?.tone, 'success')
+})
+
+test('a store that appears while the draft has edits is not taken for savable by the list alone', async () => {
+  const { fake, page, state } = setup()
+  fake.up = false
+  await page.face.open()
+  page.face.edit('BRAIN, edited\n')
+  fake.up = true
+  await page.onConfigEvent({ kind: 'proposal', id: 'abcd1234', status: 'open' })
+  assert.equal(state().commit, id(0), 'the list knows the store')
+  assert.equal(state().readOnly, true, 'the document does not yet: it has no commit')
+  assert.equal(state().saved?.commit, '')
 })
 
 // --- the History tab -------------------------------------------------------------------------------
@@ -1723,21 +1913,46 @@ test('the echo of a reset, arriving as soon as its answer has, is no conflict wi
   assert.deepEqual(state().saved, { text: DEFAULTS.brainstorming, commit: id(2) })
 })
 
-test('the echo of a delete, arriving before its answer, does not make an error of the skill that is going', async () => {
+test('the echo of a delete, arriving before its answer, waits for it and does not make an error of the skill that is going', async () => {
   const { fake, page, state } = await opened()
   await page.face.select('mine')
   const slow = gate()
-  fake.gates.set('remove', slow)
+  fake.gates.set('remove answer', slow)
   page.face.askDelete()
   const removing = page.face.remove()
-  await until('the delete to be asked for', () => fake.calls.some(call => call.startsWith('remove mine')))
-  slow.release()
   await until('the store to have deleted it', () => !fake.docs.has('mine'))
+  // The store has committed and said so, and the answer to the delete is still on its way.
+  const before = fake.calls.length
   await page.onConfigEvent({ kind: 'changed', commit: id(1), paths: [pathOf('mine')] })
+  assert.equal(state().busy, 'delete', 'the delete is still under way')
+  assert.equal(state().selected, 'mine')
+  assert.equal(fake.calls.slice(before).some(call => call === 'read mine'), false, 'the event waits: no read of the document')
+  assert.equal(state().notice, undefined)
+  slow.release()
   await removing
+  assert.equal(state().busy, undefined)
   assert.equal(state().selected, undefined)
   assert.equal(state().notice?.tone, 'success', 'the delete\'s own notice, not "was deleted elsewhere"')
   assert.match(state().notice?.text ?? '', /^Deleted mine/)
+  assert.equal(fake.calls.slice(before).some(call => call === 'read mine'), false, 'nothing is selected to read')
+})
+
+test('a delete that finds the skill already gone closes it with a notice, whatever the draft says', async () => {
+  for (const edit of [false, true]) {
+    const { fake, page, state } = await opened()
+    await page.face.select('mine')
+    if (edit) page.face.edit('my edit\n')
+    page.face.askDelete()
+    fake.externalDelete('mine')
+    await page.face.remove()
+    assert.equal(state().selected, undefined, `edit ${edit}`)
+    assert.equal(state().creating, false, `edit ${edit}: the person was deleting it, not keeping it`)
+    assert.equal(state().notice?.tone, 'info', `edit ${edit}`)
+    assert.match(state().notice?.text ?? '', /mine was deleted already/, `edit ${edit}`)
+    assert.equal(state().confirm, null, `edit ${edit}`)
+    assert.equal(state().busy, undefined, `edit ${edit}`)
+    assert.deepEqual(names(state()), ['brainstorming', 'writing-plans'], `edit ${edit}`)
+  }
 })
 
 test('Reload is not undone by a live event that arrives while it reads', async () => {
