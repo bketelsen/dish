@@ -7,9 +7,12 @@
  *
  * - **`dish`, global** (the host plugin registers it while `skills` is there): every valid skill, for the `/` menu
  *   everywhere, and never for a model (`modelInvocable: false`).
- * - **`dish-role`, in an agent's own layer** (`watchAgents` registers one on each agent of a configured preset): the
- *   skills of the agent's role, with each skill's own invocation flags. Its entries replace the global ones for that
- *   agent alone, and a skill outside the role stays the global, menu-only entry, which the `skill` tool refuses.
+ * - **`dish-role`, in an agent's own layer** (`watchAgents` registers one on every agent): while the agent is on a
+ *   configured preset, the skills of its role, with each skill's own invocation flags; otherwise nothing. Its entries
+ *   replace the global ones for that agent alone, and a skill outside the role stays the global, menu-only entry,
+ *   which the `skill` tool refuses. The preset is read at every `list()`, not once: dsh can move a blank agent to
+ *   another preset (`agentPresets.select`) without announcing it again, and the registry lists afresh when it does,
+ *   because the agent's scope chain is part of its cache key.
  *
  * Both read the `dishSkills` service on every `list()` and `get()`, and both subscribe their `invalidate` to the
  * service's changes, so an edit in the store reaches every catalog at the agent's next step. A candidate is built
@@ -67,11 +70,12 @@ const MAX_TOLD = 100
  */
 const toldBy = new WeakMap<ProviderLogger, Set<string>>()
 
-function tellOnce(logger: ProviderLogger | undefined, key: string, format: string, ...args: unknown[]): void {
-  if (logger === undefined) return
+/** Tell `format` unless `key` was told to `logger` already. Returns whether this call told it. */
+function tellOnce(logger: ProviderLogger | undefined, key: string, format: string, ...args: unknown[]): boolean {
+  if (logger === undefined) return false
   let told = toldBy.get(logger)
   if (told === undefined) toldBy.set(logger, told = new Set())
-  if (told.has(key)) return
+  if (told.has(key)) return false
   if (told.size >= MAX_TOLD) told.clear()
   told.add(key)
   try {
@@ -79,13 +83,14 @@ function tellOnce(logger: ProviderLogger | undefined, key: string, format: strin
   } catch {
     // Logging is not worth a failed catalog.
   }
+  return true
 }
 
-/** Forget what was told of `prefix`, so that the next trouble of that kind is told again: it is over. */
-function forgetTold(logger: ProviderLogger | undefined, prefix: string): void {
+/** Forget that `keys` were told, so that the next trouble of the same words is told again: this one is over. */
+function forgetTold(logger: ProviderLogger | undefined, keys: Iterable<string>): void {
   const told = logger === undefined ? undefined : toldBy.get(logger)
   if (told === undefined) return
-  for (const key of told) if (key.startsWith(prefix)) told.delete(key)
+  for (const key of keys) told.delete(key)
 }
 
 function isMapping(value: unknown): value is Readonly<Record<string, unknown>> {
@@ -139,6 +144,30 @@ function provider(service: DishSkills, control: SkillProviderControl, spec: Prov
   if (control.signal.aborted) stop()
   else control.signal.addEventListener('abort', () => { stop() }, { once: true })
 
+  /**
+   * The failures this provider told, which it forgets once it answers again. Only its own: another provider that
+   * answers (another agent's) says nothing of this one, which may still be failing.
+   */
+  const told = new Set<string>()
+  const failed = (error: unknown): void => {
+    const key = `offer:${spec.name}:${describe(error)}`
+    if (tellOnce(logger, key, 'the %s skill provider offers nothing for now, and is asked again at the next step: %s', spec.name, describe(error))) told.add(key)
+  }
+  /** What `spec.offer()` gives, or `undefined` (told) if it failed. */
+  const offered = async (): Promise<Offer | undefined> => {
+    try {
+      const offer = await spec.offer()
+      if (told.size > 0) {
+        forgetTold(logger, told)
+        told.clear()
+      }
+      return offer
+    } catch (error) {
+      failed(error)
+      return undefined
+    }
+  }
+
   /** The fit documents of `offer`, each unfit one left out and told once. */
   const fit = (offer: Offer): SkillDoc[] => offer.docs.filter((doc) => {
     const problem = unfit(doc)
@@ -151,14 +180,8 @@ function provider(service: DishSkills, control: SkillProviderControl, spec: Prov
   return {
     name: spec.name,
     async list(): Promise<SkillProviderObservation> {
-      let offer: Offer
-      try {
-        offer = await spec.offer()
-      } catch (error) {
-        tellOnce(logger, `list:${spec.name}:${describe(error)}`, 'the %s skill provider offers nothing for now, and is asked again at the next step: %s', spec.name, describe(error))
-        return { candidates: [], complete: false }
-      }
-      forgetTold(logger, `list:${spec.name}:`)
+      const offer = await offered()
+      if (offer === undefined) return { candidates: [], complete: false }
       const candidates: SkillCandidate[] = fit(offer).map(doc => ({
         ...summaryOf(spec, doc, offer.commit),
         rank: spec.rank,
@@ -167,11 +190,13 @@ function provider(service: DishSkills, control: SkillProviderControl, spec: Prov
       return { candidates, complete: true }
     },
     // Whatever the locator's commit, the document of that name now: the registry discards a definition whose name is
-    // not the candidate's, and a name that went has none.
+    // not the candidate's, and a name that went has none. A failure is no skill rather than a throw: dsh loads a skill
+    // the user invoked from `/` before the step, and a throw there would fail the step.
     async get(candidate): Promise<SkillDefinition | undefined> {
       const locator = candidate.locator as Partial<SkillLocator> | null | undefined
       const name = typeof locator?.name === 'string' ? locator.name : candidate.name
-      const offer = await spec.offer()
+      const offer = await offered()
+      if (offer === undefined) return undefined
       const doc = fit(offer).find(each => each.name === name)
       if (doc === undefined) return undefined
       return { ...summaryOf(spec, doc, offer.commit), content: doc.body }
@@ -203,40 +228,24 @@ export function globalProvider(service: DishSkills, logger?: ProviderLogger): (c
  * The provider of one agent's role: the catalog's skills that `role()` is offered, with each skill's own invocation
  * flags. Register it through the agent's own context, so that it is in that agent's layer alone.
  *
- * `role()` is asked at the first `list()` (or `get()`), and its answer is kept for the provider's life. A rejection
- * is not kept: that `list()` is incomplete (and told), so the registry asks again at the next step. `undefined`, or
- * anything that isn't a string with something in it, is no role, and the provider lists nothing.
+ * `role()` is asked at every `list()` and `get()`, because an agent's role can change under it (its preset can): it
+ * keeps what is worth keeping itself. A rejection makes that `list()` incomplete (and is told), so the registry asks
+ * again at the next step. `undefined`, or anything that isn't a string with something in it, is no role, and the
+ * provider lists nothing.
  * @param logger - where a role that couldn't be read, a document left out or a catalog that failed is told, once.
  */
 export function roleProvider(service: DishSkills, role: () => Promise<string | undefined>, logger?: ProviderLogger): (control: SkillProviderControl) => SkillProvider {
-  return (control) => {
-    let known: { role: string | undefined } | undefined
-    let asking: Promise<string | undefined> | undefined
-    const roleOnce = (): Promise<string | undefined> => {
-      if (known !== undefined) return Promise.resolve(known.role)
-      asking ??= Promise.resolve().then(role).then(
-        (answer: unknown) => {
-          known = { role: typeof answer === 'string' && answer !== '' ? answer : undefined }
-          return known.role
-        },
-        (error: unknown) => {
-          asking = undefined
-          throw new Error(`could not tell the agent's role (${describe(error)})`)
-        })
-      return asking
-    }
-    return provider(service, control, {
-      name: ROLE_PROVIDER,
-      rank: ROLE_RANK,
-      async offer() {
-        const name = await roleOnce()
-        if (name === undefined) return { commit: null, docs: [] }
-        const offer = await catalogOffer(service)
-        return { commit: offer.commit, docs: offer.docs.filter(doc => offeredTo(doc, name)) }
-      },
-      invocation: doc => ({ modelInvocable: doc.modelInvocable, userInvocable: doc.userInvocable }),
-    }, logger)
-  }
+  return control => provider(service, control, {
+    name: ROLE_PROVIDER,
+    rank: ROLE_RANK,
+    async offer() {
+      const answer: unknown = await role()
+      if (typeof answer !== 'string' || answer === '') return { commit: null, docs: [] }
+      const offer = await catalogOffer(service)
+      return { commit: offer.commit, docs: offer.docs.filter(doc => offeredTo(doc, answer)) }
+    },
+    invocation: doc => ({ modelInvocable: doc.modelInvocable, userInvocable: doc.userInvocable }),
+  }, logger)
 }
 
 /** What `watchAgents` reads of an agent. Everything is checked: the payload is dsh's, and the listener must not throw. */
@@ -262,48 +271,76 @@ export interface WatchOptions {
   logger: ProviderLogger
 }
 
+/** The registrations made into one registry, by the agent's context: one each. */
+type Registrations = Map<object, () => void>
+
 /**
- * Register a role provider on each new agent of a configured preset, in the agent's own layer. The registrations live
- * and die with each agent's ctx, and the ones still live go when `ctx` does (the plugin is unloaded), so an agent
- * never keeps the skills of a plugin that is gone.
+ * Register a role provider on every agent, in the agent's own layer: on each one announced (`agent/created`), and,
+ * whenever a registry comes (at once if it is there), on every agent that is live already. So the agents of a session
+ * that was running when this plugin (re)started, or when dsh's registry was reloaded, are offered their skills too.
  *
- * The agent's role:
+ * What a provider offers is decided at each of its `list()`s, from the agent's preset then (see `roleProvider`):
+ * - an agent whose preset isn't in `presets` (or that has none) is offered nothing of its own;
  * - a top-level agent (`isTopLevelAgent`) has the role `presets` gives its preset;
- * - a child has the role in crew's record of it (`dishCrew.records.lookup(agent.id)`), read at the provider's first
- *   `list()`: crew records a child before it starts it. A lookup that fails is retried at the next step;
- * - without crew, or for a child crew doesn't know, there is no role, and the agent's layer lists nothing.
+ * - a child has the role in crew's record of it (`dishCrew.records.lookup(agent.id)`): crew records a child before it
+ *   starts it. Crew's answer is kept for the agent's life; a lookup that fails is asked again at the next step;
+ * - without crew, or for a child crew doesn't know, there is no role.
  *
- * The listener never throws: dsh awaits it before the agent runs, and a throw would fail the agent's creation. Each
+ * The registrations live and die with each agent's ctx. Those still live go with the registry they were made in, and
+ * with `ctx` (the plugin is unloaded), so an agent never keeps the skills of a plugin that is gone.
+ *
+ * Nothing here throws: dsh awaits `agent/created` before the agent runs, and a throw would fail its creation. Each
  * kind of trouble is logged once.
  */
 export function watchAgents(ctx: Context, options: WatchOptions): void {
   const { service, presets, logger } = options
-  // Read by name on each use: `agentPresets` and `dishCrew` are siblings' services, and may come and go.
+  // Read by name on each use: `agentPresets`, `agents` and `dishCrew` are siblings' services, and may come and go.
   const lookup = ctx as unknown as { get(name: string): unknown }
-  /** The registrations this made that are still live, by the agent's context: one each, and undone when the plugin goes. */
-  const live = new Map<object, () => void>()
+  /**
+   * The registrations made into the registry that is there now, or `undefined` while there is none. A new registry
+   * has none of the old one's layers, so each gets a map of its own, and every agent is registered with it afresh.
+   */
+  let live: Registrations | undefined
 
-  const crewRole = async (id: unknown): Promise<string | undefined> => {
-    const crew = lookup.get('dishCrew') as CrewRecords | undefined
-    if (crew === undefined || (typeof id !== 'string' && typeof id !== 'number') || id === '') return undefined
-    const found = await crew.records.lookup(String(id))
-    const role = found?.record?.role
-    return typeof role === 'string' ? role : undefined
+  /** The role of `agent` now: see the header. */
+  function roleOf(agent: AgentShape, agentCtx: Context): () => Promise<string | undefined> {
+    let crewAnswer: { role: string | undefined } | undefined
+    let asking: Promise<string | undefined> | undefined
+    const crewRole = (): Promise<string | undefined> => {
+      if (crewAnswer !== undefined) return Promise.resolve(crewAnswer.role)
+      const crew = lookup.get('dishCrew') as CrewRecords | undefined
+      const id = agent.id
+      // No crew yet is not an answer: crew may come.
+      if (crew === undefined || (typeof id !== 'string' && typeof id !== 'number') || id === '') return Promise.resolve(undefined)
+      asking ??= Promise.resolve().then(() => crew.records.lookup(String(id))).then(
+        (found) => {
+          const role = found?.record?.role
+          crewAnswer = { role: typeof role === 'string' ? role : undefined }
+          asking = undefined
+          return crewAnswer.role
+        },
+        (error: unknown) => {
+          asking = undefined
+          throw new Error(`could not read the crew's record of a child agent (${describe(error)})`)
+        })
+      return asking
+    }
+    return async () => {
+      let preset: unknown
+      try {
+        preset = ctx.get('agentPresets')?.composedPreset(agentCtx)
+      } catch (error) {
+        throw new Error(`could not tell an agent's preset (${describe(error)})`)
+      }
+      if (typeof preset !== 'string' || !Object.hasOwn(presets, preset)) return undefined
+      return isTopLevelAgent(agent) ? presets[preset] : crewRole()
+    }
   }
 
-  function offer(agent: AgentShape): void {
+  /** Register a role provider on `agent` with the registry `into` is for, unless it has one there. */
+  function offer(agent: AgentShape, into: Registrations): void {
     const agentCtx = agent.ctx as Context | undefined
-    if (typeof agentCtx !== 'object' || agentCtx === null || live.has(agentCtx)) return
-
-    let preset: string | undefined
-    try {
-      preset = ctx.get('agentPresets')?.composedPreset(agentCtx)
-    } catch (error) {
-      tellOnce(logger, `preset:${describe(error)}`, 'could not tell the preset of a new agent, so it is offered no skills of its own: %s', describe(error))
-      return
-    }
-    if (typeof preset !== 'string' || !Object.hasOwn(presets, preset)) return
-
+    if (typeof agentCtx !== 'object' || agentCtx === null || into.has(agentCtx)) return
     // By `get`, not as a property: dsh's agent loop doesn't inject `skills`, so the property read throws. `get` gives
     // the registry bound to the agent's context, which is what files the provider into the agent's own layer.
     const registry = (agentCtx as unknown as { get(name: string): unknown }).get('skills') as Registry | undefined
@@ -311,14 +348,12 @@ export function watchAgents(ctx: Context, options: WatchOptions): void {
       tellOnce(logger, 'registry', 'the skill registry is not available to agents, so none is offered its role\'s skills')
       return
     }
-    const topRole = presets[preset]
-    const role = isTopLevelAgent(agent) ? async () => topRole : () => crewRole(agent.id)
-    const create = roleProvider(service, role, logger)
+    const create = roleProvider(service, roleOf(agent, agentCtx), logger)
     let dispose: (() => void) | undefined
     try {
       dispose = registry.registerProvider((control) => {
         control.signal.addEventListener('abort', () => {
-          if (live.get(agentCtx) === dispose) live.delete(agentCtx)
+          if (into.get(agentCtx) === dispose) into.delete(agentCtx)
         }, { once: true })
         return create(control)
       })
@@ -326,27 +361,47 @@ export function watchAgents(ctx: Context, options: WatchOptions): void {
       tellOnce(logger, `register:${describe(error)}`, 'could not offer an agent its role\'s skills: %s', describe(error))
       return
     }
-    live.set(agentCtx, dispose)
+    into.set(agentCtx, dispose)
+  }
+
+  /** `offer`, for whatever dsh says is an agent. Never throws. */
+  function offerSafely(agent: unknown, into: Registrations): void {
+    try {
+      if (typeof agent === 'object' && agent !== null) offer(agent as AgentShape, into)
+    } catch (error) {
+      tellOnce(logger, `offer:${describe(error)}`, 'could not offer an agent its role\'s skills: %s', describe(error))
+    }
   }
 
   ctx.on('agent/created', (payload) => {
-    try {
-      const agent: unknown = (payload as { agent?: unknown } | undefined)?.agent
-      if (typeof agent === 'object' && agent !== null) offer(agent as AgentShape)
-    } catch (error) {
-      tellOnce(logger, `created:${describe(error)}`, 'could not offer an agent its role\'s skills: %s', describe(error))
+    const agent: unknown = (payload as { agent?: unknown } | undefined)?.agent
+    if (live !== undefined) offerSafely(agent, live)
+    else if (typeof agent === 'object' && agent !== null) {
+      tellOnce(logger, 'registry', 'the skill registry is not available to agents, so none is offered its role\'s skills')
     }
     return undefined
   })
 
-  ctx.effect(() => () => {
-    for (const dispose of [...live.values()]) {
-      try {
-        dispose()
-      } catch {
-        // The agent is going too.
+  ctx.inject(['skills'], (inner) => {
+    const mine: Registrations = new Map()
+    live = mine
+    inner.effect(() => () => {
+      if (live === mine) live = undefined
+      for (const dispose of [...mine.values()]) {
+        try {
+          dispose()
+        } catch {
+          // The agent is going too.
+        }
       }
+      mine.clear()
+    })
+    let agents: readonly unknown[] = []
+    try {
+      agents = ctx.get('agents')?.list() ?? []
+    } catch (error) {
+      tellOnce(logger, `agents:${describe(error)}`, 'could not list the live agents, so those already running are offered no skills of their own: %s', describe(error))
     }
-    live.clear()
+    for (const agent of agents) offerSafely(agent, mine)
   })
 }

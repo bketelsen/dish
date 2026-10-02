@@ -2,17 +2,19 @@
  * The providers, against dsh's real skill registry (`@deepseek-ai/dsh-skill`) and real scopes (`@deepseek-ai/dsh-scope`).
  *
  * The registry is mounted as a plugin on a root `Context`, as dsh mounts it. Scopes are minted with `createScope`: a
- * fake preset's, and under it an agent's whose key is the agent object, as dsh's agent loop does. What an agent is
- * offered is read with `skills.snapshot({ scope })` and `skills.get(name, { scope })`, and `isModelInvocable` says what
- * the `skill` tool would let the model load. `agentPresets` and `dishCrew` are stubs provided by sibling plugins.
+ * fake preset's, and an agent's whose key is the agent object, as dsh's agent loop does, bound under the preset's key
+ * with `bindScopeParent`, as the preset registry binds it (and rebinds it, when a blank agent's preset is switched).
+ * What an agent is offered is read with `skills.snapshot({ scope })` and `skills.get(name, { scope })`, and
+ * `isModelInvocable` says what the `skill` tool would let the model load. `agentPresets`, `agents` and `dishCrew` are
+ * stubs provided by sibling plugins; the `agentPresets` stub names an agent's preset as dsh's does, by its scope parent.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import SkillRegistry, { isModelInvocable } from '@deepseek-ai/dsh-skill'
 import type { SkillCandidate, SkillProvider, SkillProviderControl, SkillSummary } from '@deepseek-ai/dsh-skill'
-import { createScope, scopeOf } from '@deepseek-ai/dsh-scope'
-import type { Scope } from '@deepseek-ai/dsh-scope'
+import { bindScopeParent, createScope, scopeOf, scopeParentOf } from '@deepseek-ai/dsh-scope'
+import type { Scope, ScopeParentBinding } from '@deepseek-ai/dsh-scope'
 import { DEFAULTS } from '../src/defaults.ts'
 import {
   DEFAULT_SOURCE, GLOBAL_PROVIDER, GLOBAL_RANK, ROLE_PROVIDER, ROLE_RANK, STORE_SOURCE, globalProvider, roleProvider, watchAgents,
@@ -43,21 +45,23 @@ interface FakeAgent {
   ctx: Context
 }
 
-/** What a test needs of an agent: the agent, its scope (to dispose) and the preset key it is under. */
+/** What a test needs of an agent: the agent, its scope (to dispose) and its binding to its preset (to switch it). */
 interface Minted {
   agent: FakeAgent
   scope: Scope
+  binding: ScopeParentBinding | undefined
 }
 
 /**
- * Mint a fake agent under `presetKey`'s scope: its scope key is the agent object, as dsh's agent loop makes it
- * (`createScope(loopCtx, this)`), with the preset's key as its parent, as the preset registry binds it.
+ * Mint a fake agent: its scope key is the agent object, as dsh's agent loop makes it (`createScope(loopCtx, this)`),
+ * bound under `presetKey` (when there is one) as the preset registry's `join` binds it.
  */
-function mintAgent(root: Context, presetKey: object, id: string, child = false): Minted {
+function mintAgent(root: Context, presetKey: object | undefined, id: string, child = false): Minted {
   const agent = { id, session: { header: child ? { delegationDepth: 1, origin: 'subagent' } : {} }, options: {} } as FakeAgent
-  const scope = createScope(root, agent, { parent: presetKey })
+  const binding = presetKey === undefined ? undefined : bindScopeParent(agent, presetKey)
+  const scope = createScope(root, agent)
   agent.ctx = scope.ctx
-  return { agent, scope }
+  return { agent, scope, binding }
 }
 
 /** A preset's scope key, with its scope minted as the preset registry mints one. */
@@ -67,12 +71,26 @@ function mintPreset(root: Context): object {
   return key
 }
 
-/** A stub `agentPresets` that names the preset of each agent ctx it was told about. */
-function presetsStub(): { composedPreset(ctx: Context): string | undefined, bind(agent: FakeAgent, preset: string): void } {
-  const bound = new WeakMap<object, string>()
+interface PresetsStub {
+  /** As dsh's `agentPresets.composedPreset`: the preset whose key the agent's scope is bound under. */
+  composedPreset(ctx: Context): string | undefined
+  /** Mint the scope of a preset called `id`, and return its key. */
+  preset(root: Context, id: string): object
+}
+
+function presetsStub(): PresetsStub {
+  const names = new WeakMap<object, string>()
   return {
-    composedPreset: ctx => bound.get(scopeOf(ctx) as object),
-    bind: (agent, preset) => { bound.set(agent, preset) },
+    composedPreset(ctx) {
+      const key = scopeOf(ctx)
+      const parent = key === undefined ? undefined : scopeParentOf(key)
+      return parent === undefined ? undefined : names.get(parent)
+    },
+    preset(root, id) {
+      const key = mintPreset(root)
+      names.set(key, id)
+      return key
+    },
   }
 }
 
@@ -309,9 +327,12 @@ test('the global provider comes with the registry and goes with it, whichever st
 interface Agents {
   root: Context
   skills: SkillRegistry
-  presets: ReturnType<typeof presetsStub>
+  presets: PresetsStub
   crew: CrewStub
-  presetKey: object
+  /** The dish preset's key. */
+  dish: object
+  /** What the `agents` stub lists as live. */
+  live: FakeAgent[]
   logs: string[]
 }
 
@@ -321,16 +342,17 @@ async function agents(options: { crew?: boolean, config?: Parameters<typeof moun
   const logs = watchLogs(root)
   const presets = presetsStub()
   const crew = crewStub()
+  const live: FakeAgent[] = []
   await provideStub(root, 'agentPresets', presets)
+  await provideStub(root, 'agents', { list: () => [...live] })
   if (options.crew !== false) await provideStub(root, 'dishCrew', crew)
   await mountSkills(root, options.config)
-  return { root, skills: registryOf(root), presets, crew, presetKey: mintPreset(root), logs }
+  return { root, skills: registryOf(root), presets, crew, dish: presets.preset(root, 'dish'), live, logs }
 }
 
 test('a main agent on the dish preset: main\'s skills are offered to the model, the rest stay menu-only, and get returns the body', async () => {
-  const { root, skills, presets, presetKey, logs } = await agents()
-  const { agent } = mintAgent(root, presetKey, 'main-1')
-  presets.bind(agent, 'dish')
+  const { root, skills, dish, logs } = await agents()
+  const { agent } = mintAgent(root, dish, 'main-1')
   await announce(root, agent)
 
   const snapshot = await skills.snapshot({ scope: agent })
@@ -358,10 +380,9 @@ test('a main agent on the dish preset: main\'s skills are offered to the model, 
   assert.deepEqual(logs, [])
 })
 
-test('a coder child gets its role from the crew\'s record', async () => {
-  const { root, skills, presets, crew, presetKey } = await agents()
-  const { agent } = mintAgent(root, presetKey, 'child-1', true)
-  presets.bind(agent, 'dish')
+test('a coder child gets its role from the crew\'s record, which is read once', async () => {
+  const { root, skills, crew, dish } = await agents()
+  const { agent } = mintAgent(root, dish, 'child-1', true)
   crew.roles.set('child-1', 'coder')
   await announce(root, agent)
 
@@ -371,16 +392,15 @@ test('a coder child gets its role from the crew\'s record', async () => {
   assert.ok(modelNames(snapshot.skills).includes('test-driven-development'))
   assert.ok(!modelNames(snapshot.skills).includes('brainstorming'))
   assert.deepEqual(crew.calls, ['child-1'])
-  // The role is read once: a fresh catalog doesn't ask again.
+  // A fresh catalog doesn't ask the crew again.
   ;(root.get('dishSkills') as DishSkills).changed()
-  await skills.snapshot({ scope: agent })
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: agent })).skills), shippedFor('coder'))
   assert.deepEqual(crew.calls, ['child-1'])
 })
 
 test('a crew lookup that fails is incomplete, and complete once it recovers', async () => {
-  const { root, skills, presets, crew, presetKey, logs } = await agents()
-  const { agent } = mintAgent(root, presetKey, 'child-2', true)
-  presets.bind(agent, 'dish')
+  const { root, skills, crew, dish, logs } = await agents()
+  const { agent } = mintAgent(root, dish, 'child-2', true)
   crew.roles.set('child-2', 'reviewer')
   crew.failing = true
   await announce(root, agent)
@@ -397,11 +417,35 @@ test('a crew lookup that fails is incomplete, and complete once it recovers', as
   assert.equal(logs.filter(line => line.includes('the record is locked')).length, 1, logs.join('\n'))
 })
 
+test('a child that keeps failing is told once, however many other agents answer in between', async () => {
+  const { root, skills, crew, dish, logs } = await agents()
+  const failing = mintAgent(root, dish, 'child-3', true).agent
+  const fine = mintAgent(root, dish, 'main-3').agent
+  crew.failing = true
+  await announce(root, failing)
+  await announce(root, fine)
+  const told = (): number => logs.filter(line => line.includes('the record is locked')).length
+
+  for (let step = 0; step < 3; step++) {
+    assert.equal((await skills.snapshot({ scope: failing })).complete, false)
+    assert.equal((await skills.snapshot({ scope: fine })).complete, true)
+    ;(root.get('dishSkills') as DishSkills).changed()
+  }
+  assert.equal(told(), 1, logs.join('\n'))
+  // Once it answers, the trouble is over: the next one is told again.
+  crew.failing = false
+  assert.equal((await skills.snapshot({ scope: failing })).complete, true)
+  const again = mintAgent(root, dish, 'child-4', true).agent
+  crew.failing = true
+  await announce(root, again)
+  assert.equal((await skills.snapshot({ scope: again })).complete, false)
+  assert.equal(told(), 2, logs.join('\n'))
+})
+
 test('a child the crew doesn\'t know, or a child with no crew loaded, is offered nothing of its own', async () => {
   for (const withCrew of [true, false]) {
-    const { root, skills, presets, presetKey, logs } = await agents({ crew: withCrew })
-    const { agent } = mintAgent(root, presetKey, 'stranger', true)
-    presets.bind(agent, 'dish')
+    const { root, skills, dish, logs } = await agents({ crew: withCrew })
+    const { agent } = mintAgent(root, dish, 'stranger', true)
     await announce(root, agent)
     const snapshot = await skills.snapshot({ scope: agent })
     assert.equal(snapshot.complete, true)
@@ -411,30 +455,83 @@ test('a child the crew doesn\'t know, or a child with no crew loaded, is offered
 })
 
 test('an agent on another preset, or on none, gets nothing in its own layer', async () => {
-  const { root, skills, presets, presetKey } = await agents()
-  const other = mintAgent(root, presetKey, 'other-1')
-  presets.bind(other.agent, 'other')
-  const none = mintAgent(root, presetKey, 'none-1')
-  const inherited = mintAgent(root, presetKey, 'constructor')
-  presets.bind(inherited.agent, 'constructor')
+  const { root, skills, presets } = await agents()
+  const other = mintAgent(root, presets.preset(root, 'other'), 'other-1')
+  const none = mintAgent(root, undefined, 'none-1')
+  const inherited = mintAgent(root, presets.preset(root, 'constructor'), 'constructor')
   for (const { agent } of [other, none, inherited]) {
     await announce(root, agent)
     const snapshot = await skills.snapshot({ scope: agent })
+    assert.equal(snapshot.complete, true, agent.id)
     assert.deepEqual(modelNames(snapshot.skills), [], agent.id)
     assert.ok(snapshot.skills.every(skill => skill.provider === GLOBAL_PROVIDER), agent.id)
   }
 })
 
 test('the presets setting picks the preset and the role of its top-level agents', async () => {
-  const { root, skills, presets, presetKey } = await agents({ config: { presets: { work: 'coder' } } })
-  const worker = mintAgent(root, presetKey, 'w1')
-  presets.bind(worker.agent, 'work')
-  const dish = mintAgent(root, presetKey, 'd1')
-  presets.bind(dish.agent, 'dish')
+  const { root, skills, presets, dish } = await agents({ config: { presets: { work: 'coder' } } })
+  const worker = mintAgent(root, presets.preset(root, 'work'), 'w1')
+  const onDish = mintAgent(root, dish, 'd1')
   await announce(root, worker.agent)
-  await announce(root, dish.agent)
+  await announce(root, onDish.agent)
   assert.deepEqual(modelNames((await skills.snapshot({ scope: worker.agent })).skills), shippedFor('coder'))
-  assert.deepEqual(modelNames((await skills.snapshot({ scope: dish.agent })).skills), [])
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: onDish.agent })).skills), [])
+})
+
+test('an agent moved to another preset, with no new announcement, is offered what its new preset gives, both ways', async () => {
+  const { root, skills, presets, crew, dish } = await agents()
+  const standard = presets.preset(root, 'standard')
+
+  // dish → standard: main's skills go.
+  const top = mintAgent(root, dish, 'main-switch')
+  await announce(root, top.agent)
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: top.agent })).skills), shippedFor('main'))
+  top.binding!.rebind(standard)
+  assert.equal(presets.composedPreset(top.agent.ctx), 'standard')
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: top.agent })).skills), [])
+  // standard → dish: they come.
+  const back = mintAgent(root, standard, 'standard-switch')
+  await announce(root, back.agent)
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: back.agent })).skills), [])
+  back.binding!.rebind(dish)
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: back.agent })).skills), shippedFor('main'))
+  // A child's role is crew's, and only while its preset is a configured one.
+  crew.roles.set('child-switch', 'coder')
+  const child = mintAgent(root, dish, 'child-switch', true)
+  await announce(root, child.agent)
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: child.agent })).skills), shippedFor('coder'))
+  child.binding!.rebind(standard)
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: child.agent })).skills), [])
+  child.binding!.rebind(dish)
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: child.agent })).skills), shippedFor('coder'))
+  assert.deepEqual(crew.calls, ['child-switch'])
+})
+
+test('a preset that can\'t be read is incomplete and told once, and complete once it can be', async () => {
+  const root = await registryRoot()
+  const skills = registryOf(root)
+  const logs: string[] = []
+  const logger = { warn: (format: string, ...args: unknown[]) => { logs.push([format, ...args].join(' ')) } }
+  const presets = presetsStub()
+  let presetError: Error | undefined
+  await provideStub(root, 'agentPresets', {
+    composedPreset: (ctx: Context) => {
+      if (presetError !== undefined) throw presetError
+      return presets.composedPreset(ctx)
+    },
+  })
+  await mountWatcher(root, { service: defaultsService(), presets: { dish: 'main' }, logger })
+  const { agent } = mintAgent(root, presets.preset(root, 'dish'), 'main-p')
+  await announce(root, agent)
+
+  presetError = new Error('presets are reloading')
+  for (let step = 0; step < 2; step++) assert.equal((await skills.snapshot({ scope: agent })).complete, false)
+  assert.equal(logs.length, 1, logs.join('\n'))
+  assert.match(logs[0]!, /presets are reloading/)
+  presetError = undefined
+  const snapshot = await skills.snapshot({ scope: agent })
+  assert.equal(snapshot.complete, true)
+  assert.deepEqual(modelNames(snapshot.skills), shippedFor('main'))
 })
 
 test('the registrations go when the agent\'s scope is disposed, and so do their change listeners', async () => {
@@ -444,9 +541,7 @@ test('the registrations go when the agent\'s scope is disposed, and so do their 
   await provideStub(root, 'agentPresets', presets)
   const service = fakeService({ commit: COMMIT_A, skills: [doc('alpha', ['main']), doc('beta', ['coder'])], problems: [] })
   await mountWatcher(root, { service, presets: { dish: 'main' }, logger: silent })
-  const presetKey = mintPreset(root)
-  const { agent, scope } = mintAgent(root, presetKey, 'main-2')
-  presets.bind(agent, 'dish')
+  const { agent, scope } = mintAgent(root, presets.preset(root, 'dish'), 'main-2')
   await announce(root, agent)
   assert.deepEqual(modelNames((await skills.snapshot({ scope: agent })).skills), ['alpha'])
   assert.equal(service.listeners(), 1)
@@ -457,83 +552,101 @@ test('the registrations go when the agent\'s scope is disposed, and so do their 
   assert.equal(service.listeners(), 0)
 })
 
-test('the registrations go with the plugin, and the agent keeps nothing of a plugin that is gone', async () => {
+test('the registrations go with the plugin, and a new start offers the live agents their skills again', async () => {
   const root = await registryRoot()
   const skills = registryOf(root)
   const presets = presetsStub()
+  const live: FakeAgent[] = []
   await provideStub(root, 'agentPresets', presets)
+  await provideStub(root, 'agents', { list: () => [...live] })
   const handle = mountSkills(root)
   await handle
-  const presetKey = mintPreset(root)
-  const { agent } = mintAgent(root, presetKey, 'main-3')
-  presets.bind(agent, 'dish')
+  const dish = presets.preset(root, 'dish')
+  const { agent } = mintAgent(root, dish, 'main-3')
+  live.push(agent)
   await announce(root, agent)
   assert.deepEqual(modelNames((await skills.snapshot({ scope: agent })).skills), shippedFor('main'))
 
   await handle.dispose()
   assert.deepEqual((await skills.snapshot({ scope: agent })).skills, [])
-  // A new start offers new agents their skills again; the old agent was announced before it and is left as it is.
+  // A new start (a config edit restarts the plugin) finds the agent live, and offers it its skills without an announcement.
   await mountSkills(root)
-  const { agent: next } = mintAgent(root, presetKey, 'main-4')
-  presets.bind(next, 'dish')
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: agent })).skills), shippedFor('main'))
+  // And a new agent as before.
+  const { agent: next } = mintAgent(root, dish, 'main-4')
   await announce(root, next)
   assert.deepEqual(modelNames((await skills.snapshot({ scope: next })).skills), shippedFor('main'))
-  assert.deepEqual(modelNames((await skills.snapshot({ scope: agent })).skills), [])
+})
+
+test('a registry that is reloaded gets every live agent\'s provider again', async () => {
+  const root = new Context()
+  const logs = watchLogs(root)
+  const registry = root.plugin(SkillRegistry)
+  await registry
+  const presets = presetsStub()
+  const live: FakeAgent[] = []
+  await provideStub(root, 'agentPresets', presets)
+  await provideStub(root, 'agents', { list: () => [...live] })
+  await mountSkills(root)
+  const { agent } = mintAgent(root, presets.preset(root, 'dish'), 'main-r')
+  live.push(agent)
+  await announce(root, agent)
+  assert.deepEqual(modelNames((await registryOf(root).snapshot({ scope: agent })).skills), shippedFor('main'))
+
+  // The new registry has none of the old one's layers: the agent's provider is registered with it afresh.
+  await registry.dispose()
+  await root.plugin(SkillRegistry)
+  const snapshot = await registryOf(root).snapshot({ scope: agent })
+  assert.equal(snapshot.complete, true)
+  assert.deepEqual(modelNames(snapshot.skills), shippedFor('main'))
+  assert.equal(snapshot.skills.length, SHIPPED.length)
+  assert.deepEqual(logs, [])
 })
 
 test('an agent announced twice is registered once', async () => {
-  const { root, skills, presets, presetKey, logs } = await agents()
-  const { agent } = mintAgent(root, presetKey, 'main-5')
-  presets.bind(agent, 'dish')
+  const { root, skills, dish, logs } = await agents()
+  const { agent } = mintAgent(root, dish, 'main-5')
   await announce(root, agent, 'startup')
   await announce(root, agent, 'clear')
   assert.deepEqual(modelNames((await skills.snapshot({ scope: agent })).skills), shippedFor('main'))
   assert.deepEqual(logs, [])
 })
 
-test('watchAgents never throws into dsh: no registry on the agent, a failing preset lookup, an agent that is gone, nonsense', async () => {
+test('watchAgents never throws into dsh: no registry, an agent that is gone, nonsense; agents live when the registry comes are offered theirs', async () => {
   const root = new Context()
   const logs: string[] = []
   const logger = { warn: (format: string, ...args: unknown[]) => { logs.push([format, ...args].join(' ')) } }
-  let presetError: Error | undefined
   const presets = presetsStub()
-  await provideStub(root, 'agentPresets', {
-    composedPreset: (ctx: Context) => {
-      if (presetError !== undefined) throw presetError
-      return presets.composedPreset(ctx)
-    },
-  })
+  const live: FakeAgent[] = []
+  await provideStub(root, 'agentPresets', presets)
+  await provideStub(root, 'agents', { list: () => [...live] })
   await mountWatcher(root, { service: defaultsService(), presets: { dish: 'main' }, logger })
-  const presetKey = mintPreset(root)
+  const dish = presets.preset(root, 'dish')
 
-  // No skills registry at all.
+  // No skills registry at all: told once.
   for (const id of ['n1', 'n2']) {
-    const { agent } = mintAgent(root, presetKey, id)
-    presets.bind(agent, 'dish')
+    const { agent } = mintAgent(root, dish, id)
+    live.push(agent)
     await announce(root, agent)
   }
   assert.equal(logs.length, 1, logs.join('\n'))
   assert.match(logs[0]!, /skill registry/)
 
-  // The preset lookup throws.
-  presetError = new Error('presets are reloading')
-  for (const id of ['p1', 'p2']) await announce(root, mintAgent(root, presetKey, id).agent)
-  presetError = undefined
-  assert.equal(logs.length, 2, logs.join('\n'))
-  assert.match(logs[1]!, /presets are reloading/)
+  // The registry comes: the agents that are live get their providers.
+  await root.plugin(SkillRegistry)
+  for (const agent of live) assert.deepEqual(modelNames((await registryOf(root).snapshot({ scope: agent })).skills), shippedFor('main'), agent.id)
 
   // An agent whose scope is gone: the registry refuses the registration.
-  await root.plugin(SkillRegistry)
-  const gone = mintAgent(root, presetKey, 'g1')
-  presets.bind(gone.agent, 'dish')
+  const gone = mintAgent(root, dish, 'g1')
   await gone.scope.dispose()
   await announce(root, gone.agent)
-  assert.equal(logs.length, 3, logs.join('\n'))
+  assert.equal(logs.length, 2, logs.join('\n'))
 
   // Payloads that aren't agents.
-  for (const agent of [undefined, null, 3, {}, { ctx: null }]) await root.serial('agent/created', { agent, source: 'startup' } as never)
+  for (const agent of [undefined, null, 3, {}, { ctx: null }, { ctx: {} }]) await root.serial('agent/created', { agent, source: 'startup' } as never)
   await root.serial('agent/created', undefined as never)
   assert.equal(logs.length, 3, logs.join('\n'))
+  assert.match(logs[2]!, /could not offer/)
 })
 
 // --- refresh ----------------------------------------------------------------------------------------------
@@ -569,9 +682,7 @@ test('an edit in the store reaches every agent\'s catalog, and the source says t
   try {
     await seeded(root.dishConfig)
     const skills = registryOf(root)
-    const presetKey = mintPreset(root)
-    const { agent } = mintAgent(root, presetKey, 'main-7')
-    presets.bind(agent, 'dish')
+    const { agent } = mintAgent(root, presets.preset(root, 'dish'), 'main-7')
     await announce(root, agent)
 
     const before = await waitFor('the store\'s catalog', async () => {
@@ -665,7 +776,26 @@ test('a catalog that rejects makes the provider\'s list incomplete, never a thro
   assert.deepEqual(modelNames(recovered.skills), ['alpha', 'bystander-skill'])
 })
 
-test('the role provider: the role is asked once, a rejection is not kept, no role lists nothing, and a strange role is no role', async () => {
+test('get never throws: a catalog that fails while a skill loads is no skill, told once', async () => {
+  const root = await registryRoot()
+  const skills = registryOf(root)
+  const logs: string[] = []
+  const logger = { warn: (format: string, ...args: unknown[]) => { logs.push([format, ...args].join(' ')) } }
+  const service = fakeService({ commit: COMMIT_A, skills: [doc('alpha', ['main'])], problems: [] })
+  const presetKey = mintPreset(root)
+  const { agent } = mintAgent(root, presetKey, 'main-g')
+  skills.registerProvider(globalProvider(service, logger))
+  agent.ctx.get('skills')!.registerProvider(roleProvider(service, async () => 'main', logger))
+  // The catalog is cached, complete; then the service fails under it, as a `/` invocation loads the skill before a step.
+  assert.deepEqual(modelNames((await skills.snapshot({ scope: agent })).skills), ['alpha'])
+  service.serve(new Error('the store fell over'))
+  for (const scope of [agent, undefined]) assert.equal(await skills.get('alpha', { scope }), undefined)
+  assert.equal(await skills.get('alpha', { scope: agent }), undefined)
+  assert.equal(logs.length, 2, logs.join('\n'))
+  assert.ok(logs.every(line => line.includes('the store fell over')), logs.join('\n'))
+})
+
+test('the role provider: the role is asked at every list and get, a rejection is incomplete, and no role or a strange one lists nothing', async () => {
   const root = await registryRoot()
   const service = fakeService({ commit: COMMIT_A, skills: [doc('alpha', ['main']), doc('beta', null), doc('gamma', ['coder'])], problems: [] })
   const asked: string[] = []
@@ -680,15 +810,19 @@ test('the role provider: the role is asked once, a rejection is not kept, no rol
 
   assert.deepEqual(await provider!.list({}), { candidates: [], complete: false })
   answer = async () => 'coder'
-  const [first, second] = await Promise.all([provider!.list({}), provider!.list({})])
-  assert.deepEqual(first, second)
-  const { candidates } = first as { candidates: readonly SkillCandidate[] }
+  const listed = await provider!.list({})
+  const { candidates } = listed as { candidates: readonly SkillCandidate[] }
   assert.deepEqual(candidates.map(candidate => [candidate.name, candidate.provider, candidate.rank, candidate.invocation.modelInvocable]), [
     ['beta', ROLE_PROVIDER, ROLE_RANK, true],
     ['gamma', ROLE_PROVIDER, ROLE_RANK, true],
   ])
-  await provider!.list({})
-  assert.deepEqual(asked, ['role', 'role'])
+  assert.equal((await provider!.get(candidates[1]!, {}))?.name, 'gamma')
+  assert.deepEqual(asked, ['role', 'role', 'role'])
+  // The role changed: what the provider offers and loads follows at once.
+  answer = async () => 'main'
+  const { candidates: now } = await provider!.list({}) as { candidates: readonly SkillCandidate[] }
+  assert.deepEqual(now.map(candidate => candidate.name), ['alpha', 'beta'])
+  assert.equal(await provider!.get(candidates[1]!, {}), undefined)
 
   for (const strange of [undefined, '', 3, null]) {
     let strangeProvider: SkillProvider | undefined

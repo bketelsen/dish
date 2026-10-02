@@ -10,7 +10,7 @@
  *   While the store isn't there, or has no skill documents yet, every answer is the shipped defaults;
  * - a change under `skills/` in the store, and the store coming or going, is told to the service's listeners;
  * - the skills are offered to agents through dsh's skill registry (see `providers.ts`): every skill in the `/` menu,
- *   and to each agent of a configured preset (`presets`), its role's skills for the model to load;
+ *   and to each agent on a configured preset (`presets`), its role's skills for the model to load;
  * - the Skills page's server half is the `dishSkillsRemote` Typert remote (see `remote.ts`), served by the
  *   gateway when there is one and idle otherwise.
  *
@@ -116,7 +116,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.plugin(SkillsRemote)
 
   // The skills for agents (see providers.ts): all of them in the / menu, from the global layer while dsh's registry is
-  // there, and to each agent of a configured preset its role's, from the agent's own layer.
+  // there, and to each agent on a configured preset its role's, from the agent's own layer.
   ctx.inject(['skills'], (inner) => { inner.skills.registerProvider(globalProvider(service, logger)) })
   watchAgents(ctx, { service, presets: config.presets, logger })
 
