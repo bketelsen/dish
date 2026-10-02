@@ -1,6 +1,6 @@
 # Spec: dish ops (prod and dev, updates)
 
-Status: draft 2026-10-02, for review. This is roadmap step 6a, the first part of step 6. It builds on the [deploy spec](deploy.md), whose rollout notes describe today's setup.
+Status: draft 2026-10-02, for review. Revised the same day by the plan's checks: what changed, and the evidence, is under [Checks](#checks-2026-10-02). This is roadmap step 6a, the first part of step 6. It builds on the [deploy spec](deploy.md), whose rollout notes describe today's setup. The plan is [docs/plans/2026-10-02-ops.md](../plans/2026-10-02-ops.md).
 
 ## Summary
 
@@ -16,11 +16,11 @@ dish runs like any web app: a **prod** configuration, which only the VM's servic
 |---|---|---|
 | 1 | Protecting dish from itself | No guards in dish. Separate prod and dev data, keep the live checkout out of every chat, and deploy only by hand. |
 | 2 | Who deploys | Only you, with `deploy/update.sh` through `incus exec`. Agents don't deploy dish. |
-| 3 | Prod and dev | `DISH_ENV` is `prod` or `dev`, and dev is the default. Only the service sets `prod`. |
-| 4 | Where dev data lives | `<checkout>/.dev/` (git-ignored) holds dev's dsh home, config, state, data, cache and pnpm store. A dev run is then sandbox-safe: an agent working in that checkout can run it, because everything it writes is inside the checkout. |
-| 5 | Fleet | Provisioning only: the VM, packages, Node and pnpm, the account, Tailscale and `tailscale serve`, the keys, the first clone, and `deploy.env`. Fleet stops updating the checkout, running the install, and installing or restarting the unit. dish owns its unit. |
+| 3 | Prod and dev | `DISH_ENV` is `prod` or `dev`, and dev is the default. Only the service is prod. It gets there by running dsh directly, with the account's defaults, and not by setting `DISH_ENV`: dsh passes its environment on to every agent shell, so a `DISH_ENV=prod` on the service would make every agent's `pnpm dsh` prod. |
+| 4 | Where dev data lives | `<checkout>/.dev/` (git-ignored) holds dev's dsh home and dish's config, state, data and cache. pnpm's store stays the account's, for prod and dev alike ([Checks](#checks-2026-10-02)). A dev run then writes only inside the checkout, apart from pnpm's shared store and caches. |
+| 5 | Fleet | Provisioning only: the VM, packages, Node and pnpm, the account, Tailscale and `tailscale serve`, the keys, the first clone, `deploy.env`, and the install inputs (`install.env`). Fleet stops updating the checkout, running the install, and installing or restarting the unit. dish owns its unit. |
 | 6 | Workspaces | dish never sets one up here. The service's working directory moves to `~/work`. You've removed the `/home/dish/dish` workspace record by hand. Step 6b's onboarding creates project workspaces. |
-| 7 | Installs with approval | `apt` through a narrow sudo rule (fleet). User-level tools through mise. Both are agent commands that write outside the workspace, so they go through dsh's escalation: the main agent asks you, and a child is refused unless the judge approves. |
+| 7 | Installs with approval | `apt` through a narrow sudo rule (fleet), which allows one root-owned wrapper and nothing else. User-level tools through mise. Both are agent commands that write outside the workspace, so they go through dsh's escalation: the main agent asks you, and a child is refused unless the judge approves. |
 | 8 | `update.sh` default | A dry run that shows what would change. `--apply` acts. A ref argument checks out that commit, as a rollback. |
 | 9 | Sign-in link | `deploy/url.sh` prints `https://<tailnet name>/?token=…` from the service's journal. |
 
@@ -29,6 +29,7 @@ dish runs like any web app: a **prod** configuration, which only the VM's servic
 - Guards that refuse agent commands against dish's own process or files.
 - Reaching dev on the VM from your browser. Use an SSH tunnel to `127.0.0.1:3090` for now. A second `tailscale serve` port can come later.
 - Projects, clones, worktrees and the GitHub App (step 6b), and gates (step 6c).
+- A per-checkout pnpm store. See [Checks](#checks-2026-10-02) for why, and step 6b for clones.
 
 ## Prod and dev
 
@@ -36,30 +37,41 @@ dish runs like any web app: a **prod** configuration, which only the VM's servic
 
 | | prod | dev (default) |
 |---|---|---|
-| Who | the `dish-web` service only (`Environment=DISH_ENV=prod` in the unit) | everything else: `pnpm dev`, `pnpm dsh …` and agents |
+| Who | the `dish-web` service only: it runs the checkout's dsh binary directly, never the launcher | everything else: `pnpm dev`, `pnpm dsh …` and agents |
 | dsh home | `~/.dsh` | `<checkout>/.dev/dsh` |
-| XDG config, state, data, cache | the account's defaults | `<checkout>/.dev/{config,state,data,cache}` |
-| pnpm store | the account's | inside `.dev/` |
+| dish's config, state, data, cache | the account's XDG directories (`~/.config/dish`, `~/.local/state/dish`, `~/.local/share/dish`, `~/.cache/dish`) | `<checkout>/.dev/{config,state,data,cache}/dish` |
+| pnpm store | the account's | the account's |
 | dsh profile | `web` | `web`, in dev's dsh home |
 | port | 3080, behind `tailscale serve` | 3090, loopback only |
 | config store remote | `bketelsen/dish-config` | none, ever |
 
-- **The launcher.** Root package scripts that run dsh go through a small launcher, `scripts/env.mjs`. It sets dev's variables unless `DISH_ENV=prod`. Any other value of `DISH_ENV` is refused with a message.
-- **Plugins.** They keep reading the standard variables (`xdgPaths`, `DSH_HOME`). They don't branch on `DISH_ENV`; the variables are the switch.
-- **pnpm outside the launcher.** An agent's own `pnpm install` in a checkout must also keep its store inside `.dev/`, for example through the repo's `.npmrc`. Otherwise it writes the account's store, which is outside the sandbox, and needs approval. The plan picks the mechanism and checks that prod's `install.sh` is unaffected.
-- **Tests.** They already use temp directories. Nothing changes.
+- **The launcher.** Root package scripts that run dsh go through a small launcher, `scripts/env.ts`, which Node runs with type stripping, as it runs `deploy/profile.ts`.
+  - Unless `DISH_ENV=prod`, it sets `DSH_HOME=<checkout>/.dev/dsh` and `DSH_DISH_HOME=<checkout>/.dev`, and `DISH_ENV=dev`. It replaces inherited values, because dsh gives every agent shell its own `DSH_HOME`.
+  - It sets no `XDG_*` variable and nothing of pnpm's.
+  - `DISH_ENV=prod` passes the environment through. Any other value of `DISH_ENV` is refused with a message.
+- **Why `DSH_DISH_HOME` and not `XDG_*`.** dsh hands its environment to every agent shell. It drops only `DSH_*` names and names that look like secrets.
+  - `XDG_*` set on dev's dsh would reach every command an agent runs under it. `gh` would lose its sign-in, git and mise their config, and pnpm would work out another store, then refuse to work in any existing checkout without a terminal.
+  - `DSH_DISH_HOME` starts with `DSH_`, so dsh drops it from agent shells. No `.env` file can set it either, since dsh takes `DSH_*` only from the launching environment.
+- **Plugins.** They keep calling `xdgPaths` from dish-kit. It honors `DSH_DISH_HOME` (as `<it>/{config,state,data,cache}/<app>`) before `XDG_*`. Plugins don't branch on `DISH_ENV`; the variables are the switch.
+- **pnpm.** Prod and dev use the account's store, so the store-pin contract is unchanged. An agent's own `pnpm install` that brings in new packages writes that store, outside the sandbox, and needs approval, as it does today. A per-checkout store is left for step 6b, with clones.
+- **Tests.** They already use temp directories. dsh drops `DSH_DISH_HOME` from agent shells, so a test an agent runs never sees dev's directories.
 
 ### `pnpm dev`
 
-1. Install the checkout's dependencies into dev's store. Build the client bundles.
-2. On the first run, create dev's profile and install dish into it. This is `install.sh` with `DISH_REMOTE=''`, run under the launcher's variables.
-3. Start `dsh web` on `127.0.0.1:3090` with the client bundles in watch mode. Print the sign-in link.
+1. Run `deploy/install.sh` under the launcher's variables, with `DISH_REMOTE=''` whatever the environment says, and the checkout's git identity.
+   - It is idempotent, so every run does it.
+   - It installs the dependencies (the account's store) and builds the client bundles.
+   - On the first run it creates dev's profile and installs dish into it. Later runs link any new bundle.
+2. Start `dsh web` on `127.0.0.1:3090` (`--port` changes it), from the checkout, with the client bundles in watch mode. Print the sign-in link.
+3. Refuse `DISH_ENV=prod`.
 
 Dev starts empty: no sessions, a fresh config store, and no Copilot sign-in. The first Copilot sign-in on a fresh profile is the backlog item "the sign-in card on a fresh install". 6a fixes it, because every new dev checkout would hit it otherwise.
+- **What exists today.** The card already appears in dsh's add-provider draft (Settings → Models → Add model provider → `github-copilot`), but nothing points there.
+- **The fix.** dish-copilot adds the same card to the Models page's footer while no `github-copilot` route exists. A successful sign-in adds the route, as now, and the footer card goes away.
 
 ### The desktop
 
-- The desktop switches from `pnpm web` to `pnpm dev`.
+- The desktop switches from `pnpm web` to `pnpm dev`. `pnpm web` goes away.
 - The old `~/.dsh/profiles/web` and `~/.config/dish` are no longer used by anything. Remove them by hand when you like.
 - The desktop has no prod.
 
@@ -68,12 +80,20 @@ Dev starts empty: no sessions, a fresh config store, and no Copilot sign-in. The
 | Line | Now | 6a |
 |---|---|---|
 | `WorkingDirectory` | `%h/dish` | `%h/work` |
-| `Environment` | `PATH=…` | `PATH=…` and `DISH_ENV=prod` |
+| `Environment` | `PATH=…` | `PATH=…`, unchanged. No `DISH_ENV` (see the contract) |
 | `ExecStart` | `pnpm dsh web …` (from the checkout) | dsh's own binary in the checkout, `%h/dish/node_modules/.bin/dsh web --host 127.0.0.1 --port 3080 --no-open --trusted-host ${DISH_TRUSTED_HOST}`, so dsh's working directory, which is the default for new chats, is `~/work` |
 
-Everything else stays: `EnvironmentFile`, `Restart=on-failure`, no sandboxing options (the deploy spec's reasons), and the store-pin contract.
+Everything else stays: `EnvironmentFile` (`deploy.env`, which still holds only `DISH_TRUSTED_HOST`), `Restart=on-failure`, no sandboxing options (the deploy spec's reasons), and the store-pin contract.
 
-**Check first.** dsh must not depend on starting in the checkout. The profile lives in `DSH_HOME`, but a linked bundle could be recorded with a relative path. The plan verifies this before anything else.
+**Checked.** dsh does not depend on starting in the checkout:
+- The profile records each bundle as `link:<absolute path>`. Its lockfile and symlinks are relative from the profile to the checkout.
+- `node_modules/.bin/dsh` finds its own files from its own path.
+- A scratch install, started from another directory, served the page and loaded all six dish plugins.
+
+dsh uses its working directory for three things:
+- new chats with no workspace;
+- the sandbox's fallback root;
+- a `.env` file there, which it loads. dsh refuses `PATH`, `DSH_*`, `XDG_*` and the other launch variables from it, but other names reach the service. So keep `~/work` free of a `.env`.
 
 ## `deploy/update.sh`
 
@@ -89,10 +109,17 @@ Through Minideb, prefix it with `ssh bjk@10.0.1.175`.
 
 ### Who it runs as and how
 
-- **As root,** which is what `incus exec` gives. The work runs as `dish`, through `runuser -u dish --`, with `HOME`, `XDG_RUNTIME_DIR=/run/user/<uid>` and the unit's `PATH`. HOME, XDG_DATA_HOME and PNPM_HOME stay unset, which keeps the store-pin contract.
-- **Run as `dish` itself,** it does the same without `runuser`.
+- **The account** is the owner of the checkout the script sits in (`dish` on the VM).
+- **As root,** which is what `incus exec` gives, it runs itself again as that account, through `runuser -u <account> --`, with a clean environment:
+  - `HOME` (the account's), `USER`, `LOGNAME` and `XDG_RUNTIME_DIR=/run/user/<uid>`;
+  - the unit's `PATH`, read from `Environment=PATH=` in the checkout's unit;
+  - `TMPDIR=/tmp`.
+
+  `XDG_*`, `PNPM_HOME`, `DSH_*` and `NODE_ENV` stay unset, as they are for the unit. That keeps the store-pin contract. Then, as root, it prints the journal tail.
+- **Run as the account itself,** it does the same without `runuser`. It tries to print the journal tail, and says so when the account can't read the journal.
 - **Any other account:** it refuses.
-- **It updates the file it's running from,** so the body is one function called on the last line. bash then reads the whole file before anything changes it.
+- **It updates the file it's running from,** so the body is one function called on the last line, `main "$@"; exit`. bash then reads the whole file before anything changes it.
+- **One at a time.** A second run while one is going is refused (a lock under `~/.local/state/dish/deploy/`).
 
 ### Steps
 
@@ -101,20 +128,21 @@ Through Minideb, prefix it with `ssh bjk@10.0.1.175`.
 3. **The dry run** prints:
    - HEAD and the target;
    - `git log --oneline HEAD..target`, or `target..HEAD` for a rollback;
-   - whether the unit file or `deploy.env` differ from what the service last started with;
-   - then it stops.
+   - whether the target's unit file, `deploy.env` or `install.env` differ from what the service last started with, and whether it would restart;
+   - then it stops. It changes nothing but the fetched refs.
 4. **`--apply` checks out the target:**
-   - With no ref: the checkout must be on `main`, or detached after a rollback, in which case it switches back to `main`. Then `git merge --ff-only origin/main`. A checkout with local changes, or one that can't fast-forward, is refused and left alone.
+   - With no ref: the checkout must be on `main`, or detached after a rollback, in which case it switches back to `main`. Then `git merge --ff-only origin/main`.
    - With a ref: `git switch --detach <ref>`.
-5. **Run `install.sh`** with `DISH_REMOTE`, `DISH_USER_NAME` and `DISH_USER_EMAIL` from `deploy.env`. Fleet writes those lines (see Fleet).
+   - A checkout with local changes, or one that can't fast-forward, is refused and left alone. Ignored files, such as `node_modules` and `.dev/`, don't count.
+5. **Run `install.sh`** with `DISH_REMOTE`, `DISH_USER_NAME` and `DISH_USER_EMAIL` from `~/.config/dish/install.env`, which fleet writes (see Fleet). The unit doesn't load that file, so these never reach dsh or an agent's shell. An empty `DISH_REMOTE` is refused: prod always pushes its store, and `install.sh` would remove the remote.
 6. **Install the unit:**
    - copy `deploy/dish-web.service` to `~/.config/systemd/user/`, and `systemctl --user daemon-reload` when it changed;
    - create `~/work` if missing;
    - enable the unit if it isn't enabled.
-7. **Restart** when anything is stale. The service is stale when its last start doesn't match:
+7. **Restart** when the service isn't running, or `install.sh` changed the profile, or the service is stale. The service is stale when its last start doesn't match:
    - the checkout's revision;
    - the unit file;
-   - `deploy.env`;
+   - `deploy.env` and `install.env`;
    - the Node and pnpm versions.
 
    The record of that start, the stamp, lives in `~/.local/state/dish/deploy/started`. A missing stamp counts as stale.
@@ -125,14 +153,16 @@ Through Minideb, prefix it with `ssh bjk@10.0.1.175`.
    - the last 15 journal lines with every token-bearing line removed;
    - the hint to run `url.sh` for a fresh link.
 
-**Exit codes:** 0 for done or nothing to do, 1 for a failed step (named on stderr, as `install.sh` does), and 2 for usage.
+**Exit codes:** 0 for done or nothing to do, 1 for a failed step (named on stderr, as `install.sh` does), and 2 for usage or the wrong account.
 
 ## `deploy/url.sh`
 
 Run it as `incus exec dish --project dish -- /home/dish/dish/deploy/url.sh`.
-- **What it prints:** `https://<DISH_TRUSTED_HOST>/?token=<token>`. The token comes from the last `dsh web:` line in the service's journal since its current start, and the host from `deploy.env`.
+- **What it prints:** `https://<DISH_TRUSTED_HOST>/?token=<token>`.
+  - The token comes from the last `dsh web:` line in the service's journal since its current start.
+  - The start comes from `systemctl --user -M <account>@ show`. The host comes from `deploy.env`.
 - **When there's no token:** the service isn't running or hasn't printed one, so it says which and exits 1.
-- **Read access:** it runs as root, so the journal can be read.
+- **Read access:** it runs as root, so the journal can be read. Run as anyone else, it refuses.
 - **It prints a secret, on purpose.** It's for your terminal. Don't paste the output anywhere.
 
 ## Fleet (a reviewed PR in `~/projects/fleet`)
@@ -143,50 +173,95 @@ Run it as `incus exec dish --project dish -- /home/dish/dish/deploy/url.sh`.
 - installing, linking and checking the unit, and the PATH contract check;
 - the restart;
 - the `started` stamp;
-- the wait.
+- the wait;
+- `fleet_dish_service_enabled`, which held back the first start. `update.sh --apply` starts the unit now.
 
-**Keep:** first-time provisioning, including cloning `~/dish` when it's missing and enabling linger.
+**Keep:** first-time provisioning, including cloning `~/dish` when it's missing, enabling linger, and `deploy.env` as it is (one line, `DISH_TRUSTED_HOST`).
 
 **Change:**
-- `deploy.env.j2` gains `DISH_REMOTE`, `DISH_USER_NAME` and `DISH_USER_EMAIL`.
-- Add a sudoers drop-in letting `dish` run `apt-get update` and `apt-get install` without a password, and nothing else.
-- Install mise for `dish`.
-- `docs/dish.md`: "Updating" points to dish's `deploy/update.sh`.
+- **`install.env`.** A new template writes `~/.config/dish/install.env` (mode 0600) with `DISH_REMOTE`, `DISH_USER_NAME` and `DISH_USER_EMAIL`, one `NAME=value` line each. `update.sh` reads it; the unit doesn't.
+- **`~/work`.** It's created with the account's other directories.
+- **apt.**
+  - A root-owned wrapper, `/usr/local/sbin/dish-apt-get`, runs `apt-get update`, or `apt-get install` with Debian package names only.
+  - A sudoers drop-in lets `dish` run exactly that wrapper without a password.
+  - The play's "no sudo" check becomes "sudo for the wrapper only".
+- **mise.** Install it for `dish`: a pinned release binary at `/usr/local/bin/mise`, checked against its SHA-256. Tools it installs live in `dish`'s home.
+- **Docs.**
+  - `docs/dish.md`: "Updating" points to dish's `deploy/update.sh`, and "Reaching it" to `url.sh`.
+  - `docs/backups.md`'s restore runs `update.sh --apply` after the guest play.
 
 **Deploy key:** the read-only key for `bketelsen/dish` stays. `~/work` clones of dish use it too, until step 6b's GitHub App.
 
 ## Rollout
 
-The order matters. A dish whose default is dev, started by a unit without `DISH_ENV=prod`, would come up on an empty dev store.
-1. Merge 6a in dish. The new unit, with `DISH_ENV=prod`, ships in the same commit that makes dev the default.
-2. Merge the fleet PR, and run the guest play one last time. It writes the new `deploy.env` and touches nothing else of dish's.
-3. Run `update.sh --apply`. It fast-forwards, installs the new unit, restarts once, and writes its stamp.
-4. Check:
+The order matters. A dish whose `pnpm dsh` goes through the launcher, started by the old unit's `pnpm dsh web`, would come up on an empty dev store.
+1. Merge 6a in dish, as one merge. The new unit, which runs dsh directly, ships in the same merge that routes `pnpm dsh` through the launcher.
+2. Merge the fleet PR. Run the guest play one last time: preview, apply, rerun.
+   - It writes `install.env`, `~/work`, the apt rule and mise.
+   - It touches nothing of dish's checkout, profile or unit.
+3. Fast-forward the VM's checkout once by hand. It predates `update.sh`: `incus exec dish --project dish -- su - dish -c 'git -C ~/dish pull --ff-only origin main'`. This changes no running code.
+4. Run `update.sh`, then `update.sh --apply`. It installs, copies the new unit, restarts once (there is no stamp yet), and writes its stamp.
+5. Check:
    - a new chat opened with no workspace starts in `~/work`;
    - `url.sh` prints a link that signs you in;
-   - Settings shows prod's data.
-5. Move to `pnpm dev` on the desktop.
+   - Settings shows prod's data;
+   - an agent's shell sees no `DISH_REMOTE`.
+6. Move to `pnpm dev` on the desktop.
 
 ## Testing
 
-`node --test`, in `deploy/test/`.
-- **`update.sh`** runs against a temporary bare repo and checkout, with stub `systemctl`, `journalctl` and `runuser` on `PATH`, and `install.sh` stubbed. Cases:
+`node --test`, in `deploy/test/` and `scripts/test/`.
+- **`update.sh`** runs against a temporary bare repo and checkout, with stub `id`, `getent`, `runuser`, `systemctl`, `journalctl`, `curl` and `pnpm` on `PATH`, and `install.sh` stubbed. Cases:
   - the dry run changes nothing;
   - `--apply` fast-forwards, rolls back with a ref, and switches back from a rollback;
-  - local changes are refused;
+  - local changes and a diverged `main` are refused;
   - the unit is copied and reloaded only when it changed;
-  - restart only when stale;
+  - restart only when stale, stopped, or the profile changed;
   - the stamp is written only after the wait succeeds;
+  - `install.sh` gets exactly `install.env`'s inputs, and an empty remote is refused;
   - token lines are filtered from the journal tail;
-  - root versus `dish` versus another account.
-- **`url.sh`**, with a stub journal: the latest token since the last start; no token; the host taken from `deploy.env`.
-- **The launcher:** dev's variables by default; `prod` passes through; any other value is refused.
-- **The unit file:** `WorkingDirectory`, `DISH_ENV=prod` and the `ExecStart` path.
-- **By hand, in a scratch `DSH_HOME`:** `pnpm dev` starts on 3090 with nothing outside `.dev/` written. Compare a listing of `~/.dsh`, `~/.config/dish` and `~/.local/share/dish` before and after.
+  - root versus the account versus another account.
+- **`url.sh`**, with a stub journal: the latest token since the last start; not running; no token; the host taken from `deploy.env`; not root.
+- **The launcher:** dev's variables by default, replacing inherited ones; `prod` passes through; any other value is refused.
+- **dish-kit:** `DSH_DISH_HOME` moves all four directories and wins over `XDG_*`. `install.sh` keeps it away from its dsh commands.
+- **The unit file:** `WorkingDirectory`, the `ExecStart` path, the `PATH` line, and no `DISH_ENV` and no install inputs.
+- **dish-copilot:** the status reports the route; the footer card shows only while there's none.
+- **By hand, with scratch `HOME` and `XDG_*`:** `pnpm dev` starts on 3090 with nothing written outside `.dev/`. Compare a listing of the scratch home before and after.
 
-## Open items
+## Checks (2026-10-02)
 
-- **Can dsh run from `~/work`?** Check that linked bundles and the profile resolve when the working directory isn't the checkout. This is the first thing the plan checks.
-- **The `.npmrc` store setting:** it's per-repo, so check that prod's `install.sh` (the store-pin contract) and dsh's plugin manager still agree.
-- **mise vs brew:** this spec says mise. brew is the alternative, if you'd rather match your desktop.
-- **Disk:** each dev checkout gets its own pnpm store, a few hundred MB. That's fine at today's 37 GiB free.
+These replace the open items. Each was run against a scratch `DSH_HOME` and scratch XDG directories, or read from code, before the plan.
+
+- **Can dsh run from `~/work`? Yes.**
+  - `install.sh` into a scratch `DSH_HOME` wrote `link:/<absolute checkout>/plugins/<name>` into the profile's `package.json`. The profile's lockfile and `node_modules` links are relative from the profile to the checkout. None of them involve dsh's working directory.
+  - `<checkout>/node_modules/.bin/dsh web --host 127.0.0.1 --port 3191 --no-open`, started from an unrelated directory:
+    - it served the page (its working directory confirmed through `/proc`);
+    - dish-copilot and dish-config logged;
+    - the new store got the seed commits of prompts, judge, crew and skills;
+    - the five dish client bundles were served.
+  - In dsh's code, the working directory is the default for a new chat (`dsh-api-session-controller`), the sandbox's fallback root (`dsh-base`'s `workspaceRoot: !!js process.cwd()`), and where the project `.env` is read (`dsh-app-boot`).
+- **dsh's environment reaches agent shells.** `dsh-subprocess`'s `scrubbedParentEnv` copies the whole environment except names matching `KEY|PASSWORD|SECRET|TOKEN` and names starting with `DSH_`. `dsh-shell-env` then adds `DSH_HOME` (dsh's own), `DSH_SHELL`, `DSH_SESSION_ID`, `DSH_PROFILE` and `DSH_PROFILE_DIR`. Three things follow:
+  - **`DISH_ENV=prod` on the unit** would reach every agent shell, so it's dropped (decision 3).
+  - **`XDG_*` set for dev** would reach every agent shell, so dev moves dish's directories with `DSH_DISH_HOME` instead.
+  - **Install inputs in `deploy.env`** would reach every agent shell, since the unit loads that file. Then an agent's `install.sh` that left out `DISH_REMOTE`, which the script exists to require, would pick up the real remote and make a second pusher. So they go in `install.env`, which the unit doesn't load.
+- **The pnpm store.**
+  - **pnpm 11.25 ignores `store-dir` in `.npmrc`.** A toy workspace's `pnpm store path` didn't move.
+  - **`storeDir` in `pnpm-workspace.yaml` works,** relative to the workspace root. It would apply to every checkout and worktree of the repo, prod's included, and to every `pnpm` command in them.
+  - **`pnpm_config_store_dir` in the environment beats it.** `npm_config_store_dir` is ignored.
+  - **Moving the store aborts installs.** Moving it under an existing `node_modules`, by any of the three means (the workspace setting, the environment variable, or `XDG_DATA_HOME`), makes the next install that has work to do fail without a terminal: `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`. In a terminal, it offers to delete `node_modules`.
+  - **The profile is its own workspace.** dsh's profile directory has its own `pnpm-workspace.yaml` (`packages: [.]`), so a repo setting never reaches the plugin manager. But `install.sh` asks `pnpm store path` from the checkout, so it would pin the repo's store into prod's profile. The unit's plugin manager would then refuse that profile (`ERR_PNPM_UNEXPECTED_STORE`).
+  - **The cost of a store per checkout.** Every worktree would download every package, with no offline install.
+  - **So:** the account's store everywhere, no repo setting, and no launcher setting. The store-pin contract stays as it is.
+- **The Copilot card on a fresh profile.**
+  - The card registers in the Models page's `settings.models.provider-card` seat and renders only on a card whose provider is `github-copilot`. A fresh profile has no such route, so there's no card on the list.
+  - dsh renders the same seat in the add-provider draft, and `llm-pi-ai` registers the Copilot sign-in flow whether or not a route exists. So Add model provider → `github-copilot` already shows a working card, but nothing leads there.
+  - The smallest fix is the `settings.models.footer` seat: one more registration of the existing panel, shown while the status says there's no route. That needs a `route` field in the status.
+- **sudo for apt.** A sudoers rule for `apt-get install *` is root for whoever can run it: `apt-get` takes `-o` options that run commands (`APT::Update::Pre-Invoke`, `DPkg::Pre-Invoke`), and installs local `.deb` files. Hence the wrapper.
+  - sudo works only in an escalated agent command. Inside `bubblewrap`, run with dsh's probe arguments, `/proc/self/status` shows `NoNewPrivs: 1`, so sudo can't raise privileges inside dsh's sandbox.
+  - That is decision 7's path: the main agent asks you, and a child needs the judge.
+- **mise vs brew: mise.**
+  - mise isn't packaged in Debian trixie: `apt-cache show mise` on the VM finds no package.
+  - Fleet installs a pinned release binary the way it installs Node: a checksum from the release's `SHASUMS256.txt`, a root-owned file, so it can't update itself.
+  - brew on Linux wants `/home/linuxbrew`, set up with sudo, and keeps itself current, which fleet's "nothing updates on its own" rules out.
+  - mise's shims aren't on the unit's `PATH` in 6a, so agents run tools with `mise exec`. Adding the shims is step 6b's call.
+- **Disk.** No per-checkout store, so this open item is gone.
