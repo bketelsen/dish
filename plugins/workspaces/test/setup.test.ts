@@ -319,7 +319,7 @@ interface Fixture extends Clone {
 }
 
 /** A bare repository (GitHub, `file://`) with `files` on main, and a clone of it; the code's git gets a scratch home. */
-async function fixture(files: Record<string, string> = { 'README.md': '# widget\n', '.gitignore': 'ignored/\n*.log\n' }): Promise<Fixture> {
+async function fixture(files: Record<string, string> = { 'README.md': '# widget\n' }): Promise<Fixture> {
   const dir = await tempDir()
   const made = await makeClone(dir, files)
   const main = (await runOk('git', ['-C', made.clone, 'rev-parse', 'origin/main'], { env: made.env })).trim()
@@ -370,7 +370,7 @@ async function plainIsAncestor(f: Fixture, a: string, b: string, env: Record<str
 }
 
 /** onMergedCode with the code's git given a scratch home. */
-async function check(f: Fixture, at: { commit: string } | { checkout: string }, branch = 'main', signal?: AbortSignal): Promise<MergedCheck> {
+async function check(f: Fixture, at: { commit: string }, branch = 'main', signal?: AbortSignal): Promise<MergedCheck> {
   return withEnv(await dishHome(f.dir), () => onMergedCode(f.clone, at, branch, signal))
 }
 
@@ -461,14 +461,14 @@ test('onMergedCode { commit }: a forged commit-graph does not make a commit merg
   assert.match(reasonOf(await check(f, { commit: evil })), /isn't on origin\/main/)
 })
 
-test('onMergedCode { commit }: a commit whose tree has a gitlink is not merged, even on main', async () => {
+test("onMergedCode { commit }: a gitlink on GitHub's main doesn't stop it (a fresh checkout leaves it empty)", async () => {
   const f = await fixture()
   const tip = await pushToMain(f, 'b', 'b\n', async work => {
     const env = await scratchGitEnv(dirname(work))
     await runOk('git', ['-C', work, 'update-index', '--add', '--cacheinfo', `160000,${f.main},vendor/sub`], { env })
   })
   await fetch(f)
-  assert.match(reasonOf(await check(f, { commit: tip })), /it has a nested repository/)
+  assert.deepEqual(await check(f, { commit: tip }), { ok: true })
 })
 
 test("onMergedCode { commit }: an unknown commit, or one that looks like an option, isn't merged", async () => {
@@ -490,7 +490,6 @@ test("onMergedCode: when GitHub can't be asked, or its main isn't in the clone, 
   // GitHub can't be reached.
   await runOk('git', ['-C', f.clone, 'remote', 'set-url', 'origin', `file://${join(f.dir, 'nowhere.git')}`], { env: f.env })
   assert.match(reasonOf(await check(f, { commit: f.main })), /^couldn't confirm the default branch with GitHub/)
-  assert.match(reasonOf(await check(f, { checkout: f.clone })), /^couldn't confirm the default branch with GitHub/)
 })
 
 test("onMergedCode: a default branch that isn't GitHub's is refused", async () => {
@@ -502,87 +501,6 @@ test("onMergedCode: a default branch that isn't GitHub's is refused", async () =
   assert.match(reason, /GitHub's default branch is main, not dish\/x/)
 })
 
-test('onMergedCode { checkout }: a clean checkout at origin/main, or behind it, is merged; an ignored file is fine', async () => {
-  const f = await fixture()
-  assert.deepEqual(await check(f, { checkout: f.clone }), { ok: true })
-  await mkdir(join(f.clone, 'ignored'), { recursive: true })
-  await writeFile(join(f.clone, 'ignored', 'cache'), 'x\n')
-  await writeFile(join(f.clone, 'build.log'), 'x\n')
-  assert.deepEqual(await check(f, { checkout: f.clone }), { ok: true }, 'ignored files')
-  await pushToMain(f, 'b', 'b\n')
-  await fetch(f)
-  assert.deepEqual(await check(f, { checkout: f.clone }), { ok: true }, 'behind GitHub, not pulled')
-})
-
-test("onMergedCode { checkout }: dish's .worktrees/ (excluded) with a linked worktree in it is fine", async () => {
-  const f = await fixture()
-  await writeFile(join(f.clone, '.git', 'info', 'exclude'), '.worktrees/\n', { flag: 'a' })
-  await runOk('git', ['-C', f.clone, 'worktree', 'add', '-q', '-b', 'dish/one', join(f.clone, '.worktrees', 'one'), 'origin/main'], { env: f.env })
-  assert.deepEqual(await check(f, { checkout: f.clone }), { ok: true })
-})
-
-test('onMergedCode { checkout }: an untracked file, a modified file or a staged change is not merged', async () => {
-  const f = await fixture()
-  await writeFile(join(f.clone, 'new.txt'), 'x\n')
-  assert.match(reasonOf(await check(f, { checkout: f.clone })), /isn't clean/)
-  await runOk('git', ['-C', f.clone, 'add', 'new.txt'], { env: f.env })
-  assert.match(reasonOf(await check(f, { checkout: f.clone })), /isn't clean/, 'staged')
-  await runOk('git', ['-C', f.clone, 'rm', '-q', '--cached', 'new.txt'], { env: f.env })
-  await runOk('git', ['-C', f.clone, 'clean', '-q', '-f'], { env: f.env })
-  assert.deepEqual(await check(f, { checkout: f.clone }), { ok: true })
-  await writeFile(join(f.clone, 'README.md'), '# changed\n')
-  assert.match(reasonOf(await check(f, { checkout: f.clone })), /isn't clean/)
-})
-
-test("onMergedCode { checkout }: an edit hidden from status by the index (assume-unchanged, skip-worktree) is still seen", async () => {
-  for (const flag of ['--assume-unchanged', '--skip-worktree']) {
-    const f = await fixture()
-    await runOk('git', ['-C', f.clone, 'update-index', flag, 'README.md'], { env: f.env })
-    await writeFile(join(f.clone, 'README.md'), '# evil\n')
-    const plain = await runOk('git', ['-C', f.clone, 'status', '--porcelain'], { env: f.env })
-    assert.equal(plain, '', `the fixture is real: ${flag} hides the edit from a plain status`)
-    assert.match(reasonOf(await check(f, { checkout: f.clone })), /isn't clean/, flag)
-  }
-})
-
-test('onMergedCode { checkout }: HEAD on a local commit is not merged, even with origin/main moved to it', async () => {
-  const f = await fixture()
-  await writeFile(join(f.clone, 'a'), 'evil\n')
-  await runOk('git', ['-C', f.clone, 'add', 'a'], { env: f.env })
-  await runOk('git', ['-C', f.clone, 'commit', '-q', '-m', 'evil'], { env: f.env })
-  const evil = (await runOk('git', ['-C', f.clone, 'rev-parse', 'HEAD'], { env: f.env })).trim()
-  const reason = reasonOf(await check(f, { checkout: f.clone }))
-  assert.match(reason, /HEAD/)
-  assert.match(reason, /isn't on origin\/main/)
-  await runOk('git', ['-C', f.clone, 'update-ref', 'refs/remotes/origin/main', evil], { env: f.env })
-  assert.match(reasonOf(await check(f, { checkout: f.clone })), /isn't on origin\/main/, 'a planted origin/main changes nothing')
-})
-
-test('onMergedCode { checkout }: a nested repository (untracked, or staged as a gitlink) is not merged', async () => {
-  const f = await fixture()
-  const nested = join(f.clone, 'tools', 'nested')
-  await runOk('git', ['init', '-q', '-b', 'main', nested], { env: f.env })
-  await writeFile(join(nested, 'f'), 'x\n')
-  await runOk('git', ['-C', nested, 'add', 'f'], { env: f.env })
-  await runOk('git', ['-C', nested, 'commit', '-q', '-m', 'n'], { env: f.env })
-  const untracked = reasonOf(await check(f, { checkout: f.clone }))
-  assert.match(untracked, /it has a nested repository/)
-  assert.match(untracked, /tools\/nested/)
-  await runOk('git', ['-C', f.clone, 'add', 'tools/nested'], { env: f.env })
-  assert.match(reasonOf(await check(f, { checkout: f.clone })), /it has a nested repository/, 'staged as a gitlink')
-})
-
-test('onMergedCode { checkout }: a committed gitlink on GitHub\'s main is not merged either', async () => {
-  const f = await fixture()
-  await pushToMain(f, 'b', 'b\n', async work => {
-    const env = await scratchGitEnv(dirname(work))
-    await runOk('git', ['-C', work, 'update-index', '--add', '--cacheinfo', `160000,${f.main},vendor/sub`], { env })
-  })
-  await fetch(f)
-  await runOk('git', ['-C', f.clone, 'merge', '-q', '--ff-only', 'origin/main'], { env: f.env })
-  assert.match(reasonOf(await check(f, { checkout: f.clone })), /it has a nested repository/)
-})
-
 test('onMergedCode: an aborted signal is not merged', async () => {
   const f = await fixture()
   const controller = new AbortController()
@@ -590,13 +508,3 @@ test('onMergedCode: an aborted signal is not merged', async () => {
   assert.match(reasonOf(await check(f, { commit: f.main }, 'main', controller.signal)), /aborted/)
 })
 
-test("onMergedCode's temporary index is removed", async () => {
-  const f = await fixture()
-  const tmp = join(f.dir, 'tmp')
-  await mkdir(tmp)
-  await withEnv({ ...(await dishHome(f.dir)), TMPDIR: tmp }, async () => {
-    assert.deepEqual(await onMergedCode(f.clone, { checkout: f.clone }, 'main'), { ok: true })
-  })
-  const { readdir } = await import('node:fs/promises')
-  assert.deepEqual(await readdir(tmp), [])
-})

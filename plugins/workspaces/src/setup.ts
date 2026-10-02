@@ -6,31 +6,26 @@
  *   gives dish's own children (dsh's scrub, no `GIT_*` name, `GIT_TERMINAL_PROMPT=0`), its own process group, and a time
  *   limit. A timeout or an abort sends the group TERM, then KILL after `KILL_GRACE_MS`; so does bash's exit, for anything
  *   it left running (nothing setup starts outlives it in its group). The last 64 KB of its output, masked, is the log.
- * - **onMergedCode** is the spec's decision 1, as hardened on 2026-10-02 (option A): setup runs outside the sandbox only
- *   on code a human merged, which means on the commit GitHub reports for the default branch, never on what the clone's
- *   own refs say. An agent in the workspace can write anything in the clone, `.git` included, so nothing the check reads
+ * - **onMergedCode** is the spec's decision 1, as hardened on 2026-10-02 (option A, then Task 6's review): setup runs
+ *   outside the sandbox only on code a human merged, and only in a checkout dish has just made (its own fresh clone, or
+ *   a new worktree), since an existing checkout's ignored files can't be trusted. So it checks a commit, never a
+ *   working tree. An agent in the workspace can write anything in the clone, `.git` included, so nothing the check reads
  *   may be the agent's to choose:
  *   - GitHub's word: `ls-remote --symref origin HEAD` names the default branch and its sha. A local `origin/<default>`
  *     (or `origin/HEAD`) is never read.
  *   - Ancestry ignores replace refs and grafts (git()'s `SAFE_FLAGS` and environment) and the commit-graph file
- *     (`core.commitGraph=false` here), each of which an agent can plant to make its commit look like an ancestor.
- *   - "Clean" is judged against the commit's own tree in a temporary index, never the clone's index: an agent can mark
- *     an edited file `assume-unchanged` or `skip-worktree` (or forge its stat data) to hide it from a plain status.
- *   - A gitlink or a nested repository counts as unmerged: `--ignore-submodules=dirty` (which git() requires) hides the
- *     edits inside one, and looking inside would run its own config.
+ *     (`core.commitGraph=false`), each of which an agent can plant to make its commit look like an ancestor.
+ *   - No gitlink or nested-repository check: see `onMergedCode`.
  *
- *   What is left: a forged object (an agent overwriting a stored object under its real hash), files git ignores
- *   (`.gitignore`, and `.git/info/exclude`, which an agent can write), and the time between the check and the run, as
- *   the spec says. The caller checks the clone (`checkClone`, with its expected origin URL) and fetches just before.
+ *   What is left: a forged object (an agent overwriting a stored object under its real hash), and the time between the
+ *   check and the run, as the spec says. The caller fetches and checks the clone (`checkClone`, with its expected origin
+ *   URL) just before.
  *
  * @module dish-workspaces/setup
  */
 
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { maskSecrets } from 'dish-kit'
 import { childEnvironment } from './env.ts'
 import { git, maskUrlPasswords } from './git.ts'
@@ -52,9 +47,8 @@ const GROUP_POLL_MS = 50
 const PIPE_GRACE_MS = 1_000
 /** The longest delay `setTimeout` takes. */
 const MAX_TIMER_MS = 2 ** 31 - 1
-/** What git() keeps of stdout: an output this long may have been cut. */
-const GIT_OUTPUT_CAP = 4 * 1024 * 1024
 /** Turns off the commit-graph file for one git call: a forged one lies about parents. */
+// SAFE_FLAGS carries core.commitGraph=false too (on `projects`, after this module was written); this stays as a belt.
 const NO_COMMIT_GRAPH: readonly string[] = ['-c', 'core.commitGraph=false']
 /** The start of every reason that comes from not hearing GitHub's word. */
 const UNCONFIRMED = "couldn't confirm the default branch with GitHub"
@@ -350,66 +344,53 @@ function lastLines(text: string, count: number): string {
 export type MergedCheck = { ok: true } | { ok: false, reason: string }
 
 /**
- * Whether setup may run outside the sandbox (the spec's decision 1, as hardened 2026-10-02: option A).
+ * Whether setup may run outside the sandbox, in a checkout dish has just made of `at.commit` (the spec's decision 1, as
+ * hardened 2026-10-02: option A, then fresh checkouts only).
  * - First the remote's word: `ls-remote --symref origin HEAD` (through the credential helper), right after the
  *   caller's fetch, gives GitHub's default branch and its sha. `defaultBranch` must be that branch. A local
  *   `origin/<defaultBranch>` is never trusted: an agent can write refs. If ls-remote fails, GitHub names another
  *   branch, or the sha isn't in the clone, setup is skipped ("couldn't confirm the default branch with GitHub").
- * - `{ commit }`: the commit is an ancestor of (or equal to) that sha.
- * - `{ checkout }`: its HEAD is an ancestor of (or equal to) that sha, and that working tree is clean against HEAD's
- *   own tree (`status --porcelain --untracked-files=normal --ignore-submodules=dirty` empty, with a temporary index
- *   read from HEAD, so nothing the clone's index says hides an edit). Ignored files don't count.
- * - Either way, not if the tree has a gitlink (mode 160000) or the checkout a nested repository that isn't ignored:
- *   `dirty` hides edits inside one, and recursing into it would run its own config. The reason says "it has a nested
- *   repository".
+ * - The commit is an ancestor of (or equal to) that sha.
+ *
+ * A gitlink (a submodule) in the commit is not refused. The rule against nested repositories was for an existing
+ * checkout, where `--ignore-submodules=dirty` hides edits inside one; a checkout dish has just made has none of those.
+ * A commit can't hold a nested repository (git refuses a `.git` path), and dish's `worktree add` (submodule recursion
+ * off) leaves a gitlink an empty directory. If setup fetches it (`git submodule update`), it gets the commit the merged
+ * tree pins, from the URL the merged `.gitmodules` names (a `submodule.*` key in the clone's config is refused by
+ * `checkClone`), into a module directory that is new too (a fresh clone's `.git/modules`, or a new worktree's own
+ * `.git/worktrees/<name>/modules`, not the shared `.git/modules`: checked with git 2.47): nothing an agent wrote.
+ *
  * Ancestry ignores replace refs, grafts and the commit-graph file. Uses git() only. Never throws: a failure is a
  * refusal with its reason.
  *
  * Before it, the caller fetches and checks the clone (`checkClone` with the expected `url`): `origin` is whatever the
  * clone's config says, so only that check keeps an agent from pointing it at a remote of its own.
  */
-export async function onMergedCode(clone: string, at: { commit: string } | { checkout: string }, defaultBranch: string, signal?: AbortSignal): Promise<MergedCheck> {
+export async function onMergedCode(clone: string, at: { commit: string }, defaultBranch: string, signal?: AbortSignal): Promise<MergedCheck> {
   try {
-    return await mergedCheck(clone, at, defaultBranch, signal)
+    return await mergedCheck(clone, at.commit, defaultBranch, signal)
   } catch (error) {
     if (signal?.aborted) return aborted()
     return { ok: false, reason: `the check failed: ${shown(messageOf(error), 200)}` }
   }
 }
 
-async function mergedCheck(clone: string, at: { commit: string } | { checkout: string }, defaultBranch: string, signal?: AbortSignal): Promise<MergedCheck> {
+async function mergedCheck(clone: string, revision: string, defaultBranch: string, signal?: AbortSignal): Promise<MergedCheck> {
   if (signal?.aborted) return aborted()
+  if (revision === '' || revision.startsWith('-') || /[\x00-\x20\x7f]/.test(revision)) {
+    return { ok: false, reason: `${JSON.stringify(shown(revision, 60))} isn't a commit` }
+  }
   const remote = await githubTip(clone, defaultBranch, signal)
   if (signal?.aborted) return aborted()
   if ('reason' in remote) return { ok: false, reason: remote.reason }
-  const onMain = `origin/${shown(defaultBranch, 100)}`
-
-  if ('commit' in at) {
-    const revision = at.commit
-    if (revision === '' || revision.startsWith('-') || /[\x00-\x20\x7f]/.test(revision)) {
-      return { ok: false, reason: `${JSON.stringify(shown(revision, 60))} isn't a commit` }
-    }
-    const commit = await resolveCommit(clone, revision, signal)
-    if (signal?.aborted) return aborted()
-    if (commit === undefined) return { ok: false, reason: `commit ${shown(revision, 60)} isn't in the clone` }
-    if (!await isAncestor(clone, commit, remote.sha, signal)) {
-      if (signal?.aborted) return aborted()
-      return { ok: false, reason: `commit ${await describe(clone, commit, signal)} isn't on ${onMain}` }
-    }
-    return await gitlinkReason(clone, commit, signal) ?? (signal?.aborted ? aborted() : { ok: true })
-  }
-
-  const checkout = at.checkout
-  const head = await resolveCommit(checkout, 'HEAD', signal)
+  const commit = await resolveCommit(clone, revision, signal)
   if (signal?.aborted) return aborted()
-  if (head === undefined) return { ok: false, reason: 'the checkout has no commit checked out' }
-  if (!await isAncestor(clone, head, remote.sha, signal)) {
+  if (commit === undefined) return { ok: false, reason: `commit ${shown(revision, 60)} isn't in the clone` }
+  if (!await isAncestor(clone, commit, remote.sha, signal)) {
     if (signal?.aborted) return aborted()
-    return { ok: false, reason: `the checkout's HEAD, commit ${await describe(checkout, head, signal)}, isn't on ${onMain}` }
+    return { ok: false, reason: `commit ${await describe(clone, commit, signal)} isn't on origin/${shown(defaultBranch, 100)}` }
   }
-  const gitlink = await gitlinkReason(checkout, head, signal)
-  if (gitlink !== undefined) return gitlink
-  return await cleanAgainst(checkout, head, signal)
+  return { ok: true }
 }
 
 function aborted(): MergedCheck {
@@ -417,8 +398,8 @@ function aborted(): MergedCheck {
 }
 
 /** Run dish's git in `dir`, the commit-graph file off. */
-function gitIn(dir: string, args: readonly string[], signal?: AbortSignal, env: Record<string, string> = {}): Promise<GitResult> {
-  return git([...NO_COMMIT_GRAPH, '-C', dir, ...args], { signal, env: { ...internals.gitEnv, ...env } })
+function gitIn(dir: string, args: readonly string[], signal?: AbortSignal): Promise<GitResult> {
+  return git([...NO_COMMIT_GRAPH, '-C', dir, ...args], { signal, env: { ...internals.gitEnv } })
 }
 
 /** GitHub's default branch tip: `ls-remote --symref origin HEAD`, which must name `refs/heads/<defaultBranch>`, and whose sha must be in the clone. */
@@ -469,49 +450,6 @@ async function describe(dir: string, commit: string, signal?: AbortSignal): Prom
   const listed = await gitIn(dir, ['for-each-ref', `--points-at=${commit}`, '--format=%(refname:short)', 'refs/heads/'], signal)
   const names = listed.code === 0 ? listed.stdout.split('\n').filter(name => name !== '').slice(0, 3).map(name => shown(name, 60)) : []
   return names.length === 0 ? short : `${short} (${names.join(', ')})`
-}
-
-/** Why `commit`'s tree counts as unmerged because of a gitlink, or undefined. */
-async function gitlinkReason(dir: string, commit: string, signal?: AbortSignal): Promise<MergedCheck | undefined> {
-  const listed = await gitIn(dir, ['ls-tree', '-r', '--full-tree', '--format=%(objectmode)', commit], signal)
-  if (signal?.aborted) return aborted()
-  if (listed.code !== 0 || listed.timedOut) return { ok: false, reason: `its tree couldn't be listed: ${firstLine(listed.stderr)}` }
-  if (listed.stdout.length >= GIT_OUTPUT_CAP - 8) return { ok: false, reason: 'its tree is too big to check for nested repositories' }
-  if (listed.stdout.split('\n').includes('160000')) return { ok: false, reason: 'it has a nested repository (a gitlink, as a submodule is)' }
-  return undefined
-}
-
-/**
- * Whether `checkout`'s working tree is `head`'s tree and nothing more but ignored files: a temporary index read from
- * `head` (so no bit or stat in the clone's index can hide an edit; every file is hashed), then the untracked files it
- * leaves (a nested repository is one, shown with a trailing `/`), then status.
- */
-async function cleanAgainst(checkout: string, head: string, signal?: AbortSignal): Promise<MergedCheck> {
-  const temp = await mkdtemp(join(tmpdir(), 'dish-merged-'))
-  try {
-    const env = { GIT_INDEX_FILE: join(temp, 'index') }
-    const read = await gitIn(checkout, ['read-tree', head], signal, env)
-    if (signal?.aborted) return aborted()
-    if (read.code !== 0) return { ok: false, reason: `the checkout couldn't be compared: ${firstLine(read.stderr)}` }
-
-    const others = await gitIn(checkout, ['ls-files', '-z', '--others', '--exclude-standard'], signal, env)
-    if (signal?.aborted) return aborted()
-    if (others.code !== 0) return { ok: false, reason: `the checkout couldn't be listed: ${firstLine(others.stderr)}` }
-    const nested = others.stdout.split('\0').find(path => path.endsWith('/'))
-    if (nested !== undefined) return { ok: false, reason: `it has a nested repository (${shown(nested.slice(0, -1), 100)})` }
-
-    const status = await gitIn(checkout, ['status', '--porcelain', '--untracked-files=normal', '--ignore-submodules=dirty'], signal, env)
-    if (signal?.aborted) return aborted()
-    if (status.code !== 0) return { ok: false, reason: `the checkout's status failed: ${firstLine(status.stderr)}` }
-    const changed = status.stdout.split('\n').filter(line => line !== '')
-    if (changed.length > 0) {
-      const more = changed.length > 1 ? ` and ${changed.length - 1} more` : ''
-      return { ok: false, reason: `the checkout isn't clean: ${shown(changed[0]!, 100)}${more}` }
-    }
-    return { ok: true }
-  } finally {
-    await rm(temp, { recursive: true, force: true }).catch(() => {})
-  }
 }
 
 /** The first non-empty line of git's stderr, masked and cut short. */
