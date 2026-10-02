@@ -9,7 +9,7 @@ import { PushQueue, checkRemote, firstLine, redact } from '../src/store/push.ts'
 import type { RemoteStatus } from '../src/store/push.ts'
 import { NamespaceRegistry } from '../src/store/namespaces.ts'
 import { ConfigStore } from '../src/store/store.ts'
-import { USER, USERA, isPlainError, isStoreError, ns, openAt, openStore, repoPath, tempDir } from './helpers.ts'
+import { USER, USERA, isPlainError, isStoreError, ns, openAt, openStore, ownEnv, repoPath, tempDir } from './helpers.ts'
 
 const MAIN = 'refs/heads/main'
 const TOKEN = `ghp_${'a'.repeat(36)}`
@@ -669,7 +669,7 @@ test('a missing repository is restored from the remote: the history, the formats
   await a.store.close()
   // Something else on the remote that is not the store's to take.
   await remote.git.casRef('refs/heads/elsewhere', head, null)
-  await run('git', ['--git-dir', remote.path, 'tag', 'v1', head])
+  await run('git', ['--git-dir', remote.path, 'tag', 'v1', head], { env: ownEnv() })
   await rm(a.repository, { recursive: true })
 
   // A user whose own git config asks for the other formats must not get them.
@@ -733,10 +733,10 @@ test('a remote that hangs at a first start is cut off by pushTimeoutMs', async (
 test('a sha256 remote is refused at a first start, and leaves nothing behind', async () => {
   const remote = join(await tempDir(), 'sha256.git')
   const work = await tempDir()
-  await run('git', ['init', '-q', '--bare', '--object-format=sha256', '-b', 'main', remote])
-  await run('git', ['init', '-q', '--object-format=sha256', '-b', 'main', work])
-  await run('git', ['-C', work, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'x'])
-  await run('git', ['-C', work, 'push', '-q', remote, 'main'])
+  await run('git', ['init', '-q', '--bare', '--object-format=sha256', '-b', 'main', remote], { env: ownEnv() })
+  await run('git', ['init', '-q', '--object-format=sha256', '-b', 'main', work], { env: ownEnv() })
+  await run('git', ['-C', work, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'x'], { env: ownEnv() })
+  await run('git', ['-C', work, 'push', '-q', remote, 'main'], { env: ownEnv() })
   const repository = await repoPath()
   await assert.rejects(openStore({ repository, remote }), isPlainError(/sha1|sha256|algorithm|object format|hash/i))
   assert.deepEqual(await readdir(repository), [])

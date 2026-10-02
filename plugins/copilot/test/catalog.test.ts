@@ -47,7 +47,7 @@ async function writerOnceRead(fifo: string, timeoutMs = 20_000): Promise<FileHan
 test('unloading the plugin while apply is still awaiting is no failure: no error, nothing provided', () => withTempDir(async (dir) => {
   // The cache is a named pipe, so apply's read of it waits until the test closes the writing end.
   const cacheFile = join(dir, 'copilot-models.json')
-  execFileSync('mkfifo', [cacheFile])
+  execFileSync('mkfifo', [cacheFile], { env: { PATH: process.env.PATH, HOME: dir } })
   const ctx = new Context()
   const logs = watchLogs(ctx)
   const handle = ctx.plugin(catalog, { cacheFile, refreshOnStart: false, updateRoute: false, terminal: false })

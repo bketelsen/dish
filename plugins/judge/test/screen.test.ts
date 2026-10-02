@@ -18,7 +18,7 @@ import type { ScreenLog } from '../src/screen.ts'
 import { DEFAULT_SETTINGS, parseSettings } from '../src/settings.ts'
 import type { JudgeSettings } from '../src/settings.ts'
 import * as judgePlugin from '../src/index.ts'
-import { dirs, jevBody, mountJudge, noulAnswer, provideStub, shippedWith, startFakeJev } from './helpers.ts'
+import { dirs, jevBody, mountJudge, noulAnswer, provideStub, shippedWith, startFakeJev, tempDir } from './helpers.ts'
 
 // --- what the tests are made of -----------------------------------------------------------------------
 
@@ -1663,8 +1663,9 @@ test('a process with nothing else to do does not exit while a screen waits for r
     await Promise.all([0, 1].map(() => screen.call(undefined, exec(), result, next).then(() => { finished += 1 })))
     console.log('finished', finished)
   `
+  const env = { PATH: process.env.PATH, HOME: await tempDir() }
   const { code, stdout, stderr } = await new Promise<{ code: number | null, stdout: string, stderr: string }>((resolve) => {
-    execFile(process.execPath, ['--input-type=module', '-e', script], { timeout: 15_000 }, (error, out, err) => {
+    execFile(process.execPath, ['--input-type=module', '-e', script], { timeout: 15_000, env }, (error, out, err) => {
       resolve({ code: error === null ? 0 : (error as { code?: number }).code ?? 1, stdout: out, stderr: err })
     })
   })

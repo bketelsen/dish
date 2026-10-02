@@ -348,10 +348,13 @@ test('unifiedDiff: texts too big for an exact diff still give a patch that appli
 
 // ---- against git ------------------------------------------------------------------------------------------------------
 
-const git = spawnSync('git', ['--version'], { encoding: 'utf8' })
-const hasGit = git.status === 0
 const scratch = mkdtempSync(join(tmpdir(), 'dish-kit-diff-'))
 after(() => { rmSync(scratch, { recursive: true, force: true }) })
+// The HOME of every git these tests start: a scratch directory, never the runner's.
+const home = join(scratch, 'home')
+mkdirSync(home)
+const git = spawnSync('git', ['--version'], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home } })
+const hasGit = git.status === 0
 
 /**
  * What git says about the change from `before` to `after`, as the part `unifiedDiff` also writes. git's own header lines
@@ -369,7 +372,7 @@ function gitHunks(before: string, after: string): string {
   const run = spawnSync('git', ['diff', '--no-index', '--no-ext-diff', '--no-color', '-U3', '--', 'a/f', 'b/f'], {
     cwd: dir,
     encoding: 'utf8',
-    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    env: { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
   })
   assert.ok(run.status === 0 || run.status === 1, `git diff failed: ${run.stderr}`)
   const out = run.stdout
