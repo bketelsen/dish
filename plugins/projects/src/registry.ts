@@ -42,7 +42,7 @@ const SHOWN = 64
 /** What a variable in `gateEnv` may be called. */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 /** The prefix of dsh's own variables, which its scrub removes from every agent shell. Pinned to dsh's `DSH_ENV_PREFIX` by dish-workspaces' env test. */
-const DSH_PREFIX = 'DSH_'
+export const DSH_PREFIX = 'DSH_'
 
 const DURATION = /^([0-9]+)([smh])$/
 const UNIT_MS = { s: 1000, m: 60_000, h: 3_600_000 } as const

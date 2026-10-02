@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DSH_ENV_PREFIX, SENSITIVE_ENV_PATTERN, scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import { DSH_PREFIX, SENSITIVE_NAME, childEnvironment } from '../src/env.ts'
+import { DSH_PREFIX as REGISTRY_DSH_PREFIX, SECRET_NAME } from 'dish-projects/registry'
 import { withEnv } from './helpers.ts'
 
 const PINNED = "dsh changed its environment scrub; re-check dish-workspaces' env.ts"
@@ -31,6 +32,13 @@ test("the scrub is pinned to dsh's own: same pattern, same prefix", () => {
   assert.equal(SENSITIVE_NAME.source, SENSITIVE_ENV_PATTERN.source, PINNED)
   assert.equal(SENSITIVE_NAME.flags, SENSITIVE_ENV_PATTERN.flags, PINNED)
   assert.equal(DSH_PREFIX, DSH_ENV_PREFIX, PINNED)
+})
+
+test("dish-projects' gateEnv rules are pinned to dsh's scrub too", () => {
+  const pinned = "dsh changed its environment scrub; re-check dish-projects' src/registry.ts (SECRET_NAME, DSH_PREFIX)"
+  assert.equal(SECRET_NAME.source, SENSITIVE_ENV_PATTERN.source, pinned)
+  assert.equal(SECRET_NAME.flags, SENSITIVE_ENV_PATTERN.flags, pinned)
+  assert.equal(REGISTRY_DSH_PREFIX, DSH_ENV_PREFIX, pinned)
 })
 
 test("childEnvironment drops every name dsh's scrubbedParentEnv drops, and GIT_* names besides", async () => {
