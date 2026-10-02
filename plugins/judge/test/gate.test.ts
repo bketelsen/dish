@@ -781,6 +781,82 @@ test('a message with no text falls back to the prompt before it', () => {
   assert.equal(taskOf(agentOf({ events: [userEvent(1, 'fix the layout'), image] }), true), 'fix the layout')
 })
 
+// --- secrets in the task ----------------------------------------------------------------------------
+
+/** Bytes that look random and are always the same, for a made-up key. */
+function madeUpBytes(count: number, seed: number): Buffer {
+  const bytes = Buffer.alloc(count)
+  let state = seed
+  for (let index = 0; index < count; index++) {
+    state = (state * 1_103_515_245 + 12_345) % 2_147_483_648
+    bytes[index] = (state >>> 16) & 0xff
+  }
+  return bytes
+}
+
+/** The base64 of a made-up PKCS#8 RSA key, in 64-character lines as `openssl genpkey` writes them. */
+const PEM_BODY = madeUpBytes(1_218, 7).toString('base64').match(/.{1,64}/g)!.join('\n')
+/** That key whole: header, body and END line. Nothing here is a real key. */
+const PEM_KEY = `-----BEGIN PRIVATE KEY-----\n${PEM_BODY}\n-----END PRIVATE KEY-----`
+/** A made-up GitHub token. */
+const GH_TOKEN = `ghp_${madeUpBytes(60, 11).toString('base64').replace(/[^A-Za-z0-9]/g, '').slice(0, 36)}`
+
+/** Prose of `length` characters, words and spaces only, with nothing in it like a key. */
+function prose(length: number): string {
+  return 'The blog needs a header, a footer and an RSS feed in the neobrutalist style. '.repeat(Math.ceil(length / 77)).slice(0, length)
+}
+
+/** Whether any `size` characters in a row of `secret` (whitespace left out of both) are in `text`. */
+function leaks(text: string, secret: string, size = 8): boolean {
+  const flat = text.replace(/\s/g, '')
+  const hidden = secret.replace(/\s/g, '')
+  for (let index = 0; index + size <= hidden.length; index++) if (flat.includes(hidden.slice(index, index + size))) return true
+  return false
+}
+
+test('a private key whose header falls in a cut is masked before the cut: its END line and its base64 never reach the task', () => {
+  assert.ok(GH_TOKEN.length === 40 && /^ghp_[A-Za-z0-9]{36}$/.test(GH_TOKEN))
+  // The probe: a 700-character prompt of prose and a key, between the first and the newest, so cut to 1000.
+  const probe = `${prose(700)}\n${PEM_KEY}`
+  // And one long enough that a cut to 4000 takes out the header too.
+  const long = `${prose(2_500)}\n${PEM_KEY}`
+  assert.ok(probe.length > MAX_MIDDLE_CHARS && long.length > MAX_PART_CHARS)
+  const tasks = {
+    'a middle prompt': taskOf(agentOf({ events: [userEvent(1, 'hello!'), userEvent(2, probe), userEvent(3, 'yes write it up')] }), true),
+    'the first prompt': taskOf(agentOf({ events: [userEvent(1, long), userEvent(2, 'yes write it up')] }), true),
+    'the newest prompt': taskOf(agentOf({ events: [userEvent(1, 'hello!'), userEvent(2, long)] }), true),
+    'a child\'s brief': taskOf(agentOf({ child: true, events: [userEvent(1, [long, DSH_NOTE])] }), false),
+    'a child\'s fix round': taskOf(agentOf({ child: true, events: [userEvent(1, 'the brief'), agentMessage(2, 'main-1', long)] }), false),
+  }
+  for (const [where, task] of Object.entries(tasks)) {
+    assert.doesNotMatch(task, /END PRIVATE KEY|BEGIN PRIVATE KEY/, where)
+    assert.equal(leaks(task, PEM_BODY), false, `${where}: the key's base64 is in the task`)
+    assert.match(task, /\[a private key, left out\]/, where)
+    assert.doesNotMatch(task, /‹secret:/, `${where}: no mask the client would read as a private key's`)
+    assert.ok(task.includes(prose(400)), `${where}: the prose before the key is still there`)
+  }
+  assert.equal(tasks['a middle prompt'], ['hello!', `${prose(700)}\n[a private key, left out]`, 'yes write it up'].join('\n\n'))
+})
+
+test('a token that a cut goes through is masked before the cut, so none of it reaches the task', () => {
+  // Cut to 1000, a middle prompt keeps its first 498 characters: the token starts at 481 and runs past the cut.
+  const middle = `${prose(480)} ${GH_TOKEN} ${prose(1_000)}`
+  // Cut to 4000, the first prompt keeps its first 1998.
+  const first = `${prose(1_980)} ${GH_TOKEN} ${prose(4_000)}`
+  const tasks = [
+    taskOf(agentOf({ events: [userEvent(1, 'hello!'), userEvent(2, middle), userEvent(3, 'go on')] }), true),
+    taskOf(agentOf({ events: [userEvent(1, first), userEvent(2, 'go on')] }), true),
+    taskOf(agentOf({ child: true, events: [userEvent(1, [first, DSH_NOTE])] }), false),
+  ]
+  for (const task of tasks) {
+    assert.doesNotMatch(task, /ghp_/)
+    assert.equal(leaks(task, GH_TOKEN.slice(4)), false, 'some of the token is in the task')
+    assert.doesNotMatch(task, /‹secret:/)
+  }
+  // A whole token is masked as a whole, with a marker that says what it was.
+  assert.equal(taskOf(agentOf({ events: [userEvent(1, `push with ${GH_TOKEN} please`)] }), true), 'push with [a GitHub token, left out] please')
+})
+
 test('a child\'s brief is the first text block of its first prompt, clipped in the middle: the 5.8k brief keeps its commit instructions', () => {
   assert.equal(LONG_BRIEF.length, 5_853)
   const task = taskOf(agentOf({ child: true, events: [userEvent(1, [LONG_BRIEF, CREW_NOTE, DSH_NOTE]), otherEvent(2)] }), false)
@@ -1422,6 +1498,28 @@ test('a command that a fake private key header would hide from the judge does no
   assert.match(p.approvals[0]!.displayReason?.en ?? '', /^The command needs your approval: it holds what looks like a private key, which isn't sent to the judge, so the judge couldn't read it\.$/)
   assert.deepEqual(p.ran, [], 'nothing ran')
   assert.equal(p.jev.requests.length, 0, 'and nothing was sent to TypeSafe')
+})
+
+test('a private key in the first prompt, which is always in the task, does not make every later command opaque, and none of it is sent', async (t) => {
+  const p = await plugged(t)
+  p.jev.always(jevSays(READ_ONLY, 0.95))
+  const first = `Use this deploy key for the server:\n${PEM_KEY}\nand set up the blog. ${prose(3_000)}`
+  const events = [userEvent(1, first), otherEvent(2), userEvent(3, `now run the tests, and push with ${GH_TOKEN}`), otherEvent(4), userEvent(5, `${prose(700)}\n${PEM_KEY}`), userEvent(6, 'go on')]
+  const main = agentOf({ cwd: '/work/app', events })
+  const child = agentOf({ child: true, cwd: '/work/app', events: [userEvent(1, [first, DSH_NOTE]), agentMessage(2, 'main-1', `${prose(2_500)}\n${PEM_KEY}`)] })
+  assert.equal(textOf(await p.call('bash', BASH('npm test'), main)), 'it ran')
+  assert.equal(textOf(await p.call('bash', BASH('git status'), main)), 'it ran')
+  assert.equal(textOf(await p.call('bash', BASH('npm test'), child)), 'it ran')
+  assert.deepEqual(p.ran.map(args => args.command), ['npm test', 'git status', 'npm test'])
+  assert.equal(p.approvals.length, 0, 'nothing was put to you')
+  assert.equal(p.jev.requests.length, 3, 'each command went to the judge, and none was refused as opaque')
+  for (const request of p.jev.requests) {
+    const task: string = request.json.state.task
+    assert.match(task, /^Use this deploy key for the server:\n\[a private key, left out\]\nand set up the blog\./)
+    assert.doesNotMatch(request.text, /PRIVATE KEY|ghp_|‹secret: a private key›/)
+    assert.equal(leaks(request.text, PEM_BODY), false, 'the key\'s base64 was sent')
+    assert.equal(leaks(request.text, GH_TOKEN.slice(4)), false, 'the token was sent')
+  }
 })
 
 test('a gated call writes its line to the plugin\'s decision log in the state directory, with the verdict, the command and the call, and secrets masked', async (t) => {

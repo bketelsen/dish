@@ -49,7 +49,8 @@
  *   (`createAgentMessage` in `dsh-subagent`). Everything else is context dsh injected (`goal`, `runtime-context`,
  *   `subagent-settled`, `tool-jobs`, tool results and so on), and never counts. Text blocks only; each message is cut by
  *   taking out its middle (`clipMiddle`), so its head and its tail, where a brief's commit and report instructions tend to
- *   be, both stay.
+ *   be, both stay. Its secrets are masked **before** the cut, each as a plain `[<kind>, left out]` (`taskPart`): a cut that
+ *   took out a private key's header, or went through a token, would leave the rest of it for the client's mask to miss.
  *   - **A top-level agent's** task is its prompts, oldest first, a resend (one equal to the one before it) counted once: the
  *     first, then the newest that fit in `MAX_TASK_CHARS`, with `[… N earlier messages left out]` for the rest. The first and
  *     the newest are always in, cut to `MAX_PART_CHARS`. The first is often the request, and the newest what was said since
@@ -83,7 +84,7 @@ import { createHash } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
-import { isTopLevelAgent } from 'dish-kit'
+import { isTopLevelAgent, maskSecrets } from 'dish-kit'
 import type { Decision, Judge, JudgeAgent, JudgeResult, JsonValue, Question } from './client.ts'
 import { ASK_JUDGE_TOOL } from './ask.ts'
 import { DEFAULT_SETTINGS } from './settings.ts'
@@ -454,10 +455,29 @@ function promptText(event: unknown): string | undefined {
   return message?.source.kind === 'user' ? joined(message.texts) : undefined
 }
 
+/** A mask `maskSecrets` puts where a secret was: `‹secret: <kind>›`. */
+const SECRET_MASK = /‹secret: ([^›]*)›/g
+
+/**
+ * One message of the task, as it is sent: its secrets masked, and then cut in the middle to `max`.
+ *
+ * - **Masked first.** `maskSecrets` finds a private key by its `-----BEGIN … PRIVATE KEY-----` header and a token by its
+ *   prefix. A cut that took out the header, or went through a token, would leave the key's base64 and END line, or the
+ *   token's other half, for the client's own mask to miss.
+ * - **Each mask becomes a plain marker,** `[<kind>, left out]`. The client refuses a request that holds a private key's mask
+ *   (or a scan's that failed) as opaque, because a key's mask can take in what is written around it. That is right for a
+ *   command, whose text is what runs. The task is context, and its first prompt is always in it: one key there would make
+ *   every later command in the session opaque. The marker says what was there, and it holds nothing the client masks.
+ */
+function taskPart(text: string, max: number): string {
+  return clipMiddle(maskSecrets(text).replace(SECRET_MASK, '[$1, left out]'), max)
+}
+
 /**
  * A top-level agent's task: its prompts, oldest first, a resend (one equal to the one before it) once. The first and the newest
- * are always in, each clipped to `MAX_PART_CHARS`; the ones between are clipped to `MAX_MIDDLE_CHARS` and added newest first
- * while the whole stays within `MAX_TASK_CHARS`, and a gap line stands for those left out.
+ * are always in, each cut to `MAX_PART_CHARS`; the ones between are cut to `MAX_MIDDLE_CHARS` and added newest first while
+ * the whole stays within `MAX_TASK_CHARS`, and a gap line stands for those left out. Only the messages it looks at are
+ * masked (`taskPart`): those it keeps, and the one that didn't fit, not the whole of a long chat on every command.
  */
 function topLevelTask(events: Iterable<unknown>): string {
   const texts: string[] = []
@@ -468,22 +488,26 @@ function topLevelTask(events: Iterable<unknown>): string {
     previous = text
     texts.push(text)
   }
-  const last = texts.length - 1
-  const prompts = texts.map((text, index) => clipMiddle(text, index === 0 || index === last ? MAX_PART_CHARS : MAX_MIDDLE_CHARS))
-  if (prompts.length <= 2) return prompts.join(SEPARATOR)
-  const first = prompts[0]!
-  const newest = prompts.length - 1
-  // `from` is the oldest message kept after the first, and `kept` the length of those from it to the newest, joined.
+  if (texts.length === 0) return ''
+  const newest = texts.length - 1
+  const first = taskPart(texts[0]!, MAX_PART_CHARS)
+  if (newest === 0) return first
+  const last = taskPart(texts[newest]!, MAX_PART_CHARS)
+  // The ones kept between the first and the newest, newest first; `from` is the oldest of them (or the newest, with none), and
+  // `kept` the length of those from it to the newest, joined.
+  const between: string[] = []
   let from = newest
-  let kept = prompts[newest]!.length
+  let kept = last.length
   for (let index = newest - 1; index >= 1; index--) {
-    const withIt = prompts[index]!.length + SEPARATOR.length + kept
+    const part = taskPart(texts[index]!, MAX_MIDDLE_CHARS)
+    const withIt = part.length + SEPARATOR.length + kept
     const gap = index > 1 ? gapLine(index - 1).length + SEPARATOR.length : 0
     if (first.length + SEPARATOR.length + gap + withIt > MAX_TASK_CHARS) break
+    between.push(part)
     from = index
     kept = withIt
   }
-  return [first, ...from > 1 ? [gapLine(from - 1)] : [], ...prompts.slice(from)].join(SEPARATOR)
+  return [first, ...from > 1 ? [gapLine(from - 1)] : [], ...between.reverse(), last].join(SEPARATOR)
 }
 
 /**
@@ -513,8 +537,8 @@ function childTask(events: Iterable<unknown>, parent: string | undefined): strin
     }
   }
   if (brief === undefined) return ''
-  const task = clipMiddle(brief, MAX_PART_CHARS)
-  return latest === undefined ? task : `${task}${SEPARATOR}${clipMiddle(latest, MAX_PART_CHARS)}`
+  const task = taskPart(brief, MAX_PART_CHARS)
+  return latest === undefined ? task : `${task}${SEPARATOR}${taskPart(latest, MAX_PART_CHARS)}`
 }
 
 /**
