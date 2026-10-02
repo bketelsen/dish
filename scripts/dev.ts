@@ -43,9 +43,10 @@
  * - install.sh stays in this process's group, so the terminal's Ctrl-C reaches it directly and is not forwarded.
  *
  * Stop it with Ctrl-C, or SIGTERM the node process. A signal sent to the outer `pnpm dev` alone does not reach this
- * process (pnpm does not pass it on; `pnpm dsh` is the same). Ctrl-Z stops only pnpm and this process: dsh and the
- * watchers, in sessions of their own, keep running until the job is resumed (`fg`) and stopped. If this process is
- * SIGKILLed, dsh and the watchers are orphaned: no hangup reaches their sessions.
+ * process (pnpm does not pass it on; `pnpm dsh` is the same). Ctrl-\ stops dsh too, but pnpm itself dies of it at once
+ * and gives the prompt back before dsh has stopped, so a second key goes to the shell: prefer Ctrl-C. Ctrl-Z stops only
+ * pnpm and this process: dsh and the watchers, in sessions of their own, keep running until the job is resumed (`fg`)
+ * and stopped. If this process is SIGKILLed, dsh and the watchers are orphaned: no hangup reaches their sessions.
  *
  * Nothing here sets `XDG_*` or anything of pnpm's, as in the launcher (its header says why).
  */
