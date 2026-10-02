@@ -484,6 +484,19 @@ test('a .git/config another git replaced between dish\'s read and its write is r
   assert.deepEqual((await readdir(join(path, '.git'))).filter(name => name.endsWith('.lock')), [])
 })
 
+test('a .git/config edited in place between dish\'s read and the rename is read again, and the edit kept', async () => {
+  const deps = await adoptDeps()
+  const path = await existingClone(deps, 'https://github.com/acme/widget.git')
+  const config = join(path, '.git', 'config')
+  const env = await scratchGitEnv(deps.dir)
+  await withEnv(await dishHome(deps.dir), async () => {
+    // `>>`: the same file (device and inode), longer.
+    await racing(config, () => appendFile(config, '[pull]\n\trebase = true\n'), () => configureClone(path, project(), IDENTITY, deps))
+  })
+  assert.equal((await runOk('git', ['config', '--file', config, 'pull.rebase'], { env })).trim(), 'true')
+  assert.equal((await runOk('git', ['config', '--file', config, 'user.name'], { env })).trim(), 'dish-test[bot]')
+})
+
 test('a crash after dish wrote its new config, before the rename, leaves .git/config byte for byte as it was and no lock', async () => {
   const deps = await adoptDeps()
   const path = await existingClone(deps, 'https://github.com/acme/widget.git')
@@ -513,7 +526,7 @@ test('a config.lock an agent holds: dish tries once more, and refuses without to
   await writeFile(lock, 'an agent\'s git config at work\n')
   await withEnv(await dishHome(deps.dir), async () => {
     const error = await refusedAt(configureClone(path, project(), IDENTITY, deps), 'configure')
-    assert.match(error.message, /config\.lock/)
+    assert.match(error.message, /\.git\/config\.lock is held; if no git is running in the clone, remove \S*\.git\/config\.lock/)
     assert.equal(await readFile(lock, 'utf8'), 'an agent\'s git config at work\n')
     assert.equal(await readFile(config, 'utf8'), before)
 

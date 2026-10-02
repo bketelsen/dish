@@ -21,14 +21,16 @@
  *     link, checked through Linux's `/proc/self/fd` to be where dish expects (no link anywhere on the way);
  *   - edits a private copy under dish's state directory with `git config --file <copy>` (from `/`, no system or global
  *     config: nothing of the clone's runs); writes nothing if the edit changes nothing;
- *   - writes the result into a new file beside the old one (git's own `config.lock` for the config, so an agent's
- *     `git config` and dish's wait for each other), created never through a link nor over a file that is there,
+ *   - writes the result into a new file beside the old one (git's own `config.lock` for the config, so they exclude
+ *     each other: an agent's `git config` fails while dish holds the lock; dish tries once more while an agent's holds
+ *     it), created never through a link nor over a file that is there,
  *     checked through `/proc/self/fd` too, with the old file's mode, and synced;
  *   - just before renaming it over the old file, checks `.git` is the directory it pinned and the old file is the one it
- *     read (device, inode, one link). A crash at any point leaves the old file whole; a failure removes the new file
+ *     read (device, inode, one link) and unchanged (size, mtime and ctime, so an edit in place isn't dropped unseen). A crash at any point leaves the old file whole; a failure removes the new file
  *     (where `/proc/self/fd` says it is, and only it).
- *   A file replaced meanwhile by another regular file (an agent's `git config`), or a `config.lock` held, is tried once
- *   more from the read; a second change, or a link, is refused. A file with another hard link (a dedup tool's) is
+ *   A file replaced or edited meanwhile (an agent's `git config`, or a `>>`), or a `config.lock` held, is tried once
+ *   more from the read; a second change, or a link, is refused. A held lock's message says to remove it if no git is
+ *   running in the clone (a crash leaves it, as git's own does). A file with another hard link (a dedup tool's) is
  *   refused only when dish has something to write to it.
  * - **Fetch.** `checkClone` first, then `git fetch --prune origin +refs/heads/*:refs/remotes/origin/*`: the refspec on
  *   the command line, so a refspec written into the config can't fetch elsewhere or keep a hand-written origin ref
@@ -244,7 +246,16 @@ async function configWrite(file: string, args: readonly string[], ok: readonly n
 interface Identity { dev: bigint, ino: bigint }
 
 /** A clone's file as dish read it. */
-interface Read { bytes: Buffer, id: Identity, nlink: bigint, mode: number }
+interface Read {
+  bytes: Buffer
+  id: Identity
+  nlink: bigint
+  mode: number
+  /** What tells an edit in place (same device and inode): its size, and its times to the nanosecond. */
+  size: bigint
+  mtimeNs: bigint
+  ctimeNs: bigint
+}
 
 /**
  * A benign change by someone else while dish was writing (the file replaced by another regular file, as an agent's
@@ -310,7 +321,11 @@ async function readPinned(file: string, real: string, name: string, step: Onboar
     if (!stats.isFile()) throw new OnboardError(step, `${name} is not a regular file`)
     if (stats.size > BigInt(MAX_CLONE_FILE_BYTES)) throw new OnboardError(step, `${name} is too large`)
     await verifyAt(handle, real, name, step)
-    return { bytes: await handle.readFile(), id: { dev: stats.dev, ino: stats.ino }, nlink: stats.nlink, mode: Number(stats.mode & 0o7777n) }
+    const bytes = await handle.readFile()
+    return {
+      bytes, id: { dev: stats.dev, ino: stats.ino }, nlink: stats.nlink, mode: Number(stats.mode & 0o7777n),
+      size: stats.size, mtimeNs: stats.mtimeNs, ctimeNs: stats.ctimeNs,
+    }
   } finally {
     await handle.close()
   }
@@ -365,18 +380,20 @@ interface Replacement {
   name: string
   /** What the file was when read; `undefined`: it was missing. */
   read: Read | undefined
-  /** The new file beside it: its real path and its name in messages. */
+  /** The new file beside it: its real path and its name in messages; `lock`: it is git's lock file for the target. */
   realTemp: string
   tempName: string
+  lock: boolean
   bytes: Buffer
 }
 
 /**
  * Replace a clone's file whole: `bytes` into a new file beside it (created, never through a link or over one that is
- * there: `O_EXCL`; for `.git/config` it is git's own `config.lock`, so an agent's `git config` and dish's wait for each
- * other), checked to be where dish expects (`/proc/self/fd`), with the old file's mode, synced; then, just before the
- * rename, the directories on the way still the ones pinned and the file still the one read (same device and inode, one
- * link; or still missing); then renamed over it, and the directory synced. A crash at any point leaves the old file
+ * there: `O_EXCL`; for `.git/config` it is git's own `config.lock`, so they exclude each other: an agent's `git config`
+ * fails while dish holds the lock; dish tries once more while an agent's holds it), checked to be where dish expects
+ * (`/proc/self/fd`), with the old file's mode, synced; then, just before the rename, the directories on the way still
+ * the ones pinned and the file still the one read, unchanged (same device and inode, one link, same size, mtime and
+ * ctime; or still missing); then renamed over it, and the directory synced. A crash at any point leaves the old file
  * whole. On failure, the new file is removed where it is, and only it.
  */
 async function replaceFile(o: Replacement): Promise<void> {
@@ -385,7 +402,12 @@ async function replaceFile(o: Replacement): Promise<void> {
   try {
     handle = await open(o.realTemp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode)
   } catch (error) {
-    if (codeOf(error) === 'EEXIST') throw new Changed(o.step, `${o.tempName} is held (a git config at work?); dish wrote nothing`)
+    if (codeOf(error) === 'EEXIST') {
+      // As git says it: a lock left by a crash (dish's or an agent's) stays until someone removes it.
+      throw new Changed(o.step, o.lock
+        ? `${o.tempName} is held; if no git is running in the clone, remove ${o.realTemp}. dish wrote nothing`
+        : `${o.tempName} is there already; dish wrote nothing`)
+    }
     throw new OnboardError(o.step, `${o.tempName} can't be made (${codeOf(error)}); dish wrote nothing`)
   }
   let renamed = false
@@ -407,7 +429,7 @@ async function replaceFile(o: Replacement): Promise<void> {
   await syncDirectory(dirname(o.realTarget))
 }
 
-/** The file is still the one read: a link is refused; another regular file (or one gone, or one that appeared) is a change, tried once more. */
+/** The file is still the one read, unchanged: a link is refused; another regular file, an edit in place, or one gone or appeared is a change, tried once more. */
 async function stillTheFile(o: Replacement): Promise<void> {
   let stats
   try {
@@ -423,6 +445,10 @@ async function stillTheFile(o: Replacement): Promise<void> {
   if (o.read === undefined) throw new Changed(o.step, `${o.name} appeared while dish was configuring the clone; dish wrote nothing`)
   if (stats.dev !== o.read.id.dev || stats.ino !== o.read.id.ino) {
     throw new Changed(o.step, `${o.name} was replaced while dish was configuring the clone; dish wrote nothing`)
+  }
+  // The same file, edited in place (`>>`): the rename would drop the edit unseen.
+  if (stats.size !== o.read.size || stats.mtimeNs !== o.read.mtimeNs || stats.ctimeNs !== o.read.ctimeNs) {
+    throw new Changed(o.step, `${o.name} was changed while dish was configuring the clone; dish wrote nothing`)
   }
 }
 
@@ -471,7 +497,7 @@ async function editConfig(clone: string, project: Project, deps: CloneDeps, step
     await replaceFile({
       step, dirs: [{ path: dotGit, pinned, name: '.git' }],
       target: file, realTarget: join(realGit, 'config'), name: '.git/config', read,
-      realTemp: join(realGit, 'config.lock'), tempName: '.git/config.lock', bytes: edited,
+      realTemp: join(realGit, 'config.lock'), tempName: '.git/config.lock', lock: true, bytes: edited,
     })
   })
 }
@@ -628,7 +654,7 @@ async function excludeWorktrees(clone: string, step: OnboardStep): Promise<void>
       step,
       dirs: [{ path: dotGit, pinned, name: '.git' }, { path: info, pinned: pinnedInfo, name: '.git/info' }],
       target: file, realTarget: join(realInfo, 'exclude'), name: '.git/info/exclude', read,
-      realTemp: join(realInfo, temp), tempName: `.git/info/${temp}`,
+      realTemp: join(realInfo, temp), tempName: `.git/info/${temp}`, lock: false,
       bytes: Buffer.from(`${text}${text === '' || text.endsWith('\n') ? '' : '\n'}${EXCLUDE_LINE}\n`),
     })
   })
