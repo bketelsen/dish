@@ -275,6 +275,42 @@ test('the CLI forwards SIGTERM to the command, and the exit code the command cho
   assert.equal(code, 5, 'the command got the signal, and its own exit code came back')
 })
 
+test('the CLI leaves SIGINT to the terminal: the command gets one, and the launcher waits and returns its code', async () => {
+  // A terminal's Ctrl-C signals the whole foreground process group, command included. So the child runs in a group of
+  // its own here, and the test signals the group the way a terminal does. A forwarded copy would make it two SIGINTs,
+  // and a second SIGINT during dsh's shutdown makes dsh force-exit with its work half done. Prod, so no `.dev`.
+  const out = join(dir, `sigint-${++counter}.txt`)
+  const script = 'const { writeFileSync } = require("node:fs"); let count = 0; '
+    + 'process.on("SIGINT", () => { if (++count === 1) setTimeout(() => { writeFileSync(process.argv[1], String(count)); process.exit(130) }, 500) }); '
+    + 'console.log("ready"); setInterval(() => {}, 1000)'
+  const child = spawn(process.execPath, [CLI, process.execPath, '-e', script, out], {
+    env: { PATH: process.env.PATH ?? BASE_PATH, DISH_ENV: 'prod' },
+    stdio: ['ignore', 'pipe', 'inherit'],
+    detached: true,
+  })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.on('error', reject)
+      child.stdout.on('data', chunk => {
+        if (String(chunk).includes('ready')) resolve()
+      })
+    })
+    process.kill(-child.pid!, 'SIGINT')
+    const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>(resolve => {
+      child.on('close', (exitCode, exitSignal) => resolve([exitCode, exitSignal]))
+    })
+    assert.equal(await readFile(out, 'utf8'), '1', 'the command counted one SIGINT, not a forwarded second one')
+    assert.equal(signal, null, 'the launcher did not die of the SIGINT')
+    assert.equal(code, 130, 'the launcher waited for the command and returned its code')
+  } finally {
+    try {
+      process.kill(-child.pid!, 'SIGKILL')
+    } catch {
+      // The group is already gone, which is the normal case.
+    }
+  }
+})
+
 test('package.json: pnpm dsh goes through the launcher, and no script runs dsh web', async () => {
   const pkg = JSON.parse(await readFile(join(REPO, 'package.json'), 'utf8')) as { scripts: Record<string, string> }
   assert.equal(pkg.scripts.dsh, 'node scripts/env.ts dsh')

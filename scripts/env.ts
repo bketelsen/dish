@@ -84,12 +84,23 @@ export async function ensureDevDirectories(root: string): Promise<void> {
 }
 
 const USAGE = 'usage: node scripts/env.ts <command> [args...]'
-const FORWARDED: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP']
+/** Signals sent to the launcher alone (a service manager, `kill`) that the command must still get. */
+const FORWARDED: NodeJS.Signals[] = ['SIGTERM', 'SIGHUP']
+
+/**
+ * SIGINT is not forwarded. A terminal's Ctrl-C signals the whole foreground process group, and the command is in the
+ * launcher's group, so it already gets one. A forwarded copy would be a second, and dsh treats a second SIGINT during
+ * its shutdown as a demand to force-exit: disposal is cut short and agent commands, which run detached, can be left
+ * running. So the launcher only has to survive it (a listener, so the default action, dying, does not apply) and
+ * wait for the command, whose exit code it then returns.
+ */
+const ignore = (): void => {}
 
 /**
  * `node scripts/env.ts <command> [args...]`. Returns the exit code: the command's, 128+n when a signal ended it, 127
- * when it can't be started, 2 for usage, and 1 when dev's directories can't be made. `SIGINT`, `SIGTERM` and `SIGHUP`
- * go on to the command. The command runs in the current directory with inherited stdio.
+ * when it can't be started, 2 for usage, and 1 when dev's directories can't be made. `SIGTERM` and `SIGHUP` go on to
+ * the command. `SIGINT` does not (the terminal has already delivered it to the command): the launcher outlives it,
+ * waits, and returns the command's code. The command runs in the current directory with inherited stdio.
  */
 export async function main(argv: string[], options: { root?: string, env?: NodeJS.ProcessEnv } = {}): Promise<number> {
   const root = options.root ?? ROOT
@@ -118,8 +129,10 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
       child.kill(signal)
     }
     for (const signal of FORWARDED) process.on(signal, forward)
+    process.on('SIGINT', ignore)
     const finish = (code: number): void => {
       for (const signal of FORWARDED) process.off(signal, forward)
+      process.off('SIGINT', ignore)
       settle(code)
     }
     child.once('error', error => {
