@@ -28,6 +28,7 @@ test('registerWorkspace: a new path gets a record with the title, created', asyn
     assert.ok(workspace, 'the registry holds it')
     assert.equal(workspace.title, 'acme/widget')
     assert.equal(workspace.path, path)
+    assert.equal(result.path, path, 'the result carries the path dsh holds')
     assert.equal(mounted.registry.list().length, 1)
   } finally {
     await mounted.stop()
@@ -76,6 +77,7 @@ test('registerWorkspace: a path through a symlink, or with a trailing slash, is 
     await symlink(path, link)
     const first = await registerWorkspace(mounted.registry, path, 'real')
     const viaLink = await registerWorkspace(mounted.registry, link, 'link')
+    assert.equal(viaLink.path, path)
     assert.equal(viaLink.id, first.id)
     assert.equal(viaLink.created, false)
     assert.equal(viaLink.title, 'real')
@@ -98,6 +100,22 @@ test('registerWorkspace: a missing path, a file and a relative path reject, and 
     await assert.rejects(registerWorkspace(mounted.registry, file, 'x'))
     await assert.rejects(registerWorkspace(mounted.registry, 'relative/dir', 'x'))
     assert.equal(mounted.registry.list().length, 0)
+  } finally {
+    await mounted.stop()
+  }
+})
+
+test('registerWorkspace: a new record made through a symlink is held at the real path, and the result says so', async () => {
+  const dir = await tempDir()
+  const mounted = await mountRegistry(dir)
+  try {
+    const path = await folder(dir, 'real')
+    const link = join(dir, 'link')
+    await symlink(path, link)
+    const result = await registerWorkspace(mounted.registry, link, 'via link')
+    assert.equal(result.created, true)
+    assert.equal(result.path, path)
+    assert.equal(mounted.registry.get(WorkspaceId(result.id))?.path, path)
   } finally {
     await mounted.stop()
   }
@@ -179,6 +197,7 @@ test('registerWorkspace: a dsh whose create ignores the title gets setTitle on t
   const result = await registerWorkspace(stub.registry, '/w/acme-widget', 'acme/widget')
   assert.equal(result.created, true)
   assert.equal(result.title, 'acme/widget')
+  assert.equal(result.path, '/w/acme-widget')
   assert.deepEqual(stub.setTitles, ['acme/widget'])
   assert.equal(stub.entries.get(result.id)?.title, 'acme/widget')
 })

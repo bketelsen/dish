@@ -20,7 +20,8 @@ export type WorkspaceRegistryLike = Pick<WorkspaceRegistry, 'create' | 'resolveB
  * its README says may happen), `setTitle` on it. A record that was there keeps its title: whatever it is called now is
  * the user's.
  *
- * `created` says whether this call made the record, and `title` is the title the record has afterwards. A title is
+ * `created` says whether this call made the record, `title` is the title the record has afterwards and `path` the path it
+ * holds: dsh's canonical one (`realpath`), which differs from `path` as given when a link is on the way. A title is
  * cosmetic, so a `setTitle` that fails doesn't undo the registration (the directory is registered either way, and the
  * next call would find the record and leave its title alone): the result's `title` tells the caller what dsh holds.
  *
@@ -34,9 +35,10 @@ export async function registerWorkspace(
   registry: WorkspaceRegistryLike,
   path: string,
   title: string,
-): Promise<{ id: string, created: boolean, title: string }> {
-  // create() hands back an existing record without saying so. resolveByPath canonicalises the same way and rejects the
-  // same paths, so a bad path fails here with dsh's own error before anything is made.
+): Promise<{ id: string, created: boolean, title: string, path: string }> {
+  // create() hands back an existing record without saying so. resolveByPath canonicalises the same way, so a relative
+  // or missing path fails here with dsh's own error before anything is made. (It doesn't check for a directory, as
+  // create does: a file resolves and has no record, and create then rejects it. Nothing is made either way.)
   const existing = await registry.resolveByPath(path)
   const workspace = await registry.create(path, title)
   const created = existing === undefined
@@ -47,5 +49,5 @@ export async function registerWorkspace(
       // Cosmetic: see above. The result says what the title is.
     }
   }
-  return { id: workspace.id, created, title: workspace.title }
+  return { id: workspace.id, created, title: workspace.title, path: workspace.path }
 }

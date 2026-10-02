@@ -32,19 +32,25 @@ export interface ScratchOptions {
   /** `scratchRecordFile(state)`. */
   record: string
   logger: { warn(format: string, ...args: unknown[]): void }
+  /**
+   * What has been logged, so a failure that repeats (a start after start, a reloaded registry) is one line. The caller
+   * owns it, and drops it when its plugin goes, so a reload starts clean. Without one, each call remembers nothing.
+   */
+  logged?: Set<string>
 }
 
 const MAX_LOGGED_CHARS = 200
 
-/** What has been logged, so a failure that repeats (a reloaded registry, a start after start) is one line. */
-const logged = new Set<string>()
+/** The random part of writeFileAtomic's temporary file name (`.<name>.<12 hex>.tmp`): it differs on every attempt. */
+const TEMP_SUFFIX = /\.[0-9a-f]{12}\.tmp\b/g
 
 function logOnce(options: ScratchOptions, error: unknown): void {
   const text = error instanceof Error ? error.message : String(error)
   const message = Array.from(maskSecrets(text.replace(/[\x00-\x1f\x7f]+/g, ' '))).slice(0, MAX_LOGGED_CHARS).join('')
-  const key = `${options.record}\n${message}`
-  if (logged.has(key)) return
-  logged.add(key)
+  // The same failure is the same line, whatever the temporary file was called this time.
+  const key = `${options.record}\n${message.replace(TEMP_SUFFIX, '')}`
+  if (options.logged?.has(key)) return
+  options.logged?.add(key)
   options.logger.warn('could not set up the scratch workspace: %s', message)
 }
 
@@ -61,12 +67,12 @@ async function recorded(file: string): Promise<boolean> {
 
 /**
  * Once only: with no record, `mkdir -p <workRoot>/scratch` (0700), register it as "scratch", write the record
- * (`{ path, workspace, at }`, `at` in ms). With a record, nothing, not even the directory.
+ * (`{ path, workspace, at }`: the workspace's canonical path, its id, and the time in ms). With a record, nothing, not even the directory.
  *
  * - `registered`: dish made the registration.
  * - `adopted`: the registry already had a record for the path; it keeps its title and is now recorded.
  * - `recorded-before`: a record was there.
- * - `failed`: an error, logged (masked, once per distinct error); no record is written unless the registration was made,
+ * - `failed`: an error, logged (masked, once per distinct error for a caller that passes `logged`); no record is written unless the registration was made,
  *   and a registration without its record is adopted at the next start. Never throws.
  */
 export async function ensureScratch(options: ScratchOptions): Promise<'registered' | 'adopted' | 'recorded-before' | 'failed'> {
@@ -77,7 +83,9 @@ export async function ensureScratch(options: ScratchOptions): Promise<'registere
     // Register first, record after: a failure between them registers the directory again at the next start (adopting
     // it), where the other order would never register it at all.
     const workspace = await registerWorkspace(options.registry, path, SCRATCH_TITLE)
-    await writeFileAtomic(options.record, `${JSON.stringify({ path, workspace: workspace.id, at: Date.now() })}\n`)
+    // The path dsh holds (canonical), not the one dish built: they differ when the work root has a link on the way.
+    const record = { path: workspace.path, workspace: workspace.id, at: Date.now() }
+    await writeFileAtomic(options.record, `${JSON.stringify(record)}\n`)
     return workspace.created ? 'registered' : 'adopted'
   } catch (error) {
     logOnce(options, error)

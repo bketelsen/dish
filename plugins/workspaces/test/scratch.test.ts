@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { access, chmod, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { format } from 'node:util'
 import { WorkspaceId } from '@deepseek-ai/dsh-workspace'
@@ -18,24 +18,30 @@ interface Setup {
   scratch: string
   record: string
   warnings: string[]
-  /** `ensureScratch` over `registry` with this setup's paths and logger. */
-  run(registry: WorkspaceRegistryLike): ReturnType<typeof ensureScratch>
+  /** `ensureScratch` over `registry` with this setup's paths and logger, and the caller's `logged` set when one is given. */
+  run(registry: WorkspaceRegistryLike, logged?: Set<string>): ReturnType<typeof ensureScratch>
 }
 
-async function setup(): Promise<Setup> {
+/** `linkedWorkRoot`: the work root is a symlink to a directory beside it, as `/home` is to `/var/home` on this host. */
+async function setup(settings: { linkedWorkRoot?: boolean } = {}): Promise<Setup> {
   const dir = await tempDir()
   const workRoot = join(dir, 'work')
+  if (settings.linkedWorkRoot) {
+    await mkdir(join(dir, 'real-work'))
+    await symlink(join(dir, 'real-work'), workRoot)
+  }
   const state = join(dir, 'state')
   const warnings: string[] = []
-  const options = (registry: WorkspaceRegistryLike): ScratchOptions => ({
+  const options = (registry: WorkspaceRegistryLike, logged?: Set<string>): ScratchOptions => ({
     registry,
     workRoot,
     record: scratchRecordFile(state),
     logger: { warn: (...args: [string, ...unknown[]]) => { warnings.push(format(...args)) } },
+    ...(logged ? { logged } : {}),
   })
   return {
     dir, workRoot, scratch: join(workRoot, 'scratch'), record: scratchRecordFile(state), warnings,
-    run: registry => ensureScratch(options(registry)),
+    run: (registry, logged) => ensureScratch(options(registry, logged)),
   }
 }
 
@@ -81,6 +87,32 @@ test('first start: <work root>/scratch is made, registered as "scratch", and rec
     assert.ok(typeof record.at === 'number' && record.at >= before && record.at <= after, 'at is the time, in ms')
     assert.equal((await stat(s.record)).mode & 0o777, 0o600)
     assert.deepEqual(s.warnings, [])
+  })
+})
+
+test('the record holds the path dsh holds: the real one, when the work root is a symlink', async () => {
+  const s = await setup({ linkedWorkRoot: true })
+  await withRegistry(s, async ({ registry }) => {
+    assert.equal(await s.run(registry), 'registered')
+    const real = await realpath(s.scratch)
+    assert.notEqual(real, s.scratch, 'the fixture links')
+    const [workspace] = registry.list()
+    assert.equal(workspace!.path, real)
+    const record = JSON.parse(await readFile(s.record, 'utf8')) as { path: string, workspace: string }
+    assert.equal(record.path, workspace!.path)
+    assert.equal(record.workspace, workspace!.id)
+  })
+})
+
+test('an adopted workspace is recorded at its real path too', async () => {
+  const s = await setup({ linkedWorkRoot: true })
+  await withRegistry(s, async ({ registry }) => {
+    await mkdir(s.scratch, { recursive: true })
+    const mine = await registry.create(s.scratch, 'mine')
+    assert.equal(await s.run(registry), 'adopted')
+    const record = JSON.parse(await readFile(s.record, 'utf8')) as { path: string }
+    assert.equal(record.path, mine.path)
+    assert.equal(record.path, await realpath(s.scratch))
   })
 })
 
@@ -238,16 +270,44 @@ test('a registry that throws gives "failed", never throws, and writes no record'
   assert.equal(await exists(s.record), false, 'no record: the next start tries again')
 })
 
-test('the same failure on a second call is logged once, a different one is logged too', async () => {
+test('a failure that repeats is logged once when the caller keeps the set, and a different one is logged too', async () => {
   const s = await setup()
+  const logged = new Set<string>()
   const registry = failingRegistry(() => new Error('the domain is not open'))
-  assert.equal(await s.run(registry), 'failed')
-  assert.equal(await s.run(registry), 'failed')
+  assert.equal(await s.run(registry, logged), 'failed')
+  assert.equal(await s.run(registry, logged), 'failed')
   assert.equal(s.warnings.length, 1, 'twice gives one line')
 
-  assert.equal(await s.run(failingRegistry(() => new Error('something else broke'))), 'failed')
+  assert.equal(await s.run(failingRegistry(() => new Error('something else broke')), logged), 'failed')
   assert.equal(s.warnings.length, 2)
   assert.match(s.warnings[1]!, /something else broke/)
+})
+
+test('the set is the caller\'s: a new one (a plugin reload) logs again, and with none every call logs', async () => {
+  const s = await setup()
+  const registry = failingRegistry(() => new Error('the domain is not open'))
+  const first = new Set<string>()
+  assert.equal(await s.run(registry, first), 'failed')
+  assert.equal(await s.run(registry, first), 'failed')
+  assert.equal(s.warnings.length, 1)
+  assert.ok(first.size > 0, 'the set holds what was logged')
+
+  assert.equal(await s.run(registry, new Set()), 'failed')
+  assert.equal(s.warnings.length, 2, 'a plugin that reloads starts with a set of its own')
+
+  assert.equal(await s.run(registry), 'failed')
+  assert.equal(await s.run(registry), 'failed')
+  assert.equal(s.warnings.length, 4, 'without a set nothing is remembered between calls')
+})
+
+test('the same failure for another record is logged again', async () => {
+  const a = await setup()
+  const b = await setup()
+  const logged = new Set<string>()
+  const registry = failingRegistry(() => new Error('the domain is not open'))
+  assert.equal(await a.run(registry, logged), 'failed')
+  assert.equal(await b.run(registry, logged), 'failed')
+  assert.equal(a.warnings.length + b.warnings.length, 2)
 })
 
 test('a failure is retried at the next start: once the registry works, scratch is registered', async () => {
@@ -268,6 +328,7 @@ test('a record that cannot be written is "failed"; the registration is kept and 
     try {
       assert.equal(await s.run(registry), 'failed')
       assert.equal(s.warnings.length, 1)
+      assert.match(s.warnings[0]!, /\.tmp/, 'the error names the temporary file, whose name is random')
       assert.equal(registry.list().length, 1, 'registered, but not recorded')
       assert.equal(await exists(s.record), false)
     } finally {
@@ -277,6 +338,22 @@ test('a record that cannot be written is "failed"; the registration is kept and 
     assert.equal(await s.run(registry), 'adopted')
     assert.equal(registry.list().length, 1)
     assert.ok(await exists(s.record))
+  })
+})
+
+test('a record write that fails the same way every time is logged once, whatever the temporary file is called', { skip: process.getuid?.() === 0 && 'root can write anywhere' }, async () => {
+  const s = await setup()
+  await withRegistry(s, async ({ registry }) => {
+    const directory = join(s.record, '..')
+    await mkdir(directory, { recursive: true })
+    await chmod(directory, 0o500)
+    try {
+      const logged = new Set<string>()
+      for (let attempt = 0; attempt < 3; attempt++) assert.equal(await s.run(registry, logged), 'failed')
+      assert.equal(s.warnings.length, 1, 'three starts, one line')
+    } finally {
+      await chmod(directory, 0o700)
+    }
   })
 })
 
