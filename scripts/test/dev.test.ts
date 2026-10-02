@@ -231,7 +231,8 @@ test('main: a bad --port returns 2 and makes no .dev', async () => {
 /**
  * What a stand-in does. By default it runs until it is signalled: SIGTERM ends it with `termCode` (0) at once, and SIGINT
  * with 130 after `interruptMs` (dsh takes a moment to shut down). Every start and every signal is appended to
- * `<role>.log`.
+ * `<role>.log`. How it ended goes to `<role>.exit`: its exit code, which an error nobody handled (an EIO or an EPIPE on
+ * stdout or stderr) makes 1, as dsh's own fail-loud handler does, with the error's code in `<role>.uncaught`.
  */
 interface Stub {
   /** Exit by itself after this many milliseconds, with `code`. */
@@ -239,6 +240,15 @@ interface Stub {
   code?: number
   /** Lines to print to stdout on start (the sign-in line, for dsh). */
   print?: string[]
+  /** Lines to print to stderr on start. */
+  printErr?: string[]
+  /**
+   * Lines to log as it shuts down, once a signal has told it to and its `interruptMs` or `termMs` is up, as dsh logs its
+   * dispose: on stdout, stderr, stdout, stderr and stdout, 100 ms apart, each line followed by ` (stdout)` or ` (stderr)`.
+   * So it writes to each stream again after pnpm dev has had a write fail and has seen more of its output. The exit comes
+   * 100 ms after the last, so a write that failed has ended it by then.
+   */
+  stopLines?: string[]
   /** Milliseconds from a first SIGINT to the exit. */
   interruptMs?: number
   /** The exit code after a SIGTERM or SIGHUP. */
@@ -273,12 +283,29 @@ try {
   const stat = fs.readFileSync('/proc/self/stat', 'utf8')
   pgrp = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[2])
 } catch {}
+process.on('uncaughtException', error => {
+  fs.writeFileSync(process.env.STUB_LOG + '/' + role + '.uncaught', [error.code, error.syscall].filter(Boolean).join(' ') || String(error))
+  process.exit(1)
+})
+process.on('exit', code => fs.writeFileSync(process.env.STUB_LOG + '/' + role + '.exit', String(code)))
 log('start ' + JSON.stringify({
   argv: process.argv.slice(2), cwd: process.cwd(), pid: process.pid, pgrp,
   DSH_HOME: process.env.DSH_HOME, DSH_DISH_HOME: process.env.DSH_DISH_HOME, DISH_ENV: process.env.DISH_ENV,
   dishNames: Object.keys(process.env).filter(name => /^DISH_/.test(name)).sort(), DISH_REMOTE: process.env.DISH_REMOTE,
 }))
 for (const line of stub.print || []) console.log(line)
+for (const line of stub.printErr || []) console.error(line)
+// The streams' own write, not console's, which would swallow a failed write: a failure must end the stand-in.
+const stop = code => {
+  const bursts = stub.stopLines ? ['stdout', 'stderr', 'stdout', 'stderr', 'stdout'] : []
+  const next = () => {
+    const name = bursts.shift()
+    if (name === undefined) return process.exit(code)
+    for (const line of stub.stopLines) process[name].write(line + ' (' + name + ')\\n')
+    setTimeout(next, 100)
+  }
+  next()
+}
 if (stub.grandchild) {
   const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
   fs.writeFileSync(process.env.STUB_LOG + '/' + role + '.child.pid', String(child.pid))
@@ -289,8 +316,8 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     log(signal)
     if (ending) return
     ending = true
-    if (signal === 'SIGINT') setTimeout(() => process.exit(130), stub.interruptMs ?? 300)
-    else setTimeout(() => process.exit(stub.termCode ?? 0), stub.termMs ?? 0)
+    if (signal === 'SIGINT') setTimeout(() => stop(130), stub.interruptMs ?? 300)
+    else setTimeout(() => stop(stub.termCode ?? 0), stub.termMs ?? 0)
   })
 }
 if (stub.exitAfterMs !== undefined) setTimeout(() => process.exit(stub.code ?? 0), stub.exitAfterMs)
@@ -358,6 +385,22 @@ async function makeFixture(stubs: { dsh?: Stub, pnpm?: Stub } = {}, extraEnv: No
 
 async function readLog(fixture: Fixture, role: string): Promise<string[]> {
   return (await readFile(join(fixture.logs, `${role}.log`), 'utf8').catch(() => '')).split('\n').filter(line => line !== '')
+}
+
+/**
+ * How a stand-in ended: its exit code, followed by the error that ended it (`1 (EIO write)`) if one did, or `no exit
+ * recorded` when it recorded none within 5 s (it was killed).
+ */
+async function ending(fixture: Fixture, role: string): Promise<string> {
+  for (const deadline = Date.now() + 5000; ;) {
+    const code = await readFile(join(fixture.logs, `${role}.exit`), 'utf8').catch(() => undefined)
+    if (code !== undefined) {
+      const uncaught = await readFile(join(fixture.logs, `${role}.uncaught`), 'utf8').catch(() => '')
+      return uncaught === '' ? code : `${code} (${uncaught})`
+    }
+    if (Date.now() > deadline) return 'no exit recorded'
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
 }
 
 interface Launched {
@@ -461,8 +504,10 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
   const fixture = await makeFixture({
     dsh: {
       print: ['booting', 'dsh web: http://127.0.0.1:3999/?token=abc', 'dsh web: opening the default browser; pass --no-open to disable'],
+      printErr: ['dsh: a line on stderr'],
       exitAfterMs: 400,
     },
+    pnpm: { print: ['watchers: built'], printErr: ['watchers: a line on stderr'] },
   })
   // install.sh's inputs, as a shell or an .envrc on the desktop might have them: the real remote among them.
   Object.assign(fixture.env, {
@@ -519,6 +564,10 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
     assert.ok(own >= 0, 'including the sign-in line')
     assert.ok(open > own, 'the dev: open line follows it')
     assert.equal(lines.filter(line => line.startsWith('dev: open ')).length, 1, 'once')
+    assert.ok(lines.includes('watchers: built'), 'the watchers\' stdout is passed through')
+    const errors = run.stderr().split('\n')
+    assert.ok(errors.includes('dsh: a line on stderr'), 'dsh\'s stderr is passed through to stderr')
+    assert.ok(errors.includes('watchers: a line on stderr'), 'and the watchers\'')
     for (const name of ['dsh', 'config', 'state', 'data', 'cache']) {
       assert.equal((await stat(join(fixture.root, '.dev', name))).mode & 0o777, 0o700, name)
     }
@@ -757,14 +806,15 @@ const HAS_SCRIPT = (() => {
   }
 })()
 
-test('closing the terminal: dsh gets one SIGTERM, the watchers a hangup, nothing is left, and pnpm dev ends 129', {
+test('closing the terminal: dsh gets one SIGTERM, the watchers a hangup, all three end as they choose, nothing is left, and pnpm dev ends 129', {
   skip: !HAS_SCRIPT && 'needs util-linux script',
 }, async () => {
   // An interactive bash on a pty runs pnpm dev as its foreground job. When the terminal goes away, bash hangs up its job
   // (a SIGHUP to the job's group) and, as it exits, the kernel hangs up the session's foreground group again: pnpm dev
   // sees two SIGHUPs a few milliseconds apart. dsh must still get exactly one signal, and it takes 500 ms over its exit
-  // here, so a second one would show.
-  const fixture = await makeFixture({ dsh: { termMs: 500 }, pnpm: { grandchild: true } })
+  // here, so a second one would show. Then dsh and the watchers log their shutdown on both streams, when the terminal is
+  // gone (a write to it fails with EIO): that must end neither them nor pnpm dev, which relays it.
+  const fixture = await makeFixture({ dsh: { termMs: 500, stopLines: ['dsh: shutting down'] }, pnpm: { grandchild: true, stopLines: ['watchers: stopping'] } })
   const wrapper = join(fixture.root, 'wrapper-pty.ts')
   const exitFile = join(fixture.logs, 'wrapper.exit')
   await writeFile(wrapper, [
@@ -800,6 +850,8 @@ test('closing the terminal: dsh gets one SIGTERM, the watchers a hangup, nothing
     }
     assert.ok(await exists(history), 'the shell saved its history in the fixture, not in a real home')
     assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), ['SIGTERM'], 'dsh: one SIGTERM, though the hangup came twice')
+    assert.equal(await ending(fixture, 'dsh'), '0', 'dsh finished its shutdown and exited as it chose to')
+    assert.equal(await ending(fixture, 'pnpm'), '0', 'the watchers too')
     const grandchild = Number(await readFile(join(fixture.logs, 'pnpm.child.pid'), 'utf8'))
     for (const deadline = Date.now() + 5000; alive(grandchild) && Date.now() < deadline;) {
       await new Promise(resolve => setTimeout(resolve, 25))
@@ -808,6 +860,36 @@ test('closing the terminal: dsh gets one SIGTERM, the watchers a hangup, nothing
   } finally {
     terminal.kill('SIGKILL')
     await reap(fixture)
+  }
+})
+
+test('a closed pipe (pnpm dev | tee, then Ctrl-C): pnpm dev, dsh and the watchers all end as they choose', async () => {
+  // A Ctrl-C ends tee with the rest of the foreground group, so pnpm dev's stdout is a pipe nobody reads while dsh shuts
+  // down and logs it (a write to it fails with EPIPE). pnpm dev must drop what it can't write and keep reading what dsh
+  // and the watchers write, so that neither gets an EPIPE of its own; what goes to stderr still arrives.
+  const fixture = await makeFixture({
+    dsh: { print: ['dsh web: http://127.0.0.1:3999/?token=abc'], interruptMs: 300, stopLines: ['dsh: shutting down'] },
+    pnpm: { stopLines: ['watchers: stopping'] },
+  })
+  const run = await launch(fixture)
+  try {
+    await bothUp(fixture, run)
+    for (const deadline = Date.now() + 5000; !run.stdout().includes('dev: open ');) {
+      assert.ok(Date.now() < deadline, `pnpm dev printed the link (stderr: ${run.stderr()})`)
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    run.child.stdout!.destroy() // tee is gone: nothing reads pnpm dev's stdout any more
+    killGroup(run, 'SIGINT')
+    const { code, signal } = await finished(run)
+    assert.equal(signal, null, 'pnpm dev did not die')
+    assert.equal(code, 130, `pnpm dev waited for the children and returned 128 + SIGINT (stderr: ${run.stderr()})`)
+    assert.equal(await ending(fixture, 'dsh'), '130', 'dsh finished its shutdown and exited as it chose to')
+    assert.equal(await ending(fixture, 'pnpm'), '0', 'the watchers, stopped once dsh had gone, too')
+    const errors = run.stderr().split('\n')
+    assert.ok(errors.includes('dsh: shutting down (stderr)'), `dsh's stderr still arrives: ${run.stderr()}`)
+    assert.ok(errors.includes('watchers: stopping (stderr)'), `and the watchers': ${run.stderr()}`)
+  } finally {
+    await reap(fixture, run)
   }
 })
 

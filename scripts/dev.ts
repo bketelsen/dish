@@ -14,6 +14,13 @@
  * When one of the two stops, the other is stopped. The exit code is the first non-zero code of the two, or 128+n when
  * this process was itself sent signal n.
  *
+ * **Output.** dsh and the watchers write to pipes, never to the terminal: this process reads both of each one's streams
+ * and copies them to its own stdout and stderr. dsh's shutdown takes up to 5 s and logs as it goes, and by then the
+ * terminal may be gone (a write to it fails with EIO) or a pipe closed (`pnpm dev | tee log`, where a Ctrl-C ends tee
+ * too: EPIPE). A child writing there itself would die of it halfway (dsh's fail-loud handler exits 1 on an error nobody
+ * handled), and so would this process. So a write that fails here is dropped, with whatever follows on that stream, and
+ * the children's pipes are still read to their end, so that neither blocks on a full pipe or gets an EPIPE of its own.
+ *
  * **Signals.** dsh handles SIGINT and SIGTERM and nothing else. A SIGHUP kills it at once, without its shutdown, which
  * leaves agent commands (they run detached) behind; and a second signal of either kind during its shutdown
  * (`createProcessShutdown`: `interrupt` after `interrupt`) makes it force-exit. So nothing reaches dsh but what this
@@ -45,6 +52,7 @@
 
 import { execFile, spawn } from 'node:child_process'
 import type { ChildProcess, SpawnOptions } from 'node:child_process'
+import type { Readable } from 'node:stream'
 import { constants } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -149,8 +157,43 @@ const RECEIVED: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']
 
 /** How long after the first child's exit the other is stopped, so that a signal that is still arriving is forwarded first. */
 const STOP_GRACE_MS = 200
-/** How long dsh's stdout may take to close after dsh has exited: a command that outlived dsh could hold it open. */
+/** How long the children's output may take to close after they have exited: a command that outlived dsh could hold it open. */
 const DRAIN_MS = 1000
+
+/** This process's stdout or stderr, once a write to it has failed: nothing more is written there (see the header's Output). */
+const failedOutput = new Set<NodeJS.WriteStream>()
+const guardedOutput = new Set<NodeJS.WriteStream>()
+
+/**
+ * From here on, a closed terminal or pipe can't end this process: an error on its stdout or stderr is not thrown, but
+ * marks the stream failed. (`writable` can't tell: node revives its own stdio streams after an error.)
+ */
+function guardOutput(): void {
+  for (const stream of [process.stdout, process.stderr]) {
+    if (guardedOutput.has(stream)) continue
+    guardedOutput.add(stream)
+    stream.on('error', () => { failedOutput.add(stream) })
+  }
+}
+
+/** Writes to this process's `stream`, unless a write to it has failed. */
+function put(stream: NodeJS.WriteStream, text: string | Uint8Array): void {
+  if (!failedOutput.has(stream)) stream.write(text)
+}
+
+/** Copies a child's `from` to this process's `to`, reading it to its end whatever happens to `to`. Settles when it closes. */
+function relay(from: Readable | null, to: NodeJS.WriteStream): Promise<void> {
+  if (from === null) return Promise.resolve()
+  from.on('data', (chunk: Uint8Array) => put(to, chunk))
+  return new Promise(settle => from.once('close', () => settle()))
+}
+
+/** `relay`, a line at a time, to `each`. */
+function relayLines(from: Readable | null, each: (line: string) => void): Promise<void> {
+  if (from === null) return Promise.resolve()
+  createInterface({ input: from }).on('line', each)
+  return new Promise(settle => from.once('close', () => settle()))
+}
 
 /** A running child: the process, whether this process has signalled it, and its exit code once it is gone. */
 interface Running {
@@ -268,6 +311,7 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
     console.error(`dev: ${error.message}`)
     return 2
   }
+  guardOutput()
   try {
     await ensureDevDirectories(root)
   } catch (error) {
@@ -303,29 +347,29 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
     const watchers = start('the watchers', 'pnpm', ['--filter', './plugins/*', '--parallel', '--if-present', 'run', 'dev'], {
       cwd: root,
       env: serverEnv,
-      stdio: 'inherit',
+      stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
     }, { forwarding: WATCHER_SIGNALS, group: true })
     const server = start('dsh', join(root, 'node_modules', '.bin', 'dsh'), [
       'web', '--host', '127.0.0.1', '--port', String(port), '--no-open',
-    ], { cwd: root, env: serverEnv, stdio: ['inherit', 'pipe', 'inherit'], detached: true }, { forwarding: DSH_SIGNALS })
+    ], { cwd: root, env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true }, { forwarding: DSH_SIGNALS })
     children.push(watchers, server)
 
+    // dsh's stdout a line at a time, for its sign-in line; the rest as it comes.
     let announced = false
-    const drained = server.process.stdout === null
-      ? Promise.resolve()
-      : new Promise<void>(settle => {
-        const lines = createInterface({ input: server.process.stdout! })
-        lines.on('line', line => {
-          process.stdout.write(`${line}\n`)
-          const url = announced ? undefined : signInLink(line)
-          if (url !== undefined) {
-            announced = true
-            process.stdout.write(`dev: open ${url}\n`)
-          }
-        })
-        lines.once('close', settle)
-      })
+    const drained = Promise.all([
+      relayLines(server.process.stdout, line => {
+        put(process.stdout, `${line}\n`)
+        const url = announced ? undefined : signInLink(line)
+        if (url !== undefined) {
+          announced = true
+          put(process.stdout, `dev: open ${url}\n`)
+        }
+      }),
+      relay(server.process.stderr, process.stderr),
+      relay(watchers.process.stdout, process.stdout),
+      relay(watchers.process.stderr, process.stderr),
+    ])
 
     // When either child has exited, stop the other, unless a signal has already been sent to it: a second one makes
     // dsh force-exit. (Watchers that did not get the Ctrl-C's SIGINT are stopped here, once dsh has gone.)
