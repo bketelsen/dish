@@ -188,6 +188,15 @@ describe('GitHubApp against the fake', () => {
     assert.deepEqual([last.method, last.path, last.auth, last.status], ['GET', '/users/dish-test%5Bbot%5D', 'token', 200])
   })
 
+  it('botUser() without a token asks without a credential, reading no App credentials (a public endpoint: no installation permission needed)', async () => {
+    const { fake, app, credentials } = await setup()
+    assert.deepEqual(await app.botUser('dish-test'), { id: fake.bot.id, login: 'dish-test[bot]' })
+    const last = fake.requests.at(-1)!
+    assert.deepEqual([last.method, last.path, last.auth, last.status], ['GET', '/users/dish-test%5Bbot%5D', 'none', 200])
+    assert.equal(fake.minted.length, 0)
+    assert.equal(credentials.calls, 0)
+  })
+
   it('pullsForCommit() lists the pull requests, and a 404 or a 422 is an empty list', async () => {
     const { fake, app } = await setup()
     fake.installations.set('acme', { id: 77, account: 'Acme', repos: new Set(['widget']) })
@@ -421,6 +430,16 @@ describe('requests', () => {
     const headers = new Headers(calls[0]!.init.headers)
     assert.equal(headers.get('authorization'), `token ${token}`)
     assert.ok(!calls[0]!.url.includes(token))
+    assert.equal(calls[0]!.url, 'https://api.github.com/users/x%5Bbot%5D')
+  })
+
+  it('botUser() without a token sends no Authorization header at all', async () => {
+    const { fn, calls } = recording({ id: 5, login: 'x[bot]' })
+    const app = new GitHubApp(async () => ({ appId: '4242', privateKey: keys.privateKeyPem }), { fetch: fn })
+    assert.deepEqual(await app.botUser('x'), { id: 5, login: 'x[bot]' })
+    const headers = new Headers(calls[0]!.init.headers)
+    assert.equal(headers.get('authorization'), null)
+    assert.equal(headers.get('user-agent'), 'dish-workspaces')
     assert.equal(calls[0]!.url, 'https://api.github.com/users/x%5Bbot%5D')
   })
 

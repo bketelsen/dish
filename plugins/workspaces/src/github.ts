@@ -201,7 +201,7 @@ async function readCapped(response: Response, max: number): Promise<{ text: stri
   return { text: Buffer.concat(chunks).toString('utf8'), truncated }
 }
 
-type Auth = { kind: 'jwt' } | { kind: 'token', token: string }
+type Auth = { kind: 'jwt' } | { kind: 'token', token: string } | { kind: 'none' }
 
 interface Answer {
   status: number
@@ -306,9 +306,14 @@ export class GitHubApp {
     return { token, expiresAt, permissions: granted, repositories: names }
   }
 
-  /** `GET /users/<slug>%5Bbot%5D` with an installation token: the bot's id, for its commit email. */
-  async botUser(slug: string, token: string): Promise<{ id: number, login: string }> {
-    const auth: Auth = { kind: 'token', token: checkedToken(token) }
+  /**
+   * `GET /users/<slug>%5Bbot%5D`: the bot's id, for its commit email. With an installation token when one is given;
+   * without one, the request carries no credential at all. The endpoint is public, so onboarding asks it that way (Task
+   * 7a's review): the in-memory API token needs Pull requests read, which an installation that hasn't accepted it yet
+   * can't mint, and the identity mustn't wait on that.
+   */
+  async botUser(slug: string, token?: string): Promise<{ id: number, login: string }> {
+    const auth: Auth = token === undefined ? { kind: 'none' } : { kind: 'token', token: checkedToken(token) }
     const path = `/users/${segment('slug', `${slug}[bot]`)}`
     const call = `GET ${path}`
     const { json } = await this.#request('GET', path, auth, call)
@@ -345,7 +350,7 @@ export class GitHubApp {
 
   /** One request. `call` (method and path, no query) is what an error names. */
   async #request(method: 'GET' | 'POST', path: string, auth: Auth, call: string, body?: unknown): Promise<Answer> {
-    let authorization: string
+    let authorization: string | undefined
     if (auth.kind === 'jwt') {
       let credentials: AppCredentials | undefined
       try {
@@ -358,11 +363,12 @@ export class GitHubApp {
       }
       // The credentials are dropped here: only the JWT, good for minutes, goes on.
       authorization = `Bearer ${appJwt(credentials, this.#now())}`
-    } else {
+    } else if (auth.kind === 'token') {
       authorization = `token ${auth.token}`
     }
 
-    const headers: Record<string, string> = { ...API_HEADERS, Authorization: authorization }
+    const headers: Record<string, string> = { ...API_HEADERS }
+    if (authorization !== undefined) headers.Authorization = authorization
     if (body !== undefined) headers['Content-Type'] = 'application/json'
     const signal = AbortSignal.timeout(Math.max(1, Math.ceil(this.#timeoutMs)))
     let response: Response

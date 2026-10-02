@@ -6,6 +6,7 @@
  * - every request carries the contract's headers (`Accept`, `X-GitHub-Api-Version`, `User-Agent`), else 400;
  * - `/app…` takes only a JWT (`Authorization: Bearer`): header `alg` RS256, the signature against the test's public
  *   key, `iss` the App's id, `exp − iat` at most 600 s, `iat` not in the future and `exp` not past. Anything else is 401;
+ * - `GET /users/<login>` is public, as on GitHub: it takes no credential, or a good installation token;
  * - the rest takes only an installation token it minted (`Authorization: token`) that hasn't expired (401), for a
  *   repository the token covers (404, as GitHub hides what a token can't see), with the permission the call needs (403);
  * - the App is read-only (the spec's decision 2): asking for any permission but `read`, or for one it lacks, is 422,
@@ -42,6 +43,11 @@ export interface FakeInstallation {
   account: string
   /** The repositories it was given (names, any case), or all of the owner's. */
   repos: Set<string> | 'all'
+  /**
+   * The permissions the owner has accepted, when fewer than the App asks for (an installation that hasn't accepted a
+   * permission the App added later): a token asking for another is 422, as on GitHub. Default: all of the App's.
+   */
+  permissions?: Readonly<Record<string, string>>
 }
 
 export interface FakeMint {
@@ -230,8 +236,9 @@ export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: n
         const asked = isRecord(parsed) ? parsed : {}
         const repositories = Array.isArray(asked.repositories) ? asked.repositories.map(String) : []
         const permissions = isRecord(asked.permissions) ? Object.fromEntries(Object.entries(asked.permissions).map(([k, v]) => [k, String(v)])) : {}
+        const accepted = installation.permissions ?? APP_PERMISSIONS
         for (const [name, level] of Object.entries(permissions)) {
-          if (level !== 'read' || APP_PERMISSIONS[name] === undefined) {
+          if (level !== 'read' || APP_PERMISSIONS[name] === undefined || accepted[name] === undefined) {
             send(res, request, 422, { message: 'The permissions requested are not granted to this installation.' })
             return
           }
@@ -241,7 +248,7 @@ export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: n
           return
         }
         const token = newToken()
-        const granted = Object.keys(permissions).length === 0 ? { ...APP_PERMISSIONS } : permissions
+        const granted = Object.keys(permissions).length === 0 ? { ...accepted } : permissions
         const expiresAt = Date.now() + TOKEN_LIFE_MS
         tokens.set(token, { installation: id, repositories, permissions: granted, expiresAt })
         minted.push({ installation: id, token, repositories: [...repositories], permissions: { ...granted } })
@@ -271,6 +278,16 @@ export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: n
         return
       }
       send(res, request, 200, installationJson(installation))
+      return
+    }
+
+    // `GET /users/<login>` is public: GitHub answers it without a credential too (with one, the token must be good).
+    if (method === 'GET' && segments[0] === 'users' && segments.length === 2 && auth === 'none') {
+      if (segments[1] !== `${slug}[bot]`) {
+        send(res, request, 404, { message: 'Not Found' })
+        return
+      }
+      send(res, request, 200, { login: `${slug}[bot]`, id: bot.id, type: 'Bot' })
       return
     }
 

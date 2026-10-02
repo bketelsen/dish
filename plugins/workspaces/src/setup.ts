@@ -559,6 +559,8 @@ function firstLine(stderr: string): string {
   return shown(line, 200)
 }
 
+export type SetupOutcome = { ran: false, reason: string } | ({ ran: true } & SetupResult)
+
 /** The skip message: why, and the command to run instead, e.g. "setup didn't run outside the sandbox: base dish/plan-x isn't on origin/main. Run it yourself in <cwd>: <command>". */
 export function skipReason(why: string, cwd: string, command: string): string {
   const reason = why.replace(/\.+$/, '')
