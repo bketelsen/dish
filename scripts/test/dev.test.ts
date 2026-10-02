@@ -129,7 +129,7 @@ test('installEnvironment: adds exactly its four names to an environment that has
 
 /** An environment in which git reads no global or system configuration, so only the repository's own counts. */
 function isolatedGit(): NodeJS.ProcessEnv {
-  return { PATH: BASE_PATH, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }
+  return { PATH: BASE_PATH, HOME: dir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }
 }
 
 async function makeRepo(): Promise<string> {
@@ -161,7 +161,7 @@ test('gitIdentity: each half falls back on its own', async () => {
 
 test('gitIdentity: git missing from PATH gives the fallbacks too', async () => {
   const repo = await makeRepo()
-  assert.deepEqual(await gitIdentity(repo, { PATH: join(dir, 'no-such-bin') }), { name: 'dish dev', email: 'dev@dish.invalid' })
+  assert.deepEqual(await gitIdentity(repo, { PATH: join(dir, 'no-such-bin'), HOME: dir }), { name: 'dish dev', email: 'dev@dish.invalid' })
 })
 
 // ---- signInLink -------------------------------------------------------------------------------------------------
@@ -189,7 +189,7 @@ test('main: DISH_ENV=prod and a bad DISH_ENV return 2, say so on one stderr line
   for (const [value, message] of cases) {
     const root = join(dir, `refuse-${++counter}`)
     await mkdir(root)
-    const { result, stderr } = await capturedStderr(() => main([], { root, env: { PATH: BASE_PATH, DISH_ENV: value } }))
+    const { result, stderr } = await capturedStderr(() => main([], { root, env: { PATH: BASE_PATH, HOME: dir, DISH_ENV: value } }))
     assert.equal(result, 2, value)
     assert.equal(stderr, message, value)
     assert.equal(await exists(join(root, '.dev')), false, `${value}: no .dev`)
@@ -200,7 +200,7 @@ test('main: a bad --port returns 2 and makes no .dev', async () => {
   for (const argv of [['--port', 'abc'], ['--port', '70000'], ['--port'], ['--nope']]) {
     const root = join(dir, `badport-${++counter}`)
     await mkdir(root)
-    const { result, stderr } = await capturedStderr(() => main(argv, { root, env: { PATH: BASE_PATH } }))
+    const { result, stderr } = await capturedStderr(() => main(argv, { root, env: { PATH: BASE_PATH, HOME: dir } }))
     assert.equal(result, 2, JSON.stringify(argv))
     assert.match(stderr, /^dev: [^\n]+\n$/, 'one line')
     assert.equal(await exists(join(root, '.dev')), false)
@@ -326,6 +326,8 @@ async function makeFixture(stubs: { dsh?: Stub, pnpm?: Stub } = {}, extraEnv: No
     logs,
     env: {
       PATH: BASE_PATH,
+      // Nothing started from a fixture may find the real home: not a stand-in, not a shell on a pty.
+      HOME: root,
       STUB_LOG: logs,
       STUB_CONFIG: JSON.stringify({ dsh: stubs.dsh ?? {}, pnpm: stubs.pnpm ?? {} }),
       GIT_CONFIG_GLOBAL: '/dev/null',
@@ -724,7 +726,7 @@ test('a second signal for a child already signalled is dropped, except a second 
 /** Whether util-linux's `script` is here: it runs a command on a pty of its own, which a terminal-close test needs. */
 const HAS_SCRIPT = (() => {
   try {
-    return /util-linux/.test(execFileSync('script', ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }))
+    return /util-linux/.test(execFileSync('script', ['--version'], { encoding: 'utf8', env: { PATH: BASE_PATH, HOME: tmpdir() }, stdio: ['ignore', 'pipe', 'ignore'] }))
   } catch {
     return false
   }
@@ -748,12 +750,15 @@ test('closing the terminal: dsh gets one SIGTERM, the watchers a hangup, nothing
     `writeFileSync(${JSON.stringify(exitFile)}, String(code))`,
     '',
   ].join('\n'))
+  // The shell keeps its history in the fixture: bash saves it when it is hung up, and with no HOME or HISTFILE of its
+  // own it would rewrite the user's real ~/.bash_history.
+  const history = join(fixture.root, '.bash_history')
   const terminal = spawn('script', ['-qefc', 'bash --norc -i', '/dev/null'], {
-    env: { ...fixture.env, TERM: 'dumb' },
+    env: { ...fixture.env, HOME: fixture.root, HISTFILE: history, TERM: 'dumb' },
     stdio: ['pipe', 'ignore', 'ignore'],
   })
   try {
-    terminal.stdin.write(`cd ${fixture.root} && node ${wrapper}\n`)
+    terminal.stdin.write(`cd ${JSON.stringify(fixture.root)} && node ${JSON.stringify(wrapper)}\n`)
     for (const deadline = Date.now() + 15000; ;) {
       if ((await readLog(fixture, 'dsh')).length > 0 && (await readLog(fixture, 'pnpm')).length > 0) break
       assert.ok(Date.now() < deadline, 'the stand-ins started')
@@ -765,6 +770,10 @@ test('closing the terminal: dsh gets one SIGTERM, the watchers a hangup, nothing
       await new Promise(resolve => setTimeout(resolve, 25))
     }
     assert.equal(await readFile(exitFile, 'utf8'), '129', 'pnpm dev ended with 128 + SIGHUP')
+    for (const deadline = Date.now() + 5000; !(await exists(history)) && Date.now() < deadline;) {
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    assert.ok(await exists(history), 'the shell saved its history in the fixture, not in a real home')
     assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), ['SIGTERM'], 'dsh: one SIGTERM, though the hangup came twice')
     const grandchild = Number(await readFile(join(fixture.logs, 'pnpm.child.pid'), 'utf8'))
     for (const deadline = Date.now() + 5000; alive(grandchild) && Date.now() < deadline;) {

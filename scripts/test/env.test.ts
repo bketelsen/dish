@@ -50,7 +50,7 @@ async function run(root: string, env: NodeJS.ProcessEnv): Promise<{ code: number
   const out = join(dir, `seen-${++counter}.json`)
   const script = 'const e = process.env; require("node:fs").writeFileSync(process.argv[1], JSON.stringify({ '
     + 'DSH_HOME: e.DSH_HOME, DSH_DISH_HOME: e.DSH_DISH_HOME, DISH_ENV: e.DISH_ENV, XDG_DATA_HOME: e.XDG_DATA_HOME, PATH: e.PATH }))'
-  const code = await main([process.execPath, '-e', script, out], { root, env })
+  const code = await main([process.execPath, '-e', script, out], { root, env: { HOME: dir, ...env } })
   const seen = await readFile(out, 'utf8').then(text => JSON.parse(text) as Seen, () => undefined)
   return { code, seen }
 }
@@ -204,7 +204,7 @@ test('main: a bad DISH_ENV returns 2 on one stderr line, never runs the command 
   try {
     code = await main([process.execPath, '-e', `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "x")`], {
       root,
-      env: { PATH: BASE_PATH, DISH_ENV: 'staging' },
+      env: { HOME: dir, PATH: BASE_PATH, DISH_ENV: 'staging' },
     })
   } finally {
     process.stderr.write = write
@@ -217,28 +217,28 @@ test('main: a bad DISH_ENV returns 2 on one stderr line, never runs the command 
 
 test('main: no command returns 2, and makes no .dev', async () => {
   const root = await makeRoot()
-  assert.equal(await main([], { root, env: { PATH: BASE_PATH } }), 2)
+  assert.equal(await main([], { root, env: { HOME: dir, PATH: BASE_PATH } }), 2)
   assert.equal(await exists(join(root, '.dev')), false)
 })
 
 test('main: returns the command\'s exit code', async () => {
   const root = await makeRoot()
-  assert.equal(await main([process.execPath, '-e', 'process.exit(7)'], { root, env: { PATH: BASE_PATH } }), 7)
-  assert.equal(await main([process.execPath, '-e', 'process.exit(0)'], { root, env: { PATH: BASE_PATH } }), 0)
+  assert.equal(await main([process.execPath, '-e', 'process.exit(7)'], { root, env: { HOME: dir, PATH: BASE_PATH } }), 7)
+  assert.equal(await main([process.execPath, '-e', 'process.exit(0)'], { root, env: { HOME: dir, PATH: BASE_PATH } }), 0)
 })
 
 test('main: a command killed by a signal gives 128 plus the signal number', async () => {
   const root = await makeRoot()
   const code = await main([process.execPath, '-e', 'process.kill(process.pid, "SIGTERM"); setTimeout(() => {}, 5000)'], {
     root,
-    env: { PATH: BASE_PATH },
+    env: { HOME: dir, PATH: BASE_PATH },
   })
   assert.equal(code, 128 + 15)
 })
 
 test('main: a command that cannot be started gives 127', async () => {
   const root = await makeRoot()
-  const code = await main(['dish-no-such-command-anywhere'], { root, env: { PATH: BASE_PATH, DISH_ENV: 'prod' } })
+  const code = await main(['dish-no-such-command-anywhere'], { root, env: { HOME: dir, PATH: BASE_PATH, DISH_ENV: 'prod' } })
   assert.equal(code, 127)
 })
 
@@ -251,7 +251,7 @@ test('main: finds a bare command in the checkout\'s node_modules/.bin, in dev an
     await writeFile(tool, `#!/bin/sh\nprintf %s "$DISH_ENV" > "$1"\n`)
     await chmod(tool, 0o755)
     const out = join(root, 'tool-ran')
-    const code = await main(['dish-test-tool', out], { root, env: { PATH: BASE_PATH, DISH_ENV } })
+    const code = await main(['dish-test-tool', out], { root, env: { HOME: dir, PATH: BASE_PATH, DISH_ENV } })
     assert.equal(code, 0, DISH_ENV)
     assert.equal(await readFile(out, 'utf8'), DISH_ENV)
   }
@@ -261,7 +261,7 @@ test('the CLI forwards SIGTERM to the command, and the exit code the command cho
   // Prod, so the launcher makes no .dev. The command answers the signal with its own exit code, to prove it got one.
   const child = spawn(process.execPath, [CLI, process.execPath, '-e',
     'process.on("SIGTERM", () => process.exit(5)); console.log("ready"); setInterval(() => {}, 1000)'], {
-    env: { PATH: process.env.PATH ?? BASE_PATH, DISH_ENV: 'prod' },
+    env: { HOME: dir, PATH: process.env.PATH ?? BASE_PATH, DISH_ENV: 'prod' },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
   await new Promise<void>((resolve, reject) => {
@@ -280,7 +280,7 @@ test('the CLI forwards SIGHUP to the command as SIGTERM, which dsh answers with 
   // apart by its exit code, to prove which one arrived. Prod, so the launcher makes no .dev.
   const child = spawn(process.execPath, [CLI, process.execPath, '-e',
     'process.on("SIGTERM", () => process.exit(5)); process.on("SIGHUP", () => process.exit(6)); console.log("ready"); setInterval(() => {}, 1000)'], {
-    env: { PATH: process.env.PATH ?? BASE_PATH, DISH_ENV: 'prod' },
+    env: { HOME: dir, PATH: process.env.PATH ?? BASE_PATH, DISH_ENV: 'prod' },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
   await new Promise<void>((resolve, reject) => {
@@ -303,7 +303,7 @@ test('the CLI leaves SIGINT to the terminal: the command gets one, and the launc
     + 'process.on("SIGINT", () => { if (++count === 1) setTimeout(() => { writeFileSync(process.argv[1], String(count)); process.exit(130) }, 500) }); '
     + 'console.log("ready"); setInterval(() => {}, 1000)'
   const child = spawn(process.execPath, [CLI, process.execPath, '-e', script, out], {
-    env: { PATH: process.env.PATH ?? BASE_PATH, DISH_ENV: 'prod' },
+    env: { HOME: dir, PATH: process.env.PATH ?? BASE_PATH, DISH_ENV: 'prod' },
     stdio: ['ignore', 'pipe', 'inherit'],
     detached: true,
   })
