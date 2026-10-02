@@ -386,6 +386,58 @@ test('the dry run of a diverged main shows both sides', async () => {
   assert.match(result.stderr, /main has commits that origin\/main doesn't/)
 })
 
+/** Detach the checkout at the seed, as a rollback leaves it, and commit there. Returns the new commit, which no branch has. */
+async function commitDetached(host: Host): Promise<string> {
+  await git(host.checkout, 'switch', '--quiet', '--detach', host.seed)
+  await writeFile(join(host.checkout, 'LOCAL.md'), 'local work\n')
+  await git(host.checkout, 'add', 'LOCAL.md')
+  await git(host.checkout, 'commit', '--quiet', '--message', 'local work on the detached HEAD')
+  return host.head()
+}
+
+test('the dry run of a detached HEAD with a commit of its own refuses, after its report', async () => {
+  const { host, sha } = await hostWithUpdate()
+  const local = await commitDetached(host)
+  const before = await snapshot(host)
+  const result = await host.run('update.sh', [])
+  assert.equal(result.code, 1, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`)
+  const lines = stdoutLines(result)
+  assert.equal(lines[0], `update: HEAD ${local} (detached)`)
+  assert.equal(lines[1], `update: target ${sha} (origin/main)`)
+  assert.equal(lines[2], 'update: diverged: 1 commit only at HEAD, 1 only at the target')
+  assert.doesNotMatch(result.stdout, /dry run; run with --apply/)
+  assert.deepEqual(result.stderr.split('\n').filter((line) => line !== ''), [
+    'update: HEAD has commits no branch or tag has; update.sh would leave them behind',
+    'update: FAILED at step: checking the checkout (exit 1)',
+  ])
+  await assertUnchanged(host, before)
+})
+
+test('a detached HEAD at a commit that only a tag has is no refusal: --apply goes back to main', async () => {
+  // A rollback to a tag whose commit no branch has; the tag keeps it.
+  const { host, sha } = await hostWithUpdate()
+  const tagged = await commitDetached(host)
+  await git(host.checkout, 'tag', 'kept', tagged)
+  const result = await host.run('update.sh', ['--apply'])
+  assertOk(result)
+  assert.equal(await host.head(), sha)
+  assert.equal((await git(host.checkout, 'rev-parse', '--abbrev-ref', 'HEAD')).trim(), 'main')
+  assert.equal((await git(host.checkout, 'rev-parse', 'kept')).trim(), tagged)
+})
+
+test('a detached HEAD at a commit that only the local main has is no refusal for a ref: main keeps it', async () => {
+  const host = await createHost()
+  await writeFile(join(host.checkout, 'LOCAL.md'), 'local\n')
+  await git(host.checkout, 'add', 'LOCAL.md')
+  await git(host.checkout, 'commit', '--quiet', '--message', 'a local commit on main')
+  const local = await host.head()
+  await git(host.checkout, 'switch', '--quiet', '--detach', local)
+  const result = await host.run('update.sh', ['--apply', host.seed])
+  assertOk(result)
+  assert.equal(await host.head(), host.seed)
+  assert.equal((await git(host.checkout, 'rev-parse', 'main')).trim(), local)
+})
+
 test('a ref that names a tag works too', async () => {
   const host = await appliedHost()
   await git(host.checkout, 'tag', 'v0-seed', host.seed)
@@ -459,6 +511,20 @@ const REFUSALS: Refusal[] = [
       return {}
     },
   },
+  // After a rollback the checkout is detached, and a commit made there is on no branch: moving the checkout, back to main
+  // or to another ref, would leave it behind.
+  ...([
+    ['a commit made on the detached HEAD after a rollback', undefined],
+    ['a commit made on the detached HEAD after a rollback, with a ref', 'seed'],
+  ] as const).map(([name, ref]): Refusal => ({
+    name,
+    step: 'checking the checkout',
+    message: /^update: HEAD has commits no branch or tag has; update\.sh would leave them behind$/m,
+    async setup(host) {
+      await commitDetached(host)
+      return ref === undefined ? {} : { args: ['--apply', host.seed] }
+    },
+  })),
   {
     name: 'another branch',
     step: 'checking the checkout',

@@ -38,7 +38,8 @@
 #   4. resolve the target: the ref given, else origin/main;
 #   5. report: HEAD and the target, the commits between them, whether the unit, deploy.env and install.env differ from
 #      what the service last started with, and whether it would restart;
-#   6. check the checkout: no local changes, and with no ref, main (or detached) and able to fast-forward.
+#   6. check the checkout: no local changes, no commits on a detached HEAD that no branch or tag has (moving would lose
+#      them), and with no ref, main (or detached) and able to fast-forward.
 #      The dry run stops here. Everything above changes nothing but the fetched refs (and makes the lock file), so every
 #      refusal comes before the first change, and a dry run that passes means --apply can start;
 #   7. move the checkout: a fast-forward of main, or a detached checkout of the ref;
@@ -515,12 +516,18 @@ report() {
 # Refusals that need the checkout. Ignored files, such as node_modules and .dev/, don't count as local changes.
 check_the_checkout() {
   step='checking the checkout'
-  local changes
+  local changes stray
   changes=$(git --no-optional-locks -C "$checkout" status --porcelain --untracked-files=normal)
   if [ -n "$changes" ]; then
     warn "the checkout has local changes, which update.sh leaves alone:"
     printf '%s\n' "$changes" | show_lines 10 >&2
     exit 1
+  fi
+  # A detached HEAD (after a rollback) may have commits of its own, made there: moving the checkout, back to main or to
+  # another ref, would leave them on no branch.
+  if [ -z "$branch" ]; then
+    stray=$(git -C "$checkout" rev-list -n 1 HEAD --not --remotes --tags --branches)
+    if [ -n "$stray" ]; then fail 'HEAD has commits no branch or tag has; update.sh would leave them behind'; fi
   fi
   if [ -n "$ref" ]; then return 0; fi
   if [ -n "$branch" ] && [ "$branch" != main ]; then
