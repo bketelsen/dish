@@ -14,6 +14,10 @@
  * - **The App's credentials** are read with `ctx.get('credentials')?.resolve(ref)` for every request that needs the JWT,
  *   and never kept. The bot identity (`GET /app`, then the public `GET /users/<slug>[bot]`, which GitHub limits to 60 an
  *   hour per address without a credential) is looked up once per service life, and again after either credential changes.
+ * - **The App's status** (`appStatus`, for Settings → GitHub App): a test is `GET /app`, the installations and the bot's
+ *   public profile, made with the credentials read for that one test and dropped after it. Its answer is remembered until
+ *   either credential changes (`credentialsChanged`); a test that was under way when one did is not remembered. The answer
+ *   has neither credential, and the texts in it have the App's ID and the lines of the key taken out as well as masked.
  * - **The read tokens:** the owner map (each owner's installation and the repos of its projects whose clone state names
  *   an installation) is recomputed at start, on `dish-projects/changed` and after each onboarding, one recompute at a
  *   time; onboarding's own addition of a new repo goes through the same queue, and only adds.
@@ -47,12 +51,13 @@ import { workRoot as defaultWorkRoot, xdgPaths } from 'dish-kit'
 import { configureClone, defaultBranch, fetchClone, httpsUrl } from './clone.ts'
 import type { CloneDeps } from './clone.ts'
 import { shown } from './git.ts'
-import { GITHUB_API, GITHUB_WEB, GitHubApp, GitHubError } from './github.ts'
-import type { AppCredentials, PullSummary } from './github.ts'
+import { GITHUB_API, GITHUB_WEB, GitHubApp, GitHubError, botIdentity } from './github.ts'
+import type { AppCredentials, GitHubClientOptions, PullSummary } from './github.ts'
 import { KeyedLock } from './locks.ts'
 import { appIdentity, onboardProject } from './onboard.ts'
 import type { OnboardDeps, OnboardResult, OnboardStep } from './onboard.ts'
 import { cloneStateFile, clonePath, helperValue, projectStateDir, scratchRecordFile, tokensDir } from './paths.ts'
+import type { AppStatus } from './protocol.ts'
 import { registerWorkspace } from './registry.ts'
 import type { WorkspaceRegistryLike } from './registry.ts'
 import { ensureScratch } from './scratch.ts'
@@ -102,6 +107,13 @@ export interface DishWorkspaces {
   resolve(pathOrRef: string): Promise<Worktree | undefined>
   /** Fetch, then sweep, one project or every ready one. */
   sweep(project?: string): Promise<SweepResult>
+  /**
+   * What GitHub says of the App, for Settings → GitHub App. `test` makes the test (`GET /app`, the installations, the bot) and
+   * remembers its answer; without it the last answer is given from memory, and a test is made when there is none. A change to
+   * either credential forgets the memory. The answer holds neither credential, and every text in it is masked. Never rejects
+   * but for a service that has stopped.
+   */
+  appStatus(test: boolean): Promise<AppStatus>
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -230,6 +242,27 @@ function mergeOwners(current: ReadonlyMap<string, OwnerRepos>, extra: ReadonlyMa
   return merged
 }
 
+/**
+ * A function that takes the App's ID, its key and each long line of the key out of a text (as they are, JSON-escaped and
+ * URL-encoded), for what GitHub or a failure says: the masks know the shapes of tokens and PEM blocks, and not these. A value
+ * too short to tell from other text is left (an ID under 4 characters), as is a line of the key under 16.
+ */
+function hiding(credentials: AppCredentials | undefined): (text: string) => string {
+  if (credentials === undefined) return text => text
+  const pieces = new Set<string>()
+  const add = (value: string, shortest: number): void => {
+    const plain = value.trim()
+    if (plain.length < shortest) return
+    for (const form of [plain, JSON.stringify(plain).slice(1, -1), encodeURIComponent(plain)]) pieces.add(form)
+  }
+  add(credentials.appId, 4)
+  add(credentials.privateKey, 16)
+  for (const line of credentials.privateKey.split(/\r?\n/)) add(line, 16)
+  // The longest first: the whole key before its lines.
+  const ordered = [...pieces].sort((a, b) => b.length - a.length)
+  return text => ordered.reduce((hidden, piece) => hidden.split(piece).join('…'), text)
+}
+
 class Service implements WorkspacesService {
   readonly #ctx: Context
   readonly #config: WorkspacesConfig
@@ -262,6 +295,12 @@ class Service implements WorkspacesService {
   #owners = new Map<string, OwnerRepos>()
   #tokenQueue: Promise<void> = Promise.resolve()
   #identity: Promise<Identity> | undefined
+  /** The App client's options (the API's address, a test's `fetch`): the status test builds its own client with them. */
+  readonly #appOptions: GitHubClientOptions
+  /** The last test of the App, until a credential changes; the test under way, if any; and a count of credential changes. */
+  #lastApp: AppStatus | undefined
+  #appTest: Promise<AppStatus> | undefined
+  #credentialsGeneration = 0
   #roundTimer: unknown
   #round: Promise<void> | undefined
 
@@ -280,17 +319,9 @@ class Service implements WorkspacesService {
     this.#timers = internals.timers ?? defaultTimers
     this.#firstRoundMs = internals.firstRoundMs ?? FIRST_ROUND_MS
     this.#roundEveryMs = internals.roundEveryMs ?? ROUND_EVERY_MS
+    this.#appOptions = { api: internals.api ?? GITHUB_API, ...(internals.fetch === undefined ? {} : { fetch: internals.fetch }) }
     // Read for every request that needs the JWT, and dropped once it is signed.
-    const credentials = async (): Promise<AppCredentials | undefined> => {
-      const provider = this.#ctx.get('credentials')
-      if (provider === undefined) return undefined
-      const [appId, privateKey] = await Promise.all([
-        provider.resolve(this.#config.appIdName as CredentialRef),
-        provider.resolve(this.#config.privateKeyName as CredentialRef),
-      ])
-      return appId === undefined || privateKey === undefined ? undefined : { appId: appId.value, privateKey: privateKey.value }
-    }
-    this.#app = new GitHubApp(credentials, { api: internals.api ?? GITHUB_API, ...(internals.fetch === undefined ? {} : { fetch: internals.fetch }) })
+    this.#app = new GitHubApp(() => this.#readCredentials(), this.#appOptions)
     this.#tokens = new TokenManager({
       directory: tokensDir(this.#state),
       app: this.#app,
@@ -401,7 +432,12 @@ class Service implements WorkspacesService {
   }
 
   credentialsChanged(ref: string): void {
-    if (ref === this.#config.appIdName || ref === this.#config.privateKeyName) this.#identity = undefined
+    if (ref !== this.#config.appIdName && ref !== this.#config.privateKeyName) return
+    this.#identity = undefined
+    // What was tested with the old credentials says nothing of the new, and a test still out must not be kept.
+    this.#lastApp = undefined
+    this.#appTest = undefined
+    this.#credentialsGeneration++
   }
 
   // --- DishWorkspaces ------------------------------------------------------------------------------------------------
@@ -558,6 +594,12 @@ class Service implements WorkspacesService {
       }
     }
     return total
+  }
+
+  async appStatus(test: boolean): Promise<AppStatus> {
+    if (this.#closed) throw stopped()
+    if (!test && this.#lastApp !== undefined) return structuredClone(this.#lastApp)
+    return structuredClone(await this.#testApp())
   }
 
   // --- the lock and the work in flight -------------------------------------------------------------------------------
@@ -778,6 +820,82 @@ class Service implements WorkspacesService {
       asked.catch(() => { if (this.#identity === asked) this.#identity = undefined })
     }
     return this.#identity
+  }
+
+  /** The App's ID and private key, read from dsh's credential store now; `undefined` when either (or the store) is missing. Kept by nobody. */
+  async #readCredentials(): Promise<AppCredentials | undefined> {
+    const provider = this.#ctx.get('credentials')
+    if (provider === undefined) return undefined
+    const [appId, privateKey] = await Promise.all([
+      provider.resolve(this.#config.appIdName as CredentialRef),
+      provider.resolve(this.#config.privateKeyName as CredentialRef),
+    ])
+    return appId === undefined || privateKey === undefined ? undefined : { appId: appId.value, privateKey: privateKey.value }
+  }
+
+  /** The status test, shared by callers that come while it runs, and remembered unless a credential changed meanwhile. */
+  #testApp(): Promise<AppStatus> {
+    if (this.#appTest !== undefined) return this.#appTest
+    const generation = this.#credentialsGeneration
+    const run = this.#runAppTest().then((status) => {
+      if (generation === this.#credentialsGeneration && !this.#closed) this.#lastApp = status
+      return status
+    })
+    const tracked: Promise<AppStatus> = run.finally(() => { if (this.#appTest === tracked) this.#appTest = undefined })
+    this.#appTest = tracked
+    return tracked
+  }
+
+  /**
+   * `GET /app`, then the installations and the bot's profile, as far as they go: what one call could not do is in `error`
+   * and the rest of the answer stands. The credentials are read once, used by a client made for this test, and dropped.
+   * Never rejects.
+   */
+  async #runAppTest(): Promise<AppStatus> {
+    const status: AppStatus = {
+      names: { appId: this.#config.appIdName, privateKey: this.#config.privateKeyName },
+      app: null, bot: null, installations: [], error: null, checkedAt: null,
+    }
+    let credentials: AppCredentials | undefined
+    let unreadable: unknown
+    try {
+      credentials = await this.#readCredentials()
+    } catch (error) {
+      unreadable = error
+    }
+    // `undefined` credentials are the client's own 'no-credentials' error before any request; so is a store that failed.
+    const app = new GitHubApp(async () => {
+      if (unreadable !== undefined) throw unreadable
+      return credentials
+    }, this.#appOptions)
+    const hide = hiding(credentials)
+    const errors: string[] = []
+    const fail = (error: unknown): void => { errors.push(shown(hide(messageOf(error)), LOGGED_CHARS)) }
+
+    let slug: string | undefined
+    try {
+      const found = await app.app()
+      status.app = { slug: found.slug, name: found.name }
+      slug = found.slug
+    } catch (error) {
+      fail(error)
+    }
+    if (slug !== undefined) {
+      try {
+        status.installations = (await app.installations()).map(({ id, account, accountType, selection }) => ({ id, account, type: accountType, selection }))
+      } catch (error) {
+        fail(error)
+      }
+      try {
+        const bot = await app.botUser(slug)
+        status.bot = { login: bot.login, email: botIdentity(slug, bot.id).email }
+      } catch (error) {
+        fail(error)
+      }
+    }
+    status.error = errors.length === 0 ? null : errors.join('; ')
+    status.checkedAt = Date.now()
+    return status
   }
 
   #onboardDeps(): OnboardDeps {

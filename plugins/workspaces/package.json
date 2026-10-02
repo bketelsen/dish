@@ -6,7 +6,8 @@
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./client": "./lib/client.js"
   },
   "files": [
     "src",
@@ -21,6 +22,16 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "external": [
+        "@deepseek-ai/dsh-api-gateway/client"
+      ]
     }
   },
   "dependencies": {
@@ -55,5 +66,10 @@
     "@deepseek-ai/dsh-workspace": "0.2.0-rc.2",
     "@types/react": "~18.3.1",
     "dish-config": "workspace:*"
+  },
+  "scripts": {
+    "build": "node ../../packages/dish-kit/scripts/build-client.mjs",
+    "dev": "node ../../packages/dish-kit/scripts/build-client.mjs --watch",
+    "typecheck": "tsc -p tsconfig.client.json"
   }
 }

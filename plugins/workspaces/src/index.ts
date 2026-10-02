@@ -10,6 +10,9 @@
  * - **The App's credentials** are two references in dsh's credential store, named by the rows `appIdName` and
  *   `privateKeyName` (environment-variable names, checked at load), read on every use and never kept.
  * - **The `worktree` tool** registers whenever a `tools` service is there (see `tool.ts`).
+ * - **Settings → GitHub App's server half** is the `dishWorkspacesRemote` Typert remote (see `remote.ts`), served by the
+ *   gateway for as long as `dishWorkspaces` is. It tells the card what GitHub says of the App (`appStatus`) and takes
+ *   nothing from it: the ID and the key go from the browser to dsh's own credential store.
  * - **The workspace registry,** each time one appears: the scratch workspace (once) and every ready project without a
  *   workspace are registered; the service uses it until it goes.
  * - **Nothing in `apply` is awaited:** the clone states are read at once (small files), and the token recompute, the
@@ -22,10 +25,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs } from 'dish-kit'
+import { WorkspacesRemote } from './remote.ts'
 import { createDishWorkspaces } from './service.ts'
 import type { DishWorkspaces, WorkspacesInternals, WorkspacesService } from './service.ts'
 import { worktreeTool } from './tool.ts'
 
+export type { AppStatus, InstallationInfo } from './protocol.ts'
 export type { CloneInfo, DishWorkspaces, WorkspacesInternals, WorkspacesService } from './service.ts'
 export type { CreatedWorktree, Worktree, WorktreeInfo } from './worktrees.ts'
 export type { SweepResult } from './sweep.ts'
@@ -94,8 +99,11 @@ export function start(ctx: Context, config: Config, internals: WorkspacesInterna
     removeWorktree: (project, slug, force) => service.removeWorktree(project, slug, force),
     resolve: pathOrRef => service.resolve(pathOrRef),
     sweep: project => service.sweep(project),
+    appStatus: test => service.appStatus(test),
   }
   ctx.provide('dishWorkspaces', dishWorkspaces)
+  // Settings → GitHub App's server half: a child plugin that needs `dishWorkspaces`, so it goes when the service does.
+  ctx.plugin(WorkspacesRemote, { appIdName, privateKeyName })
 
   // A global tool, registered through the child context, so it goes when `tools` does, or this plugin. The service is
   // read with `ctx.get` on each call.
