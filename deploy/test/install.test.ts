@@ -22,6 +22,7 @@ import { join } from 'node:path'
 import { after, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { parse } from 'yaml'
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url))
 const INSTALL = join(ROOT, 'deploy', 'install.sh')
@@ -35,13 +36,27 @@ const BUNDLES = ['dish-copilot', 'dish-config', 'dish-prompts', 'dish-crew', 'di
 
 const execFileAsync = promisify(execFile)
 
-/** Loaded into every node process the install starts: it records each dsh process's argument list and XDG directories. */
+/**
+ * Loaded into every node process the install starts: it records each dsh process's argument list and XDG directories,
+ * and, for a `plugin ... add`, whether the profile's patch file already has the dish-config row.
+ */
 const SPY = `
-const { appendFileSync } = require('node:fs')
+const { appendFileSync, readFileSync } = require('node:fs')
+const { join } = require('node:path')
 if (/@deepseek-ai[\\\\/]dsh[\\\\/]lib[\\\\/]bin\\.js$/.test(process.argv[1] ?? '')) {
   const env = process.env
+  const args = process.argv.slice(2)
   const xdg = [env.XDG_CONFIG_HOME, env.XDG_STATE_HOME, env.XDG_DATA_HOME, env.XDG_CACHE_HOME]
-  appendFileSync(env.DISH_TEST_SPY, JSON.stringify({ args: process.argv.slice(2), xdg }) + '\\n')
+  let patchHasRow
+  if (args[0] === 'plugin' && args.includes('add')) {
+    try {
+      const patch = join(env.DSH_HOME, 'profiles', args[args.indexOf('--profile') + 1], 'cordis.patch.yml')
+      patchHasRow = readFileSync(patch, 'utf8').includes('id: dish-config')
+    } catch {
+      patchHasRow = false
+    }
+  }
+  appendFileSync(env.DISH_TEST_SPY, JSON.stringify({ args, xdg, patchHasRow }) + '\\n')
 }
 `
 
@@ -75,9 +90,12 @@ async function makeScratch(extra: Record<string, string | undefined> = {}): Prom
   const spyLog = join(dir, 'spy.log')
 
   // The caller's environment, less what would steer dsh, dish or pnpm, and what `pnpm test` adds for its own scripts.
+  // PNPM_HOME is the one that matters most: pnpm 11 looks for its store under it before XDG_DATA_HOME, and a user's
+  // shell usually sets it, which would pin the scratch profile to their real store. CI makes pnpm purge and rebuild the
+  // checkout's node_modules against a store the test then deletes.
   const env: NodeJS.ProcessEnv = {}
   for (const [name, value] of Object.entries(process.env)) {
-    if (!/^(DISH_|DSH_|XDG_|npm_|NODE_OPTIONS$)/.test(name)) env[name] = value
+    if (!/^(DISH_|DSH_|XDG_|npm_|pnpm_|PNPM_HOME$|CI$|NODE_OPTIONS$)/.test(name)) env[name] = value
   }
   Object.assign(env, {
     HOME: home,
@@ -120,6 +138,8 @@ async function run(command: string, args: string[], scratch: Scratch, env: NodeJ
 interface DshCall {
   args: string[]
   xdg: string[]
+  /** For a `plugin ... add`: whether the patch file had the dish-config row at that moment. */
+  patchHasRow?: boolean
 }
 
 /** Every dsh process started so far under this scratch's spy. */
@@ -139,6 +159,13 @@ function assertIsolated(scratch: Scratch, calls: DshCall[]): void {
       assert.ok(path.startsWith(`${scratch.tmp}/`), `dsh ${call.args.join(' ')}: ${path} is not under the install's TMPDIR`)
     })
   }
+}
+
+/** Fail unless every `plugin ... add` found the dish-config row already in the patch file: the rows go in before the bundles. */
+function assertRowsFirst(calls: DshCall[]): void {
+  const adds = calls.filter((call) => call.args[0] === 'plugin' && call.args.includes('add'))
+  assert.ok(adds.length > 0, 'the install linked a bundle')
+  for (const call of adds) assert.equal(call.patchHasRow, true, `dsh ${call.args.join(' ')}: the patch file had no dish-config row yet`)
 }
 
 /** The account's own XDG directories hold nothing of dish's: no `dish` directory, so no config store. */
@@ -182,6 +209,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   const firstCalls = dshCalls(scratch)
   assert.equal(firstCalls.length, 6, 'one dsh command makes the profile, one links each bundle')
   assertIsolated(scratch, firstCalls)
+  assertRowsFirst(firstCalls)
   assert.deepEqual(await readdir(scratch.tmp), [], "the install's throwaway directory is removed")
 
   const patchBefore = statSync(patch).mtimeMs
@@ -217,6 +245,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   const repairCalls = dshCalls(scratch).slice(6)
   assert.equal(repairCalls.length, 2, 'the removal, and one `plugin add`')
   assertIsolated(scratch, repairCalls.slice(1))
+  assertRowsFirst(repairCalls)
 
   // What dsh makes of the profile, composed without booting it, and run with throwaway XDG directories as well.
   const throwaway = join(scratch.dir, 'throwaway')
@@ -236,8 +265,8 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   await assertNoStore(scratch)
 })
 
-test('install.sh makes a custom profile from the web one, and takes an empty remote', { skip: SKIP, timeout: 600_000 }, async () => {
-  const scratch = await makeScratch({ DISH_PROFILE: 'dish-scratch', DISH_REMOTE: '' })
+test('install.sh makes a custom profile from the web one, takes an empty remote, and values that start with a dash', { skip: SKIP, timeout: 600_000 }, async () => {
+  const scratch = await makeScratch({ DISH_PROFILE: 'dish-scratch', DISH_REMOTE: '', DISH_USER_NAME: '-Dash Test', DISH_USER_EMAIL: '--dash@example.invalid' })
   const profile = join(scratch.dshHome, 'profiles', 'dish-scratch')
 
   const first = await run(INSTALL, [], scratch)
@@ -246,8 +275,10 @@ test('install.sh makes a custom profile from the web one, and takes an empty rem
   assert.match(first.stdout, /install: dish rows \(none, the store stays local\): updated/)
   const manifest = JSON.parse(await readFile(join(profile, 'package.json'), 'utf8')) as { dsh: { profile: { bundles: string[] } } }
   assert.deepEqual(manifest.dsh.profile.bundles, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', ...BUNDLES])
-  assert.match(await readFile(join(profile, 'cordis.patch.yml'), 'utf8'), /^ {4}remote: ""$/m)
+  const rows = parse(await readFile(join(profile, 'cordis.patch.yml'), 'utf8')) as Array<{ id: string; config: Record<string, string> }>
+  assert.deepEqual(rows.find((row) => row.id === 'dish-config')?.config, { remote: '', userName: '-Dash Test', userEmail: '--dash@example.invalid' })
   assertIsolated(scratch, dshCalls(scratch))
+  assertRowsFirst(dshCalls(scratch))
 
   const second = await run(INSTALL, [], scratch)
   assert.equal(second.code, 0, second.stderr)

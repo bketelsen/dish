@@ -3,17 +3,27 @@
 # 127.0.0.1:3080, and `tailscale serve` is what puts it on the tailnet.
 [Unit]
 Description=dsh web for dish
+# The user manager has no network-online.target, so this does nothing. A start before the network is up fails, and
+# Restart=on-failure below tries again.
 After=network-online.target
 
 [Service]
 WorkingDirectory=%h/dish
 # Written by fleet. It holds one line, DISH_TRUSTED_HOST=dish.<tailnet>.ts.net, which ExecStart below reads. The file is
-# required: with no host to trust, dsh answers every /api call from the tailnet name with a 403.
+# required, and both ways it can go wrong fail closed. With the file missing the unit does not start. With the variable
+# missing from it, systemd passes one empty argument, dsh refuses to load (the trustedHosts entry "" is not a bare
+# host[:port] authority), and the unit restarts every 5 seconds until fleet fixes the file.
 EnvironmentFile=%h/.config/dish/deploy.env
 
 # Where Node and pnpm are found, which is a contract with fleet's dish_guest role (F3): it makes /opt/dish/node a
 # symlink to the pinned Node install (24.21.0) and puts pnpm (11.25.0) in that Node's bin. Agents' commands inherit this
 # PATH too (dsh keeps PATH and drops names that look like secrets), so it also says what a shell command can run.
+#
+# A second contract with fleet: this unit sets none of HOME, XDG_DATA_HOME or PNPM_HOME, and pnpm works its store out
+# from them. install.sh pins the store that `pnpm store path` gives under its own environment into the profile, and
+# dsh's plugin manager, running here, works it out again from this one. They must be the same store (pnpm refuses a
+# profile recorded with another), so those three variables have to be the same for install.sh and for this unit.
+# Fleet must not set them for just one of the two.
 Environment=PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin
 
 # --trusted-host takes any number of values, so it must stay last. DISH_TRUSTED_HOST is a bare host name, no scheme.

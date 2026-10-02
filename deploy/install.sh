@@ -30,10 +30,17 @@
 # not boot anything (the first composes patch files, the second runs pnpm), so this is a guard against a later dsh, not
 # a fix. HOME and DSH_HOME stay real, so the profile lands where `dsh web` reads it.
 #
-# One thing in those directories has to stay put: pnpm's store. pnpm finds it under $XDG_DATA_HOME, records it in the
-# profile's node_modules/.modules.yaml, and refuses (ERR_PNPM_UNEXPECTED_STORE) to work on that profile with any other.
-# A throwaway store would break every later `plugin add`, and the plugin manager inside dsh web. So the store pnpm
-# would use for this account is looked up first, and handed to the dsh commands as pnpm_config_store_dir.
+# One thing in those directories has to stay put: pnpm's store. pnpm finds it under $PNPM_HOME, else $XDG_DATA_HOME,
+# records it in the profile's node_modules/.modules.yaml, and refuses (ERR_PNPM_UNEXPECTED_STORE) to work on that
+# profile with any other. A throwaway store would break every later `plugin add`, and the plugin manager inside dsh web.
+# So the store pnpm would use for this account is looked up first, and handed to the dsh commands as
+# pnpm_config_store_dir.
+#
+# The store-pin contract: the pinned store is whatever `pnpm store path` prints in the environment this script runs
+# with, while dsh's own plugin manager works the store out again from the environment of the dish-web unit, which sets
+# none of HOME, XDG_DATA_HOME or PNPM_HOME. The two must give the same store, so HOME, XDG_DATA_HOME and PNPM_HOME have
+# to be the same for the install and for the unit. Neither this script's caller (fleet) nor the unit may set one of them
+# for just one of the two.
 
 set -euo pipefail
 
@@ -75,6 +82,7 @@ if [[ $pnpm_store != /* || $pnpm_store == *$'\n'* ]]; then
   echo 'install: pnpm store path did not print a single absolute path' >&2
   exit 1
 fi
+step="making the throwaway directory in ${TMPDIR:-/tmp}"
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/dish-install.XXXXXX")
 
 # dsh, from this checkout, with its XDG directories in the throwaway one and pnpm's store where it always is.
@@ -125,10 +133,11 @@ begin "writing dish's rows into $patch"
 remote_args=(--no-remote)
 remote_shown='none, the store stays local'
 if [ -n "$DISH_REMOTE" ]; then
-  remote_args=(--remote "$DISH_REMOTE")
+  remote_args=("--remote=$DISH_REMOTE")
   remote_shown=$DISH_REMOTE
 fi
-rows=$(node deploy/profile.ts --patch "$patch" "${remote_args[@]}" --user-name "$DISH_USER_NAME" --user-email "$DISH_USER_EMAIL")
+# The --opt=value form, so that a value that starts with a dash is not read as another option.
+rows=$(node deploy/profile.ts --patch "$patch" "${remote_args[@]}" "--user-name=$DISH_USER_NAME" "--user-email=$DISH_USER_EMAIL")
 if [ "$rows" != unchanged ]; then changed=1; fi
 
 added=()
