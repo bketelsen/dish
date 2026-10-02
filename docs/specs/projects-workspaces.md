@@ -101,6 +101,7 @@ dsh's web UI has no chat without a workspace: every chat it creates names one, a
 
 `setup` is your command from the registry, run by dish (not by an agent) like a CI job:
 - **Where:** the clone, or a new worktree, as its working directory. `bash -c <setup>`, with stdin closed.
+- **When:** only on merged code ([Decided after the checks](#decided-after-the-checks), 1), and never in a tree with a nested repository or a submodule: edits inside one are invisible to dish's `status`, so its contents count as unmerged. Setup is then skipped with the command to run instead.
 - **The environment:** dsh's own, with the scrub dsh gives every agent shell (no name containing `KEY`, `PASSWORD`, `SECRET` or `TOKEN`, and no `DSH_*` name), every `GIT_*` name removed, and `GIT_TERMINAL_PROMPT=0` added. Under the service that is the unit's `PATH` and the account's `HOME`; in dev it is `pnpm dev`'s environment, whose `DSH_*` names the scrub removes.
 - **Its own process group,** killed (TERM, then KILL after 5 seconds) when `setupTimeout` passes, when the project is removed, or when dish stops.
 - **The log:** its last 64 KB, with anything that looks like a credential masked (dish-kit's `maskSecrets`), in `setup.log` (onboarding) or `worktrees/<slug>.setup.log` (a worktree).
@@ -108,9 +109,11 @@ dsh's web UI has no chat without a workspace: every chat it creates names one, a
 ## dish's own git commands
 
 Agents in a project's workspace can write anything inside the clone, `.git` included, so dish never lets a clone's own files choose what dish's git runs:
-- every git command dish runs passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, with no `GIT_*` name inherited and `GIT_TERMINAL_PROMPT=0`;
+- every git command dish runs passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c fetch.recurseSubmodules=false -c submodule.recurse=false`, with no `GIT_*` name inherited and `GIT_TERMINAL_PROMPT=0`. Its `status` and `diff` also pass `--ignore-submodules=dirty`: a nested repository an agent makes inside the clone has its own config, which the clone check never sees, and git would otherwise run its filters (`status`, `diff`) or its `uploadpack` (`fetch`, through an agent's `.gitmodules`). Setup treats a tree with a nested repository as unmerged ([Setup](#setup));
 - before working in a clone, dish checks it: `.git` is a directory, its local config has only keys git never runs a program from (an allowlist: core basics, `remote.*` URLs and refspecs, `branch.*`, `user.*`, and the credential keys dish writes, with the values dish wrote), no `extensions.worktreeConfig`, and each worktree's administrative files point where git put them. A clone that fails is refused with the key or file named, and the page shows it; dish changes nothing in it;
 - a token is never in an argument, a URL, an environment variable or a config value: git gets it from the credential helper, which reads the token file.
+
+**A known limit:** the clone check and dish's next git command are two steps, and an agent can rewrite `.git/config` between them. The flags above can't be raced, but the allowlist can, so a determined agent racing dish could get a filter or driver run once by dish's git, outside the sandbox. It holds against mistakes and planted files, not against a race: the same footing as the App key (Decided after the checks, 2). Closing it means running dish's working-tree commands (`status`, `diff`, `worktree add`) inside dsh's sandbox, which 6c's sandboxed runner makes possible.
 
 ## Credentials
 
