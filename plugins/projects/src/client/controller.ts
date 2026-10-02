@@ -23,7 +23,11 @@
  * - **Removal and moving away ask first** (`confirm`): a removal says the clone and workspace stay, and leaving a form with
  *   edits asks whether to drop them.
  * - **Status arrives by polling.** Onboarding runs in the background and there is no stream for it, so while any project is
- *   pending, cloning or in setup the list is read again every 5 seconds; it stops when none is, and when the stream is lost.
+ *   pending, cloning or in setup the list is read again every 5 seconds. Only while the page is shown (`open` to `close`: a
+ *   tab that never opened Settings → Projects doesn't poll); it stops when no project is being onboarded, when a read fails,
+ *   and when the stream is lost (until the next stream opens, or the page is opened again).
+ * - **Throwing it away.** `dispose` clears every timer and makes what is still out change nothing, for the scope that ends
+ *   and is made again: two controllers must not both poll.
  * - **Live updates** come from dish-config's remote, which may not be there: a change to `projects.yaml` or a proposal reads
  *   the list again, and without the remote nothing arrives that way.
  *
@@ -158,8 +162,10 @@ export interface PageState {
 /** What a component can ask of the page, beside the `usePage` hook the `hooks` entry becomes. */
 export interface ProjectsActions {
   hooks: { page: ObservableSnapshot<PageState> }
-  /** The page was shown: load what it needs, or read again what it has. */
+  /** The page was shown: load what it needs, or read again what it has, and keep the status of onboarding fresh. */
   open(): Promise<void>
+  /** The page was hidden: stop polling. (`open` starts it again.) */
+  close(): void
   /** Show a project. With a form that has edits it only asks (`confirm`); `confirmDiscard` or `cancelConfirm` answers. */
   select(name: string): void
   /** Open the form on a new project. With a form that has edits it asks first. Refused, with the reason, without a store. */
@@ -205,6 +211,11 @@ export interface ProjectsController {
   streamDown(): void
   /** dish-config's remote arrived, or went; `undefined` for gone. */
   setConfig(calls: ConfigCalls | undefined): void
+  /**
+   * The controller is being thrown away (the page's scope ended, and a new one will make another): its timers are cleared, and a
+   * read or a check still out when this is called changes nothing and starts nothing when it lands.
+   */
+  dispose(): void
 }
 
 /** The timer the check's pause and the poll run on: the browser's, unless a test gives its own. */
@@ -397,6 +408,12 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
   let eventWhileWriting = false
   /** The next read of the list follows a write that was refused as a `CONFLICT`: a new project's form is told whether the name is taken now. */
   let conflictRead = false
+  /** `face.open` was called and `face.close` wasn't: the page is shown, and only then is the status polled. */
+  let shown = false
+  /** The stream was lost: the poll stays off until the next stream opens (or the page is opened again), whatever reads land meanwhile. */
+  let streamLost = false
+  /** `dispose` was called: nothing is scheduled, and nothing that lands is taken. */
+  let disposed = false
 
   /** A save or a removal is under way. */
   const writing = (): boolean => get().busy === 'save' || get().busy === 'remove'
@@ -445,7 +462,7 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     const adding = form.mode === 'add'
     const running = (async (): Promise<void> => {
       const result = await settle(() => api.check(name, form.fields, adding))
-      if (generation !== checkGeneration) return
+      if (disposed || generation !== checkGeneration) return
       if (result.ok) patchForm({ problem: result.value.problem, checking: false, checkError: undefined })
       else patchForm({ problem: null, checking: false, checkError: result.notice })
     })()
@@ -456,6 +473,7 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
 
   /** The form changed: check it once the person pauses. */
   const scheduleCheck = (): void => {
+    if (disposed) return
     disarm()
     checkGeneration++
     patchForm({ checking: true })
@@ -564,7 +582,8 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
         void runCheck()
       } else if (sameFields(form.fields, theirs)) {
         // Somebody made the very edit that is in the form: it is what is stored, and there is nothing left to save.
-        patch({ conflict: undefined, form: { ...form, saved: cloneFields(theirs), base: commit, dirty: false } })
+        const settled = { ...form, saved: cloneFields(theirs), base: commit }
+        patch({ conflict: undefined, form: { ...settled, dirty: dirtyOf(settled) } })
       } else {
         patch({ conflict: { theirs: cloneFields(theirs), commit } })
       }
@@ -601,6 +620,7 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
   /** Wait `pollEvery` and read the list again, if any project is being onboarded. One poll waits at a time. */
   const armPoll = (): void => {
     disarmPoll()
+    if (disposed || !shown || streamLost) return
     if (!get().projects.some(project => ONBOARDING_STATES.includes(project.status.state))) return
     polling = true
     poll = timer.setTimeout(() => {
@@ -617,9 +637,11 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
 
   /** Read the list as the server gives it now. A failure leaves what is shown alone and ends the poll: the page says so. */
   const readProjects = async (): Promise<void> => {
+    if (disposed) return
     const afterConflict = conflictRead
     conflictRead = false
     const result = await settle(() => api.projects())
+    if (disposed) return
     if (!result.ok) {
       patch({ listLoaded: true, listError: result.notice })
       disarmPoll()
@@ -631,12 +653,14 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     // A write is out: its own commit is on its way back, and would be taken for someone else's. The read it makes after does this.
     if (writing()) {
       eventWhileWriting = true
-    } else {
+    } else if (listAgain) {
+      // A newer read follows, and this one may be older than what the page has done since (a project it just added is not in it):
+      // it decides nothing about the selection or the form, and passes on what it was to tell them.
+      if (afterConflict) conflictRead = true
+    } else if (problem === null && commit !== '') {
       // Without a registry to read (it doesn't parse, or there is no store) there is nothing to hold a form to.
-      if (problem === null && commit !== '') {
-        reconcileSelection()
-        reconcileForm(before !== projects.map(project => project.name).join('\n'), afterConflict)
-      }
+      reconcileSelection()
+      reconcileForm(before !== projects.map(project => project.name).join('\n'), afterConflict)
     }
     armPoll()
   }
@@ -886,6 +910,8 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
   }
 
   const open = async (): Promise<void> => {
+    shown = true
+    streamLost = false
     await refreshProjects()
     const state = get()
     const first = state.projects[0]
@@ -896,12 +922,23 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     // A store to read and subscribe to, not the one the controller writes.
     hooks: { page: { getSnapshot: store.getSnapshot, subscribe: store.subscribe } },
     open,
+    close() {
+      shown = false
+      disarmPoll()
+    },
     select,
     startAdd,
     startEdit,
     editField(key, value) {
       change((form) => {
-        if (key === 'name') return form.mode === 'add' && form.name !== value ? { name: value } : undefined
+        if (key === 'name') {
+          if (form.mode !== 'add' || form.name === value) return undefined
+          // A conflict is about the name that was typed: with another name the form is over the commit that was read, and the check judges the name.
+          const conflict = get().conflict
+          if (conflict === undefined) return { name: value }
+          patch({ conflict: undefined })
+          return { name: value, base: conflict.commit }
+        }
         return form.fields[key] === value ? undefined : { fields: { ...form.fields, [key]: value } }
       })
     },
@@ -938,7 +975,7 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
           name: form.name.trim(),
           saved: cloneFields(conflict.theirs),
           base: conflict.commit,
-          dirty: !sameFields(form.fields, conflict.theirs),
+          dirty: dirtyOf({ ...form, mode: 'edit', saved: cloneFields(conflict.theirs) }),
         },
       })
       if (wasNew) void runCheck()
@@ -956,6 +993,7 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
       if (opening) {
         // The first item of every stream, the very first included: a commit made between the page's own read and the
         // stream's subscription would otherwise be missed.
+        streamLost = false
         patch({ stream: 'live' })
         await refreshProjects()
         return
@@ -975,10 +1013,18 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     onStatus: refreshProjects,
     streamDown() {
       disarmPoll()
-      if (get().stream !== 'off') patch({ stream: 'down' })
+      // A page with no stream has none to lose.
+      if (get().stream === 'off') return
+      streamLost = true
+      patch({ stream: 'down' })
     },
     setConfig(calls) {
       patch({ stream: calls === undefined ? 'off' : 'connecting' })
+    },
+    dispose() {
+      disposed = true
+      disarmPoll()
+      disarm()
     },
   }
 }

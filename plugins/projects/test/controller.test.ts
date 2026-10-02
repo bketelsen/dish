@@ -119,17 +119,23 @@ class FakeProjects {
   readonly api: ProjectsApi = {
     projects: async () => {
       this.calls.push('projects')
-      await this.wait('projects')
-      if (this.projectsDown) return carrierDown()
-      if (!this.up) return ok<ProjectsResult>({ commit: '', projects: [], problem: null, pendingProposals: 0 })
-      const names = [...this.entries.keys()].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
-      const result: ProjectsResult = {
-        commit: id(this.head),
-        projects: this.problem === null ? names.map(name => this.info(name)) : [],
-        problem: this.problem,
-        pendingProposals: this.proposals,
+      // The answer is what the registry says when the call is made, not when the gate lets it through.
+      let answer: RemoteResult<Outcome<ProjectsResult>>
+      if (this.projectsDown) {
+        answer = carrierDown()
+      } else if (!this.up) {
+        answer = ok<ProjectsResult>({ commit: '', projects: [], problem: null, pendingProposals: 0 })
+      } else {
+        const names = [...this.entries.keys()].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+        answer = ok<ProjectsResult>({
+          commit: id(this.head),
+          projects: this.problem === null ? names.map(name => this.info(name)) : [],
+          problem: this.problem,
+          pendingProposals: this.proposals,
+        })
       }
-      return ok(result)
+      await this.wait('projects')
+      return answer
     },
     check: async (name, entry, adding) => {
       this.calls.push(`check ${name}`)
@@ -1226,6 +1232,217 @@ test('reads of the list do not overlap: one made while another is out waits, and
   await Promise.all([first, second])
   assert.deepEqual(names(state()), ['acme/gadget', 'acme/widget', 'zed/lib'], 'read again after the change')
   assert.equal(count(fake.calls, 'projects'), 2)
+})
+
+// --- the page going away ---------------------------------------------------------------------------
+
+test('dispose clears the poll that is waiting, and nothing arms it again', async () => {
+  const made = setup()
+  const { fake, page, timer } = made
+  fake.states.set('acme/gadget', 'cloning')
+  await page.face.open()
+  assert.equal(timer.armed(POLL_INTERVAL), 1)
+  page.dispose()
+  assert.equal(timer.armed(POLL_INTERVAL), 0)
+  await page.onStatus()
+  await page.onConfigEvent(changed(['projects.yaml']))
+  assert.equal(timer.armed(POLL_INTERVAL), 0, 'a read after dispose does not poll')
+})
+
+test('dispose clears the pause of a check that is due, and no check is due after it', async () => {
+  const made = await opened()
+  const { fake, page, timer } = made
+  await page.face.startAdd()
+  page.face.editField('name', 'acme/new')
+  assert.equal(timer.armed(CHECK_DELAY), 1)
+  const checks = fake.checked.length
+  page.dispose()
+  assert.equal(timer.armed(CHECK_DELAY), 0)
+  page.face.editField('family', 'acme')
+  assert.equal(timer.armed(CHECK_DELAY), 0, 'an edit after dispose sets no pause')
+  assert.equal(fake.checked.length, checks)
+})
+
+test('a read that lands after dispose neither arms the poll nor changes the page', async () => {
+  const made = setup()
+  const { fake, page, state, timer } = made
+  fake.states.set('acme/gadget', 'cloning')
+  await page.face.open()
+  const slow = gate()
+  fake.gates.set('projects', slow)
+  timer.fire(POLL_INTERVAL)
+  await until('the read to be out', () => count(fake.calls, 'projects') === 2)
+  fake.external(entries => entries.set('zed/lib', fields()))
+  page.dispose()
+  const before = state()
+  slow.release()
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(state(), before, 'nothing was patched')
+  assert.equal(timer.armed(), 0)
+})
+
+test('a read in flight when the stream is lost does not bring the poll back, and the next stream does', async () => {
+  const made = setup()
+  const { fake, page, timer } = made
+  fake.states.set('acme/gadget', 'cloning')
+  await page.face.open()
+  page.setConfig(CONFIG)
+  const slow = gate()
+  fake.gates.set('projects', slow)
+  timer.fire(POLL_INTERVAL)
+  await until('the read to be out', () => count(fake.calls, 'projects') === 2)
+  page.streamDown()
+  slow.release()
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(timer.armed(POLL_INTERVAL), 0, 'the read landed after the stream was lost')
+  await page.onConfigEvent({ kind: 'remote', status: { pending: 0 } }, true)
+  assert.equal(timer.armed(POLL_INTERVAL), 1)
+})
+
+// --- polling only while the page is shown ---------------------------------------------------------
+
+test('nothing polls before the page has been opened: a read made for another reason leaves no timer', async () => {
+  const made = setup()
+  const { fake, page, state, timer } = made
+  fake.states.set('acme/gadget', 'cloning')
+  await page.onConfigEvent({ kind: 'remote', status: { pending: 0 } }, true)
+  assert.equal(state().projects.length, 2, 'the list was read')
+  assert.equal(timer.armed(), 0)
+  await page.onStatus()
+  assert.equal(timer.armed(), 0)
+})
+
+test('close stops the polling and nothing starts it until the page is opened again', async () => {
+  const made = setup()
+  const { fake, page, timer } = made
+  fake.states.set('acme/gadget', 'cloning')
+  await page.face.open()
+  assert.equal(timer.armed(POLL_INTERVAL), 1)
+  page.face.close()
+  assert.equal(timer.armed(POLL_INTERVAL), 0)
+  await page.onStatus()
+  await page.onConfigEvent(changed(['projects.yaml']))
+  assert.equal(timer.armed(POLL_INTERVAL), 0, 'a hidden page does not poll')
+  await page.face.open()
+  assert.equal(timer.armed(POLL_INTERVAL), 1)
+})
+
+test('a read in flight when the page is closed does not poll on landing', async () => {
+  const made = setup()
+  const { fake, page, timer } = made
+  fake.states.set('acme/gadget', 'cloning')
+  await page.face.open()
+  const slow = gate()
+  fake.gates.set('projects', slow)
+  timer.fire(POLL_INTERVAL)
+  await until('the read to be out', () => count(fake.calls, 'projects') === 2)
+  page.face.close()
+  slow.release()
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(timer.armed(POLL_INTERVAL), 0)
+})
+
+// --- a read that a newer one follows -------------------------------------------------------------
+
+test('a read that a newer one follows does not drop what a save just selected', async () => {
+  const made = await opened()
+  const { fake, page, state } = made
+  await page.face.startAdd()
+  await fillAdd(made, 'acme/new')
+  // A read that began before the save: its answer has no acme/new.
+  const stale = gate()
+  fake.gates.set('projects', stale)
+  const reading = page.onStatus()
+  await until('the stale read to be out', () => count(fake.calls, 'projects') === 2)
+  const saving = page.face.save()
+  await until('the save to be made', () => fake.entries.has('acme/new'))
+  await until('the page to select it', () => state().selected === 'acme/new')
+  stale.release()
+  await Promise.all([reading, saving])
+  assert.equal(state().selected, 'acme/new')
+  assert.deepEqual(names(state()), ['acme/gadget', 'acme/new', 'acme/widget'])
+})
+
+test('a read that a newer one follows passes on that it follows a refused save, so the newer one tells a new project of the conflict', async () => {
+  const made = await opened()
+  const { fake, page, state } = made
+  await page.face.startAdd()
+  await fillAdd(made, 'acme/new')
+  const theirCommit = fake.external(entries => entries.set('acme/new', fields({ role: 'theirs' })))
+  // The read the refused save makes is itself followed by another one.
+  const slow = gate()
+  fake.gates.set('projects', slow)
+  const saving = page.face.save()
+  await until('the read after the refused save to be out', () => count(fake.calls, 'projects') === 2)
+  const status = page.onStatus()
+  slow.release()
+  await Promise.all([saving, status])
+  assert.deepEqual(state().conflict, { theirs: fields({ role: 'theirs' }), commit: theirCommit })
+})
+
+// --- the name of a new project while a conflict is open ---------------------------------------
+
+test('renaming a new project while a conflict is open drops the conflict, and Save adds the new name', async () => {
+  const made = await opened()
+  const { fake, page, state } = made
+  await page.face.startAdd()
+  await fillAdd(made, 'acme/new')
+  const theirCommit = fake.external(entries => entries.set('acme/new', fields({ role: 'theirs' })))
+  await page.face.save()
+  assert.notEqual(state().conflict, undefined)
+  page.face.editField('name', 'acme/other')
+  assert.equal(state().conflict, undefined, 'the conflict was about the old name')
+  assert.equal(state().form?.mode, 'add')
+  assert.equal(state().form?.base, theirCommit)
+  await checked(made)
+  assert.equal(state().form?.problem, null)
+  assert.equal(fake.checked.at(-1)?.name, 'acme/other')
+  await page.face.save()
+  assert.equal(fake.saved.at(-1)?.name, 'acme/other')
+  assert.equal(fake.saved.at(-1)?.adding, true)
+  assert.equal(fake.saved.at(-1)?.base, theirCommit)
+  assert.equal(state().notice?.tone, 'success')
+  assert.equal(fake.entries.get('acme/other')?.role, 'something new')
+  assert.equal(fake.entries.get('acme/new')?.role, 'theirs', 'the other project is as it was')
+})
+
+test('renaming a new project without a conflict leaves the base alone', async () => {
+  const made = await opened()
+  const { page, state } = made
+  await page.face.startAdd()
+  page.face.editField('name', 'acme/new')
+  page.face.editField('name', 'acme/other')
+  assert.equal(state().form?.base, id(0))
+})
+
+// --- a row with no variable is an edit ---------------------------------------------------------
+
+test('Keep mine counts a row with no variable as an edit even when the settings are what is there now', async () => {
+  const made = await opened()
+  const { fake, page, state } = made
+  await page.face.startEdit('acme/widget')
+  page.face.editField('role', 'mine')
+  fake.external(entries => entries.set('acme/widget', fields({ role: 'theirs' })))
+  await page.onConfigEvent(changed(['projects.yaml']))
+  assert.notEqual(state().conflict, undefined)
+  // After the conflict the person makes the form say what is there now, and leaves a row half typed.
+  page.face.editField('role', 'theirs')
+  page.face.editEnv([{ name: '', value: 'orphan' }])
+  page.face.keepMine()
+  assert.equal(state().conflict, undefined)
+  assert.equal(state().form?.dirty, true)
+})
+
+test('somebody making the very edit that is in the form still leaves a row with no variable as an edit', async () => {
+  const made = await opened()
+  const { fake, page, state } = made
+  await page.face.startEdit('acme/widget')
+  page.face.editField('role', 'same')
+  page.face.editEnv([{ name: '', value: 'orphan' }])
+  fake.external(entries => entries.set('acme/widget', fields({ role: 'same' })))
+  await page.onConfigEvent(changed(['projects.yaml']))
+  assert.equal(state().conflict, undefined)
+  assert.equal(state().form?.dirty, true)
 })
 
 // --- the helpers -----------------------------------------------------------------------------------
