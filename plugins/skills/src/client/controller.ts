@@ -707,6 +707,11 @@ export function createSkills(api: SkillsApi, config?: ConfigCalls, options: Skil
     const { skills, commit, roles } = result.value
     const state = get()
     const entry = skills.find(skill => skill.name === state.selected)
+    // A new skill started with no store has no commit to be saved over, and a read of it can't give one (it isn't stored).
+    // Only the list can say the store has come: the skill is then over the list's commit, as one started with a store is,
+    // unless the store already holds that name, which a read of it shows as a conflict instead.
+    const arrived = state.creating && state.saved?.commit === '' && commit !== ''
+    const taken = arrived && entry !== undefined
     patch({
       skills,
       commit,
@@ -716,9 +721,11 @@ export function createSkills(api: SkillsApi, config?: ConfigCalls, options: Skil
       // A document that is open says whether there is a store for itself, with the commit it was read at; a list that says
       // otherwise first would leave a draft that was loaded with no store looking savable, over a base of nothing.
       ...(state.document === 'ready' || state.document === 'loading' ? {} : { readOnly: commit === '' }),
+      ...(arrived && !taken ? { saved: { text: '', commit }, readOnly: false } : {}),
       // What the list says of the open skill is the word on whether it is shipped.
       ...(entry !== undefined && !state.creating ? { shipped: entry.shipped } : {}),
     })
+    if (taken) await refreshSelected()
     return skills
   }
 

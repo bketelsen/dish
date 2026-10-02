@@ -1563,6 +1563,51 @@ test('a store that appears while the draft has edits is not taken for savable by
   assert.equal(state().saved?.commit, '')
 })
 
+test('a new skill started while the store was down follows the store\'s arrival: its base becomes the list\'s commit', async () => {
+  const { fake, page, state, timer } = setup()
+  fake.up = false
+  await page.face.open()
+  assert.equal(await page.face.startNew('fresh'), true)
+  assert.equal(state().readOnly, true)
+  assert.deepEqual(state().saved, { text: '', commit: '' })
+  // The store starts. A not-yet-stored skill can't be read, so only the list can tell the page.
+  fake.up = true
+  fake.head = 2
+  await page.onConfigEvent({ kind: 'proposal', id: 'abcd1234', status: 'open' })
+  assert.equal(state().commit, id(2))
+  assert.equal(state().readOnly, false)
+  assert.deepEqual(state().saved, { text: '', commit: id(2) })
+  assert.equal(state().creating, true)
+  assert.equal(state().draft, NEW_SKILL_TEMPLATE('fresh'))
+  assert.equal(state().conflict, undefined)
+  await page.face.save()
+  assert.ok(fake.calls.includes(`save fresh ${id(2).slice(0, 7)} -`), `saved over the store's commit, not over nothing: ${fake.calls.join(', ')}`)
+  assert.equal(state().creating, false)
+  assert.match(state().notice?.text ?? '', /^Created fresh as /)
+})
+
+test('a new skill whose name the store turns out to hold already is a conflict, not a write over it', async () => {
+  const { fake, page, state } = setup()
+  fake.up = false
+  await page.face.open()
+  await page.face.startNew('fresh')
+  fake.up = true
+  fake.docs.set('fresh', { text: 'THEIRS\n', changedAt: 1 })
+  fake.head = 1
+  await page.onConfigEvent({ kind: 'proposal', id: 'abcd1234', status: 'open' })
+  assert.deepEqual(state().conflict, { theirs: 'THEIRS\n', commit: id(1) })
+  assert.equal(state().draft, NEW_SKILL_TEMPLATE('fresh'))
+  assert.deepEqual(state().saved, { text: '', commit: '' }, 'not rebased over a skill it has not seen')
+  const before = fake.calls.length
+  await page.face.save()
+  assert.equal(fake.calls.length, before, 'no save while the conflict is open')
+  page.face.keepMine()
+  assert.equal(state().creating, false)
+  await page.face.save()
+  assert.ok(fake.calls.includes(`save fresh ${id(1).slice(0, 7)} -`), fake.calls.join(', '))
+  assert.equal(fake.docs.get('fresh')?.text, NEW_SKILL_TEMPLATE('fresh'))
+})
+
 // --- the History tab -------------------------------------------------------------------------------
 
 test('the History tab loads this document\'s log, 20 at a time, with the newest page first', async () => {
