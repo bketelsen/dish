@@ -388,9 +388,9 @@ test('a blank dataDirectory is the default, and a relative one fails the plugin 
   assert.equal(ctx.get('dishCrew'), undefined)
 })
 
-test('the configuration has dataDirectory, subagentProvider (spawn) and terminal, and nothing of the spike', () => {
+test('the configuration has dataDirectory, subagentProvider (spawn), messageLimit (1200) and terminal, and nothing of the spike', () => {
   const config = plugin.Config({} as plugin.Config)
-  assert.deepEqual({ ...config }, { dataDirectory: '', subagentProvider: 'spawn', terminal: true })
+  assert.deepEqual({ ...config }, { dataDirectory: '', subagentProvider: 'spawn', messageLimit: 1200, terminal: true })
   assert.equal(plugin.name, 'dish-crew')
 })
 

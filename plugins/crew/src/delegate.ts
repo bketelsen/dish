@@ -18,7 +18,8 @@
  *    whose reviewed work is a crew child of this session or `"main"`.
  * 6. **The route** resolves (the model on its family's provider, else the file's, which is what the child starts on), and
  *    7. **the tools** the child may have (`allowList`) are not none.
- * 8. **The start or the send.**
+ * 8. **The start or the send.** A new child's prompt is the task, and, if it has `send_message`, a note that its closing message
+ *    is its report (`CLOSING_NOTE`).
  *
  * From 4 to the end, a call holds its session's lock, so two calls in one step can't both pass the same check. A start
  * writes the child's record before `startContinuable`, which is given the id the record has: a child that is quick finds
@@ -77,6 +78,16 @@ const TOOL = 'delegate'
 const TITLE_LENGTH = 80
 /** The most children a refusal lists. */
 const LISTED_CHILDREN = 6
+
+/**
+ * Said to a new child after its task, when it has `send_message`: its closing message is its report. dsh appends a note of its own
+ * after the prompt of a continuable child that has the tool (`withContinuableReturnGuidance` in `dsh-subagent`: "send your result to
+ * that agent with send_message"), which is the opposite of how the crew reports, so this goes in front of it and says so. A follow-up
+ * (`to`) gets nothing added: dsh appends nothing to it either. Both are recorded under "What dsh gives us" in the spec, so that a dsh upgrade re-checks them.
+ */
+export const CLOSING_NOTE = 'Your closing message is your report: when you finish, the main agent receives it in full, automatically. '
+  + 'So don\'t send your result with send_message, not even a summary or part of it, even though the note after this one says to. '
+  + 'Use send_message only for a short question you\'re blocked on while you work.'
 
 /** The id of a session or a child, as dsh brands it. */
 type SessionId = NonNullable<ContinuableStartSpec['childId']>
@@ -365,13 +376,16 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     } catch (error) {
       throw new Error(`could not record the delegation, so nothing was started: ${describe(error)}. Try again, or tell the user.`, { cause: error })
     }
+    // dsh adds its own note under the same condition: the child has `send_message`.
+    const prompt = [{ type: 'text' as const, text: call.task }]
+    if (allowed.allow.includes('send_message')) prompt.push({ type: 'text', text: CLOSING_NOTE })
     try {
       await ctx.subagents.startContinuable({
         provider: call.crew.subagentProvider,
         label,
         childId: childId as SessionId,
         request: {
-          prompt: [{ type: 'text', text: call.task }],
+          prompt,
           parent: call.agent,
           agentOptions: { provider: route.provider, model: route.model },
           persona: persona.prefix,
