@@ -153,6 +153,7 @@ Only the coder gets it, as approved. The architect, the writer and ops also have
   - dropped: `{{model}}` (dsh's own sections get the selection; dish's row read too early) and "EROFS lacks the marker" (dsh marks it; the agent's `2>&1 | tail` hid it).
 - **Your Astro project** (rec. 13): the pnpm store in `astroapp/.mise/`, the commit hash in the spec (`9450db1`), the invented RSS email.
 - **Two approvals for one escalated command?** For the main agent, the gate's own `ask` and then the tool's escalation request both look like they fall through to you (the answerer's `ask` row). The rollout checks it with one `mise install`; if it asks twice, the answerer could let your yes to the gate's ask cover that call's escalation.
+  *Outcome:* it asked twice. **Done** (2026-10-02, branch `one-approval`): the gate's ask now shows the escalation (the mode and the whole justification), and your yes to it covers that call's escalation request, once; see [the judge spec](judge.md#the-approval-answerer).
 - **A no-op escalation reads as one.** The GPT reviewer sent `sandbox_permissions: "workspace-write"` (its mode already) on 9 calls. dsh ignores it (`dsh-tool-bash` `lib/index.js:238`), but the gate puts the escalation question to the judge. The gate could drop a `sandbox_permissions` equal to the session's mode.
 - **The `write`/`edit` bullet** for the architect, the writer and ops, which also edit files.
 - **Crew's own `send_message`** (question 2, option A), after 6b merges, so that dsh's "send your result" note isn't appended to children.

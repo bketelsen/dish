@@ -4,12 +4,13 @@
  *
  * ### What it decides
  *
- * The spec's four cases, in order, with the command gate's verdict for the same call (`VerdictCache`, by agent and call id)
+ * The spec's cases, in order, with the command gate's verdict for the same call (`VerdictCache`, by agent and call id)
  * as the only thing it knows about the call: a request carries the agent, tool name, call id and reason, never the arguments.
  *
  * | The gate's verdict for this agent's call | Main agent | Child |
  * |---|---|---|
  * | `allow`, with the escalation it was shown (`escalationCovered`), and this is that escalation's request | `allowed-once` | `allowed-once` |
+ * | `ask`, the gate's own, which showed you the escalation, and you said yes to it (`coveredByYou`); this is that escalation's request, the first | `allowed-once` | `rejected` (a child is never asked, so never has one) |
  * | `ask` (the gate's own, or another listener's: the cache keeps the stricter) | `next()`: you | `rejected` |
  * | `deny`, `allow` with nothing covered, or no entry at all | `next()`: you | `rejected` |
  * | the cache fails | `next()`: you | `rejected` |
@@ -22,6 +23,14 @@
  *   escalation in view. Anything else (`plugin_manager`, `run_code`, a tool not in `tools.gated`, the gate's own ask) is
  *   yours: the answerer makes no Jev call, and "the judge is unavailable" for an approval request is the gate's: its verdict
  *   was `ask` for you or `deny` for a child, which are the rows above.
+ * - **Your yes to the gate's own ask covers that call's escalation, once.** An escalated call the gate asks you about would
+ *   otherwise ask you twice: the gate's ask, and then the tool's escalation request for the same call. The gate's ask shows you
+ *   the escalation (the mode and the whole justification) and the cache keeps its reason (`askReason`). When the answerer
+ *   passes that ask to you (this tool, exactly that reason) and you say yes (`allowed-once`), it writes `coveredByYou` on the
+ *   entry it read, if the entry is still that one (`VerdictCache.replace`). The escalation's request (this agent, this call
+ *   id, this tool, exactly `escalationReason`) is then `allowed-once`, and the cover is used up before it is answered, so a
+ *   second request for the call is put to you. A no, a cancel, an ask that showed you no escalation, or a yes to anything else
+ *   covers nothing. A child's call is never put to you (the gate refuses it instead of asking), so a child never has one.
  * - **A covered entry covers one request.** The gate records the tool (`exec.name`) and the reason dsh's tool will put on the request
  *   for the escalation (`escalate sandbox to <mode>: <justification>`, from `approveEscalation` in `dsh-sandbox`, which `bash` and
  *   `pwsh` both call). Only a request with that tool name and exactly that reason is approved. A hook's ask, or `run_code`'s,
@@ -32,7 +41,8 @@
  * - **One log line for each decision,** through `ctx.get('dishJudge').log.write`: the approval purpose, no answers (the
  *   answerer asks nothing), no latency, and `pass`, `allowed-once` or `rejected` for the decision. The subject is the tool
  *   and a short reason, with what the tool said it was asking for (`reason`, cut short; the log masks secrets). A line that
- *   can't be written changes nothing.
+ *   can't be written changes nothing. An escalation your yes covered says so ("you approved the command gate's ask about
+ *   this call …"); recording the yes itself is not a decision, and has no line.
  * - **No reason travels to the model.** The waterfall's result is one of four words (`ApprovalOutcome`), so a child that is
  *   rejected is told what dsh's tool says ("the user rejected escalating ...; it stays denied, so stop and explain instead of
  *   working around it") and the reason is in the log. Reasons written for the model are the gate's (it denies with them,
@@ -135,6 +145,13 @@ function asAgent(value: unknown): GateAgent | undefined {
 
 type Decision = 'pass' | 'allowed-once' | 'rejected'
 
+/** The gate's entry for a request's call, with the agent and call id it is kept under. */
+interface Found {
+  readonly owner: string
+  readonly callId: string
+  readonly entry: VerdictEntry
+}
+
 /** What the answerer does with a request, and what it says about it on the line. */
 interface Verdict {
   decision: Decision
@@ -142,6 +159,7 @@ interface Verdict {
 }
 
 const COVERED_WHY = 'the command gate approved this call, with the escalation it was shown'
+const YOURS_WHY = 'you approved the command gate\'s ask about this call, which showed you this escalation'
 
 /**
  * Whether `entry` covers this request: the gate allowed this agent's call with the escalation in view, and the request is that
@@ -161,13 +179,41 @@ function covers(entry: VerdictEntry | undefined, request: ApprovalAnswererReques
 }
 
 /**
- * The decision for one request: the table in the header. `entry` is the gate's verdict for this agent's call, or `undefined`,
- * and `covered` is whether it covers this request. A child is never `pass`.
+ * Whether your yes covers this request: you said yes to the gate's own ask about this agent's call, which showed you the
+ * escalation (`coveredByYou`, on the entry of that ask), and the request is that escalation: the same tool, exactly
+ * `escalationReason`. Never for a child, which is never asked; and not for an entry with no tool or no reason to compare with.
  */
-function decide(topLevel: boolean, entry: VerdictEntry | undefined, covered: boolean): Verdict {
-  if (covered) return { decision: 'allowed-once', why: COVERED_WHY }
+function yourYesCovers(topLevel: boolean, entry: VerdictEntry, request: ApprovalAnswererRequest): boolean {
+  return topLevel
+    && entry.verdict === 'ask'
+    && entry.coveredByYou === true
+    && entry.tool !== undefined
+    && entry.escalationReason !== undefined
+    && request.toolName === entry.tool
+    && request.reason === entry.escalationReason
+}
+
+/**
+ * Whether the request is the gate's own ask about this call that showed you its escalation: the entry kept that ask's reason
+ * (`askReason`), and the request is the same tool's with exactly that reason. A yes to it covers the escalation.
+ */
+function showsYouTheEscalation(entry: VerdictEntry, request: ApprovalAnswererRequest): boolean {
+  return entry.askReason !== undefined
+    && request.toolName === entry.tool
+    && request.reason === entry.askReason
+}
+
+/**
+ * The decision for one request: the table in the header. `entry` is the gate's verdict for this agent's call, or `undefined`;
+ * `cover` is what covers this request, if anything does (the judge's allow, or your yes); and `showing` is whether the request
+ * is the gate's ask that showed you the escalation. A child is never `pass`.
+ */
+function decide(topLevel: boolean, entry: VerdictEntry | undefined, cover: 'judge' | 'you' | undefined, showing: boolean): Verdict {
+  if (cover === 'judge') return { decision: 'allowed-once', why: COVERED_WHY }
+  if (cover === 'you') return { decision: 'allowed-once', why: YOURS_WHY }
   if (topLevel) {
     if (entry === undefined) return { decision: 'pass', why: 'not a call the command gate judged; passed on to you' }
+    if (showing) return { decision: 'pass', why: 'the command gate asked you about this call, and showed you its escalation, which a yes also covers; passed on to you' }
     if (entry.verdict === 'ask') return { decision: 'pass', why: 'the command gate asked you about this call; passed on to you' }
     return { decision: 'pass', why: `the command gate's verdict for this call (${entry.verdict}) does not cover this request; passed on to you` }
   }
@@ -179,10 +225,10 @@ function decide(topLevel: boolean, entry: VerdictEntry | undefined, covered: boo
 
 /**
  * The `approval/request` listener, for `registerApprovalAnswerer` (and for tests, which give it a cache and a log of their own).
- * It is synchronous inside, answers at once, and does not wait for a log write. It never throws, and for a child it never calls
- * `next()`: see the header.
+ * It is synchronous inside, answers at once, and does not wait for a log write; what it passes to you it waits for only to
+ * record a yes that covers an escalation. It never throws, and for a child it never calls `next()`: see the header.
  */
-export function approvalAnswerer(cache: Pick<VerdictCache, 'get'>, log: AnswererLog, now: () => number = Date.now): ApprovalAnswerer {
+export function approvalAnswerer(cache: Pick<VerdictCache, 'get' | 'replace'>, log: AnswererLog, now: () => number = Date.now): ApprovalAnswerer {
   return (request, next) => {
     const agent = asAgent(request?.agent)
     let topLevel = false
@@ -193,23 +239,37 @@ export function approvalAnswerer(cache: Pick<VerdictCache, 'get'>, log: Answerer
     }
     let owner: string | undefined
     let callId: string | undefined
-    let entry: VerdictEntry | undefined
+    /** The gate's entry for this agent's call, and where it is kept, which is where a yes is written. */
+    let found: Found | undefined
     try {
       owner = verdictOwner(agent)
       callId = request.callId === undefined || request.callId === null ? undefined : String(request.callId)
-      entry = callId === undefined ? undefined : cache.get(owner, callId)
+      if (callId !== undefined) {
+        const entry = cache.get(owner, callId)
+        if (entry !== undefined) found = { owner, callId, entry }
+      }
     } catch {
       // No entry is the same as one that doesn't cover anything: the main agent is asked, a child is refused.
-      entry = undefined
+      found = undefined
     }
+    const entry = found?.entry
 
-    let covered = false
+    let cover: 'judge' | 'you' | undefined
+    /** Set when the request is the gate's ask that showed you the escalation: your yes to it is written there. */
+    let shown: Found | undefined
     try {
-      covered = covers(entry, request)
+      if (covers(entry, request)) {
+        cover = 'judge'
+      } else if (found !== undefined && yourYesCovers(topLevel, found.entry, request)) {
+        // Used up before it is answered, so that it covers one request; one that can't be used up covers nothing.
+        if (cache.replace(found.owner, found.callId, found.entry, { ...found.entry, coveredByYou: false })) cover = 'you'
+      } else if (found !== undefined && showsYouTheEscalation(found.entry, request)) {
+        shown = found
+      }
     } catch {
-      // Nothing is covered by what can't be read.
+      // Nothing is covered by what can't be read, or used up.
     }
-    const verdict = decide(topLevel, entry, covered)
+    const verdict = decide(topLevel, entry, cover, shown !== undefined)
 
     try {
       const tool = typeof request?.toolName === 'string' && request.toolName !== '' ? request.toolName : undefined
@@ -232,8 +292,21 @@ export function approvalAnswerer(cache: Pick<VerdictCache, 'get'>, log: Answerer
       // A line that can't be written changes nothing.
     }
 
-    if (verdict.decision === 'pass') return next()
-    return Promise.resolve(verdict.decision)
+    if (verdict.decision !== 'pass') return Promise.resolve(verdict.decision)
+    if (shown === undefined) return next()
+    // The gate's ask that showed you the escalation: your yes to it covers the escalation's request, if the entry is still the one
+    // you were asked about (a child never gets here: it is never passed on).
+    const asked = shown
+    return next().then((outcome) => {
+      if (outcome === 'allowed-once') {
+        try {
+          cache.replace(asked.owner, asked.callId, asked.entry, { ...asked.entry, coveredByYou: true })
+        } catch {
+          // Not recorded: the escalation is put to you.
+        }
+      }
+      return outcome
+    })
   }
 }
 

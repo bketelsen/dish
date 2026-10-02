@@ -22,6 +22,10 @@
  *   cancels wins, and the gate never lets a human approve over it. Its own `deny` is final and `next()` is not called, as in
  *   dsh's auto-review: a call that will not run should not start the `PreToolUse` hooks or recorders after it.
  * - **A verdict cache** (`VerdictCache`, below) is written before `next()` is called and read by the approval answerer.
+ * - **Its ask shows you the escalation.** When the gate asks you about a call whose tool will then ask to escalate the
+ *   sandbox (`sandbox_permissions` with a `justification`), the ask says so, with the mode and the whole justification
+ *   (`showingEscalation`), and the cache keeps the ask's reason (`askReason`). Your yes to that ask is then also your yes to
+ *   the escalation's request, which the answerer allows once instead of asking you a second time about the same call.
  *
  * ### What was found in dsh 0.2.0-rc.2, and where the state comes from
  *
@@ -192,9 +196,22 @@ export interface VerdictEntry {
    * The `reason` dsh's tool gives when it asks to escalate this call, as it will arrive in the approval request:
    * `escalate sandbox to <sandbox_permissions>: <justification>` (`approveEscalation` in `dsh-sandbox`, which `bash` and `pwsh`
    * both call). Set when the call asked for an escalation. Only a request with exactly this reason is the escalation the judge
-   * was shown; an entry with none covers nothing.
+   * was shown, or the one your yes covers; an entry with none covers nothing.
    */
   readonly escalationReason?: string
+  /**
+   * The reason of the gate's own ask about this call, when that ask showed you the escalation the call will ask for (the mode
+   * and the justification, whole: `showingEscalation`). The approval request with this tool and exactly this reason is that
+   * ask, and your yes to it covers the escalation (`coveredByYou`). Set only when the gate itself asks you and `escalationReason`
+   * is set: never for an allow, a deny, a child, or another listener's ask.
+   */
+  readonly askReason?: string
+  /**
+   * `true` from when you said yes to the ask in `askReason` until the escalation's request (this tool, `escalationReason`) is
+   * answered with it: that request is `allowed-once`, once, and then this is gone. Written by the approval answerer, through
+   * `replace`; the gate never writes it.
+   */
+  readonly coveredByYou?: boolean
   /** When it was written, on the cache's monotonic clock, in ms. */
   readonly at: number
   /** The gate's own: lets it see that it has already decided this call. The answerer ignores it. */
@@ -202,7 +219,7 @@ export interface VerdictEntry {
 }
 
 /** What `set` takes: the entry, and the clock supplies `at`. */
-export type VerdictInput = Pick<VerdictEntry, 'verdict' | 'escalationCovered' | 'tool' | 'escalationReason' | 'memo'>
+export type VerdictInput = Pick<VerdictEntry, 'verdict' | 'escalationCovered' | 'tool' | 'escalationReason' | 'askReason' | 'coveredByYou' | 'memo'>
 
 export interface VerdictCacheOptions {
   /** A monotonic clock, in ms. Defaults to `performance.now()`. For tests. */
@@ -264,6 +281,8 @@ export class VerdictCache {
       escalationCovered: input.escalationCovered,
       ...input.tool === undefined ? {} : { tool: input.tool },
       ...input.escalationReason === undefined ? {} : { escalationReason: input.escalationReason },
+      ...input.askReason === undefined ? {} : { askReason: input.askReason },
+      ...input.coveredByYou === true ? { coveredByYou: true } : {},
       at: this.#now(),
       ...input.memo === undefined ? {} : { memo: input.memo },
     })
@@ -277,6 +296,18 @@ export class VerdictCache {
       if (oldest.done === true) break
       this.#entries.delete(oldest.value)
     }
+  }
+
+  /**
+   * Write `input` for this agent's call `callId`, as `set` does, only if the entry there is still `entry`: the very object the
+   * caller read, so that nothing has been written for the call since, and it has not been deleted (its call settled) or
+   * evicted. One that has expired since it was read, and is still there, is still that entry, and is written fresh. This is
+   * the approval answerer's: it reads an entry, waits for you, and then writes your yes on it. Returns whether it wrote.
+   */
+  replace(owner: string, callId: string, entry: VerdictEntry, input: VerdictInput): boolean {
+    if (this.#entries.get(keyOf(owner, callId)) !== entry) return false
+    this.set(owner, callId, input)
+    return true
   }
 
   /** Forget this agent's call `callId`; the same call id of another agent stays. */
@@ -400,16 +431,41 @@ function escalationOf(args: unknown): string | undefined {
     : `sandbox_permissions: ${permissions}; justification: ${clip(justification, MAX_JUSTIFICATION_CHARS)}`
 }
 
+/** The escalation dsh's tool will ask the approval service for: the mode and the justification, as the model gave them. */
+interface EscalationAsked {
+  readonly mode: string
+  readonly justification: string
+}
+
 /**
- * The `reason` dsh's tools put on the approval request for this call's escalation, or `undefined` if the call would not make one
- * (no `sandbox_permissions`, or no `justification` to send with it: `bash` and `pwsh` ask only when they have both). It is the
- * wording of `approveEscalation` in `dsh-sandbox`, with the arguments as the model gave them, not as they are shown to the judge.
+ * The escalation this call's tool will ask for, or `undefined` if it would not ask (no `sandbox_permissions`, or no
+ * `justification` to send with it: `bash` and `pwsh` ask only when they have both). The arguments as the model gave them, not
+ * as they are shown to the judge.
  */
-function escalationReasonOf(args: unknown): string | undefined {
+function escalationAskedOf(args: unknown): EscalationAsked | undefined {
   if (!isRecord(args)) return undefined
-  const permissions = given(args.sandbox_permissions)
-  if (permissions === undefined || typeof args.justification !== 'string') return undefined
-  return `escalate sandbox to ${permissions}: ${args.justification}`
+  const mode = given(args.sandbox_permissions)
+  if (mode === undefined || typeof args.justification !== 'string') return undefined
+  return { mode, justification: args.justification }
+}
+
+/** The `reason` dsh's tool puts on the approval request for the escalation: the wording of `approveEscalation` in `dsh-sandbox`. */
+function escalationReasonOf(asked: EscalationAsked): string {
+  return `escalate sandbox to ${asked.mode}: ${asked.justification}`
+}
+
+/** The gate's own ask, as dsh-tools puts it to the approval service: its reason, and the same words to show you. */
+type GateAsk = { kind: 'ask', reason: string, displayReason: { en: string } }
+
+/**
+ * The gate's own `ask` for a call that will ask to escalate, with the escalation in it: the mode, and the justification whole
+ * and as the model gave it, which is what dsh's own request for it would show you. Your yes to this ask also answers that
+ * request (the approval answerer), so the ask must show you all of it.
+ */
+function showingEscalation(ask: Extract<PreToolDecision, { kind: 'ask' }>, asked: EscalationAsked): GateAsk {
+  const before = ask.reason === undefined ? '' : `${ask.reason} `
+  const reason = `${before}The command also asks for ${asked.mode} permissions: "${asked.justification}". Allowing it allows that too.`
+  return { kind: 'ask', reason, displayReason: { en: reason } }
 }
 
 /** Where the command runs: `workdir` if the call names one (as `bash` and `pwsh` resolve it), else the session's cwd. */
@@ -696,7 +752,8 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     const args = exec.arguments
     const command = commandOf(exec.name, args)
     const escalation = shell ? escalationOf(args) : undefined
-    const escalationReason = shell ? escalationReasonOf(args) : undefined
+    const asked = shell ? escalationAskedOf(args) : undefined
+    const escalationReason = asked === undefined ? undefined : escalationReasonOf(asked)
     const sessionCwd = given(agent.session?.header?.cwd)
     const cwd = shell ? directoryOf(args, sessionCwd) : sessionCwd
     let workspace: string | undefined
@@ -727,7 +784,7 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
       try {
         const judge = deps.judge()
         if (judge !== undefined) {
-          const asked = await judge.ask<Outcome>({
+          const answered = await judge.ask<Outcome>({
             state,
             // The spec's question, or, when a wider sandbox is asked for, the same with the escalation named in it.
             questions: { effect: escalation === undefined ? EFFECT_QUESTION : EFFECT_WITH_ESCALATION_QUESTION, serves_task: SERVES_TASK_QUESTION },
@@ -740,7 +797,7 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
             // A call that was cancelled has no one to ask, so the line says it was cancelled, not asked or denied.
             decide: result => exec.signal.aborted ? { decision: 'cancel', pre: { kind: 'cancel' } } : decideCommand(result, settings, topLevel),
           })
-          outcome = asked.decided
+          outcome = answered.decided
         }
       } catch {
         // The client never throws for a Jev failure; this is anything else, and is no reason to let a command run.
@@ -748,11 +805,19 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
       // A call that was cancelled must not leave an approval prompt behind.
       if (exec.signal.aborted) return { kind: 'cancel' }
       ours = (outcome ?? unavailable(topLevel)).pre
+      // The gate's own ask shows you the escalation the tool will ask for, so that your yes to it can cover that request too.
+      let askReason: string | undefined
+      if (ours.kind === 'ask' && asked !== undefined) {
+        const shown = showingEscalation(ours, asked)
+        ours = shown
+        askReason = shown.reason
+      }
       deps.cache.set(owner, callId, {
         verdict: verdictOf(ours),
         escalationCovered: ours.kind === 'allow' && escalation !== undefined,
         tool: exec.name,
         ...escalationReason === undefined ? {} : { escalationReason },
+        ...askReason === undefined ? {} : { askReason },
         memo: { key, decision: ours },
       })
     }

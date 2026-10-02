@@ -7,7 +7,7 @@ import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import { approvalAnswerer, childPolicy, CREW_LOOKUP_BUDGET_MS, registerApprovalAnswerer } from '../src/answerer.ts'
 import type { ApprovalAnswererRequest, ChildPolicyDeps } from '../src/answerer.ts'
 import type { Answer, Decision, JudgeRequest, JudgeResult } from '../src/client.ts'
-import { registerCommandGate, VerdictCache, verdictOwner } from '../src/gate.ts'
+import { registerCommandGate, VERDICT_TTL_MS, VerdictCache, verdictOwner } from '../src/gate.ts'
 import type { JudgeLogLine } from '../src/log.ts'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
 import { choiceAnswer, dirs, jevBody, mountJudge, noulAnswer, provideStub, startFakeJev } from './helpers.ts'
@@ -98,11 +98,18 @@ function requestOf(agent: unknown, toolName = 'bash', callId: string | null = 'c
 
 const COVERED = { verdict: 'allow', escalationCovered: true, tool: 'bash', escalationReason: REASON } as const
 
+/** The gate's own ask about the call of `ESCALATE`, which the judge read as irreversible, as the gate words it: it shows you the escalation. */
+const ASK_REASON = 'The judge reads this as irreversible (p 0.87), and as serving the task (p 0.90). The command also asks for danger-full-access permissions: "needs the network". Allowing it allows that too.'
+
+/** The entry the gate writes when it asks you about that call: an ask that showed you the escalation, which you have not answered yet. */
+const ASKED = { verdict: 'ask', escalationCovered: false, tool: 'bash', escalationReason: REASON, askReason: ASK_REASON } as const
+
 /** Everything the answerer is not to approve for a child: and, for the main agent, everything that goes to the human. */
 const OTHER_ENTRIES = [
   ['no entry for the call', undefined],
   ['an ask (the gate\'s own, or another listener\'s)', { verdict: 'ask', escalationCovered: false }],
-  ['an ask for a call that escalates, as the gate writes one', { verdict: 'ask', escalationCovered: false, tool: 'bash', escalationReason: REASON }],
+  ['an ask for a call that escalates, which showed you nothing of it', { verdict: 'ask', escalationCovered: false, tool: 'bash', escalationReason: REASON }],
+  ['the gate\'s ask that showed you the escalation, before you said yes to it', ASKED],
   ['a deny', { verdict: 'deny', escalationCovered: false }],
   ['a deny for a call that escalates', { verdict: 'deny', escalationCovered: false, tool: 'bash', escalationReason: REASON }],
   ['an allow with no escalation covered', { verdict: 'allow', escalationCovered: false }],
@@ -115,6 +122,12 @@ const OTHER_ENTRIES = [
   ['a covered entry with another reason', { ...COVERED, escalationReason: 'escalate sandbox to workspace-write: needs the network' }],
   ['a covered entry with no tool', { verdict: 'allow', escalationCovered: true, escalationReason: REASON }],
   ['a covered entry with no reason', { verdict: 'allow', escalationCovered: true, tool: 'bash' }],
+  // Your yes covers the one escalation the gate's ask showed you, and only on that ask's entry. The gate and the answerer never
+  // write the first two; a cache that held one still can't approve anything.
+  ['a deny that says you covered its escalation', { ...ASKED, verdict: 'deny', coveredByYou: true }],
+  ['an allow that says you covered its escalation', { ...ASKED, verdict: 'allow', coveredByYou: true }],
+  ['an entry you covered, for another tool', { ...ASKED, coveredByYou: true, tool: 'run_code' }],
+  ['an entry you covered, with another reason', { ...ASKED, coveredByYou: true, escalationReason: 'escalate sandbox to workspace-write: needs the network' }],
 ] as const
 
 // --- approvalAnswerer: the main agent ------------------------------------------------------------------
@@ -166,7 +179,7 @@ test('main agent: any other request goes to you, and the judge approves nothing 
 })
 
 test('main agent: a cache that throws goes to you, the same as no entry', async () => {
-  const boom = { get: () => { throw new Error('the cache is broken') } }
+  const boom = { get: () => { throw new Error('the cache is broken') }, replace: () => { throw new Error('the cache is broken') } }
   const { spy, next } = nextOf('rejected')
   const { log, lines } = sink()
   assert.equal(await approvalAnswerer(boom, log)(requestOf(main()), next), 'rejected')
@@ -207,8 +220,8 @@ test('child: no call id, a cache that throws, and an agent that is not top-level
   const agent = child()
   const cache = new VerdictCache()
   cache.set(verdictOwner(agent), 'call-1', COVERED)
-  const broken = { get: () => { throw new Error('the cache is broken') } }
-  const odd: Array<[string, { get: VerdictCache['get'] }, ApprovalAnswererRequest | null | undefined]> = [
+  const broken = { get: () => { throw new Error('the cache is broken') }, replace: () => { throw new Error('the cache is broken') } }
+  const odd: Array<[string, Pick<VerdictCache, 'get' | 'replace'>, ApprovalAnswererRequest | null | undefined]> = [
     ['no call id', cache, requestOf(agent, 'plugin_manager', null)],
     ['a cache that throws', broken, requestOf(agent)],
     ['no agent', cache, requestOf(undefined)],
@@ -304,6 +317,9 @@ test('a covered entry with no tool, or no reason, is matched by no request, even
       [{ verdict: 'allow', escalationCovered: true, escalationReason: REASON }, { toolName: undefined, reason: REASON }],
       [{ verdict: 'allow', escalationCovered: true, tool: 'bash' }, { toolName: 'bash', reason: undefined }],
       [{ verdict: 'allow', escalationCovered: true }, { toolName: undefined, reason: undefined }],
+      // The same for a cover your yes gave.
+      [{ verdict: 'ask', escalationCovered: false, escalationReason: REASON, askReason: ASK_REASON, coveredByYou: true }, { toolName: undefined, reason: REASON }],
+      [{ verdict: 'ask', escalationCovered: false, tool: 'bash', askReason: ASK_REASON, coveredByYou: true }, { toolName: 'bash', reason: undefined }],
     ] as const) {
       const cache = new VerdictCache()
       cache.set(verdictOwner(agent), 'call-0', entry)
@@ -347,6 +363,204 @@ test('a covered entry approves the one escalation the gate showed the judge: not
     assert.equal(await answer({ agent, toolName: 'bash', callId: 'call-0' }, next), 'rejected')
     assert.equal(spy.calls, isChild ? 0 : 1)
   }
+})
+
+// --- your yes to the gate's own ask covers that call's escalation, once ------------------------------------
+
+test('main agent: your yes to the gate\'s ask that showed you the escalation covers that escalation, once', async () => {
+  const agent = main()
+  const owner = verdictOwner(agent)
+  const cache = new VerdictCache()
+  cache.set(owner, 'call-1', ASKED)
+  const { log, lines } = sink()
+  const answer = approvalAnswerer(cache, log)
+
+  const ask = nextOf('allowed-once')
+  assert.equal(await answer(requestOf(agent, 'bash', 'call-1', ASK_REASON), ask.next), 'allowed-once')
+  assert.equal(ask.spy.calls, 1, 'the gate\'s ask is yours')
+  assert.equal(cache.get(owner, 'call-1')?.coveredByYou, true)
+
+  const escalation = nextOf('rejected')
+  assert.equal(await answer(requestOf(agent), escalation.next), 'allowed-once')
+  assert.equal(escalation.spy.calls, 0, 'you are not asked again')
+  assert.deepEqual(lines.map(line => [line.decision, line.tool, line.callId, line.child]), [['pass', 'bash', 'call-1', false], ['allowed-once', 'bash', 'call-1', false]])
+  assert.match(lines[0]!.subject, /showed you its escalation/)
+  assert.match(lines[1]!.subject, /^bash: you approved the command gate's ask about this call, which showed you this escalation/)
+
+  // Once: the cover is used up, and a second request for the same call is put to you.
+  assert.equal(cache.get(owner, 'call-1')?.coveredByYou, undefined)
+  const again = nextOf('rejected')
+  assert.equal(await answer(requestOf(agent), again.next), 'rejected')
+  assert.equal(again.spy.calls, 1)
+  assert.equal(lines.at(-1)?.decision, 'pass')
+})
+
+test('main agent: a no to the gate\'s ask, a cancel or no answer covers nothing: the escalation is put to you', async () => {
+  for (const said of ['rejected', 'cancelled', 'unavailable'] as const) {
+    const agent = main()
+    const cache = new VerdictCache()
+    cache.set(verdictOwner(agent), 'call-1', ASKED)
+    const answer = approvalAnswerer(cache, sink().log)
+    assert.equal(await answer(requestOf(agent, 'bash', 'call-1', ASK_REASON), nextOf(said).next), said)
+    assert.equal(cache.get(verdictOwner(agent), 'call-1')?.coveredByYou, undefined, said)
+    const escalation = nextOf('rejected')
+    assert.equal(await answer(requestOf(agent), escalation.next), 'rejected', said)
+    assert.equal(escalation.spy.calls, 1, said)
+  }
+})
+
+test('your yes covers that escalation only: another reason or another tool under the same call id is put to you, and does not use it up', async () => {
+  const agent = main()
+  const cache = new VerdictCache()
+  cache.set(verdictOwner(agent), 'call-1', ASKED)
+  const answer = approvalAnswerer(cache, sink().log)
+  await answer(requestOf(agent, 'bash', 'call-1', ASK_REASON), nextOf('allowed-once').next)
+  for (const [tool, reason, what] of [
+    ['bash', 'escalate sandbox to workspace-write: needs the network', 'another mode'],
+    ['bash', 'escalate sandbox to danger-full-access: something else entirely', 'another justification'],
+    ['bash', `${REASON} `, 'the reason with something after it'],
+    ['bash', 'a PreToolUse hook asks', 'a hook\'s ask'],
+    ['run_code', REASON, 'another tool, with the same reason'],
+    ['pwsh', REASON, 'the other shell, with the same reason'],
+  ] as const) {
+    const { spy, next } = nextOf('rejected')
+    assert.equal(await answer(requestOf(agent, tool, 'call-1', reason), next), 'rejected', what)
+    assert.equal(spy.calls, 1, what)
+  }
+  const bare = nextOf('rejected')
+  assert.equal(await answer({ agent, toolName: 'bash', callId: 'call-1' }, bare.next), 'rejected', 'no reason at all')
+  assert.equal(bare.spy.calls, 1)
+  // The escalation itself is still covered.
+  const escalation = nextOf('rejected')
+  assert.equal(await answer(requestOf(agent), escalation.next), 'allowed-once')
+  assert.equal(escalation.spy.calls, 0)
+})
+
+test('your yes to one agent\'s ask covers nothing of another agent\'s call with the same call id', async () => {
+  const a = main('main-A')
+  const b = main('main-B')
+  const kid = child('child-B')
+  const cache = new VerdictCache()
+  cache.set(verdictOwner(a), 'call-1', ASKED)
+  cache.set(verdictOwner(b), 'call-1', ASKED)
+  const answer = approvalAnswerer(cache, sink().log)
+  await answer(requestOf(a, 'bash', 'call-1', ASK_REASON), nextOf('allowed-once').next)
+  // B was asked too, and has not answered: its escalation is put to you.
+  const forB = nextOf('rejected')
+  assert.equal(await answer(requestOf(b), forB.next), 'rejected')
+  assert.equal(forB.spy.calls, 1)
+  assert.equal(cache.get(verdictOwner(b), 'call-1')?.coveredByYou, undefined)
+  // A main agent with no entry of its own is put to you; a child with none is refused.
+  const forC = nextOf('rejected')
+  assert.equal(await answer(requestOf(main('main-C')), forC.next), 'rejected')
+  assert.equal(forC.spy.calls, 1)
+  const forKid = nextOf('allowed-once')
+  assert.equal(await answer(requestOf(kid), forKid.next), 'rejected')
+  assert.equal(forKid.spy.calls, 0)
+  // A's is still A's.
+  const forA = nextOf('rejected')
+  assert.equal(await answer(requestOf(a), forA.next), 'allowed-once')
+  assert.equal(forA.spy.calls, 0)
+})
+
+test('a yes to an ask that showed you no escalation records nothing, and the next request is put to you', async () => {
+  const READING = 'The judge reads this as irreversible (p 0.87), and as serving the task (p 0.90).'
+  for (const [name, entry, request] of [
+    ['the gate\'s ask about a call with no escalation', { verdict: 'ask', escalationCovered: false, tool: 'bash' }, { toolName: 'bash', reason: READING }],
+    ['an ask that showed you nothing, for a call that escalates', { verdict: 'ask', escalationCovered: false, tool: 'bash', escalationReason: REASON }, { toolName: 'bash', reason: READING }],
+    ['the same, asked with no reason at all', { verdict: 'ask', escalationCovered: false, tool: 'bash', escalationReason: REASON }, { toolName: 'bash' }],
+    ['another tool\'s request in the words of the gate\'s ask', ASKED, { toolName: 'run_code', reason: ASK_REASON }],
+    ['the escalation itself, which you were asked about', ASKED, { toolName: 'bash', reason: REASON }],
+  ] as const) {
+    const agent = main()
+    const cache = new VerdictCache()
+    cache.set(verdictOwner(agent), 'call-1', entry)
+    const answer = approvalAnswerer(cache, sink().log)
+    const yes = nextOf('allowed-once')
+    assert.equal(await answer({ agent, callId: 'call-1', ...request }, yes.next), 'allowed-once', name)
+    assert.equal(yes.spy.calls, 1, name)
+    assert.equal(cache.get(verdictOwner(agent), 'call-1')?.coveredByYou, undefined, name)
+    const escalation = nextOf('rejected')
+    assert.equal(await answer(requestOf(agent), escalation.next), 'rejected', name)
+    assert.equal(escalation.spy.calls, 1, name)
+  }
+})
+
+test('an entry written again, or deleted, while you were answering is left as it is: your yes covers nothing of it', async () => {
+  const agent = main()
+  const owner = verdictOwner(agent)
+  const cache = new VerdictCache()
+  const answer = approvalAnswerer(cache, sink().log)
+  const OTHER = 'escalate sandbox to workspace-write: needs the network'
+  cache.set(owner, 'call-1', ASKED)
+  const said = await answer(requestOf(agent, 'bash', 'call-1', ASK_REASON), () => {
+    // Meanwhile another call with the same id is gated.
+    cache.set(owner, 'call-1', { ...ASKED, escalationReason: OTHER })
+    return Promise.resolve('allowed-once')
+  })
+  assert.equal(said, 'allowed-once')
+  assert.equal(cache.get(owner, 'call-1')?.escalationReason, OTHER, 'the newer entry stands')
+  assert.equal(cache.get(owner, 'call-1')?.coveredByYou, undefined)
+  for (const reason of [REASON, OTHER]) {
+    const { spy, next } = nextOf('rejected')
+    assert.equal(await answer(requestOf(agent, 'bash', 'call-1', reason), next), 'rejected', reason)
+    assert.equal(spy.calls, 1, reason)
+  }
+  // One deleted meanwhile (its call settled) is not written back.
+  cache.set(owner, 'call-2', ASKED)
+  await answer(requestOf(agent, 'bash', 'call-2', ASK_REASON), () => { cache.delete(owner, 'call-2'); return Promise.resolve('allowed-once') })
+  assert.equal(cache.get(owner, 'call-2'), undefined)
+})
+
+test('a yes that came after the entry\'s 10 minutes still covers the escalation, when the entry is still the one that asked', async () => {
+  let now = 0
+  const agent = main()
+  const cache = new VerdictCache({ now: () => now })
+  cache.set(verdictOwner(agent), 'call-1', ASKED)
+  const answer = approvalAnswerer(cache, sink().log)
+  await answer(requestOf(agent, 'bash', 'call-1', ASK_REASON), () => { now += 2 * VERDICT_TTL_MS; return Promise.resolve('allowed-once') })
+  const escalation = nextOf('rejected')
+  assert.equal(await answer(requestOf(agent), escalation.next), 'allowed-once')
+  assert.equal(escalation.spy.calls, 0)
+})
+
+test('child: an entry that says you covered its escalation is rejected, and your yes is never asked for: a child is never put to you', async () => {
+  const agent = child()
+  const owner = verdictOwner(agent)
+  const cache = new VerdictCache()
+  cache.set(owner, 'call-1', { ...ASKED, coveredByYou: true })
+  const answer = approvalAnswerer(cache, sink().log)
+  const { spy, next } = nextOf('allowed-once')
+  assert.equal(await answer(requestOf(agent), next), 'rejected')
+  assert.equal(spy.calls, 0)
+  // The words of the gate's ask, from a child, are refused, and record nothing.
+  cache.set(owner, 'call-2', ASKED)
+  const asked = nextOf('allowed-once')
+  assert.equal(await answer(requestOf(agent, 'bash', 'call-2', ASK_REASON), asked.next), 'rejected')
+  assert.equal(asked.spy.calls, 0)
+  assert.equal(cache.get(owner, 'call-2')?.coveredByYou, undefined)
+  assert.equal(await answer(requestOf(agent, 'bash', 'call-2'), nextOf('allowed-once').next), 'rejected')
+})
+
+test('a cache whose replace throws covers nothing: the gate\'s ask is still yours, and so is the escalation', async () => {
+  const agent = main()
+  const cache = new VerdictCache()
+  cache.set(verdictOwner(agent), 'call-1', ASKED)
+  const failing = { get: cache.get.bind(cache), replace: () => { throw new Error('the cache is broken') } }
+  const answer = approvalAnswerer(failing, sink().log)
+  assert.equal(await answer(requestOf(agent, 'bash', 'call-1', ASK_REASON), nextOf('allowed-once').next), 'allowed-once')
+  const escalation = nextOf('rejected')
+  assert.equal(await answer(requestOf(agent), escalation.next), 'rejected')
+  assert.equal(escalation.spy.calls, 1)
+  // A cover already there that can't be used up is not used: whether writing it throws, or does not happen.
+  cache.set(verdictOwner(agent), 'call-2', { ...ASKED, coveredByYou: true })
+  const refusing = { get: cache.get.bind(cache), replace: () => false }
+  for (const source of [failing, refusing]) {
+    const stuck = nextOf('rejected')
+    assert.equal(await approvalAnswerer(source, sink().log)(requestOf(agent, 'bash', 'call-2'), stuck.next), 'rejected')
+    assert.equal(stuck.spy.calls, 1)
+  }
+  assert.equal(cache.get(verdictOwner(agent), 'call-2')?.coveredByYou, true, 'and it is still there')
 })
 
 // --- the lines written ---------------------------------------------------------------------------------
@@ -1110,20 +1324,56 @@ test('through the real services: the gate\'s own ask for the main agent reaches 
     const result = await w.call('bash', { command: 'git push', description: 'push' }, agent, 'm-ask')
     assert.equal(w.humanSaw.length, 1, human)
     assert.equal(w.humanSaw[0]!.toolName, 'bash')
-    assert.match(w.humanSaw[0]!.reason ?? '', /The judge reads this as irreversible/)
+    assert.equal(w.humanSaw[0]!.reason, 'The judge reads this as irreversible (p 0.87), and as serving the task (p 0.90).', 'no escalation, nothing more to show')
     assert.equal(w.ran.length, runs, human)
     assert.equal(result.isError, runs === 0, human)
     assert.equal(w.lines.find(line => line.purpose === 'approval')?.decision, 'pass')
   }
 })
 
-test('through the real services: an escalation the judge would not allow alone is put to you, not approved', async () => {
+test('through the real services: an escalated call the judge would not allow alone is put to you once, with its escalation; your yes runs it', async () => {
   const w = await world({ script: () => answers(IRREVERSIBLE, 0.9), human: 'allowed-once' })
-  const result = await w.call('bash', ESCALATE('git push --force'), main('main-1'), 'm-esc')
+  const agent = main('main-1')
+  const result = await w.call('bash', ESCALATE('git push --force'), agent, 'm-esc')
   assert.equal(result.isError, false)
-  // The gate's ask, and then the escalation: both go to you. The cache says ask, so the judge approves neither.
-  assert.equal(w.humanSaw.length, 2)
-  assert.deepEqual(w.lines.filter(line => line.purpose === 'approval').map(line => line.decision), ['pass', 'pass'])
+  assert.equal(textOf(result), 'it ran')
+  // The gate's ask goes to you, and shows you the escalation; your yes to it answers the escalation's request too.
+  assert.equal(w.humanSaw.length, 1, 'asked once')
+  assert.deepEqual(w.humanSaw[0], {
+    toolName: 'bash',
+    callId: 'm-esc',
+    reason: 'The judge reads this as irreversible (p 0.87), and as serving the task (p 0.90). The command also asks for danger-full-access permissions: "needs the network". Allowing it allows that too.',
+  })
+  assert.deepEqual(w.approvalOutcomes, ['allowed-once'], 'the escalation was allowed')
+  assert.deepEqual(w.ran.map(args => args.command), ['git push --force'])
+  assert.deepEqual(w.audit(agent), [['asked', 'bash'], ['decided', 'allowed-once'], ['asked', 'bash'], ['decided', 'allowed-once']], 'dsh logged both requests')
+  const approvals = w.lines.filter(line => line.purpose === 'approval')
+  assert.deepEqual(approvals.map(line => line.decision), ['pass', 'allowed-once'])
+  assert.match(approvals[1]!.subject, /you approved the command gate's ask/)
+  assert.equal(w.cache.size, 0, 'the entry, and its cover, went when the call settled')
+})
+
+test('through the real services: a no to the gate\'s ask about an escalated call runs nothing, and nothing escalates', async () => {
+  const w = await world({ script: () => answers(IRREVERSIBLE, 0.9), human: 'rejected' })
+  const agent = main('main-1')
+  const result = await w.call('bash', ESCALATE('git push --force'), agent, 'm-no')
+  assert.equal(result.isError, true)
+  assert.equal(w.humanSaw.length, 1)
+  assert.deepEqual(w.approvalOutcomes, [], 'the tool never ran, so it never asked to escalate')
+  assert.equal(w.ran.length, 0)
+  assert.deepEqual(w.audit(agent), [['asked', 'bash'], ['decided', 'rejected']])
+  assert.equal(w.cache.size, 0)
+})
+
+test('through the real services: the same call id asked again later is a new question: an earlier yes covers nothing of it', async () => {
+  const w = await world({ script: () => answers(IRREVERSIBLE, 0.9), human: 'allowed-once' })
+  const agent = main('main-1')
+  // A provider that gives no call ids makes dsh number them, so one id comes back on a later turn.
+  await w.call('bash', ESCALATE('git push --force'), agent, 'call-0')
+  await w.call('bash', ESCALATE('git push --force'), agent, 'call-0')
+  assert.equal(w.humanSaw.length, 2, 'one prompt for each call')
+  assert.deepEqual(w.approvalOutcomes, ['allowed-once', 'allowed-once'])
+  assert.deepEqual(w.lines.filter(line => line.purpose === 'approval').map(line => line.decision), ['pass', 'allowed-once', 'pass', 'allowed-once'])
 })
 
 test('through the real services: a request the main agent makes that the gate did not judge reaches you; a child\'s does not', async () => {
