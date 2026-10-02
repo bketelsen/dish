@@ -164,7 +164,7 @@ Until 6a, fleet's guest play updated the checkout, ran `install.sh` and restarte
    ssh bjk@10.0.1.175 "incus exec dish --project dish -- su - dish -c 'test -z \"\$(git -C ~/dish status --porcelain)\" && git -C ~/dish pull --ff-only origin main'"
    ```
 
-   The single quotes keep `$(…)` and `~` for `dish`'s shell to expand. If it prints nothing and fails, run `git -C ~/dish status` as `dish` (`incus exec minideb:dish --project dish -- su - dish -c 'git -C ~/dish status'`), clear what it lists, and run it again.
+   The single quotes keep `$(…)` and `~` for `dish`'s shell to expand. If it prints nothing and fails, run `git -C ~/dish status` as `dish` (`incus exec minideb:dish --project dish -- su - dish -c 'git -C ~/dish status'`), clear what it lists, and run it again. Missed, the failure is harmless: step 4 then stops at once with `env: '/home/dish/dish/deploy/update.sh': No such file or directory` (exit 127), and nothing changes.
 4. **Right away, the dry run and the update.** Run steps 3 and 4 back to back: the old unit still runs `pnpm dsh web` from the checkout, so a restart between them (a crash, `Restart=on-failure`) would start it through the new launcher, on an empty dev store.
 
    ```sh

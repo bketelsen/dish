@@ -92,7 +92,7 @@ Set in the profile's `cordis.patch.yml`: `.dev/dsh/profiles/web/` in dev, `~/.ds
 
 | Field | Default | |
 |---|---|---|
-| `cacheFile` | `$XDG_CACHE_HOME/dish/copilot-models.json` | Where the last refresh is cached. |
+| `cacheFile` | `$XDG_CACHE_HOME/dish/copilot-models.json` (`.dev/cache/dish/copilot-models.json` in dev) | Where the last refresh is cached. |
 | `legacyCacheFile` | `$DSH_HOME/dish-copilot-models.json` (set by the bundle) | Read while `cacheFile` doesn't exist yet; never written or deleted. |
 | `refreshOnStart` | `true` | Refresh at startup when signed in. |
 | `updateRoute` | `true` | Rewrite the route's model list to match the account. |
