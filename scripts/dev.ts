@@ -14,23 +14,29 @@
  *
  * **Signals.** dsh handles SIGINT and SIGTERM and nothing else. A SIGHUP kills it at once, without its shutdown, which
  * leaves agent commands (they run detached) behind; and a second signal of either kind during its shutdown
- * (`createProcessShutdown`: `interrupt` after `interrupt`) makes it force-exit. So dsh gets exactly one signal for each
- * one this process receives, and nothing reaches it any other way: it is spawned `detached`, in a session of its own
- * (`dsh web` never reads stdin), so neither a terminal's Ctrl-C nor a signal sent to this process's group touches it.
+ * (`createProcessShutdown`: `interrupt` after `interrupt`) makes it force-exit. So nothing reaches dsh but what this
+ * process sends: it is spawned `detached`, in a session of its own (`dsh web` never reads stdin), so neither a
+ * terminal's Ctrl-C nor a signal sent to this process's group touches it. And this process sends it a second signal
+ * only for a second Ctrl-C, which is a demand to force it out.
  *
- * - SIGINT is forwarded to dsh as SIGINT. One Ctrl-C is one graceful shutdown, and a second one forces dsh out, as dsh
- *   does on its own.
- * - SIGTERM is forwarded as SIGTERM, and SIGHUP (a closed terminal) as SIGTERM, so dsh shuts down instead of dying.
+ * - SIGINT is forwarded to dsh as SIGINT, every time. One Ctrl-C is one graceful shutdown, and a second one forces dsh
+ *   out, as dsh does on its own.
+ * - SIGTERM is forwarded as SIGTERM, and SIGHUP (a closed terminal) and SIGQUIT (Ctrl-\) as SIGTERM, so dsh shuts down
+ *   instead of dying. Once dsh has been signalled, any of these is dropped: a closed terminal hangs up twice (the
+ *   shell's SIGHUP to its jobs, then the kernel's when the shell exits), and a group kill can be followed by the
+ *   kernel's hangup, so forwarding each would be two signals.
  * - The watchers are `pnpm --filter ... run dev`, and pnpm does not pass a signal on to the build scripts it starts: on
  *   `SIGTERM` it carries on, and on `SIGHUP` it dies and leaves them running. So they get a process group of their own
  *   (`detached`), and every signal and the final sweep go to the whole group. SIGTERM and SIGHUP are forwarded to the
- *   group. SIGINT is not: the watchers are stopped, with a SIGTERM to the group, when dsh has gone.
+ *   group, and SIGQUIT as SIGTERM, each once. SIGINT is not: the watchers are stopped, with a SIGTERM to the group, when
+ *   dsh has gone.
  * - Stopping the other child, when one has exited, sends nothing to one that has been signalled already.
  * - install.sh stays in this process's group, so the terminal's Ctrl-C reaches it directly and is not forwarded.
  *
  * Stop it with Ctrl-C, or SIGTERM the node process. A signal sent to the outer `pnpm dev` alone does not reach this
- * process (pnpm does not pass it on; `pnpm dsh` is the same). If this process is SIGKILLed, dsh and the watchers are
- * orphaned: no hangup reaches their sessions.
+ * process (pnpm does not pass it on; `pnpm dsh` is the same). Ctrl-Z stops only pnpm and this process: dsh and the
+ * watchers, in sessions of their own, keep running until the job is resumed (`fg`) and stopped. If this process is
+ * SIGKILLed, dsh and the watchers are orphaned: no hangup reaches their sessions.
  *
  * Nothing here sets `XDG_*` or anything of pnpm's, as in the launcher (its header says why).
  */
@@ -112,18 +118,18 @@ export function signInLink(line: string): string | undefined {
 }
 
 /**
- * What each child gets for a signal this process receives: the signal to send, or nothing. Every signal received is
- * forwarded once, so a child that is also in the sender's process group would get it twice: only install.sh is.
+ * What each child gets for a signal this process receives: the signal to send, or nothing. A child gets at most one
+ * signal this way, except that every SIGINT is forwarded to dsh (see `guardSignals`).
  */
 type Forwarding = Partial<Record<NodeJS.Signals, NodeJS.Signals>>
 
-/** install.sh is in this process's group, which a terminal's Ctrl-C signals: no SIGINT. */
+/** install.sh is in this process's group, which a terminal's Ctrl-C and Ctrl-\ signal: neither is forwarded. */
 const INSTALL_SIGNALS: Forwarding = { SIGTERM: 'SIGTERM', SIGHUP: 'SIGHUP' }
-/** dsh is in a session of its own: it gets every signal from here, and SIGHUP as SIGTERM, which it handles. */
-const DSH_SIGNALS: Forwarding = { SIGINT: 'SIGINT', SIGTERM: 'SIGTERM', SIGHUP: 'SIGTERM' }
+/** dsh is in a session of its own: it gets every signal from here, and SIGHUP and SIGQUIT as SIGTERM, which it handles. */
+const DSH_SIGNALS: Forwarding = { SIGINT: 'SIGINT', SIGTERM: 'SIGTERM', SIGHUP: 'SIGTERM', SIGQUIT: 'SIGTERM' }
 /** The watchers' group is not signalled by a terminal either, but it is not stopped by a SIGINT; see the header. */
-const WATCHER_SIGNALS: Forwarding = { SIGTERM: 'SIGTERM', SIGHUP: 'SIGHUP' }
-const RECEIVED: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP']
+const WATCHER_SIGNALS: Forwarding = { SIGTERM: 'SIGTERM', SIGHUP: 'SIGHUP', SIGQUIT: 'SIGTERM' }
+const RECEIVED: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']
 
 /** How long after the first child's exit the other is stopped, so that a signal that is still arriving is forwarded first. */
 const STOP_GRACE_MS = 200
@@ -214,7 +220,10 @@ function guardSignals(targets: () => Running[]): Guard {
     first ??= signal
     for (const target of targets()) {
       const forwarded = target.forwarding[signal]
-      if (forwarded !== undefined) send(target, forwarded)
+      // A hangup arrives twice (the shell's, then the kernel's as the shell exits), and a group kill can be followed by
+      // the kernel's hangup: only a repeated Ctrl-C is a demand to force dsh out.
+      if (forwarded === undefined || (target.signalled && signal !== 'SIGINT')) continue
+      send(target, forwarded)
     }
   }
   for (const signal of RECEIVED) process.on(signal, receive)

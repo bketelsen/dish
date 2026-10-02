@@ -224,6 +224,8 @@ interface Stub {
   interruptMs?: number
   /** The exit code after a SIGTERM or SIGHUP. */
   termCode?: number
+  /** Milliseconds from a first SIGTERM or SIGHUP to the exit: dsh takes a moment, and a second signal would show. */
+  termMs?: number
   /** Start a child of its own that outlives this stand-in's exit, as pnpm's build scripts outlive pnpm's death. */
   grandchild?: boolean
 }
@@ -269,7 +271,7 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     if (ending) return
     ending = true
     if (signal === 'SIGINT') setTimeout(() => process.exit(130), stub.interruptMs ?? 300)
-    else process.exit(stub.termCode ?? 0)
+    else setTimeout(() => process.exit(stub.termCode ?? 0), stub.termMs ?? 0)
   })
 }
 if (stub.exitAfterMs !== undefined) setTimeout(() => process.exit(stub.code ?? 0), stub.exitAfterMs)
@@ -415,12 +417,13 @@ async function isStandIn(fixture: Fixture, pid: number): Promise<boolean> {
 
 /**
  * Leaves nothing running, even when an assertion failed halfway: SIGKILL to the wrapper's group, and to the groups of
- * dsh and the watchers, which have their own, and to the watchers' child, found by the pids the stand-ins recorded. A
- * recorded pid is only signalled while it still is a process running in the fixture's root.
+ * dsh and the watchers, which have their own, and to the watchers' child, found by the pids the stand-ins recorded (and
+ * the wrapper's, when a terminal started it). A recorded pid is only signalled while it still is a process running in
+ * the fixture's root.
  */
-async function reap(fixture: Fixture, run: Launched): Promise<void> {
-  killGroup(run, 'SIGKILL')
-  for (const file of ['dsh.pid', 'pnpm.pid', 'pnpm.child.pid']) {
+async function reap(fixture: Fixture, run?: Launched): Promise<void> {
+  if (run !== undefined) killGroup(run, 'SIGKILL')
+  for (const file of ['wrapper.pid', 'dsh.pid', 'pnpm.pid', 'pnpm.child.pid']) {
     const pid = Number(await readFile(join(fixture.logs, file), 'utf8').catch(() => '0'))
     if (pid <= 0 || !(await isStandIn(fixture, pid))) continue
     for (const target of [-pid, pid]) {
@@ -642,7 +645,7 @@ test('SIGINT while install.sh runs: pnpm dev waits for it, and starts neither ds
   }
 })
 
-test('SIGTERM and SIGHUP, to pnpm dev alone or to its whole group: dsh gets one SIGTERM, the watchers their group\'s signal, nothing is left', async () => {
+test('SIGTERM, SIGHUP and SIGQUIT, to pnpm dev alone or to its whole group: dsh gets one SIGTERM, the watchers their group\'s signal, nothing is left', async () => {
   // dsh handles SIGINT and SIGTERM only, and force-exits on a second signal. So a SIGHUP reaches it as a SIGTERM, and a
   // signal sent to pnpm dev's group (`kill -- -pgid`, `timeout`) is forwarded once, because dsh is not in that group.
   // The watchers' stand-in exits at once on either signal and leaves its own child behind, as pnpm does with its build
@@ -653,6 +656,9 @@ test('SIGTERM and SIGHUP, to pnpm dev alone or to its whole group: dsh gets one 
     { signal: 'SIGTERM', to: 'group', dsh: 'SIGTERM', watchers: 'SIGTERM', code: 143 },
     { signal: 'SIGHUP', to: 'process', dsh: 'SIGTERM', watchers: 'SIGHUP', code: 129 },
     { signal: 'SIGHUP', to: 'group', dsh: 'SIGTERM', watchers: 'SIGHUP', code: 129 },
+    // Ctrl-\ kills pnpm and pnpm dev's other group members, but dsh and the watchers are in sessions of their own.
+    { signal: 'SIGQUIT', to: 'process', dsh: 'SIGTERM', watchers: 'SIGTERM', code: 131 },
+    { signal: 'SIGQUIT', to: 'group', dsh: 'SIGTERM', watchers: 'SIGTERM', code: 131 },
   ] as const
   for (const { signal, to, dsh, watchers, code } of cases) {
     const label = `${signal} to ${to}`
@@ -680,6 +686,94 @@ test('SIGTERM and SIGHUP, to pnpm dev alone or to its whole group: dsh gets one 
     } finally {
       await reap(fixture, run)
     }
+  }
+})
+
+test('a second signal for a child already signalled is dropped, except a second Ctrl-C', async () => {
+  // A closed terminal hangs up twice (the shell's SIGHUP to its jobs, then the kernel's when the shell exits), and a
+  // group SIGTERM can be followed by that hangup. Each would reach dsh as a SIGTERM, and two make it force-exit. The
+  // stand-ins take 600 ms over their exit, so a second signal sent 60 ms after the first would show in their logs.
+  const cases = [
+    { signals: ['SIGHUP', 'SIGHUP'], dsh: ['SIGTERM'], watchers: ['SIGHUP'], code: 129 },
+    { signals: ['SIGTERM', 'SIGHUP'], dsh: ['SIGTERM'], watchers: ['SIGTERM'], code: 143 },
+    { signals: ['SIGTERM', 'SIGTERM'], dsh: ['SIGTERM'], watchers: ['SIGTERM'], code: 143 },
+    { signals: ['SIGQUIT', 'SIGHUP'], dsh: ['SIGTERM'], watchers: ['SIGTERM'], code: 131 },
+    // Ctrl-C and then a hangup: dsh is already shutting down, and the hangup is not a second Ctrl-C.
+    { signals: ['SIGINT', 'SIGHUP'], dsh: ['SIGINT'], watchers: ['SIGHUP'], code: 130 },
+  ] as const
+  for (const { signals, dsh, watchers, code } of cases) {
+    const label = signals.join(' then ')
+    const fixture = await makeFixture({ dsh: { termMs: 600, interruptMs: 600 }, pnpm: { termMs: 600 } })
+    const run = await launch(fixture)
+    try {
+      await bothUp(fixture, run)
+      run.child.kill(signals[0])
+      await new Promise(resolve => setTimeout(resolve, 60))
+      run.child.kill(signals[1])
+      const { code: got, signal: died } = await finished(run)
+      assert.equal(died, null, label)
+      assert.equal(got, code, `${label}: 128 + the first signal (${run.stderr()})`)
+      assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), dsh, `${label}: dsh got one signal`)
+      assert.deepEqual((await readLog(fixture, 'pnpm')).slice(1), watchers, `${label}: the watchers got one signal`)
+    } finally {
+      await reap(fixture, run)
+    }
+  }
+})
+
+/** Whether util-linux's `script` is here: it runs a command on a pty of its own, which a terminal-close test needs. */
+const HAS_SCRIPT = (() => {
+  try {
+    return /util-linux/.test(execFileSync('script', ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }))
+  } catch {
+    return false
+  }
+})()
+
+test('closing the terminal: dsh gets one SIGTERM, the watchers a hangup, nothing is left, and pnpm dev ends 129', {
+  skip: !HAS_SCRIPT && 'needs util-linux script',
+}, async () => {
+  // An interactive bash on a pty runs pnpm dev as its foreground job. When the terminal goes away, bash hangs up its job
+  // (a SIGHUP to the job's group) and, as it exits, the kernel hangs up the session's foreground group again: pnpm dev
+  // sees two SIGHUPs a few milliseconds apart. dsh must still get exactly one signal, and it takes 500 ms over its exit
+  // here, so a second one would show.
+  const fixture = await makeFixture({ dsh: { termMs: 500 }, pnpm: { grandchild: true } })
+  const wrapper = join(fixture.root, 'wrapper-pty.ts')
+  const exitFile = join(fixture.logs, 'wrapper.exit')
+  await writeFile(wrapper, [
+    `import { writeFileSync } from 'node:fs'`,
+    `import { main } from ${JSON.stringify(DEV)}`,
+    `writeFileSync(${JSON.stringify(join(fixture.logs, 'wrapper.pid'))}, String(process.pid))`,
+    `const code = await main(process.argv.slice(2), { root: ${JSON.stringify(fixture.root)} })`,
+    `writeFileSync(${JSON.stringify(exitFile)}, String(code))`,
+    '',
+  ].join('\n'))
+  const terminal = spawn('script', ['-qefc', 'bash --norc -i', '/dev/null'], {
+    env: { ...fixture.env, TERM: 'dumb' },
+    stdio: ['pipe', 'ignore', 'ignore'],
+  })
+  try {
+    terminal.stdin.write(`cd ${fixture.root} && node ${wrapper}\n`)
+    for (const deadline = Date.now() + 15000; ;) {
+      if ((await readLog(fixture, 'dsh')).length > 0 && (await readLog(fixture, 'pnpm')).length > 0) break
+      assert.ok(Date.now() < deadline, 'the stand-ins started')
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    terminal.kill('SIGKILL') // the pty master closes, and the kernel hangs up the session
+    for (const deadline = Date.now() + 15000; !(await exists(exitFile));) {
+      assert.ok(Date.now() < deadline, 'pnpm dev ended')
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    assert.equal(await readFile(exitFile, 'utf8'), '129', 'pnpm dev ended with 128 + SIGHUP')
+    assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), ['SIGTERM'], 'dsh: one SIGTERM, though the hangup came twice')
+    const grandchild = Number(await readFile(join(fixture.logs, 'pnpm.child.pid'), 'utf8'))
+    for (const deadline = Date.now() + 5000; alive(grandchild) && Date.now() < deadline;) {
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    assert.equal(alive(grandchild), false, 'the watchers\' child is gone')
+  } finally {
+    terminal.kill('SIGKILL')
+    await reap(fixture)
   }
 })
 
