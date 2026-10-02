@@ -27,7 +27,7 @@ dish moves from your desktop to a dedicated VM on Minideb, reachable only on you
 | 6. The config store | The desktop's remote is removed, and the VM starts with no store, restores from GitHub, and is the only pusher from then on. The desktop becomes a dev profile with no remote. |
 | 7. VM or container | A VM, because agents run shell commands and a VM keeps them off Minideb's kernel. It gets 4 vCPU, 8 GiB, a 40 GiB root disk, Debian 13, and its own `dish` Incus project. |
 | 8. Backups | The VM joins fleet's nightly backup, with the quiet-window rules of the others. What only the VM holds: dsh's sessions, crew's records, the judge log, and the Copilot and TypeSafe sign-ins. |
-| 9. Tailscale sign-in | An auth key kept in Semaphore's credentials is passed to the Ansible run and used once. The tailnet hostname is `dish`. |
+| 9. Tailscale sign-in | A one-off auth key, pasted at a hidden prompt when the guest play runs from the workstation, and used once. Fleet keeps no secret in Semaphore. The tailnet hostname is `dish`. |
 | 10. Who runs it | Claude writes the fleet changes on a branch and opens a PR. You, or Semaphore, apply them after reviewing the plan and the diff. Nothing is applied to live infrastructure without your go-ahead. The dish side is built here, on a branch, as usual. |
 
 ## Non-goals
@@ -54,12 +54,12 @@ Ownership follows the nsl builder's split ([fleet's nsl builder doc](../../../fl
 - **Node and pnpm:**
   - Node 24, from the official release tarball pinned by SHA-256 (the desktop runs v24.19.0).
   - pnpm at the version the repo's lockfile was written with, also pinned.
-- **Tailscale:** from Tailscale's own Debian repository. `tailscale up --auth-key=… --hostname=dish` runs once; the key comes from Semaphore and is never written to disk or printed.
+- **Tailscale:** from Tailscale's own Debian repository. `tailscale up --auth-key=file:/dev/stdin --hostname=dish` runs once; the key is read from a hidden prompt on the workstation, passed on stdin, and never written to disk or printed.
 - **The account:**
   - It is a normal account, `dish`, with no sudo and linger on. dsh, and every agent's shell command, runs as `dish`.
   - Its home holds the checkout (`~/dish`), dsh's home (`~/.dsh`) and the XDG directories: config (with the store), state (with the judge log) and data (with crew's records).
 - **Deploy keys:**
-  - The two private keys come from Semaphore and are written to `~dish/.ssh` with mode 0600.
+  - The two private keys stay on the workstation; the guest play reads them from its environment for that run only, and writes them to `~dish/.ssh` with mode 0600.
   - SSH host aliases (`github-dish`, `github-dish-config`) pick the right key for each repository. GitHub's host key is pinned in `known_hosts`.
 - **The checkout:** `git clone git@github-dish:bketelsen/dish.git ~/dish`. On later runs it does a `git fetch` and a fast-forward of `main`; a checkout that can't fast-forward fails the run instead of being reset.
 - **The install:** it runs dish's `deploy/install.sh`, then installs the user unit from `deploy/` and restarts it only when the checkout or the unit changed.
