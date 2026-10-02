@@ -6,6 +6,7 @@ Status: draft 2026-10-02, for review. This is roadmap step 6b. It builds on [ops
 
 You register repos as **projects**, and dish gets them ready to work on.
 - **Onboarding.** For each project, dish clones the repo under `~/work/<owner>/<repo>`, or adopts a clone already there. Then it runs the project's `setup` and registers the clone as a **dsh workspace**, so it appears in the sidebar for chats.
+- **A scratch workspace.** dish also registers `~/work/scratch` once, for general chats: dsh's web UI starts every chat in a workspace, and `~/work` itself shouldn't be one.
 - **Worktrees.** Task worktrees live inside each clone, one branch each. The main agent makes them with a tool, and `delegate` binds a coder to one. They're removed automatically once their branch is merged.
 - **GitHub access.** A GitHub App. Agents' git gets read-only tokens, and only the harness will push (step 7).
 - **Configuration.** The registry lives in the config store, edited on **Settings → Projects**, and agents may propose changes to it.
@@ -27,6 +28,7 @@ You register repos as **projects**, and dish gets them ready to work on.
 | 11 | Cleanup | Automatic: a sweep on every fetch and hourly removes worktrees whose branch is merged, along with their local branches. GitHub's "automatically delete head branches" setting handles the remote branch. |
 | 12 | Plugins | Two: `dish-projects` (registry, page, onboarding) and `dish-workspaces` (clones, worktrees, credentials, the tool, the sweep). |
 | 13 | Projects page | List with clone status; add, edit and remove; retry a failed clone. A per-project worktree view may come with step 7. |
+| 14 | Scratch workspace | `dish-workspaces` registers `<work root>/scratch` once, titled "scratch", for general chats ([below](#the-scratch-workspace)). If you remove it, dish doesn't bring it back. |
 
 ## Non-goals
 
@@ -56,7 +58,7 @@ projects:
 
 - **Namespace:** `projects.yaml` is claimed by `dish-projects` with agent policy `propose`, and seeded empty.
 - **Validation** refuses (`INVALID`):
-  - keys that aren't `owner/name` (GitHub's grammar);
+  - keys that aren't `owner/name` (GitHub's grammar), or whose owner is `scratch` (reserved for the [scratch workspace](#the-scratch-workspace));
   - a missing or blank `family`, `role` or `gate`;
   - timeouts that aren't `<n>s`, `<n>m` or `<n>h` between 10s and 10m for the gate, or up to 1h for setup;
   - unknown fields.
@@ -80,6 +82,15 @@ A project is onboarded when it appears in `projects.yaml`, at startup for each p
 5. **Register the workspace:** `ctx.workspaceRegistry.create(<clone path>, "<owner>/<repo>")`. This is idempotent: an existing record for the path is reused.
 
 A project is **ready** once all five succeed. Onboarding runs one project at a time and never blocks dsh's start.
+
+## The scratch workspace
+
+dsh's web UI has no chat without a workspace: every chat it creates names one, and with none selected the composer stays disabled (6a's [Notes from the build](ops.md#notes-from-the-build)). General chats need a workspace that isn't `~/work` itself, because a workspace's folder is where agents write without asking: dsh reads `~/work/.env` when the service starts, and every clone lives under `~/work`.
+
+- **At startup,** once, `dish-workspaces` makes `<work root>/scratch` (`mkdir -p`) and registers it with `ctx.workspaceRegistry.create(<path>, "scratch")`. That's idempotent, so the workspace you added by hand after 6a is adopted. In dev, it's `<checkout>/.dev/work/scratch`.
+- **Once only.** It records that it did so in `$XDG_STATE_HOME/dish/workspaces/scratch` and never registers it again, so a scratch workspace you remove stays removed, like dsh's own first-use default workspace. Deleting the record file brings it back at the next start.
+- **The name is reserved.** `scratch` can't be a project owner: validation refuses it, since its clones would land in `<work root>/scratch/<repo>`.
+- **Never fails the start.** An error is logged once, and the projects still onboard.
 
 ## Credentials
 
@@ -164,6 +175,7 @@ interface DishWorkspaces {
   - clone, adopt, and an unrelated directory refused;
   - setup succeeding, failing, and timing out;
   - workspace registration with dsh's real workspace registry against a temp store;
+  - the scratch workspace: made and registered once, an existing one adopted, not brought back after you remove it, and `scratch` refused as an owner;
   - each status, and Retry;
   - an App that isn't installed.
 - **The credential helper:** it answers only for `github.com` with that owner's token; a clone's `fetch` works, and `push` is refused.
