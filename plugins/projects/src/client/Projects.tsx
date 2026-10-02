@@ -69,7 +69,7 @@ export function Projects(props: Props) {
             {form !== null
               ? <Form state={state} form={form} actions={props} />
               : current !== undefined
-                ? <ProjectView state={state} project={current} actions={props} />
+                ? <ProjectView key={current.name} state={state} project={current} actions={props} />
                 : <p className="dish-projects-muted">
                   {projects.length === 0
                     ? (broken ? 'No project is listed until projects.yaml parses.' : storeless ? 'Nothing to list until the config store runs.' : 'No projects yet. Add one to start.')
