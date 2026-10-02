@@ -10,8 +10,10 @@ import { DEFAULTS } from '../src/defaults.ts'
 import type { DishSkills } from '../src/index.ts'
 import { NAMESPACE, NEW_SKILL_TEMPLATE, RESET_NOTE } from '../src/protocol.ts'
 import type { ErrorCode, Outcome, SkillInfo } from '../src/protocol.ts'
-import { SkillsRemote } from '../src/remote.ts'
+import { SkillsRemote, checkDocument, infoFor, rowsFor } from '../src/remote.ts'
+import type { Entry } from '../src/remote.ts'
 import { SHIPPED_ROLES, checkSkill, pathFor, parseSkill } from '../src/skill.ts'
+import type { ParseResult } from '../src/skill.ts'
 import { COMMIT, dirs, mountConfig, mountSkills, outsideCommit, provideStub, seeded, skillText, userWrite, waitFor, watchLogs } from './helpers.ts'
 
 const AGENT = { kind: 'agent', sessionId: 's1', role: 'main' } as const
@@ -325,6 +327,72 @@ test('skills takes the roles from crew when it is there, and from the shipped li
   })
 })
 
+// --- a document the parser cannot read -------------------------------------------------------------
+
+/** A stored entry for the skill `name`, with `text` as its document. */
+function entryOf(name: string, text: string, stored = true): Entry {
+  return { name, path: pathFor(name), text, stored }
+}
+
+const boom = (): never => { throw new RangeError('boom') }
+
+test('a document whose parsing throws is a row with a problem, not a failed list; the other rows are as they were', () => {
+  const calls: string[] = []
+  const flaky = (path: string, text: string): ParseResult => {
+    calls.push(path)
+    if (path === pathFor('cursed')) return boom()
+    return parseSkill(path, text)
+  }
+  const entries = [
+    entryOf('mine', MINE),
+    entryOf('cursed', skillText('cursed')),
+    entryOf('brainstorming', DEFAULTS.brainstorming!),
+    entryOf('writing-skills', DEFAULTS['writing-skills']!, false),
+  ]
+  const pending = new Map([[pathFor('cursed'), 2]])
+  const rows = rowsFor(entries, name => DEFAULTS[name], true, pending, flaky)
+  plain(rows)
+  // One parse for each document: a refusal is read from the first, and nothing parses a second time.
+  assert.deepEqual(calls.sort(), entries.map(entry => entry.path).sort())
+  assert.deepEqual(rows.map(row => row.name), ['brainstorming', 'cursed', 'mine', 'writing-skills'])
+  assert.deepEqual(rows.find(row => row.name === 'cursed'), {
+    name: 'cursed', path: 'skills/cursed/SKILL.md', description: '', roles: null, modelInvocable: false, userInvocable: false,
+    shipped: false, differsFromDefault: false, missing: false, problem: 'the document can\'t be read: boom', pendingProposals: 2,
+  })
+  assert.deepEqual(rows.find(row => row.name === 'brainstorming'), shippedInfo('brainstorming'))
+  assert.deepEqual(rows.find(row => row.name === 'writing-skills'), { ...shippedInfo('writing-skills'), missing: true })
+  assert.equal(rows.find(row => row.name === 'mine')?.problem, '')
+})
+
+test('a shipped document whose parsing throws still says it differs from its default; a thrown non-Error is described too', () => {
+  const row = infoFor(entryOf('brainstorming', 'hand edited'), DEFAULTS.brainstorming, true, 0, boom)
+  assert.equal(row.problem, 'the document can\'t be read: boom')
+  assert.equal(row.differsFromDefault, true)
+  assert.equal(row.shipped, true)
+  assert.equal(row.missing, false)
+  const odd = infoFor(entryOf('mine', MINE), undefined, true, 0, () => { throw 'plain string' })
+  assert.equal(odd.problem, 'the document can\'t be read: plain string')
+})
+
+test('a parser refusal is shown without the path in front of it, whether or not it has one', () => {
+  const real = infoFor(entryOf('mine', 'no frontmatter\n'), undefined, true, 0)
+  assert.equal(real.problem, 'the frontmatter is missing; the document must start with a --- line')
+  const bare = infoFor(entryOf('mine', MINE), undefined, true, 0, () => ({ ok: false, problem: 'a refusal with no path' }))
+  assert.equal(bare.problem, 'a refusal with no path')
+})
+
+test('check answers a problem, not a throw, when checking the document throws', () => {
+  const result = checkDocument(pathFor('mine'), MINE, ['main'], boom)
+  plain(result)
+  assert.deepEqual(result, { problems: ['skills/mine/SKILL.md: the document can\'t be read: boom'], warnings: [], summary: null })
+  // With the real check it is the answer `check` gives.
+  assert.deepEqual(checkDocument(pathFor('mine'), MINE, ['main']), {
+    problems: [],
+    warnings: [],
+    summary: { description: 'Use when you need mine.', roles: ['main'], modelInvocable: true, userInvocable: true, chars: MINE.length },
+  })
+})
+
 // --- pending proposals -----------------------------------------------------------------------------
 
 test('pendingProposals counts the open and stale proposals that change the skill\'s document, and not rejected ones', async () => {
@@ -475,6 +543,25 @@ test('save creates a skill when the path does not exist, as the user, and the li
     const { skills } = ok(await remote.skills())
     assert.equal(info(skills, 'mine').shipped, false)
     assert.equal(info(skills, 'mine').problem, '')
+  })
+})
+
+test('a new skill saved with the list\'s commit as base is created; one created under that name after that commit is CONFLICT', async () => {
+  await withRemote(async (remote, store) => {
+    const { commit } = ok(await remote.skills())
+    // Nothing has touched `fresh` since `commit`: the base is fine for a document that doesn't exist yet.
+    const created = ok(await remote.save('fresh', NEW_SKILL_TEMPLATE('fresh'), commit, 'a new one'))
+    assert.ok(created)
+    assert.deepEqual(created.paths, ['skills/fresh/SKILL.md'])
+    assert.equal(await store.read('skills/fresh/SKILL.md'), NEW_SKILL_TEMPLATE('fresh'))
+
+    // Someone else created `other` after `commit`: saving it against that base would overwrite their skill.
+    await userWrite(store, 'other', skillText('other', ['main'], 'Theirs.'))
+    const head = await store.head()
+    const message = failed(await remote.save('other', NEW_SKILL_TEMPLATE('other'), commit, ''), 'CONFLICT')
+    assert.match(message, /skills\/other\/SKILL\.md/)
+    assert.equal(await store.read('skills/other/SKILL.md'), skillText('other', ['main'], 'Theirs.'))
+    assert.equal(await store.head(), head)
   })
 })
 

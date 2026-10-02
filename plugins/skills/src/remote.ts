@@ -33,7 +33,8 @@ import { markRemote } from 'dish-kit'
 import { NAMESPACE, RESET_NOTE } from './protocol.ts'
 import type { CheckResult, CommitInfo, ErrorCode, Outcome, ReadResult, SkillInfo, SkillsResult } from './protocol.ts'
 import type { DishSkills } from './service.ts'
-import { SKILLS_PREFIX, checkSkill, nameFor, parseSkill, pathFor, validate } from './skill.ts'
+import { SKILLS_PREFIX, checkSkill, nameFor, parseSkill, pathFor } from './skill.ts'
+import type { ParseResult, SkillCheck } from './skill.ts'
 
 /** The Cordis service key. (The wire namespace is `NAMESPACE`.) */
 export const SERVICE = 'dishSkillsRemote'
@@ -142,7 +143,7 @@ async function put(ctx: Context, name: string, content: string, base: string, no
 const SHIPPED_NOT_REMOVABLE = 'a shipped skill comes back at the next start; turn it off with `roles: []` instead'
 
 /** A skill document, and whether the store has it. */
-interface Entry {
+export interface Entry {
   name: string
   path: string
   text: string
@@ -151,7 +152,13 @@ interface Entry {
 }
 
 /** What the list says of `entry`, given the shipped text of its name (if any) and the proposals that touch its path. */
-function infoFor(entry: Entry, shipped: string | undefined, store: boolean, pending: number): SkillInfo {
+export function infoFor(
+  entry: Entry,
+  shipped: string | undefined,
+  store: boolean,
+  pending: number,
+  parse: (path: string, text: string) => ParseResult = parseSkill,
+): SkillInfo {
   const base = {
     name: entry.name,
     path: entry.path,
@@ -160,21 +167,63 @@ function infoFor(entry: Entry, shipped: string | undefined, store: boolean, pend
     missing: store && !entry.stored,
     pendingProposals: pending,
   }
-  const result = parseSkill(entry.path, entry.text)
-  if (!result.ok) {
-    // Nothing is offered from a document that doesn't parse, and the page has no description or roles to show for it.
-    return {
-      ...base, description: '', roles: null, modelInvocable: false, userInvocable: false, problem: validate(entry.path, entry.text) ?? result.problem,
+  // Nothing is offered from a document that doesn't parse, and the page has no description or roles to show for it.
+  const broken = (problem: string): SkillInfo => ({
+    ...base, description: '', roles: null, modelInvocable: false, userInvocable: false, problem,
+  })
+  // One parse, guarded: a hand-committed document that makes the parser throw is a row with a problem, and costs the list nothing.
+  try {
+    const result = parse(entry.path, entry.text)
+    if (!result.ok) {
+      // The page shows the path beside the problem, so the sentence does not repeat it.
+      const prefix = `${entry.path}: `
+      return broken(result.problem.startsWith(prefix) ? result.problem.slice(prefix.length) : result.problem)
     }
+    const { skill } = result
+    return {
+      ...base,
+      description: skill.description,
+      roles: skill.roles,
+      modelInvocable: skill.modelInvocable,
+      userInvocable: skill.userInvocable,
+      problem: '',
+    }
+  } catch (error) {
+    return broken(`the document can't be read: ${describe(error)}`)
   }
-  const { skill } = result
+}
+
+/** The rows of the list, sorted by name: `infoFor` for each entry, with the proposals pending per path. */
+export function rowsFor(
+  entries: readonly Entry[],
+  defaultText: (name: string) => string | undefined,
+  store: boolean,
+  pending: ReadonlyMap<string, number>,
+  parse?: (path: string, text: string) => ParseResult,
+): SkillInfo[] {
+  return [...entries]
+    .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+    .map(entry => infoFor(entry, defaultText(entry.name), store, pending.get(entry.path) ?? 0, parse))
+}
+
+/**
+ * `checkSkill`, guarded: what `check` answers for `text`. A check that throws (a parser bug, on a text nobody
+ * thought of) is a problem with the document, as it is in the list, and not an error the page can't read.
+ */
+export function checkDocument(path: string, text: string, knownRoles: readonly string[], check: (path: string, text: string, knownRoles: readonly string[]) => SkillCheck = checkSkill): CheckResult {
+  let checked: SkillCheck
+  try {
+    checked = check(path, text, knownRoles)
+  } catch (error) {
+    return { problems: [`${path}: the document can't be read: ${describe(error)}`], warnings: [], summary: null }
+  }
+  const parsed = checked.problems.length === 0 ? checked.skill : null
   return {
-    ...base,
-    description: skill.description,
-    roles: skill.roles,
-    modelInvocable: skill.modelInvocable,
-    userInvocable: skill.userInvocable,
-    problem: '',
+    problems: checked.problems,
+    warnings: checked.warnings,
+    summary: parsed === null
+      ? null
+      : { description: parsed.description, roles: parsed.roles, modelInvocable: parsed.modelInvocable, userInvocable: parsed.userInvocable, chars: text.length },
   }
 }
 
@@ -222,9 +271,7 @@ export class SkillsRemote extends TypertRemoteService {
           for (const path of proposal.paths) pending.set(path, (pending.get(path) ?? 0) + 1)
         }
       }
-      const skills = [...entries.values()]
-        .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
-        .map(entry => infoFor(entry, service.defaultText(entry.name), store !== undefined, pending.get(entry.path) ?? 0))
+      const skills = rowsFor([...entries.values()], name => service.defaultText(name), store !== undefined, pending)
       return { commit, skills, roles }
     })
   }
@@ -265,15 +312,7 @@ export class SkillsRemote extends TypertRemoteService {
     return outcome(async () => {
       const skill = skillName(name)
       const content = stringOf('text', text)
-      const checked = checkSkill(pathFor(skill), content, await this.ctx.dishSkills.knownRoles())
-      const parsed = checked.problems.length === 0 ? checked.skill : null
-      return {
-        problems: checked.problems,
-        warnings: checked.warnings,
-        summary: parsed === null
-          ? null
-          : { description: parsed.description, roles: parsed.roles, modelInvocable: parsed.modelInvocable, userInvocable: parsed.userInvocable, chars: content.length },
-      }
+      return checkDocument(pathFor(skill), content, await this.ctx.dishSkills.knownRoles())
     })
   }
 

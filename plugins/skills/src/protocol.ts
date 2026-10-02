@@ -70,7 +70,7 @@ export interface SkillInfo {
   path: string
   /** What the document says (trimmed); `''` for a document that doesn't parse. */
   description: string
-  /** The roles offered the skill; `null` for every role, `[]` for none (and for a document that doesn't parse). */
+  /** The roles offered the skill; `null` for every role (and for a document that doesn't parse), `[]` for none. */
   roles: string[] | null
   /** A model may load it. `false` for a document that doesn't parse: nothing is offered from it. */
   modelInvocable: boolean

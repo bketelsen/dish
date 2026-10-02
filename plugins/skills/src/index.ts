@@ -9,6 +9,8 @@
  *   replaced when its text is one of an earlier shipped version that nobody has edited since (`defaults/previous.json`).
  *   While the store isn't there, or has no skill documents yet, every answer is the shipped defaults;
  * - a change under `skills/` in the store, and the store coming or going, is told to the service's listeners.
+ * - the Skills page's server half is the `dishSkillsRemote` Typert remote (see `remote.ts`), served by the
+ *   gateway when there is one and idle otherwise.
  *
  * @module dish-skills
  */
