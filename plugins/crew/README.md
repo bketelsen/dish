@@ -5,6 +5,7 @@ A fixed crew of specialists the main agent hands work to, with the conversation 
 - **Reviewers run on another family.** The reviewer always runs on a different model family, and vendor, from the work it reviews. The harness enforces this.
 - **`crew.yaml`** in the config store holds the roles, tiers, models and limits.
 - **Crew keeps its own record.** It saves every child's final report, and finish notices name the child's role and model.
+- **Children report once, in their closing message.** A child's `send_message` longer than `messageLimit` characters (1200 by default) is refused with a note to finish and report in its closing message, so the main agent gets one delivery and not two.
 - **This bundle ships the dish preset:** the main agent's preset, with `delegate`, and with dsh's own delegation tools turned off.
 
 The design and its reasoning are in the [spec](../../docs/specs/crew.md). Why this builds on dsh's subagents directly rather than its experimental agent teams is in the [research note](../../docs/research/2026-10-01-dsh-agent-team.md).
@@ -105,12 +106,14 @@ pnpm --filter dish-crew sync-preset
 |---|---|---|---|
 | `dish-crew` | `dataDirectory` | `$XDG_DATA_HOME/dish/crew` | Where records and reports go. Absolute, or starting with `~/`. |
 | `dish-crew` | `subagentProvider` | `spawn` | The `ctx.subagents` provider for children. |
+| `dish-crew` | `messageLimit` | `1200` | The most characters a crew child's `send_message` may have. A longer one is refused, and the child is told to put its report in its closing message. `0` turns the guard off. |
 | `dish-crew` | `terminal` | `true` | Print this plugin's messages, and the preset row's, to the terminal. |
 
 ## Caveats
 
 - **A start that fails still counts** toward `perSession`, a cancelled one included.
 - **`send_message` isn't checked against the limits.** It can still wake a finished child, and the woken child counts as running from then on. Fix rounds should go through `delegate` with `to`.
+- **The report guard only reads length.** A crew child's `send_message` over `messageLimit` characters is refused, whatever it says, and a short message always goes through. The main agent's messages, other plugins' children's, and any message sent while crew's record can't be read are never refused. A child could still split a report into several short messages; the guard doesn't try to catch that. dsh's own guidance to a child tells it to send its result with `send_message` before it finishes; this is what keeps a child from doing so.
 - **Children share the main agent's working directory.** dsh 0.2.0-rc.2 has no per-child `cwd`.
 - **Children can't ask you anything.** dsh runs them with approval policy `never`.
 - **A crew child's approval requests are refused when `dish-judge` isn't loaded.** With `dish-judge`, a child is switched to approval policy `ask` and the judge answers it. If the judge is then disabled, uninstalled or unloaded, a child that had settled still has `ask` in its log, and a follow-up would resume it at `ask`. Without a guard, dsh would show its prompt in the child's own session, where nobody sees it, and nothing times it out. So crew refuses a crew child's request whenever `dish-judge` is absent. Other children, and the main agent, are untouched.

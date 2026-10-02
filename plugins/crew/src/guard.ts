@@ -55,18 +55,19 @@ export interface GuardRequest {
 
 export type ApprovalGuard = (request: GuardRequest, next: () => Promise<ApprovalOutcome>) => Promise<ApprovalOutcome>
 
-function describe(error: unknown): string {
+/** `error` as a line of text. Shared with `report-guard.ts`. */
+export function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** An agent's id: a non-empty string `id`, or `undefined`. */
-function idOf(agent: unknown): string | undefined {
+/** An agent's id: a non-empty string `id`, or `undefined`. Shared with `report-guard.ts`. */
+export function idOf(agent: unknown): string | undefined {
   const id = typeof agent === 'object' && agent !== null ? (agent as { id?: unknown }).id : undefined
   return typeof id === 'string' && id !== '' ? id : undefined
 }
 
-/** `promise`, or a rejection once `ms` have passed. The timer does not keep the process alive. */
-function within<T>(promise: Promise<T>, ms: number): Promise<T> {
+/** `promise`, or a rejection once `ms` have passed. The timer does not keep the process alive. Shared with `report-guard.ts`. */
+export function within<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: NodeJS.Timeout | undefined
   const late = new Promise<never>((_, reject) => {
     timer = setTimeout(() => { reject(new Error(`no answer in ${ms} ms`)) }, ms)

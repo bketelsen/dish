@@ -130,7 +130,7 @@ Empty strings are treated as absent. The checks run in this order, before anythi
 
    Either way, the record is written.
 
-**`send_message`** stays available for quick questions in both directions: a child asking the main agent something, or the main agent nudging a child. The limits are enforced on `delegate` only. The main agent's prompt says fix rounds go through `delegate` with `to`, not `send_message`. While everything shares one directory, the writer rule depends on that prompt; step 6's worktrees make it moot.
+**`send_message`** stays available for quick questions in both directions: a child asking the main agent something, or the main agent nudging a child. A crew child's `send_message` is limited in length, so that it can't carry a report (see [Report guard](#report-guard)). The limits are enforced on `delegate` only. The main agent's prompt says fix rounds go through `delegate` with `to`, not `send_message`. While everything shares one directory, the writer rule depends on that prompt; step 6's worktrees make it moot.
 
 ## Tools
 
@@ -143,6 +143,17 @@ A child's allow list is its role's `tools` from `crew.yaml`, intersected with th
 - **A crew child's approvals are refused when `dish-judge` isn't loaded.** [`dish-judge`](judge.md) switches crew's children to approval policy `ask` and answers their requests itself; it puts `never` back on the live ones when it unloads. A child that settled keeps `ask` in its log and is resumed at `ask` by a follow-up. If `dish-judge` is absent then (disabled, uninstalled, failed to load, or a restart without it), dsh would put the child's request to the browser, which shows it in the child's own session and has no time limit. So crew registers an `approval/request` listener, prepended, that does nothing when `dishJudge` is there, and otherwise returns `rejected` for a request from a child that isn't top-level and that crew's record knows (also `rejected` if the record can't be read within 2 s). Anything else goes on to `next()`.
 
 The list is stored in the child's descriptor. So if a tool is later removed from the dish preset, older children that were allowed it may no longer reload. That's dsh's behavior, noted in the README.
+
+### Report guard
+
+A crew child reports once, in its closing message. The guard enforces it: crew registers a `tools/pre-execute` listener that refuses a crew child's `send_message` whose `message` is longer than `messageLimit` characters.
+
+- **Why.** `dsh web` shows only a turn's last message and folds everything before it. A child that sends its findings with `send_message` and then finishes gives the main agent two deliveries: the message, and the finish notice with the closing message. The main agent answers in two steps, and the fuller answer is the one that gets folded. The crew prompts say not to ("report once, in your closing message"), and some models do it anyway. dsh's own guidance, which it appends to a continuable child's task, tells the child to send its result to its parent with `send_message` before it finishes, so the prompt alone loses. The guard makes it structural.
+- **What it refuses.** A `send_message` from an agent that is not top-level (`isTopLevelAgent`) and that crew's record knows, whose `message` is a string longer than the limit (JS string length). The refusal is a tool error the child reads on its next step: the message reads like a report (its length and the limit), findings go in the closing message, and `send_message` is for a short question while it works. The call does not run, and no listener after the guard hears of it.
+- **What it leaves.** Every other tool; the main agent, which briefs and nudges its children as long as it likes; children that aren't crew's; a `message` that isn't a string (the tool refuses it). The checks go in that order, cheapest first, and the record is read only for a long message from a child, so nearly every tool call costs nothing.
+- **The limit.** `messageLimit` on the `dish-crew` row, a natural number, default 1200: a question is a few sentences, a report is not. `0` turns the guard off. It reads length only. A child could still split a report into short messages; the guard doesn't try to catch that.
+- **It fails open.** If the record can't be read, or takes more than 2 s, the message goes through, with one logged warning for each distinct problem. This is the opposite of the approval guard, which refuses in that case, and for the opposite reason: there the other outcome is a child hung on a prompt nobody sees; here it is a message delivered, which is harmless, while wrongly refusing a real question leaves a child unable to ask for what it is blocked on.
+- **Where it stands.** It is registered on the host, not prepended, before the plugin awaits anything. It only ever denies `send_message`, so its place among the other `tools/pre-execute` listeners makes no difference, and dish-judge's command gate does not gate `send_message`.
 
 ## The dish preset
 
@@ -199,6 +210,7 @@ Both changes are made to the shipped defaults. Seeding never overwrites, so your
 |---|---|---|---|
 | `dish-crew` | `dataDirectory` | `$XDG_DATA_HOME/dish/crew` | Where records and reports go. |
 | `dish-crew` | `subagentProvider` | `spawn` | The `ctx.subagents` provider for children. |
+| `dish-crew` | `messageLimit` | `1200` | The most characters a crew child's `send_message` may have; `0` turns the report guard off. |
 | `dish-crew` | `terminal` | `true` | Print this plugin's messages. |
 | `dish-crew/delegate` | — | | The preset row: the tool, the notice rewriter. |
 
@@ -213,6 +225,7 @@ Roles, models and limits live in `crew.yaml`, not here.
 - **Follow-ups (`to`):** the role must match, the limits apply, and `sendMessage` is called.
 - **Tool lists:** intersection with visible tools, the pwsh swap, and the never-list.
 - **The record:** atomic writes, reports captured on `subagent/end`, errors from `agent/error`, and pruning.
+- **The report guard:** other tools, the main agent, short messages and non-crew children pass; a long message from a crew child is refused with its length and the limit, at the limit exactly and one over; an unreadable or slow record lets it through with one warning; `0` turns it off; and through the real tool registry, with the plugin's `messageLimit`.
 - **The notice rewrite:** a crew child finished, a crew child failed, and a non-crew child left untouched.
 - **The preset generator:** the drift test, and the removed delegation rows.
 

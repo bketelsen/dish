@@ -1,8 +1,9 @@
 # The crew's host plugin (the dishCrew service). It works without dish-config,
 # on the shipped crew.yaml, and claims and seeds crew.yaml when the store is
 # there, so there is no order to keep. Config: `dataDirectory` (where records and
-# reports go; the XDG data directory for dish by default), `subagentProvider`
-# and `terminal`.
+# reports go; the XDG data directory for dish by default), `subagentProvider`,
+# `messageLimit` (the most characters a crew child's send_message may have, 1200
+# by default; 0 turns the report guard off) and `terminal`.
 - insert:
     - id: dish-crew
       name: dish-crew
