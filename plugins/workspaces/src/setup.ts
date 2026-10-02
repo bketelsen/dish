@@ -42,7 +42,7 @@ import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { maskSecrets } from 'dish-kit'
 import { childEnvironment } from './env.ts'
-import { SAFE_FLAGS, git, maskUrlPasswords } from './git.ts'
+import { SAFE_FLAGS, SHA, git, maskUrlPasswords, shown } from './git.ts'
 import type { GitResult } from './git.ts'
 import { writeFileAtomic } from './paths.ts'
 
@@ -466,7 +466,7 @@ async function mergedCheck(clone: string, revision: string, defaultBranch: strin
   if (revision === '' || revision.startsWith('-') || /[\x00-\x20\x7f]/.test(revision)) {
     return { ok: false, reason: `${JSON.stringify(shown(revision, 60))} isn't a commit` }
   }
-  const remote = await githubTip(clone, defaultBranch, signal)
+  const remote = await githubDefault(clone, { branch: defaultBranch, signal, env: internals.gitEnv })
   if (signal?.aborted) return aborted()
   if ('reason' in remote) return { ok: false, reason: remote.reason }
   const commit = await resolveCommit(clone, revision, signal)
@@ -488,9 +488,23 @@ function gitIn(dir: string, args: readonly string[], signal?: AbortSignal): Prom
   return git(['-C', dir, ...args], { signal, env: { ...internals.gitEnv } })
 }
 
-/** GitHub's default branch tip: `ls-remote --symref origin HEAD`, which must name `refs/heads/<defaultBranch>`, and whose sha must be in the clone. */
-async function githubTip(clone: string, defaultBranch: string, signal?: AbortSignal): Promise<{ sha: string } | { reason: string }> {
-  const listed = await gitIn(clone, ['ls-remote', '--symref', 'origin', 'HEAD'], signal)
+/** GitHub's default branch and its commit, or why dish couldn't hear it. */
+export type GitHubDefault = { branch: string, sha: string } | { reason: string }
+
+/**
+ * GitHub's word on its default branch, right after the caller's fetch: `ls-remote --symref origin HEAD` (through the
+ * credential helper) names the branch and its sha, which must be in the clone. A local `origin/<default>` or
+ * `origin/HEAD` is never read: an agent in the workspace can write refs. With `options.branch`, GitHub's branch must be
+ * that one. A failure is a reason starting "couldn't confirm the default branch with GitHub"; throws only when git
+ * can't be started. `options.env` goes on top of git()'s (a test's `GIT_CONFIG_NOSYSTEM`).
+ *
+ * The caller has fetched and checked the clone (`checkClone` with the expected `url`) just before: `origin` is whatever
+ * the clone's config says. Used by `onMergedCode` and by the sweep (sweep.ts) for ancestry.
+ */
+export async function githubDefault(clone: string, options: { branch?: string, signal?: AbortSignal, env?: Record<string, string> } = {}): Promise<GitHubDefault> {
+  const { signal } = options
+  const run = (args: readonly string[]): Promise<GitResult> => git(['-C', clone, ...args], { signal, env: { ...options.env } })
+  const listed = await run(['ls-remote', '--symref', 'origin', 'HEAD'])
   if (listed.code !== 0 || listed.timedOut || listed.aborted) {
     const line = firstLine(listed.stderr)
     const how = listed.timedOut ? 'ls-remote timed out' : `ls-remote failed (exit ${listed.code})`
@@ -501,27 +515,28 @@ async function githubTip(clone: string, defaultBranch: string, signal?: AbortSig
   for (const entry of listed.stdout.split('\n')) {
     const symref = /^ref: (\S+)\tHEAD$/.exec(entry)
     if (symref !== null) target = symref[1]
-    const tip = /^([0-9a-f]{40}|[0-9a-f]{64})\tHEAD$/.exec(entry)
-    if (tip !== null) sha = tip[1]
+    const tip = /^(\S+)\tHEAD$/.exec(entry)
+    if (tip !== null && SHA.test(tip[1]!)) sha = tip[1]
   }
   if (target === undefined || sha === undefined || !target.startsWith('refs/heads/')) {
     return { reason: `${UNCONFIRMED}: origin didn't name its default branch` }
   }
   const branch = target.slice('refs/heads/'.length)
-  if (branch !== defaultBranch) {
-    return { reason: `${UNCONFIRMED}: GitHub's default branch is ${shown(branch, 100)}, not ${shown(defaultBranch, 100)}` }
+  if (options.branch !== undefined && branch !== options.branch) {
+    return { reason: `${UNCONFIRMED}: GitHub's default branch is ${shown(branch, 100)}, not ${shown(options.branch, 100)}` }
   }
-  if (await resolveCommit(clone, sha, signal) !== sha) {
+  const inClone = await run(['rev-parse', '--verify', '--quiet', '--end-of-options', `${sha}^{commit}`])
+  if (inClone.code !== 0 || inClone.stdout.trim() !== sha) {
     return { reason: `${UNCONFIRMED}: its ${shown(branch, 100)} (${sha.slice(0, 12)}) isn't in the clone; fetch, then try again` }
   }
-  return { sha }
+  return { branch, sha }
 }
 
 /** `revision`'s commit in `dir`, or undefined when there is none. */
 async function resolveCommit(dir: string, revision: string, signal?: AbortSignal): Promise<string | undefined> {
   const result = await gitIn(dir, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${revision}^{commit}`], signal)
   const sha = result.stdout.trim()
-  return result.code === 0 && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha) ? sha : undefined
+  return result.code === 0 && SHA.test(sha) ? sha : undefined
 }
 
 /** Whether `commit` is `tip` or an ancestor of it (an error is a no). */
@@ -542,17 +557,6 @@ async function describe(dir: string, commit: string, signal?: AbortSignal): Prom
 function firstLine(stderr: string): string {
   const line = stderr.split(/[\r\n]+/).map(part => part.trim()).find(part => part !== '') ?? ''
   return shown(line, 200)
-}
-
-/**
- * Text from outside (a branch name, a path, git's stderr) as it may appear in a reason: no control characters, masked,
- * then cut to `max` characters (masked before the cut, so no part of a secret is left, and after, in case the cut
- * changed what matches).
- */
-function shown(text: string, max: number): string {
-  const masked = mask(text.slice(0, 64 * 1024).replace(/[\x00-\x1f\x7f]/g, ' '))
-  const chars = Array.from(masked)
-  return chars.length > max ? mask(`${chars.slice(0, max - 1).join('')}…`) : masked
 }
 
 /** The skip message: why, and the command to run instead, e.g. "setup didn't run outside the sandbox: base dish/plan-x isn't on origin/main. Run it yourself in <cwd>: <command>". */

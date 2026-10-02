@@ -283,6 +283,21 @@ export function maskUrlPasswords(text: string): string {
   return text.replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^/\s@:]*):[^/\s@]*@/gi, '$1:***@')
 }
 
+/** A full commit id as git prints it: 40 hex digits (SHA-1) or 64 (SHA-256), lower case. */
+export const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+
+/**
+ * Text from outside (a branch name, a path, git's stderr, an agent's file name) as a message may show it: no control
+ * characters, masked (`maskSecrets` and URL passwords), then cut to `max` characters. Masked before the cut, so no part
+ * of a secret is left, and after, in case the cut changed what matches.
+ */
+export function shown(text: string, max: number): string {
+  const mask = (value: string): string => maskSecrets(maskUrlPasswords(value))
+  const masked = mask(text.slice(0, 64 * 1024).replace(/[\x00-\x1f\x7f]/g, ' '))
+  const chars = Array.from(masked)
+  return chars.length > max ? mask(`${chars.slice(0, max - 1).join('')}…`) : masked
+}
+
 /** The first non-empty line of git's stderr, without control characters, masked, then cut to `MAX_ERROR_CHARS`. */
 function firstLine(stderr: string): string {
   const line = stderr.split(/[\r\n]+/).map(part => part.replace(/[\x00-\x1f\x7f]/g, ' ').trim()).find(part => part !== '') ?? ''

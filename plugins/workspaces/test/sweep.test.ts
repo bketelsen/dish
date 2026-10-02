@@ -1,9 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { GitHubApp } from '../src/github.ts'
-import { internals as sweepInternals, isMerged, sweepProject } from '../src/sweep.ts'
+import { checkedBranch, githubWord, internals as sweepInternals, isMerged, sweepProject } from '../src/sweep.ts'
 import type { SweepResult } from '../src/sweep.ts'
 import { internals } from '../src/worktrees.ts'
 import type { CreatedWorktree, WorktreeRecord } from '../src/worktrees.ts'
@@ -48,7 +48,7 @@ test('isMerged: a squash-merged pull request whose head is the tip is merged by 
   await f.git(['fetch', '-q', 'origin'])
   const ancestor = await run('git', ['-C', f.clone, 'merge-base', '--is-ancestor', tip, 'origin/main'], { env: f.env })
   assert.equal(ancestor.code, 1, 'the fixture: no ancestry')
-  assert.deepEqual(await f.call(() => isMerged(f.clone, recordOf(made), tip, 'main', [openPull(3, 'f'.repeat(40)), mergedPull(4, tip)])),
+  assert.deepEqual(await f.call(() => isMerged(f.clone, recordOf(made), tip, githubWord(f.clone), [openPull(3, 'f'.repeat(40)), mergedPull(4, tip)])),
     { merged: true, by: 'pull-request', pull: 4 })
 })
 
@@ -57,7 +57,7 @@ test('isMerged: a pull request merged at another head (commits after the merge) 
   const made = await create(f, 'x')
   const merged = await f.commit(made.path, 'x.txt', 'x\n')
   const tip = await f.commit(made.path, 'y.txt', 'after the merge\n')
-  const check = await f.call(() => isMerged(f.clone, recordOf(made), tip, 'main', [mergedPull(4, merged)]))
+  const check = await f.call(() => isMerged(f.clone, recordOf(made), tip, githubWord(f.clone), [mergedPull(4, merged)]))
   assert.equal(check.merged, false)
 })
 
@@ -67,13 +67,13 @@ test('isMerged: an ancestry merge with commits of its own is merged', async () =
   const tip = await f.commit(made.path, 'x.txt', 'x\n')
   await f.git(['push', '-q', 'origin', `${tip}:refs/heads/main`])
   await f.git(['fetch', '-q', 'origin'])
-  assert.deepEqual(await f.call(() => isMerged(f.clone, recordOf(made), tip, 'main', [])), { merged: true, by: 'ancestry' })
+  assert.deepEqual(await f.call(() => isMerged(f.clone, recordOf(made), tip, githubWord(f.clone), [])), { merged: true, by: 'ancestry' })
 })
 
 test("isMerged: a new worktree (its tip is its base, on origin/main) is not merged, even with a merged pull request at that commit", async () => {
   const f = await worktreeFixture()
   const made = await create(f, 'x')
-  const check = await f.call(() => isMerged(f.clone, recordOf(made), made.base, 'main', [mergedPull(1, made.base)]))
+  const check = await f.call(() => isMerged(f.clone, recordOf(made), made.base, githubWord(f.clone), [mergedPull(1, made.base)]))
   assert.equal(check.merged, false)
   const ancestor = await run('git', ['-C', f.clone, 'merge-base', '--is-ancestor', made.base, 'origin/main'], { env: f.env })
   assert.equal(ancestor.code, 0, 'the fixture: it is an ancestor')
@@ -83,7 +83,7 @@ test('isMerged: an open pull request at the tip is not merged', async () => {
   const f = await worktreeFixture()
   const made = await create(f, 'x')
   const tip = await f.commit(made.path, 'x.txt', 'x\n')
-  assert.equal((await f.call(() => isMerged(f.clone, recordOf(made), tip, 'main', [openPull(5, tip)]))).merged, false)
+  assert.equal((await f.call(() => isMerged(f.clone, recordOf(made), tip, githubWord(f.clone), [openPull(5, tip)]))).merged, false)
 })
 
 test("isMerged: a planted replace ref doesn't make a tip an ancestor (and does fool plain git)", async () => {
@@ -95,15 +95,43 @@ test("isMerged: a planted replace ref doesn't make a tip an ancestor (and does f
   await f.git(['replace', '--graft', main, tip])
   const plain = await run('git', ['-C', f.clone, 'merge-base', '--is-ancestor', tip, 'origin/main'], { env: f.env })
   assert.equal(plain.code, 0, 'the fixture fools plain git')
-  assert.equal((await f.call(() => isMerged(f.clone, recordOf(made), tip, 'main', []))).merged, false)
+  assert.equal((await f.call(() => isMerged(f.clone, recordOf(made), tip, githubWord(f.clone), []))).merged, false)
 })
 
-test("isMerged: a tip that isn't a commit id, or a default branch that isn't a branch name, is refused", async () => {
+test("isMerged: a tip or a target that isn't a commit id is refused; checkedBranch refuses what isn't a plain branch name", async () => {
   const f = await worktreeFixture()
   const made = await create(f, 'x')
-  await assert.rejects(f.call(() => isMerged(f.clone, recordOf(made), '--all', 'main', [])))
-  await assert.rejects(f.call(() => isMerged(f.clone, recordOf(made), 'a'.repeat(40), '-x', [])))
-  await assert.rejects(f.call(() => isMerged(f.clone, recordOf(made), 'a'.repeat(40), 'a..b', [])))
+  await assert.rejects(f.call(() => isMerged(f.clone, recordOf(made), '--all', githubWord(f.clone), [])))
+  await assert.rejects(f.call(() => isMerged(f.clone, recordOf(made), 'a'.repeat(40), { branch: 'main', sha: '--all' }, [])))
+  assert.equal(checkedBranch('main'), 'main')
+  assert.equal(checkedBranch('release/2.x'), 'release/2.x')
+  for (const name of ['-x', 'a..b', '', 'a b', 'x/', '/x', 'a//b']) assert.throws(() => checkedBranch(name), /plain branch name/, name)
+})
+
+test("isMerged: ancestry is GitHub's word: a planted origin/main does not make a tip merged (and does fool plain git)", async () => {
+  const f = await worktreeFixture()
+  const made = await create(f, 'x')
+  const tip = await f.commit(made.path, 'x.txt', 'x\n')
+  await f.git(['update-ref', 'refs/remotes/origin/main', tip])
+  const plain = await run('git', ['-C', f.clone, 'merge-base', '--is-ancestor', tip, 'origin/main'], { env: f.env })
+  assert.equal(plain.code, 0, 'the fixture fools a local check')
+  const check = await f.call(() => isMerged(f.clone, recordOf(made), tip, githubWord(f.clone), []))
+  assert.equal(check.merged, false)
+  assert.match(check.reason ?? '', /isn't on GitHub's main/)
+})
+
+test("isMerged: when GitHub can't be asked, ancestry isn't confirmed; a merged pull request still counts", async () => {
+  const f = await worktreeFixture()
+  const made = await create(f, 'x')
+  const tip = await f.commit(made.path, 'x.txt', 'x\n')
+  await f.git(['push', '-q', 'origin', `${tip}:refs/heads/main`])
+  await f.git(['fetch', '-q', 'origin'])
+  await rename(f.bare, `${f.bare}.away`)
+  const check = await f.call(() => isMerged(f.clone, recordOf(made), tip, githubWord(f.clone), []))
+  assert.equal(check.merged, false)
+  assert.match(check.reason ?? '', /couldn't confirm/)
+  assert.deepEqual(await f.call(() => isMerged(f.clone, recordOf(made), tip, githubWord(f.clone), [mergedPull(8, tip)])),
+    { merged: true, by: 'pull-request', pull: 8 })
 })
 
 // --- sweepProject ---------------------------------------------------------------------------------------------------
@@ -307,4 +335,104 @@ test("sweepProject: pulls through dish's GitHub client against the fake API (hea
   } finally {
     await fake.close()
   }
+})
+
+test("sweepProject: ancestry is GitHub's word: a planted origin/main or origin/HEAD keeps the worktree, as not merged", async () => {
+  const f = await worktreeFixture()
+  const main = await create(f, 'by-main')
+  const mainTip = await f.commit(main.path, 'a.txt', 'a\n')
+  const head = await create(f, 'by-head')
+  const headTip = await f.commit(head.path, 'b.txt', 'b\n')
+  // An agent's refs: origin/main moved to one tip, and origin/HEAD pointed at a ref holding the other.
+  await f.git(['update-ref', 'refs/remotes/origin/main', mainTip])
+  await f.git(['update-ref', 'refs/remotes/origin/evil', headTip])
+  await f.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/evil'])
+  // The default branch as dish reads it locally (Task 7a's defaultBranch): origin/HEAD's.
+  const local = async (): Promise<string> => (await f.git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])).replace(/^origin\//, '')
+  assert.equal(await local(), 'evil', 'the fixture: origin/HEAD is planted')
+  const result = await f.call(() => sweepProject(f.project, f.worktrees(), f.deps({ defaultBranch: local })))
+  assert.deepEqual(sorted(result), {
+    removed: [],
+    kept: [
+      { project: 'acme/widget', slug: 'by-head', reason: 'not-merged' },
+      { project: 'acme/widget', slug: 'by-main', reason: 'not-merged' },
+    ],
+  })
+  for (const made of [main, head]) assert.ok(await hasBranch(f, made.branch))
+})
+
+test("sweepProject: when GitHub can't be asked, an ancestry merge is kept (couldn't confirm), and a merged pull request is still swept", async () => {
+  const f = await worktreeFixture()
+  const ancestry = await create(f, 'ancestry')
+  const tip = await f.commit(ancestry.path, 'a.txt', 'a\n')
+  await f.git(['push', '-q', 'origin', `${tip}:refs/heads/main`])
+  await f.git(['fetch', '-q', 'origin'])
+  const pulled = await create(f, 'pulled')
+  const pulledTip = await f.commit(pulled.path, 'p.txt', 'p\n')
+  f.pulls.set(pulledTip, [mergedPull(5, pulledTip, 'dish/pulled')])
+  await rename(f.bare, `${f.bare}.away`)
+  const result = await sweep(f)
+  assert.deepEqual(result.removed, [{ project: 'acme/widget', slug: 'pulled', by: 'pull-request' }])
+  assert.equal(result.kept.length, 1)
+  assert.equal(result.kept[0]!.reason, 'not-merged')
+  assert.match(result.kept[0]!.detail ?? '', /couldn't confirm/)
+  assert.ok(await exists(ancestry.path))
+})
+
+test('sweepProject: a worktree holding another worktree (in .worktrees/, which the shared exclude ignores) is kept, with the other one', async () => {
+  const f = await worktreeFixture()
+  const outer = await create(f, 'outer')
+  const tip = await f.commit(outer.path, 'o.txt', 'o\n')
+  f.pulls.set(tip, [mergedPull(6, tip, 'dish/outer')])
+  const inner = join(outer.path, '.worktrees', 'inner')
+  await f.git(['worktree', 'add', '-q', '-b', 'mine', inner])
+  await writeFile(join(inner, 'work.txt'), 'uncommitted\n')
+  assert.equal(await f.git(['status', '--porcelain', '--untracked-files=normal', '--ignore-submodules=dirty'], outer.path), '', 'git calls the outer one clean')
+  const result = await sweep(f)
+  assert.deepEqual(sorted(result), { removed: [], kept: [{ project: 'acme/widget', slug: 'outer', reason: 'dirty' }] })
+  assert.match(result.kept[0]!.detail ?? '', /another worktree/)
+  assert.equal(await readFile(join(inner, 'work.txt'), 'utf8'), 'uncommitted\n')
+})
+
+test("sweepProject: a hand-made worktree whose directory is gone keeps git's entry (no prune); dish's own missing ones go", async () => {
+  const f = await worktreeFixture()
+  const manual = join(f.clone, '.worktrees', 'manual')
+  await f.git(['worktree', 'add', '-q', '--detach', manual])
+  const only = await f.commit(manual, 'only.txt', 'only in this worktree\n')
+  await rm(manual, { recursive: true, force: true })
+  const gone = await create(f, 'gone')
+  await rm(gone.path, { recursive: true, force: true })
+  await f.git(['update-ref', '-d', 'refs/heads/dish/gone'])
+  const half = await create(f, 'half')
+  const halfTip = await f.commit(half.path, 'h.txt', 'h\n')
+  f.pulls.set(halfTip, [mergedPull(4, halfTip, 'dish/half')])
+  await rm(half.path, { recursive: true, force: true })
+
+  const result = await sweep(f)
+  assert.deepEqual(sorted(result), {
+    removed: [{ project: 'acme/widget', slug: 'half', by: 'pull-request' }],
+    kept: [{ project: 'acme/widget', slug: 'gone', reason: 'missing' }],
+  })
+  const listed = await f.git(['worktree', 'list', '--porcelain'])
+  assert.ok(listed.includes(`worktree ${manual}`), "the hand-made worktree's entry is still there")
+  assert.ok(listed.includes(`HEAD ${only}`), 'and still holds its commit')
+  assert.ok(!listed.includes(`worktree ${gone.path}`))
+  assert.ok(!listed.includes(`worktree ${half.path}`))
+  assert.ok(!await hasBranch(f, 'dish/half'))
+})
+
+test('sweepProject: a branch checked out in another worktree (the clone itself) keeps the branch and the record', async () => {
+  const f = await worktreeFixture()
+  const made = await create(f, 'x')
+  const tip = await f.commit(made.path, 'x.txt', 'x\n')
+  f.pulls.set(tip, [mergedPull(3, tip, 'dish/x')])
+  await f.git(['worktree', 'remove', made.path])
+  await f.git(['checkout', '-q', 'dish/x'])
+  const result = await sweep(f)
+  assert.equal(result.removed.length, 0)
+  assert.equal(result.kept[0]!.reason, 'error')
+  assert.match(result.kept[0]!.detail ?? '', /checked out/)
+  assert.ok(await hasBranch(f, 'dish/x'))
+  assert.equal(await f.git(['symbolic-ref', 'HEAD']), 'refs/heads/dish/x')
+  assert.deepEqual((await f.call(() => f.worktrees().records(f.project))).map(record => record.slug), ['x'])
 })

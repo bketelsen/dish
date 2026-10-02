@@ -14,6 +14,17 @@
  *   check refuses the operation with the finding. A `status` in a worktree takes no optional lock, so it never gets in
  *   the way of a coder's own git there.
  * - **Setup is not run in a worktree** (`worktreeSetup`): default A of a decision the user hasn't made yet.
+ * - **Removal touches one worktree:** `git worktree remove` on its own path (a missing directory included, for its
+ *   administrative entry), never `git worktree prune`, which would also drop the entries of hand-made worktrees whose
+ *   directories are gone (and leave their commits unreachable). A worktree holding another worktree is never removed,
+ *   force or not, and a branch another worktree (the clone's own checkout included) has checked out is never deleted.
+ *
+ * Known limits:
+ * - **A nested repository inside an ignored folder** (a clone under `node_modules/` or another ignored path) is an
+ *   ignored file to git and to `dirty`, so it is deleted with the worktree, its history and uncommitted edits included.
+ * - **`.worktrees` swapped for a link** between `create`'s check of it and `git worktree add`: git then makes the
+ *   worktree wherever the link points. `create` sees it afterwards (the new path isn't canonical), removes what git
+ *   just made there, and refuses; the check and the add are still two steps.
  *
  * Nothing here takes the project's lock: the service runs `create`, `remove` and the sweep under it.
  *
@@ -22,17 +33,16 @@
 
 import { lstat, mkdir, readFile, readdir, realpath, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
-import { maskSecrets } from 'dish-kit'
 import type { Project } from 'dish-projects/registry'
-import { git, gitOk, maskUrlPasswords } from './git.ts'
+import { SHA, git, gitOk, shown } from './git.ts'
 import type { GitResult } from './git.ts'
 import type { PullSummary } from './github.ts'
 import { clonePath, projectStateDir, worktreeRecordFile, worktreeSetupLogFile, writeFileAtomic } from './paths.ts'
 import { checkClone, checkWorktree } from './safety.ts'
 import type { CloneExpectations } from './safety.ts'
 import { skipReason } from './setup.ts'
-import type { SetupResult } from './setup.ts'
-import { checkMerged, defaultBranchOf } from './sweep.ts'
+import type { GitHubDefault, SetupResult } from './setup.ts'
+import { checkMerged, defaultBranchOf, githubWord } from './sweep.ts'
 
 /** A worktree's name: its folder under `.worktrees/` and its branch `dish/<slug>`. (`.cache`, 6c's, can't be one.) */
 export const SLUG = /^[a-z0-9][a-z0-9-]{0,39}$/
@@ -48,10 +58,12 @@ export const WORKTREE_SETUP_SKIPPED = 'a worktree picks up config from the clone
  */
 type SetupOutcome = { ran: false, reason: string } | ({ ran: true } & SetupResult)
 
-/** For tests only, never set by dish: put on top of the environment of this module's git (a test's `GIT_CONFIG_NOSYSTEM`). */
-export const internals: { gitEnv?: Record<string, string> } = {}
+/**
+ * For tests only, never set by dish: `gitEnv` goes on top of the environment of this module's git (a test's
+ * `GIT_CONFIG_NOSYSTEM`); `beforeAdd` runs between `create`'s check of `.worktrees` and its `git worktree add`.
+ */
+export const internals: { gitEnv?: Record<string, string>, beforeAdd?: () => Promise<void> } = {}
 
-const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 /** git()'s cap on stdout: a listing this long may have been cut. */
 const GIT_OUTPUT_CAP = 4 * 1024 * 1024
 /** The longest `base` taken. */
@@ -113,7 +125,7 @@ export interface WorktreeDeps {
   state: string
   /** What `checkClone` expects of the project's clone: its origin's URL, dish's helper value and the web origin. */
   cloneExpectations(project: Project): CloneExpectations
-  /** The service's fetchClone, under its lock. */
+  /** The service's fetchClone: called while the service holds the project's lock; must not take it. */
   fetch(project: Project, signal?: AbortSignal): Promise<void>
   /** origin/HEAD's branch, else 'main'. */
   defaultBranch(clone: string): Promise<string>
@@ -197,10 +209,19 @@ export class Worktrees {
     // The record first: a crash after it leaves a record with no worktree and no branch, which the sweep drops.
     await writeFileAtomic(file, `${JSON.stringify(record, null, 2)}\n`)
     try {
+      await internals.beforeAdd?.()
       await gitOk(['-C', clone, 'worktree', 'add', '--no-track', '-b', record.branch, path, commit], this.#options(signal))
     } catch (error) {
       await rm(file, { force: true }).catch(() => {})
       throw new Error(`${project.name}: couldn't make worktree ${slug}: ${messageOf(error)}`, { cause: error })
+    }
+    const landed = await realpath(path).catch(() => undefined)
+    if (landed !== path) {
+      // `.worktrees` changed under git (a link swapped in): what git just made is dish's, wherever it went. Undo it.
+      await gitOk(['-C', clone, 'worktree', 'remove', '--force', path], this.#options()).catch(() => {})
+      await gitOk(['-C', clone, 'update-ref', '-d', `refs/heads/${record.branch}`, commit], this.#options()).catch(() => {})
+      await rm(file, { force: true }).catch(() => {})
+      throw new Error(`${project.name}: worktree ${slug} landed at ${shown(landed ?? 'an unreadable path', 200)}, not ${path} (.worktrees changed while it was made); dish removed it`)
     }
     return { project: project.name, slug, branch: record.branch, path, clone, base: commit, setup: worktreeSetup(project, path) }
   }
@@ -210,15 +231,18 @@ export class Worktrees {
     const clone = await this.#checkedClone(project)
     const defaultBranch = await defaultBranchOf(this.#deps, clone)
     const records = new Map((await this.records(project)).map(record => [record.slug, record]))
+    // For display only: the clone's own origin/<default>. Removal (remove, the sweep) asks GitHub instead.
+    const local = await localDefault(clone, defaultBranch)
     const infos: WorktreeInfo[] = []
-    for (const entry of await linkedWorktrees(clone)) {
-      const path = await realpath(entry.path).catch(() => entry.path)
+    const linked = (await worktreeEntries(clone)).slice(1).filter(entry => !entry.prunable)
+    for (const entry of linked) {
+      const { path } = entry
       const name = dirname(path) === join(clone, '.worktrees') ? basename(path) : undefined
       const record = name === undefined ? undefined : records.get(name)
       const bound = (await this.#deps.bindings(path)).map(({ child, role, title, running }) => ({ child, role, title, running }))
       if (record !== undefined) {
         const state = await this.inspect(project, record)
-        const merged = await checkMerged(project, state, defaultBranch, this.#deps).then(check => check.merged, () => false)
+        const merged = await checkMerged(project, state, local, this.#deps).then(check => check.merged, () => false)
         const dirty = state.problem !== undefined || await this.dirty(clone, path, record.branch).then(why => why !== undefined, () => true)
         const counts = await aheadBehind(clone, defaultBranch, state.tip ?? entry.head)
         infos.push({ project: project.name, slug: record.slug, branch: record.branch, path, clone, base: record.base, ...counts, dirty, merged, managed: true, bound })
@@ -250,7 +274,7 @@ export class Worktrees {
     }
     if (state.problem !== undefined) throw new Error(`worktree ${slug} can't be removed: ${state.problem}`)
     if (!force) {
-      const merge = await checkMerged(project, state, await defaultBranchOf(this.#deps, state.clone), this.#deps)
+      const merge = await checkMerged(project, state, githubWord(state.clone), this.#deps)
       if (!merge.merged) throw new Error(`worktree ${slug} isn't merged (${merge.reason ?? 'unknown'}); pass force to remove it anyway`)
       if (state.exists) {
         const dirty = await this.dirty(state.clone, state.path, record.branch)
@@ -328,9 +352,11 @@ export class Worktrees {
   /**
    * Why the worktree at `path` has work that removing it would lose, or `undefined` if it has none. `checkWorktree`
    * first (a refusal throws). With `branch`, it must have that branch checked out. Then: `status` with untracked files
-   * (ignored ones don't count), and nested repositories, whose own edits `--ignore-submodules=dirty` hides and whose
-   * history removal would delete: a gitlink in its index, or a `.git` in a folder git tracks (one in an untracked folder
-   * shows in `status`; one in an ignored folder is an ignored file).
+   * (ignored ones don't count); another worktree of the clone inside it (`.worktrees/` is in the clone's shared
+   * `info/exclude`, so a worktree nested at `<path>/.worktrees/<name>` is an ignored folder to `status`); and nested
+   * repositories, whose own edits `--ignore-submodules=dirty` hides and whose history removal would delete: a gitlink
+   * in its index, or a `.git` in a folder git tracks (one in an untracked folder shows in `status`; one in an ignored
+   * folder is an ignored file, a known limit).
    */
   async dirty(clone: string, path: string, branch?: string): Promise<string | undefined> {
     const check = await checkWorktree(clone, path)
@@ -344,6 +370,8 @@ export class Worktrees {
     const status = await gitOk(['-C', dir, '--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=normal', '--ignore-submodules=dirty'], this.#options())
     const changed = status.split('\0').filter(entry => entry !== '')
     if (changed.length > 0) return `${shown(changed[0]!, 120)}${changed.length > 1 ? ` and ${changed.length - 1} more` : ''}`
+    const inner = nestedWorktree(await worktreeEntries(clone), dir)
+    if (inner !== undefined) return `it holds another worktree (${shown(inner, 200)})`
     const modes = await gitOk(['-C', dir, 'ls-files', '-z', '--format=%(objectmode)'], this.#options())
     if (modes.length >= GIT_OUTPUT_CAP - 16) return 'too many files to check for nested repositories'
     if (modes.split('\0').includes('160000')) return 'it has a nested repository (a gitlink, as a submodule is)'
@@ -356,20 +384,31 @@ export class Worktrees {
   }
 
   /**
-   * For `remove` and the sweep, once they've decided: with something at the path, `checkWorktree` again, then
-   * `git worktree remove` on the resolved path (`--force` only with `force`); with nothing there, `git worktree prune`.
-   * Then the branch, only if it is still at the tip `inspect` found (`update-ref -d <ref> <tip>`), so a commit made
-   * since stays; then the record and its setup log.
+   * For `remove` and the sweep, once they've decided. Refused, with everything kept, when another worktree is inside this
+   * one (force or not: it isn't this worktree's to delete) or when another worktree (the clone's own checkout included)
+   * has its branch checked out. Then, with something at the path, `checkWorktree` again and `git worktree remove` on the
+   * resolved path (`--force` only with `force`); with nothing there, `git worktree remove` on the path only if git still
+   * has an entry for it (never `git worktree prune`, which would drop other worktrees' entries too). Then the branch,
+   * only if it is still at the tip `inspect` found (`update-ref -d <ref> <tip>`), so a commit made since stays; then the
+   * record and its setup log.
    */
   async discard(project: Project, state: WorktreeState, force: boolean): Promise<void> {
     const { clone, record, tip } = state
     const path = resolve(state.path)
+    const entries = await worktreeEntries(clone)
+    const inner = nestedWorktree(entries, path)
+    if (inner !== undefined) throw new Error(`worktree ${record.slug} holds another worktree (${shown(inner, 200)}); dish won't remove it, even with force`)
+    const other = entries.find(entry => entry.branch === `refs/heads/${record.branch}` && !entry.at(path))
+    if (other !== undefined) {
+      throw new Error(`${record.branch} is checked out in ${shown(other.path, 200)}; dish keeps the branch, worktree ${record.slug} and its record`)
+    }
     if (state.exists) {
       const check = await checkWorktree(clone, path)
       if (!check.ok) throw new Error(`worktree ${record.slug} can't be removed: ${check.problem}`)
       await gitOk(['-C', clone, 'worktree', 'remove', ...(force ? ['--force'] : []), path], this.#options())
-    } else {
-      await gitOk(['-C', clone, 'worktree', 'prune'], this.#options())
+    } else if (entries.some(entry => entry.at(path))) {
+      // git 2.47 removes the entry of a worktree whose directory is gone, and only that one, without --force.
+      await gitOk(['-C', clone, 'worktree', 'remove', path], this.#options())
     }
     if (tip !== undefined) await gitOk(['-C', clone, 'update-ref', '-d', `refs/heads/${record.branch}`, tip], this.#options())
     await rm(this.#recordFile(project, record.slug), { force: true })
@@ -540,43 +579,50 @@ async function aheadBehind(clone: string, defaultBranch: string, sha: string | u
   return { behind: Number(counts[1]), ahead: Number(counts[2]) }
 }
 
-interface LinkedWorktree {
+interface WorktreeEntry {
+  /** As git has it; canonical (`realpath`) when the directory is there. */
   path: string
   head: string | undefined
   /** `refs/heads/<name>`, or undefined when detached. */
   branch: string | undefined
+  /** Its directory is gone. */
+  prunable: boolean
+  /** Whether this entry is the worktree at `path` (canonical): by git's spelling or by its real path. */
+  at(path: string): boolean
 }
 
-/** `git worktree list --porcelain -z`, without the main checkout and without those whose directory is gone (`prunable`). */
-async function linkedWorktrees(clone: string): Promise<LinkedWorktree[]> {
+/** `git worktree list --porcelain -z`: every worktree of the clone, its own checkout first, with canonical paths. */
+async function worktreeEntries(clone: string): Promise<WorktreeEntry[]> {
   const text = await gitOk(['-C', clone, 'worktree', 'list', '--porcelain', '-z'], { env: { ...internals.gitEnv } })
-  const entries: LinkedWorktree[] = []
-  let current: (LinkedWorktree & { prunable: boolean }) | undefined
-  let first = true
-  const flush = (): void => {
-    if (current !== undefined && !first && !current.prunable) entries.push({ path: current.path, head: current.head, branch: current.branch })
-    if (current !== undefined) first = false
-    current = undefined
-  }
+  const raw: Array<{ path: string, head?: string, branch?: string, prunable: boolean }> = []
   for (const field of text.split('\0')) {
-    if (field === '') {
-      flush()
-      continue
-    }
+    if (field === '') continue
     const space = field.indexOf(' ')
     const key = space < 0 ? field : field.slice(0, space)
     const value = space < 0 ? '' : field.slice(space + 1)
-    if (key === 'worktree') {
-      flush()
-      current = { path: value, head: undefined, branch: undefined, prunable: false }
-    } else if (current !== undefined) {
-      if (key === 'HEAD') current.head = value
-      else if (key === 'branch') current.branch = value
-      else if (key === 'prunable') current.prunable = true
-    }
+    const current = raw.at(-1)
+    if (key === 'worktree') raw.push({ path: value, prunable: false })
+    else if (current === undefined) continue
+    else if (key === 'HEAD') current.head = value
+    else if (key === 'branch') current.branch = value
+    else if (key === 'prunable') current.prunable = true
   }
-  flush()
-  return entries
+  return Promise.all(raw.map(async entry => {
+    const spelled = resolve(entry.path)
+    const real = await realpath(spelled).catch(() => spelled)
+    return { path: real, head: entry.head, branch: entry.branch, prunable: entry.prunable, at: (path: string) => path === real || path === spelled }
+  }))
+}
+
+/** The first worktree in `entries` strictly inside `path` (canonical), if any; one whose directory is gone holds nothing to lose. */
+function nestedWorktree(entries: readonly WorktreeEntry[], path: string): string | undefined {
+  return entries.find(entry => !entry.prunable && !entry.at(path) && entry.path.startsWith(`${path}/`))?.path
+}
+
+/** The clone's own `refs/remotes/origin/<default>`, as a target for `list`'s display of merged (never for removal). */
+async function localDefault(clone: string, defaultBranch: string): Promise<GitHubDefault> {
+  const sha = await commitOf(clone, `refs/remotes/origin/${defaultBranch}`)
+  return sha === undefined ? { reason: `origin/${defaultBranch} isn't in the clone` } : { branch: defaultBranch, sha }
 }
 
 function messageOf(error: unknown): string {
@@ -586,11 +632,4 @@ function messageOf(error: unknown): string {
 /** A name from outside (a slug, a base, a title) in a message: shown safely, in quotes. */
 function quote(text: string): string {
   return JSON.stringify(shown(text, 80))
-}
-
-/** Text from outside (a path, a ref) as a message shows it: no control characters, masked, cut to `max`. */
-function shown(text: string, max: number): string {
-  const masked = maskSecrets(maskUrlPasswords(text.slice(0, 64 * 1024).replace(/[\x00-\x1f\x7f]/g, ' ')))
-  const chars = Array.from(masked)
-  return chars.length > max ? maskSecrets(`${chars.slice(0, max - 1).join('')}…`) : masked
 }

@@ -9,7 +9,7 @@
  * @module dish-workspaces/test/worktree-helpers
  */
 
-import { mkdir, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { Project } from 'dish-projects/registry'
 import type { PullSummary } from '../src/github.ts'
@@ -74,6 +74,8 @@ export async function worktreeFixture(options: { owner?: string, repo?: string, 
   await mkdir(dirname(clone), { recursive: true })
   const url = `file://${bare}`
   await runOk('git', ['clone', '-q', url, clone], { env })
+  // As onboarding configures a clone (Task 7a): `.worktrees/` in the shared exclude, so it's ignored in every worktree.
+  await appendFile(join(clone, '.git', 'info', 'exclude'), '.worktrees/\n')
   const fixture: WorktreeFixture = {
     dir, workRoot, state: join(dir, 'state'), bare, url, clone, env,
     project: projectOf(owner, repo, options.setup),

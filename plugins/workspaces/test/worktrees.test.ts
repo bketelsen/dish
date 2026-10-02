@@ -200,6 +200,25 @@ test('create: a .worktrees that is a link is refused', async () => {
   assert.deepEqual(await recordNames(f), [])
 })
 
+test('create: a .worktrees swapped for a link just before git makes the worktree: what git made is removed, and it is refused', async () => {
+  const f = await worktreeFixture()
+  await create(f, 'first')
+  const elsewhere = await tempDir()
+  internals.beforeAdd = async () => {
+    await rm(join(f.clone, '.worktrees'), { recursive: true, force: true })
+    await symlink(elsewhere, join(f.clone, '.worktrees'))
+  }
+  try {
+    await assert.rejects(create(f, 'two'), /landed at/)
+  } finally {
+    internals.beforeAdd = undefined
+  }
+  assert.deepEqual(await readdir(elsewhere), [], 'the worktree git made through the link is gone')
+  assert.ok(!await hasBranch(f, 'dish/two'))
+  assert.ok(!(await recordNames(f)).includes('two.json'))
+  assert.ok(!(await f.git(['worktree', 'list', '--porcelain'])).includes('/two\n'))
+})
+
 test("create: a project without a clone is refused", async () => {
   const f = await worktreeFixture()
   await assert.rejects(f.call(() => f.worktrees().create(projectOf('acme', 'other'), 'one', undefined, { cwd: f.clone })), /no clone/)
@@ -361,6 +380,47 @@ test('remove: a worktree whose .git was rewritten is refused, even with force, a
   await writeFile(join(made.path, '.git'), `gitdir: ${other}\n`)
   await assert.rejects(remove(f, 'odd', true), /\.git/)
   assert.ok(await exists(join(made.path, 'README.md')))
+})
+
+test('remove: a worktree holding another worktree is refused, with and without force, and both stay', async () => {
+  const f = await worktreeFixture()
+  const outer = await create(f, 'outer')
+  const tip = await f.commit(outer.path, 'o.txt', 'o\n')
+  f.pulls.set(tip, [mergedPull(2, tip, 'dish/outer')])
+  const inner = join(outer.path, '.worktrees', 'inner')
+  await f.git(['worktree', 'add', '-q', '-b', 'mine', inner])
+  await writeFile(join(inner, 'work.txt'), 'uncommitted\n')
+  await assert.rejects(remove(f, 'outer'), /another worktree/)
+  await assert.rejects(remove(f, 'outer', true), /another worktree/)
+  assert.equal(await readFile(join(inner, 'work.txt'), 'utf8'), 'uncommitted\n')
+  assert.ok(await hasBranch(f, 'dish/outer'))
+  const [info] = (await f.call(() => f.worktrees().list(f.project))).filter(item => item.slug === 'outer')
+  assert.equal(info!.dirty, true)
+})
+
+test("remove: ancestry is GitHub's word: a planted origin/main doesn't make it merged", async () => {
+  const f = await worktreeFixture()
+  const made = await create(f, 'x')
+  const tip = await f.commit(made.path, 'x.txt', 'x\n')
+  await f.git(['update-ref', 'refs/remotes/origin/main', tip])
+  await assert.rejects(remove(f, 'x'), /isn't merged.*GitHub's main/)
+  assert.ok(await exists(made.path))
+  await f.git(['push', '-q', 'origin', `${tip}:refs/heads/main`])
+  await remove(f, 'x')
+  assert.ok(!await exists(made.path), 'once GitHub has it')
+})
+
+test('remove: a branch checked out in another worktree (the clone itself) is kept, with its record', async () => {
+  const f = await worktreeFixture()
+  const made = await create(f, 'x')
+  const tip = await f.commit(made.path, 'x.txt', 'x\n')
+  f.pulls.set(tip, [mergedPull(3, tip, 'dish/x')])
+  await f.git(['worktree', 'remove', made.path])
+  await f.git(['checkout', '-q', 'dish/x'])
+  await assert.rejects(remove(f, 'x'), /checked out/)
+  await assert.rejects(remove(f, 'x', true), /checked out/)
+  assert.ok(await hasBranch(f, 'dish/x'))
+  assert.deepEqual(await recordNames(f), ['x.json'])
 })
 
 test('remove: a worktree whose directory was swapped for a link is refused, and the target survives', async () => {
