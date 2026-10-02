@@ -17,6 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs } from 'dish-kit'
 import { defaultsByPath, replaceMap } from './defaults.ts'
+import { SkillsRemote } from './remote.ts'
 import { createDishSkills } from './service.ts'
 import type { CrewReader } from './service.ts'
 import { ROLE_NAME, SKILLS_PREFIX, namespaceSpec } from './skill.ts'
@@ -106,6 +107,8 @@ export function apply(ctx: Context, config: Config): void {
     logger,
   })
   ctx.provide('dishSkills', service)
+  // The Skills page's remote: a child plugin that needs `dishSkills`, so it goes when the service does.
+  ctx.plugin(SkillsRemote)
 
   ctx.on('dish-config/changed', (paths) => {
     if (paths.some(path => path.startsWith(SKILLS_PREFIX))) service.changed()
