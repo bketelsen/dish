@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
@@ -228,15 +228,34 @@ interface Stub {
   grandchild?: boolean
 }
 
+/** The start line a stand-in logs. */
+interface StubStart {
+  argv: string[]
+  cwd: string
+  pid: number
+  pgrp?: number
+  DSH_HOME?: string
+  DSH_DISH_HOME?: string
+  DISH_ENV?: string
+  DISH_REMOTE?: string
+  dishNames: string[]
+}
+
 const STUB_SOURCE = `
 const fs = require('node:fs')
 const role = process.env.STUB_ROLE
 const stub = JSON.parse(process.env.STUB_CONFIG || '{}')[role] || {}
 const log = line => fs.appendFileSync(process.env.STUB_LOG + '/' + role + '.log', line + '\\n')
 fs.writeFileSync(process.env.STUB_LOG + '/' + role + '.pid', String(process.pid))
+let pgrp
+try {
+  const stat = fs.readFileSync('/proc/self/stat', 'utf8')
+  pgrp = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[2])
+} catch {}
 log('start ' + JSON.stringify({
-  argv: process.argv.slice(2), cwd: process.cwd(),
+  argv: process.argv.slice(2), cwd: process.cwd(), pid: process.pid, pgrp,
   DSH_HOME: process.env.DSH_HOME, DSH_DISH_HOME: process.env.DSH_DISH_HOME, DISH_ENV: process.env.DISH_ENV,
+  dishNames: Object.keys(process.env).filter(name => /^DISH_/.test(name)).sort(), DISH_REMOTE: process.env.DISH_REMOTE,
 }))
 for (const line of stub.print || []) console.log(line)
 if (stub.grandchild) {
@@ -347,6 +366,19 @@ async function launch(fixture: Fixture, argv: string[] = []): Promise<Launched> 
   return { child, stdout: () => stdout, stderr: () => stderr, closed }
 }
 
+/** Waits for pnpm dev to exit. When it doesn't, the test fails instead of hanging, so that its finally block can reap. */
+async function finished(run: Launched, ms = 20000): Promise<{ code: number | null, signal: NodeJS.Signals | null }> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`pnpm dev did not exit within ${ms} ms (stderr: ${run.stderr()})`)), ms)
+  })
+  try {
+    return await Promise.race([run.closed, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** Waits until both stand-ins have started. */
 async function bothUp(fixture: Fixture, run: Launched): Promise<void> {
   const deadline = Date.now() + 15000
@@ -366,6 +398,41 @@ function killGroup(run: Launched, signal: NodeJS.Signals): void {
   }
 }
 
+/** Whether a process exists (signal 0). */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Whether `pid` is one of this fixture's stand-ins or their children: they all run in the fixture's root. */
+async function isStandIn(fixture: Fixture, pid: number): Promise<boolean> {
+  return (await readlink(`/proc/${pid}/cwd`).catch(() => '')) === fixture.root
+}
+
+/**
+ * Leaves nothing running, even when an assertion failed halfway: SIGKILL to the wrapper's group, and to the groups of
+ * dsh and the watchers, which have their own, and to the watchers' child, found by the pids the stand-ins recorded. A
+ * recorded pid is only signalled while it still is a process running in the fixture's root.
+ */
+async function reap(fixture: Fixture, run: Launched): Promise<void> {
+  killGroup(run, 'SIGKILL')
+  for (const file of ['dsh.pid', 'pnpm.pid', 'pnpm.child.pid']) {
+    const pid = Number(await readFile(join(fixture.logs, file), 'utf8').catch(() => '0'))
+    if (pid <= 0 || !(await isStandIn(fixture, pid))) continue
+    for (const target of [-pid, pid]) {
+      try {
+        process.kill(target, 'SIGKILL')
+      } catch {
+        // Not a group leader, or already gone.
+      }
+    }
+  }
+}
+
 test('main: installs, then starts the watchers and dsh with the dev environment, and prints the sign-in link once', async () => {
   const fixture = await makeFixture({
     dsh: {
@@ -377,7 +444,7 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
   fixture.env.DSH_HOME = '/elsewhere'
   const run = await launch(fixture, ['--port', '3999'])
   try {
-    const { code } = await run.closed
+    const { code } = await finished(run)
     assert.equal(code, 0, run.stderr())
 
     const [install] = await readLog(fixture, 'install')
@@ -389,7 +456,7 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
     assert.ok(install!.includes('DISH_ENV=[dev]'), install)
 
     const [dshStart] = await readLog(fixture, 'dsh')
-    const dsh = JSON.parse(dshStart!.slice('start '.length)) as { argv: string[], cwd: string, DSH_HOME: string, DSH_DISH_HOME: string, DISH_ENV: string }
+    const dsh = JSON.parse(dshStart!.slice('start '.length)) as StubStart
     assert.deepEqual(dsh.argv, ['web', '--host', '127.0.0.1', '--port', '3999', '--no-open'])
     assert.equal(dsh.cwd, fixture.root, 'dsh runs in the checkout')
     assert.equal(dsh.DSH_HOME, join(fixture.root, '.dev', 'dsh'))
@@ -397,10 +464,23 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
     assert.equal(dsh.DISH_ENV, 'dev')
 
     const [pnpmStart] = await readLog(fixture, 'pnpm')
-    const watchers = JSON.parse(pnpmStart!.slice('start '.length)) as { argv: string[], cwd: string, DSH_DISH_HOME: string }
+    const watchers = JSON.parse(pnpmStart!.slice('start '.length)) as StubStart
     assert.deepEqual(watchers.argv, ['--filter', './plugins/*', '--parallel', '--if-present', 'run', 'dev'])
     assert.equal(watchers.cwd, fixture.root)
     assert.equal(watchers.DSH_DISH_HOME, join(fixture.root, '.dev'))
+
+    // Nothing of the install's reaches dsh or the watchers (nor, through dsh, an agent's shell). DISH_REMOTE is there
+    // only because the test's environment had it, and as it had it: the install got the empty one, not them.
+    for (const [name, seen] of [['dsh', dsh], ['the watchers', watchers]] as const) {
+      assert.deepEqual(seen.dishNames, ['DISH_ENV', 'DISH_REMOTE'], `${name}: no DISH_USER_NAME, DISH_USER_EMAIL or DISH_PROFILE`)
+      assert.equal(seen.DISH_REMOTE, 'git@github-dish-config:bketelsen/dish-config.git', `${name}: the remote as inherited`)
+    }
+    // dsh and the watchers each lead a process group of their own, apart from pnpm dev's (the wrapper's).
+    for (const [name, seen] of [['dsh', dsh], ['the watchers', watchers]] as const) {
+      if (seen.pgrp === undefined) continue // no /proc here
+      assert.equal(seen.pgrp, seen.pid, `${name} leads its own process group`)
+      assert.notEqual(seen.pgrp, run.child.pid, `${name} is not in pnpm dev's group`)
+    }
 
     const lines = run.stdout().split('\n')
     const own = lines.indexOf('dsh web: http://127.0.0.1:3999/?token=abc')
@@ -413,7 +493,7 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
       assert.equal((await stat(join(fixture.root, '.dev', name))).mode & 0o777, 0o700, name)
     }
   } finally {
-    killGroup(run, 'SIGKILL')
+    await reap(fixture, run)
   }
 })
 
@@ -421,13 +501,13 @@ test('main: a failing install.sh returns 1, says so, and starts neither dsh nor 
   const fixture = await makeFixture({}, { STUB_INSTALL_EXIT: '9' })
   const run = await launch(fixture)
   try {
-    const { code } = await run.closed
+    const { code } = await finished(run)
     assert.equal(code, 1)
     assert.equal(run.stderr(), 'dev: install.sh failed (exit 9)\n')
     assert.deepEqual(await readLog(fixture, 'dsh'), [])
     assert.deepEqual(await readLog(fixture, 'pnpm'), [])
   } finally {
-    killGroup(run, 'SIGKILL')
+    await reap(fixture, run)
   }
 })
 
@@ -435,11 +515,15 @@ test('main: when dsh exits, the watchers are stopped once, and the exit code is 
   const fixture = await makeFixture({ dsh: { exitAfterMs: 300, code: 3 } })
   const run = await launch(fixture)
   try {
-    const { code } = await run.closed
+    const { code } = await finished(run)
     assert.equal(code, 3, run.stderr())
+    for (const role of ['dsh', 'pnpm']) {
+      const [start] = await readLog(fixture, role)
+      assert.deepEqual((JSON.parse(start!.slice('start '.length)) as StubStart).dishNames, ['DISH_ENV'], `${role}: only DISH_ENV, with no remote to inherit`)
+    }
     assert.deepEqual((await readLog(fixture, 'pnpm')).slice(1), ['SIGTERM'], 'the watchers got one SIGTERM')
   } finally {
-    killGroup(run, 'SIGKILL')
+    await reap(fixture, run)
   }
 })
 
@@ -447,11 +531,11 @@ test('main: when the watchers exit, dsh is stopped once, and the exit code is th
   const fixture = await makeFixture({ pnpm: { exitAfterMs: 300, code: 4 } })
   const run = await launch(fixture)
   try {
-    const { code } = await run.closed
+    const { code } = await finished(run)
     assert.equal(code, 4, run.stderr())
     assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), ['SIGTERM'], 'dsh got one SIGTERM, and no second signal')
   } finally {
-    killGroup(run, 'SIGKILL')
+    await reap(fixture, run)
   }
 })
 
@@ -459,11 +543,11 @@ test('main: the first non-zero code wins, not the one of the child that was stop
   const fixture = await makeFixture({ dsh: { exitAfterMs: 300, code: 3 }, pnpm: { termCode: 143 } })
   const run = await launch(fixture)
   try {
-    const { code } = await run.closed
+    const { code } = await finished(run)
     assert.equal(code, 3, run.stderr())
     assert.deepEqual((await readLog(fixture, 'pnpm')).slice(1), ['SIGTERM'])
   } finally {
-    killGroup(run, 'SIGKILL')
+    await reap(fixture, run)
   }
 })
 
@@ -472,52 +556,66 @@ test('main: a child that cannot be started gives 127 for it, and the other is st
   await rm(join(fixture.root, 'node_modules', '.bin', 'dsh'))
   const run = await launch(fixture)
   try {
-    const { code } = await run.closed
+    const { code } = await finished(run)
     assert.equal(code, 127)
     assert.match(run.stderr(), /^dev: cannot start dsh: /m)
     assert.deepEqual((await readLog(fixture, 'pnpm')).slice(1), ['SIGTERM'], 'the watchers were stopped')
   } finally {
-    killGroup(run, 'SIGKILL')
+    await reap(fixture, run)
   }
 })
 
-test('SIGINT is left to the terminal: dsh gets one and nothing sends a second; the watchers get a SIGTERM once dsh has gone', async () => {
-  // A terminal's Ctrl-C signals the whole foreground process group. dsh is in pnpm dev's group, so the test signals the
-  // group the way a terminal does. A forwarded copy would be a second SIGINT, and a second signal of either kind during
-  // dsh's shutdown makes dsh force-exit with its work half done. The watchers are in a group of their own, which a
-  // terminal doesn't signal; they are stopped (SIGTERM, not a forwarded SIGINT) when dsh has gone. The wrapper's
-  // exit code is the SIGINT's: 130.
+test('Ctrl-C: dsh gets one SIGINT from pnpm dev, and the watchers a SIGTERM once dsh has gone', async () => {
+  // dsh is in a session of its own, so a terminal's Ctrl-C (a SIGINT to the foreground group, which here is the
+  // wrapper's) doesn't reach it: pnpm dev forwards it, once. The watchers are not sent the SIGINT; they are stopped
+  // with a SIGTERM when dsh has finished its shutdown. The wrapper's exit code is the SIGINT's: 130.
   const fixture = await makeFixture({ dsh: { interruptMs: 800 } })
   const run = await launch(fixture)
   try {
     await bothUp(fixture, run)
     killGroup(run, 'SIGINT')
-    const { code, signal } = await run.closed
+    const { code, signal } = await finished(run)
     assert.equal(signal, null, 'pnpm dev did not die of the SIGINT')
     assert.equal(code, 130, 'it waited for the children and returned 128 + SIGINT')
     assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), ['SIGINT'], 'dsh: one SIGINT, and nothing after it')
     assert.deepEqual((await readLog(fixture, 'pnpm')).slice(1), ['SIGTERM'], 'the watchers: a SIGTERM, not a forwarded SIGINT')
   } finally {
-    killGroup(run, 'SIGKILL')
+    await reap(fixture, run)
   }
 })
 
-test('the watchers leaving first, while dsh is still shutting down from a Ctrl-C, does not get dsh a SIGTERM', async () => {
-  // The watchers' stand-in is signalled directly here, so that it leaves 700 ms before dsh does. pnpm dev must not
-  // answer that with a SIGTERM to dsh, which the terminal's SIGINT has already reached.
-  const fixture = await makeFixture({ dsh: { interruptMs: 800 }, pnpm: { interruptMs: 100 } })
+test('a second Ctrl-C is a second SIGINT to dsh, which forces it out as it does on its own', async () => {
+  const fixture = await makeFixture({ dsh: { interruptMs: 1500 } })
   const run = await launch(fixture)
   try {
     await bothUp(fixture, run)
-    const [, pid] = /^(\d+)$/.exec(await readFile(join(fixture.logs, 'pnpm.pid'), 'utf8')) ?? []
-    process.kill(Number(pid), 'SIGINT')
     killGroup(run, 'SIGINT')
-    const { code } = await run.closed
+    for (const deadline = Date.now() + 5000; (await readLog(fixture, 'dsh')).length < 2;) {
+      assert.ok(Date.now() < deadline, 'dsh got the first SIGINT')
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    killGroup(run, 'SIGINT')
+    const { code } = await finished(run)
     assert.equal(code, 130)
-    assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), ['SIGINT'], 'dsh: one SIGINT, and no SIGTERM after the watchers left')
-    assert.deepEqual((await readLog(fixture, 'pnpm')).slice(1), ['SIGINT'], 'the watchers: the one SIGINT')
+    assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), ['SIGINT', 'SIGINT'], 'each Ctrl-C was forwarded once')
   } finally {
-    killGroup(run, 'SIGKILL')
+    await reap(fixture, run)
+  }
+})
+
+test('the watchers leaving while dsh is still shutting down from a Ctrl-C does not get dsh a SIGTERM', async () => {
+  // The Ctrl-C comes within a second of the start; the watchers' stand-in leaves on its own 1.5 s after its start,
+  // and dsh takes 3 s over its shutdown. A SIGTERM on top of dsh's SIGINT would make it force-exit.
+  const fixture = await makeFixture({ dsh: { interruptMs: 3000 }, pnpm: { exitAfterMs: 1500 } })
+  const run = await launch(fixture)
+  try {
+    await bothUp(fixture, run)
+    killGroup(run, 'SIGINT')
+    const { code } = await finished(run)
+    assert.equal(code, 130)
+    assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), ['SIGINT'], 'dsh: the one SIGINT, and no SIGTERM after the watchers left')
+  } finally {
+    await reap(fixture, run)
   }
 })
 
@@ -532,7 +630,7 @@ test('SIGINT while install.sh runs: pnpm dev waits for it, and starts neither ds
       await new Promise(resolve => setTimeout(resolve, 25))
     }
     killGroup(run, 'SIGINT')
-    const { code, signal } = await run.closed
+    const { code, signal } = await finished(run)
     assert.equal(signal, null, 'pnpm dev did not die of the SIGINT')
     assert.equal(code, 1)
     assert.equal(run.stderr(), 'dev: install.sh failed (exit 130)\n')
@@ -540,25 +638,24 @@ test('SIGINT while install.sh runs: pnpm dev waits for it, and starts neither ds
     assert.deepEqual(await readLog(fixture, 'dsh'), [])
     assert.deepEqual(await readLog(fixture, 'pnpm'), [])
   } finally {
-    killGroup(run, 'SIGKILL')
+    await reap(fixture, run)
   }
 })
 
-/** Whether a process exists (signal 0). */
-function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
-}
-
-test('SIGTERM and SIGHUP sent to pnpm dev alone go on to dsh and the watchers, and nothing the watchers started is left', async () => {
+test('SIGTERM and SIGHUP, to pnpm dev alone or to its whole group: dsh gets one SIGTERM, the watchers their group\'s signal, nothing is left', async () => {
+  // dsh handles SIGINT and SIGTERM only, and force-exits on a second signal. So a SIGHUP reaches it as a SIGTERM, and a
+  // signal sent to pnpm dev's group (`kill -- -pgid`, `timeout`) is forwarded once, because dsh is not in that group.
   // The watchers' stand-in exits at once on either signal and leaves its own child behind, as pnpm does with its build
   // scripts (a SIGHUP kills pnpm and orphans them; a SIGTERM leaves pnpm running with them). pnpm dev signals the
   // watchers' whole process group, so the child must go too.
-  for (const [signal, expected] of [['SIGTERM', 143], ['SIGHUP', 129]] as const) {
+  const cases = [
+    { signal: 'SIGTERM', to: 'process', dsh: 'SIGTERM', watchers: 'SIGTERM', code: 143 },
+    { signal: 'SIGTERM', to: 'group', dsh: 'SIGTERM', watchers: 'SIGTERM', code: 143 },
+    { signal: 'SIGHUP', to: 'process', dsh: 'SIGTERM', watchers: 'SIGHUP', code: 129 },
+    { signal: 'SIGHUP', to: 'group', dsh: 'SIGTERM', watchers: 'SIGHUP', code: 129 },
+  ] as const
+  for (const { signal, to, dsh, watchers, code } of cases) {
+    const label = `${signal} to ${to}`
     const fixture = await makeFixture({ pnpm: { grandchild: true } })
     const run = await launch(fixture)
     let grandchild = 0
@@ -568,20 +665,20 @@ test('SIGTERM and SIGHUP sent to pnpm dev alone go on to dsh and the watchers, a
         grandchild = Number(await readFile(join(fixture.logs, 'pnpm.child.pid'), 'utf8').catch(() => '0'))
         if (grandchild === 0) await new Promise(resolve => setTimeout(resolve, 25))
       }
-      assert.ok(grandchild > 0 && alive(grandchild), `${signal}: the watchers' child is running`)
-      run.child.kill(signal)
-      const { code, signal: died } = await run.closed
-      assert.equal(died, null, signal)
-      assert.equal(code, expected, `${signal}: 128 + the signal (${run.stderr()})`)
-      assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), [signal], `${signal}: dsh`)
-      assert.deepEqual((await readLog(fixture, 'pnpm')).slice(1), [signal], `${signal}: the watchers`)
+      assert.ok(grandchild > 0 && alive(grandchild), `${label}: the watchers' child is running`)
+      if (to === 'group') killGroup(run, signal)
+      else run.child.kill(signal)
+      const { code: got, signal: died } = await finished(run)
+      assert.equal(died, null, label)
+      assert.equal(got, code, `${label}: 128 + the signal (${run.stderr()})`)
+      assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), [dsh], `${label}: dsh`)
+      assert.deepEqual((await readLog(fixture, 'pnpm')).slice(1), [watchers], `${label}: the watchers`)
       for (const deadline = Date.now() + 5000; alive(grandchild) && Date.now() < deadline;) {
         await new Promise(resolve => setTimeout(resolve, 25))
       }
-      assert.equal(alive(grandchild), false, `${signal}: the watchers' child is gone`)
+      assert.equal(alive(grandchild), false, `${label}: the watchers' child is gone`)
     } finally {
-      killGroup(run, 'SIGKILL')
-      if (grandchild > 0 && alive(grandchild)) process.kill(grandchild, 'SIGKILL')
+      await reap(fixture, run)
     }
   }
 })
@@ -591,7 +688,7 @@ test('when the watchers die by themselves, what they started goes too', async ()
   const run = await launch(fixture)
   let grandchild = 0
   try {
-    const { code } = await run.closed
+    const { code } = await finished(run)
     assert.equal(code, 4, run.stderr())
     grandchild = Number(await readFile(join(fixture.logs, 'pnpm.child.pid'), 'utf8'))
     assert.ok(grandchild > 0)
@@ -600,8 +697,7 @@ test('when the watchers die by themselves, what they started goes too', async ()
     }
     assert.equal(alive(grandchild), false, 'the watchers\' child is gone')
   } finally {
-    killGroup(run, 'SIGKILL')
-    if (grandchild > 0 && alive(grandchild)) process.kill(grandchild, 'SIGKILL')
+    await reap(fixture, run)
   }
 })
 

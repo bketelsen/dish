@@ -275,6 +275,25 @@ test('the CLI forwards SIGTERM to the command, and the exit code the command cho
   assert.equal(code, 5, 'the command got the signal, and its own exit code came back')
 })
 
+test('the CLI forwards SIGHUP to the command as SIGTERM, which dsh answers with its shutdown', async () => {
+  // dsh handles SIGINT and SIGTERM only: a SIGHUP would kill it without its shutdown. The command here tells the two
+  // apart by its exit code, to prove which one arrived. Prod, so the launcher makes no .dev.
+  const child = spawn(process.execPath, [CLI, process.execPath, '-e',
+    'process.on("SIGTERM", () => process.exit(5)); process.on("SIGHUP", () => process.exit(6)); console.log("ready"); setInterval(() => {}, 1000)'], {
+    env: { PATH: process.env.PATH ?? BASE_PATH, DISH_ENV: 'prod' },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  })
+  await new Promise<void>((resolve, reject) => {
+    child.on('error', reject)
+    child.stdout.on('data', chunk => {
+      if (String(chunk).includes('ready')) resolve()
+    })
+  })
+  child.kill('SIGHUP')
+  const code = await new Promise<number | null>(resolve => child.on('close', resolve))
+  assert.equal(code, 5, 'the command got a SIGTERM, not a SIGHUP')
+})
+
 test('the CLI leaves SIGINT to the terminal: the command gets one, and the launcher waits and returns its code', async () => {
   // A terminal's Ctrl-C signals the whole foreground process group, command included. So the child runs in a group of
   // its own here, and the test signals the group the way a terminal does. A forwarded copy would make it two SIGINTs,

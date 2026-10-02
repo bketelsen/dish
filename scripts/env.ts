@@ -84,8 +84,20 @@ export async function ensureDevDirectories(root: string): Promise<void> {
 }
 
 const USAGE = 'usage: node scripts/env.ts <command> [args...]'
-/** Signals sent to the launcher alone (a service manager, `kill`) that the command must still get. */
+/**
+ * Signals sent to the launcher alone (a service manager, `kill`) that the command must still get. dsh handles SIGINT and
+ * SIGTERM and nothing else: a SIGHUP kills it at once, without its shutdown, which can orphan agent commands, which run
+ * detached. So a SIGHUP goes on as a SIGTERM (`forwardedAs`). A real terminal hangup signals the whole foreground group,
+ * so dsh still gets its own SIGHUP from the terminal, and this cannot prevent that. For the same reason a SIGTERM sent
+ * to the launcher's process group (`kill -- -<pgid>`, `timeout`) reaches dsh twice, directly and forwarded, and dsh
+ * force-exits on the second: SIGTERM the node process, not the group.
+ */
 const FORWARDED: NodeJS.Signals[] = ['SIGTERM', 'SIGHUP']
+
+/** The signal the command gets for a forwarded `signal`. */
+function forwardedAs(signal: NodeJS.Signals): NodeJS.Signals {
+  return signal === 'SIGHUP' ? 'SIGTERM' : signal
+}
 
 /**
  * SIGINT is not forwarded. A terminal's Ctrl-C signals the whole foreground process group, and the command is in the
@@ -98,9 +110,11 @@ const ignore = (): void => {}
 
 /**
  * `node scripts/env.ts <command> [args...]`. Returns the exit code: the command's, 128+n when a signal ended it, 127
- * when it can't be started, 2 for usage, and 1 when dev's directories can't be made. `SIGTERM` and `SIGHUP` go on to
- * the command. `SIGINT` does not (the terminal has already delivered it to the command): the launcher outlives it,
- * waits, and returns the command's code. The command runs in the current directory with inherited stdio.
+ * when it can't be started, 2 for usage, and 1 when dev's directories can't be made. `SIGTERM` goes on to the command,
+ * and `SIGHUP` goes on as a `SIGTERM` (see `FORWARDED`). `SIGINT` does not go on (the terminal has already delivered it
+ * to the command): the launcher outlives it, waits, and returns the command's code. The command stays in the
+ * launcher's process group, which interactive dsh commands need for the terminal's job control. It runs in the current
+ * directory with inherited stdio.
  */
 export async function main(argv: string[], options: { root?: string, env?: NodeJS.ProcessEnv } = {}): Promise<number> {
   const root = options.root ?? ROOT
@@ -126,7 +140,7 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
   return await new Promise<number>(settle => {
     const child = spawn(command, args, { stdio: 'inherit', env: environmentFor(mode, root, env) })
     const forward = (signal: NodeJS.Signals): void => {
-      child.kill(signal)
+      child.kill(forwardedAs(signal))
     }
     for (const signal of FORWARDED) process.on(signal, forward)
     process.on('SIGINT', ignore)

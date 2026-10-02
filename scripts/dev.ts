@@ -12,23 +12,25 @@
  * When one of the two stops, the other is stopped. The exit code is the first non-zero code of the two, or 128+n when
  * this process was itself sent signal n.
  *
- * **Signals.** The two children are treated differently, because they sit differently in the terminal's process
- * groups.
+ * **Signals.** dsh handles SIGINT and SIGTERM and nothing else. A SIGHUP kills it at once, without its shutdown, which
+ * leaves agent commands (they run detached) behind; and a second signal of either kind during its shutdown
+ * (`createProcessShutdown`: `interrupt` after `interrupt`) makes it force-exit. So dsh gets exactly one signal for each
+ * one this process receives, and nothing reaches it any other way: it is spawned `detached`, in a session of its own
+ * (`dsh web` never reads stdin), so neither a terminal's Ctrl-C nor a signal sent to this process's group touches it.
  *
- * - dsh is in this process's group, so a terminal's Ctrl-C signals it directly. `SIGINT` is therefore not forwarded to
- *   it: a second signal of either kind during dsh's shutdown (`createProcessShutdown`: `interrupt` after `interrupt`)
- *   is a demand to force-exit, which cuts disposal short and can leave agent commands, which run detached, running.
- *   So this process only survives a SIGINT (a listener, so the default action, dying, does not apply) and waits, as
- *   `scripts/env.ts` does. `SIGTERM` and `SIGHUP` sent to this process alone go on to dsh, once.
- * - The watchers are `pnpm --filter ... run dev`, and pnpm does not pass a signal on to the build scripts it starts:
- *   on `SIGTERM` it carries on, and on `SIGHUP` it dies and leaves them running. So they get a process group of their
- *   own (`detached`), and every signal and the final sweep go to the whole group. A terminal's Ctrl-C does not reach
- *   that group, and this process does not forward SIGINT to it either: the watchers are stopped, with a SIGTERM to
- *   the group, when dsh has gone, which is when the stop-the-other rule applies. `SIGTERM` and `SIGHUP` go to the
- *   group straight away.
- * - Stopping the other child sends nothing to one that a SIGINT or a forwarded signal has already reached.
- * - A SIGINT sent to this process alone (`kill -INT <pid>`, not a terminal) reaches neither child, so it stops
- *   nothing: use `kill -TERM`.
+ * - SIGINT is forwarded to dsh as SIGINT. One Ctrl-C is one graceful shutdown, and a second one forces dsh out, as dsh
+ *   does on its own.
+ * - SIGTERM is forwarded as SIGTERM, and SIGHUP (a closed terminal) as SIGTERM, so dsh shuts down instead of dying.
+ * - The watchers are `pnpm --filter ... run dev`, and pnpm does not pass a signal on to the build scripts it starts: on
+ *   `SIGTERM` it carries on, and on `SIGHUP` it dies and leaves them running. So they get a process group of their own
+ *   (`detached`), and every signal and the final sweep go to the whole group. SIGTERM and SIGHUP are forwarded to the
+ *   group. SIGINT is not: the watchers are stopped, with a SIGTERM to the group, when dsh has gone.
+ * - Stopping the other child, when one has exited, sends nothing to one that has been signalled already.
+ * - install.sh stays in this process's group, so the terminal's Ctrl-C reaches it directly and is not forwarded.
+ *
+ * Stop it with Ctrl-C, or SIGTERM the node process. A signal sent to the outer `pnpm dev` alone does not reach this
+ * process (pnpm does not pass it on; `pnpm dsh` is the same). If this process is SIGKILLed, dsh and the watchers are
+ * orphaned: no hangup reaches their sessions.
  *
  * Nothing here sets `XDG_*` or anything of pnpm's, as in the launcher (its header says why).
  */
@@ -109,11 +111,21 @@ export function signInLink(line: string): string | undefined {
   return SIGN_IN_LINE.exec(line)?.[1]
 }
 
-/** Signals that go on to the children as soon as they arrive. SIGINT is left to the terminal; see the header. */
-const FORWARDED: NodeJS.Signals[] = ['SIGTERM', 'SIGHUP']
-const ignore = (): void => {}
+/**
+ * What each child gets for a signal this process receives: the signal to send, or nothing. Every signal received is
+ * forwarded once, so a child that is also in the sender's process group would get it twice: only install.sh is.
+ */
+type Forwarding = Partial<Record<NodeJS.Signals, NodeJS.Signals>>
 
-/** How long after the first child's exit the other is stopped, so that a Ctrl-C that is still arriving is seen first. */
+/** install.sh is in this process's group, which a terminal's Ctrl-C signals: no SIGINT. */
+const INSTALL_SIGNALS: Forwarding = { SIGTERM: 'SIGTERM', SIGHUP: 'SIGHUP' }
+/** dsh is in a session of its own: it gets every signal from here, and SIGHUP as SIGTERM, which it handles. */
+const DSH_SIGNALS: Forwarding = { SIGINT: 'SIGINT', SIGTERM: 'SIGTERM', SIGHUP: 'SIGTERM' }
+/** The watchers' group is not signalled by a terminal either, but it is not stopped by a SIGINT; see the header. */
+const WATCHER_SIGNALS: Forwarding = { SIGTERM: 'SIGTERM', SIGHUP: 'SIGHUP' }
+const RECEIVED: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP']
+
+/** How long after the first child's exit the other is stopped, so that a signal that is still arriving is forwarded first. */
 const STOP_GRACE_MS = 200
 /** How long dsh's stdout may take to close after dsh has exited: a command that outlived dsh could hold it open. */
 const DRAIN_MS = 1000
@@ -122,8 +134,9 @@ const DRAIN_MS = 1000
 interface Running {
   name: string
   process: ChildProcess
-  /** It leads a process group of its own (spawned `detached`): signals go to the group, and a terminal's Ctrl-C misses it. */
+  /** It leads a process group of its own (spawned `detached`), and signals go to the whole group. */
   group: boolean
+  forwarding: Forwarding
   signalled: boolean
   exited: boolean
   /** The exit code: the child's, 128+n when a signal ended it, 127 when it couldn't be started. Never rejects. */
@@ -144,12 +157,23 @@ function signalGroup(pid: number | undefined, signal: NodeJS.Signals): void {
   }
 }
 
-function start(name: string, command: string, args: string[], options: SpawnOptions): Running {
+/**
+ * Starts a child. `group`: it leads a group of its own, which gets its signals and a SIGTERM when it exits. A child
+ * can be `detached` without that (dsh: its own agent commands are its business, not ours).
+ */
+function start(
+  name: string,
+  command: string,
+  args: string[],
+  options: SpawnOptions,
+  behavior: { forwarding: Forwarding, group?: boolean },
+): Running {
   const child = spawn(command, args, options)
   const running: Running = {
     name,
     process: child,
-    group: options.detached === true,
+    group: behavior.group === true,
+    forwarding: behavior.forwarding,
     signalled: false,
     exited: false,
     done: new Promise<number>(settle => {
@@ -177,34 +201,27 @@ function send(running: Running, signal: NodeJS.Signals): void {
   else running.process.kill(signal)
 }
 
-/** What has reached this process: `SIGTERM` and `SIGHUP` are forwarded, `SIGINT` is only survived. */
+/** What has reached this process, and each child's share of it. */
 interface Guard {
   /** The first signal received, if any. */
   received: () => NodeJS.Signals | undefined
-  /** Whether a SIGINT has been received (the terminal has then signalled the children in this process's group). */
-  interrupted: () => boolean
   release: () => void
 }
 
 function guardSignals(targets: () => Running[]): Guard {
   let first: NodeJS.Signals | undefined
-  let interrupted = false
-  const forward = (signal: NodeJS.Signals): void => {
+  const receive = (signal: NodeJS.Signals): void => {
     first ??= signal
-    for (const target of targets()) send(target, signal)
+    for (const target of targets()) {
+      const forwarded = target.forwarding[signal]
+      if (forwarded !== undefined) send(target, forwarded)
+    }
   }
-  const interrupt = (): void => {
-    first ??= 'SIGINT'
-    interrupted = true
-  }
-  for (const signal of FORWARDED) process.on(signal, forward)
-  process.on('SIGINT', interrupt)
+  for (const signal of RECEIVED) process.on(signal, receive)
   return {
     received: () => first,
-    interrupted: () => interrupted,
     release: () => {
-      for (const signal of FORWARDED) process.off(signal, forward)
-      process.off('SIGINT', interrupt)
+      for (const signal of RECEIVED) process.off(signal, receive)
     },
   }
 }
@@ -246,7 +263,7 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
       cwd: root,
       env: installEnvironment(env, identity),
       stdio: 'inherit',
-    })
+    }, { forwarding: INSTALL_SIGNALS })
     children.push(install)
     const installCode = await install.done
     children.length = 0
@@ -262,10 +279,10 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
       env,
       stdio: 'inherit',
       detached: true,
-    })
+    }, { forwarding: WATCHER_SIGNALS, group: true })
     const server = start('dsh', join(root, 'node_modules', '.bin', 'dsh'), [
       'web', '--host', '127.0.0.1', '--port', String(port), '--no-open',
-    ], { cwd: root, env, stdio: ['inherit', 'pipe', 'inherit'] })
+    ], { cwd: root, env, stdio: ['inherit', 'pipe', 'inherit'], detached: true }, { forwarding: DSH_SIGNALS })
     children.push(watchers, server)
 
     let announced = false
@@ -284,13 +301,12 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
         lines.once('close', settle)
       })
 
-    // When either child has exited, stop the other, unless a signal has already reached it: one this process
-    // forwarded, or a Ctrl-C, which the terminal delivers to the children in this process's group but not to the watchers.
+    // When either child has exited, stop the other, unless a signal has already been sent to it: a second one makes
+    // dsh force-exit. (Watchers that did not get the Ctrl-C's SIGINT are stopped here, once dsh has gone.)
     const codes: number[] = []
     const stopOthers = (): void => {
       for (const child of children) {
-        if (child.exited || child.signalled || (guard.interrupted() && !child.group)) continue
-        send(child, 'SIGTERM')
+        if (!child.exited && !child.signalled) send(child, 'SIGTERM')
       }
     }
     for (const child of children) {
