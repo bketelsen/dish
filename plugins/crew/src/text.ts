@@ -1,6 +1,7 @@
 /**
  * The text dish-crew writes: the two small things every refusal does to text it doesn't control (cut a name short, and list
- * names), and the block a bound coder's brief gets (`worktreeBrief`).
+ * names), the block a bound coder's brief gets (`worktreeBrief`), and the block a reviewer gets when the main agent overrode
+ * the gate of the work it reviews (`gateOverrideBrief`).
  *
  * @module dish-crew/text
  */
@@ -29,10 +30,25 @@ export function listed(names: readonly string[], max = LISTED, cut?: number): st
 /**
  * The block added to a bound coder's prompt, after its task and before the closing note: where its worktree is, and that it
  * works only there. dsh gives a child its parent's `cwd` (the chat's workspace, the clone), so this is what points it at the
- * worktree. The one place the block is built: dish-gates (6c) appends its gate sentence here.
+ * worktree. The one place the block is built.
+ *
+ * With `gate` (projects.yaml's, which `delegate` reads from `dishGates.gateFor` while dish-gates runs), the block goes on to
+ * say that dish runs it when the coder finishes, and how to opt out when blocked. Without one, or with one that has nothing
+ * in it, the block is 6b's, byte for byte.
  */
-export function worktreeBrief(worktree: { path: string, branch: string }): string {
+export function worktreeBrief(worktree: { path: string, branch: string }, gate?: string): string {
   const { path, branch } = worktree
-  return `Your worktree is \`${path}\` on branch \`${branch}\`. Work only there: use absolute paths, and \`git -C ${path}\` or \`cd ${path} &&\` in commands. `
+  const block = `Your worktree is \`${path}\` on branch \`${branch}\`. Work only there: use absolute paths, and \`git -C ${path}\` or \`cd ${path} &&\` in commands. `
     + 'The main agent\'s own checkout is not yours to change.'
+  if (gate === undefined || gate.trim() === '') return block
+  return `${block} When you finish, dish runs this project's gate (\`${gate}\`) in your worktree, and a failure comes back to you. `
+    + 'If you\'re blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.'
+}
+
+/**
+ * The block a reviewer's brief, or a follow-up to it, gets after its task when the main agent overrode the gate of the work
+ * it reviews (`delegate`'s `gateOverride`): whose work it is, where its gate stands, and the main agent's ruling.
+ */
+export function gateOverrideBrief(reviewed: string, standing: string, ruling: string): string {
+  return `The harness's gate for the work you review (${reviewed}) hasn't passed: ${standing}. The main agent started this review anyway, with this ruling: ${ruling}`
 }

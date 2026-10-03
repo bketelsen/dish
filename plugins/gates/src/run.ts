@@ -27,6 +27,7 @@
 
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { ShellExecRequest, ShellExecutor, ShellRunResult } from '@deepseek-ai/dsh-shell'
+import { rm } from 'node:fs/promises'
 import { maskSecrets } from 'dish-kit'
 import { writeLog } from './logs.ts'
 
@@ -134,10 +135,27 @@ function request(run: GateRun): ShellExecRequest {
   }
 }
 
+/**
+ * A stream's kept text, masked. A cut stream keeps its tail, which can start partway through a token (that the mask wouldn't
+ * know without its prefix) or a character: its first, partial line goes before masking.
+ */
+function maskedTail(stream: { text: string, truncated: boolean }): string {
+  if (!stream.truncated) return maskSecrets(stream.text)
+  const lineEnd = stream.text.indexOf('\n')
+  return maskSecrets(lineEnd === -1 ? '' : stream.text.slice(lineEnd + 1))
+}
+
+/** dsh's full-stream spill files of a cut run: unmasked, and not needed, since the gate keeps its own log. Never throws. */
+async function dropSpills(result: ShellRunResult): Promise<void> {
+  for (const spill of [result.stdout.spillPath, result.stderr.spillPath]) {
+    if (spill !== undefined) await rm(spill, { force: true }).catch(() => undefined)
+  }
+}
+
 /** The joined output, masked, then whatever the runner itself put on stderr. */
 function outputOf(result: ShellRunResult): string {
-  const out = maskSecrets(result.stdout.text)
-  const err = maskSecrets(result.stderr.text)
+  const out = maskedTail(result.stdout)
+  const err = maskedTail(result.stderr)
   if (err.length === 0) return out
   const separator = out.length === 0 || out.endsWith('\n') ? '' : '\n'
   return `${out}${separator}[stderr]\n${err}`
@@ -174,6 +192,7 @@ export async function runGate(run: GateRun): Promise<GateRunResult> {
       return { kind: 'error', reason: rejection(error), durationMs: now() - started }
     }
     const durationMs = now() - started
+    await dropSpills(result)
     if (result.aborted || run.signal.aborted) return { kind: 'cancelled' }
     const output = outputOf(result)
     const ran = {
