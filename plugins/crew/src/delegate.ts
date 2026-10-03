@@ -69,11 +69,12 @@
  * recorded or sent:
  *
  * - **The tags.** A start is recorded with the run and the task `dishRuns.place` gives (`ChildRecord.run`, `.task`); a
- *   follow-up keeps its child's, whatever `place` says now. A `place` that throws, or answers with no run, is logged and
- *   is no run: a delegation is never refused for it.
+ *   follow-up keeps its child's, whatever `place` says now. A `place` that throws, or gives a malformed answer, is logged;
+ *   either is no run, and a delegation is never refused for it.
  * - **`final`** (the reviewer role only; refused for any other, before anything is read) asks `place` for the run's final
- *   review, and is recorded on the reviewer (`ChildRecord.final`, sticky) only when `place` gives it. Otherwise the answer's
- *   note says it had no effect; nothing is refused.
+ *   review, and is recorded on the reviewer (`ChildRecord.final`, sticky) only when `place` gives it, and, for a follow-up,
+ *   only in the run the reviewer is tagged with: one started outside that run can't give its final review. Otherwise the
+ *   answer's note says it had no effect; nothing is refused.
  * - **The escalation ladder.** A coder start or follow-up on a run's task is a round, which `place` counts from the run's
  *   ledger. Rounds 1 to 4 get a note in the answer (`ladderNote`). From `LADDER_RULING_ROUND` the call is refused, unless
  *   `ruling` holds a ruling; either way `dishRuns.ladder` records it, and a refusal there is the only one that writes (to the
@@ -288,6 +289,8 @@ const STILL_RUNNING = 'it is still running'
 
 /** The note for `final` that placed nothing: no run, or a `place` that failed. */
 const FINAL_NO_RUN = '`final` had no effect: this chat drives no run, so there is no final review for `open_pr` to read.'
+/** The note for `final` on a follow-up to a reviewer whose tags don't name the run `place` gives now (another run, or none). */
+const FINAL_OTHER_RUN = '`final` had no effect: this reviewer was started outside the run this chat drives now, so start a fresh reviewer with `final: true` for that run\'s final review.'
 /** The note for `final` without dish-orchestrator. */
 const FINAL_NO_RUNS = '`final` had no effect: dish keeps no runs here (dish-orchestrator isn\'t loaded).'
 
@@ -848,7 +851,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
    * tags are its own, whatever `place` says now.
    *
    * Without dish-orchestrator there are no tags and no ladder, and the only note is `final`'s. A follow-up is counted only
-   * when `place` still puts it where its child's tags say (the same run and task).
+   * when `place` still puts it where its child's tags say (the same run and task), and made final only in its child's run.
    * @throws the ladder's refusal, from `LADDER_RULING_ROUND`, when `ruling` holds no ruling; it is recorded first.
    */
   async function placeCall(call: Call, where: { worktree?: string | undefined, reviews?: string | undefined }, target?: ChildRecord): Promise<Placed> {
@@ -859,11 +862,14 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       ...where.reviews === undefined ? {} : { reviews: where.reviews },
       ...call.final ? { final: true } : {},
     })
-    const final = call.final && placed?.final === true
+    // A follow-up's reviewer gives the final review of its own run only: tagged with another run, or none, the ledger would
+    // put the verdict where `open_pr` doesn't read it.
+    const elsewhere = target !== undefined && placed !== undefined && (target.run === undefined || placed.run !== target.run)
+    const final = call.final && placed?.final === true && !elsewhere
     const own = target ?? placed
     const tags = { ...own?.run === undefined ? {} : { run: own.run }, ...own?.task === undefined ? {} : { task: own.task } }
     const finish = (note?: string): Placed => {
-      const notes = [note, call.final && !final ? FINAL_NO_RUN : undefined].filter(text => text !== undefined)
+      const notes = [note, call.final && !final ? (elsewhere ? FINAL_OTHER_RUN : FINAL_NO_RUN) : undefined].filter(text => text !== undefined)
       return { tags, ...final ? { final: true } : {}, ...notes.length === 0 ? {} : { note: notes.join(' ') } }
     }
     const { task } = tags

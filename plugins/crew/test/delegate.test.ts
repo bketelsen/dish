@@ -2590,6 +2590,7 @@ const BOUND = { ...CODER, worktree: 'frostyard/snosi/fix-1' }
 const TOKEN = `ghp_${'A1b2C3d4E5'.repeat(4)}`
 const NO_RUN = '`final` had no effect: this chat drives no run, so there is no final review for `open_pr` to read.'
 const NO_ORCHESTRATOR = '`final` had no effect: dish keeps no runs here (dish-orchestrator isn\'t loaded).'
+const FINAL_OTHER_RUN = '`final` had no effect: this reviewer was started outside the run this chat drives now, so start a fresh reviewer with `final: true` for that run\'s final review.'
 
 /** The ladder's refusal of more coder work on task `task` at `round`, as the plan words it. */
 function ladderRefusal(round: number, task = 'fix-1'): string {
@@ -2767,6 +2768,49 @@ test('final: a follow-up with final: true (placed final) makes a reviewer final,
   assert.equal(sent.note, NO_RUN)
   assert.equal(lone.sends.length, 1)
   assert.ok(!('final' in await recordOf(lone, mine.child)))
+})
+
+test('final: a follow-up is made final only in the run its reviewer is tagged with: not after the chat moved to another run', async () => {
+  const w = await world({ runs: true })
+  const other = 'frostyard/snosi/20261004-fix-2'
+  // place answers as dish-orchestrator does for reviews "main": the run the chat drives, final when asked.
+  const drives = { current: RUN }
+  w.placements.set(`${SESSION}||main`, (asked: { final?: boolean }) => ({ run: drives.current, ...asked.final === true ? { final: true } : {} }))
+  const reviewer = await w.delegate({ ...REVIEW, reviews: 'main' })
+  assert.equal((await recordOf(w, reviewer.child)).run, RUN)
+  await finish(w, reviewer.child)
+  // The chat now drives another run: its final review isn't this reviewer's to give.
+  drives.current = other
+  const heard: CrewDelegated[] = []
+  w.ctx.on('dish-crew/delegated', (event) => { heard.push(event) })
+  const result = await w.delegate({ ...REVIEW, task: 'Re-review, as the final review.', to: reviewer.child, final: true })
+  assert.deepEqual(w.placeAsked.at(-1), { sessionId: SESSION, target: { reviews: 'main', final: true } })
+  assert.equal(result.note, FINAL_OTHER_RUN)
+  assert.equal(w.sends.length, 1, 'the follow-up is still sent')
+  const record = await recordOf(w, reviewer.child)
+  assert.ok(!('final' in record))
+  assert.equal(record.run, RUN, 'its tags are its own')
+  assert.equal(record.followUps, 1)
+  assert.ok(!('final' in heard[0]!.child))
+  // Back in its own run, it is made final.
+  await finish(w, reviewer.child)
+  drives.current = RUN
+  const again = await w.delegate({ ...REVIEW, task: 'Once more, as the final review.', to: reviewer.child, final: true })
+  assert.ok(!('note' in again))
+  assert.equal((await recordOf(w, reviewer.child)).final, true)
+})
+
+test('final: a follow-up to a reviewer started outside any run isn\'t made final, whatever place says now', async () => {
+  const w = await world({ runs: true })
+  const reviewer = await w.delegate({ ...REVIEW, reviews: 'main' })
+  assert.ok(!('run' in await recordOf(w, reviewer.child)))
+  await finish(w, reviewer.child)
+  w.placements.set(`${SESSION}||main`, (asked: { final?: boolean }) => ({ run: RUN, ...asked.final === true ? { final: true } : {} }))
+  const result = await w.delegate({ ...REVIEW, task: 'Re-review, as the final review.', to: reviewer.child, final: true })
+  assert.equal(result.note, FINAL_OTHER_RUN)
+  assert.equal(w.sends.length, 1)
+  const record = await recordOf(w, reviewer.child)
+  assert.ok(!('final' in record) && !('run' in record))
 })
 
 // Run tags.
