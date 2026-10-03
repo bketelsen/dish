@@ -28,7 +28,8 @@
  * **Binding a worktree** (`worktree`, a worktree dish-workspaces made, as `<project>/<slug>` or its path). After step 2 (and
  * 3, for a follow-up), before the lock, a start checks that the role writes, that dish-workspaces is running
  * (`dishWorkspaces`, read with `ctx.get`: crew doesn't depend on it, and reads it through `WorkspacesReader`), that it
- * resolves the worktree, and that the worktree is inside the calling session's `cwd`, both canonical: a crew child works in
+ * resolves the worktree (when it doesn't, the refusal gives its `resolveProblem`, such as a clone that failed dish's
+ * safety check, and why), and that the worktree is inside the calling session's `cwd`, both canonical: a crew child works in
  * its parent's sandbox, which is that workspace, and couldn't write anywhere else. After step 4, inside the session's lock,
  * it takes a second lock keyed by the worktree (always after the session's, so two calls can't deadlock) and refuses a
  * worktree a running crew child is bound to (`dishCrew.worktreeBindings`), of any session; it holds that lock until the
@@ -108,10 +109,13 @@ type SessionId = NonNullable<ContinuableStartSpec['childId']>
 
 /**
  * What the row reads of dish-workspaces with `ctx.get('dishWorkspaces')`, structurally: crew doesn't depend on
- * dish-workspaces. `resolve` gives a worktree dish made, of a registered project, or `undefined`.
+ * dish-workspaces. `resolve` gives a worktree dish made, of a registered project, or `undefined`; when it gives
+ * `undefined`, `resolveProblem` says why for a worktree dish made that fails dish's safety check (its clone's or its
+ * own) or whose branch is gone, and `undefined` for anything else. A dish-workspaces without it gives no reason.
  */
 interface WorkspacesReader {
   resolve(ref: string): Promise<{ project: string, slug: string, branch: string, path: string, clone: string } | undefined>
+  resolveProblem?(ref: string): Promise<string | undefined>
 }
 
 /** A worktree `resolve` gave, with its path canonical. */
@@ -411,11 +415,24 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     }
   }
 
-  /** `resolveWorktree`, refusing a worktree it doesn't give. */
+  /** Why `reader` gives no worktree for `ref`, when dish-workspaces can say (a worktree it made that fails a check). Never throws. */
+  async function unresolvedProblem(reader: WorkspacesReader, ref: string): Promise<string | undefined> {
+    try {
+      const problem = await reader.resolveProblem?.(ref)
+      return typeof problem === 'string' && problem !== '' ? problem : undefined
+    } catch {
+      // No reason to give: the refusal is the one for a worktree it doesn't know.
+      return undefined
+    }
+  }
+
+  /** `resolveWorktree`, refusing a worktree it doesn't give: with dish-workspaces' reason when it has one. */
   async function knownWorktree(reader: WorkspacesReader, ref: string): Promise<Worktree> {
     const found = await resolveWorktree(reader, ref)
-    if (found === undefined) throw new Error(`no worktree ${shownWorktree(ref)} in a registered project; make one with the worktree tool (action create)`)
-    return found
+    if (found !== undefined) return found
+    const problem = await unresolvedProblem(reader, ref)
+    if (problem !== undefined) throw new Error(`worktree ${shownWorktree(ref)} can't be bound: ${problem}. Nothing was started or sent; tell the user.`)
+    throw new Error(`no worktree ${shownWorktree(ref)} in a registered project; make one with the worktree tool (action create)`)
   }
 
   /** The first check of a `worktree`: the role writes. */
@@ -466,7 +483,11 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       return target.worktree
     }
     const bound = target.worktree!
-    if ((await resolveWorktree(workspaces(), bound))?.path !== bound) {
+    const reader = workspaces()
+    const found = await resolveWorktree(reader, bound)
+    if (found?.path !== bound) {
+      const problem = found === undefined ? await unresolvedProblem(reader, bound) : undefined
+      if (problem !== undefined) throw new Error(`child ${target.id}'s worktree \`${bound}\` can't be used: ${problem}. Nothing was sent; tell the user.`)
       throw new Error(`child ${target.id}'s worktree \`${bound}\` is gone (merged or removed); ${again}`)
     }
     return bound

@@ -92,6 +92,8 @@ interface World {
   worktrees: Map<string, Worktree>
   /** What `dishWorkspaces.resolve` was asked, in order. */
   resolveAsked: string[]
+  /** What `dishWorkspaces.resolveProblem` says, by ref: why a worktree dish made doesn't resolve. */
+  problems: Map<string, string>
   stub: {
     /** An error `startContinuable` throws instead of starting. */
     startFails: Error | undefined
@@ -107,6 +109,8 @@ interface World {
     startedStatus: 'running' | 'idle'
     /** An error `dishWorkspaces.resolve` throws instead of answering. */
     resolveWorktreeFails: Error | undefined
+    /** An error `dishWorkspaces.resolveProblem` throws instead of answering. */
+    resolveProblemFails: Error | undefined
   }
   main: Agent
   /** A scoped agent as dsh makes one under the preset. */
@@ -154,11 +158,12 @@ async function world(options: Options = {}): Promise<World> {
   const recordedAtStart = new Map<string, ChildRecord | undefined>()
   const stub: World['stub'] = {
     startFails: undefined, sendFails: undefined, resolveFails: undefined, startMs: 0, noPrompt: new Set(), promptFails: undefined, startedStatus: 'running',
-    resolveWorktreeFails: undefined,
+    resolveWorktreeFails: undefined, resolveProblemFails: undefined,
   }
   const workspace = await realpath(await tempDir())
   const worktrees = new Map<string, Worktree>()
   const resolveAsked: string[] = []
+  const problems = new Map<string, string>()
 
   if (options.agents !== false) await provide(ctx, 'agents', { get: (id: string) => agents.get(id) })
   await provide(ctx, 'llm', {
@@ -203,6 +208,10 @@ async function world(options: Options = {}): Promise<World> {
         const found = worktrees.get(ref)
         return found === undefined ? undefined : { ...found }
       },
+      async resolveProblem(ref: string) {
+        if (stub.resolveProblemFails !== undefined) throw stub.resolveProblemFails
+        return problems.get(ref)
+      },
     })
   }
   if (options.realPrompts === true) {
@@ -242,7 +251,7 @@ async function world(options: Options = {}): Promise<World> {
 
   return {
     ctx, settings, records, directory, mainModel, agents, starts, sends, resolves, personaAsked, recordedAtStart, stub, main, agent, exec, tool,
-    workspace, worktrees, resolveAsked,
+    workspace, worktrees, resolveAsked, problems,
     delegate: (args, who = exec()) => tool.execute(args, who),
     async makeWorktree(slug, root = workspace) {
       const path = join(root, '.worktrees', slug)
@@ -1747,6 +1756,32 @@ test('a follow-up naming another worktree is refused, and so is binding a child 
   assert.equal(w.resolveAsked.length, asked)
   // A worktree nobody knows is refused as for a start.
   assert.match(await refusal(w.delegate({ ...CODER, task: 'x', to: bound.child, worktree: 'frostyard/snosi/nope' })), /no worktree `frostyard\/snosi\/nope`/)
+  assert.equal(w.sends.length, 0)
+})
+
+test('a worktree dish made that fails dish\'s safety check is refused with why, and nothing starts', async () => {
+  const w = await world()
+  const why = 'frostyard/snosi\'s clone (/w/frostyard/snosi) failed dish\'s safety check: .git/config sets core.pager, which dish doesn\'t allow'
+  w.problems.set('frostyard/snosi/fix-1', why)
+  assert.equal(await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })),
+    `worktree \`frostyard/snosi/fix-1\` can't be bound: ${why}. Nothing was started or sent; tell the user.`)
+  // When dish-workspaces can't say why, the refusal is the one for a worktree it doesn't know.
+  w.stub.resolveProblemFails = new Error('the state directory is unreadable')
+  assert.match(await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })), /^no worktree `frostyard\/snosi\/fix-1` in a registered project/)
+  assert.equal(w.starts.length, 0)
+  assert.deepEqual(await w.records.children(SESSION), [])
+})
+
+test('a follow-up to a child whose worktree now fails dish\'s safety check is refused with why, not as gone', async () => {
+  const w = await world()
+  const tree = await w.makeWorktree('fix-1')
+  const started = await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  await finish(w, started.child)
+  w.worktrees.clear()
+  const why = 'worktree fix-1 failed dish\'s safety check: .git does not point at a worktree of /w/frostyard/snosi'
+  w.problems.set(tree.path, why)
+  assert.equal(await refusal(w.delegate({ ...CODER, task: 'Fix it.', to: started.child })),
+    `child ${started.child}'s worktree \`${tree.path}\` can't be used: ${why}. Nothing was sent; tell the user.`)
   assert.equal(w.sends.length, 0)
 })
 
