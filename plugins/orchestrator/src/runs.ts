@@ -522,7 +522,7 @@ export class Runs {
     }
     const { run: opened, released } = await this.openAround(sessionId, created, { goal: created.slug, how: 'auto' })
     if (released !== undefined) this.#info(`released run ${released.id} of ${released.project}: this chat opened run ${opened.id} in ${opened.project}`)
-    return { id: opened.id, opened: true }
+    return { id: opened.id, opened: true, ...released === undefined ? {} : { released: released.id } }
   }
 
   /**

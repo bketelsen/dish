@@ -296,6 +296,8 @@ test('worktreeCreated: a run in another project is released, logged, and a new o
   const created = await w.created('gizmo', { project: OTHER_PROJECT })
   const joined = await w.runs.worktreeCreated(SESSION, created)
   assert.equal(joined?.opened, true)
+  // The answer names the run it released, so the worktree tool can say so.
+  assert.deepEqual(joined, { id: joined!.id, opened: true, released: old.id })
   assert.equal(w.record(old)?.driver.session, '')
   assert.equal(w.record(old)?.state, 'open')
   assert.equal((await w.runs.driving(SESSION))?.project, OTHER_PROJECT)

@@ -271,6 +271,19 @@ test('create\'s answer says the run it opened, or the task it joined, or why the
   const joined = await tool.execute({ action: 'create', project: 'acme/widget', slug: 'fix-1' }, exec())
   assert.deepEqual((joined as { run?: unknown }).run, { id: '20261003-fix-1', opened: false })
   assert.equal(rendered(tool, joined), `${today}\nIt is task \`fix-1\` of run \`20261003-fix-1\`, which this chat drives.`)
+  // A run opened in another project releases the chat's run there: the answer says which, and how to take it back.
+  answers.splice(next, 0, { id: '20261003-fix-1', opened: true, released: '20261002-feat' })
+  const switched = await tool.execute({ action: 'create', project: 'acme/widget', slug: 'fix-1' }, exec())
+  assert.deepEqual((switched as { run?: unknown }).run, { id: '20261003-fix-1', opened: true, released: '20261002-feat' })
+  assert.equal(rendered(tool, switched), `${today}\nOpened run \`20261003-fix-1\` for this worktree; \`run\` with \`action: goal\` names it, and \`open_pr\` ends it.\n`
+    + 'Released run `20261002-feat`: it stays open, and `run` `resume` takes it back.')
+  // A `released` that isn't a run id is left out; the run stands.
+  answers.splice(next, 0, { id: '20261003-fix-1', opened: true, released: '../x' }, { id: '20261003-fix-1', opened: true, released: 42 })
+  for (let index = 0; index < 2; index++) {
+    const odd = await tool.execute({ action: 'create', project: 'acme/widget', slug: 'fix-1' }, exec())
+    assert.deepEqual((odd as { run?: unknown }).run, { id: '20261003-fix-1', opened: true })
+    assert.equal('runProblem' in (odd as object), false)
+  }
   // No run (dish-orchestrator gave none): no field, and today's text.
   const nothing = await tool.execute({ action: 'create', project: 'acme/widget', slug: 'fix-1' }, exec())
   assert.equal('run' in (nothing as object), false)
@@ -339,7 +352,8 @@ test('the output schema dsh accepts includes run and runProblem', () => {
   type Shape = { type?: string, required?: string[], properties?: Record<string, Shape> }
   const create = (tool.output.schema as { oneOf: Shape[] }).oneOf[0]!
   assert.equal(create.properties?.run?.type, 'object')
-  assert.deepEqual(Object.keys(create.properties?.run?.properties ?? {}).sort(), ['id', 'opened'])
+  assert.deepEqual(Object.keys(create.properties?.run?.properties ?? {}).sort(), ['id', 'opened', 'released'])
+  // `released` is optional: dish-orchestrator gives it only for a run it released.
   assert.deepEqual([...(create.properties?.run?.required ?? [])].sort(), ['id', 'opened'])
   assert.equal(create.properties?.runProblem?.type, 'string')
   assert.ok(create.required?.includes('setup'))
