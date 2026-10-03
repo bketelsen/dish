@@ -25,8 +25,10 @@
 #
 # Copies, not links (steps 2 and 5). pnpm hard-links its store's files into node_modules where it can (the VM's ext4),
 # so the checkout's files would share their inodes with every agent's project, and with DISH_SANDBOX_HOME on a sandboxed
-# command can write the store and those projects. The checkout's pnpm-workspace.yaml and the profile's say
-# `packageImportMethod: clone-or-copy`, and step 5 copies what earlier installs linked, which pnpm never re-imports.
+# command can write the store and those projects. Step 1 installs with `--package-import-method=clone-or-copy`, the
+# profile's pnpm-workspace.yaml says `packageImportMethod: clone-or-copy`, and step 5 copies what earlier installs
+# linked, which pnpm never re-imports. The flag is on the command, not in the checkout's pnpm-workspace.yaml: that file
+# goes with every clone of dish, and agents' clones and worktrees should keep linking (copies of ~545 MB each on ext4).
 # None of this touches the store itself, or which store is used (the store-pin contract below).
 #
 # The rows go in before the bundles on purpose. The dish-config row patches a row that the config bundle inserts, so
@@ -134,7 +136,7 @@ bundle_state() {
 }
 
 begin 'pnpm install --frozen-lockfile'
-pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile --package-import-method=clone-or-copy
 
 begin 'pnpm build'
 pnpm build

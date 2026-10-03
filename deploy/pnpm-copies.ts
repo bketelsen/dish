@@ -5,9 +5,11 @@
  * as on the VM's ext4. A file in the checkout's `node_modules` and the same file in an agent's project under `~/work`
  * are then one inode. With DISH_SANDBOX_HOME on, the store and every project are writable by sandboxed commands, so an
  * agent that patched a file in its own `node_modules` would change the deployed dish too. So dish's own installs copy:
- * the checkout's `pnpm-workspace.yaml` and the profile's say `packageImportMethod: clone-or-copy` (a reflink where the
- * file system has them, as the desktop's btrfs does, else a copy), and files that are links already are replaced by
- * copies, since pnpm never imports a package again when only that setting changes. Agents' own installs still link.
+ * install.sh runs the checkout's install with `--package-import-method=clone-or-copy`, the profile's
+ * `pnpm-workspace.yaml` says `packageImportMethod: clone-or-copy` (a reflink where the file system has them, as the
+ * desktop's btrfs does, else a copy), and files that are links already are replaced by copies, since pnpm never imports
+ * a package again when only that setting changes. Agents' own installs still link, in clones of dish too: the flag is
+ * not in the checkout's `pnpm-workspace.yaml`, which every clone carries.
  *
  *   node deploy/pnpm-copies.ts [--workspace <pnpm-workspace.yaml>] [--unlink <dir>]...
  *
@@ -110,7 +112,15 @@ export function unlinkFiles(dir: string): Unlinked {
     }
     for (const name of names) {
       const path = join(current, name)
-      const entry = lstatSync(path)
+      let entry
+      try {
+        entry = lstatSync(path)
+      } catch (error) {
+        // Gone since the readdir (pnpm at work in the profile, say): nothing to copy.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+        result.failed.push({ path, error: (error as Error).message })
+        continue
+      }
       if (entry.isDirectory()) {
         pending.push(path)
       } else if (entry.isFile() && entry.nlink > 1) {
