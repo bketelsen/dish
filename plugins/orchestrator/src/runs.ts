@@ -15,7 +15,9 @@
  *   (masked; at most 100 kept), and give `undefined`. Each has a time limit: crew awaits `place` and `ladder` inside its
  *   own locks, the `worktree` tool awaits `worktreeCreated`, and dish-workspaces' `close` awaits the sweep's
  *   `worktreeRemoved`, all with none of their own. A call past its limit is logged and given up on by its caller; what it
- *   was doing finishes in the background (so a worktree whose hook waited on a busy session lock still joins its run).
+ *   was doing finishes in the background. `worktreeCreated`'s limit is on the wait for the session's lock: once it holds
+ *   it, its caller waits for it (local writes only). A worktree whose hook gave up waiting joins late only the run its chat
+ *   drives in that project by then, and only if it still resolves: a late hook never opens, switches or releases a run.
  *   Each read of another plugin's service inside them (`resolve`, `headOf`, crew's `lookup`) has a shorter limit of its own.
  *
  * @module dish-orchestrator/runs
@@ -96,7 +98,11 @@ const TIMED_OUT: unique symbol = Symbol('timed out')
 /** `promise`, or TIMED_OUT once `ms` have passed. The timer goes when either settles. */
 function within<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
   let timer: ReturnType<typeof setTimeout> | undefined
-  const limit = new Promise<typeof TIMED_OUT>((settle) => { timer = setTimeout(() => { settle(TIMED_OUT) }, ms) })
+  const limit = new Promise<typeof TIMED_OUT>((settle) => {
+    timer = setTimeout(() => { settle(TIMED_OUT) }, ms)
+    // A call that stalls never holds the process open at exit.
+    timer.unref?.()
+  })
   return Promise.race([promise, limit]).finally(() => { clearTimeout(timer) })
 }
 
@@ -357,7 +363,8 @@ export class Runs {
    */
   place(sessionId: string, target: PlaceTarget): Promise<Placement | undefined> {
     return this.#guarded(`place a delegation of session ${String(sessionId)} in a run`, () => this.#place(sessionId, target), this.#placeMs, undefined,
-      `could not place a delegation of session ${String(sessionId)} in a run: it took longer than ${seconds(this.#placeMs)}, so the delegation goes on outside any run`)
+      `could not place a delegation of session ${String(sessionId)} in a run: it took longer than ${seconds(this.#placeMs)}, so it isn't placed: `
+      + 'a start goes on outside any run, and a follow-up keeps its child\'s run and task but isn\'t counted by the escalation ladder')
   }
 
   async #place(sessionId: string, target: PlaceTarget): Promise<Placement | undefined> {
@@ -431,19 +438,66 @@ export class Runs {
   /**
    * The `worktree` tool made a worktree: it joins the run the session drives in that project (`task.opened`), or a run is
    * opened around it (`how: 'auto'`). Under the session's lock. Never rejects.
+   *
+   * The time limit is on the wait for the lock (another call of the same chat can hold it while it waits for a run's lock,
+   * which `open_pr` holds through a gate and a push). Past it, the tool is answered `undefined`, and when the lock comes the
+   * hook only joins late (`#joinLate`): never opening, switching or releasing a run the chat was told nothing about. Once
+   * the hook holds the lock, its caller waits for it: what it does then is the store's and the ledger's writes.
    */
-  worktreeCreated(sessionId: string, created: CreatedForRun): Promise<JoinedRun | undefined> {
+  async worktreeCreated(sessionId: string, created: CreatedForRun): Promise<JoinedRun | undefined> {
     const shown = isObject(created) ? `${String(created.project)}/${String(created.slug)}` : 'a worktree'
-    return this.#guarded(`add worktree ${shown} to a run`, async () => {
+    /** Decided once, on the lock: whether the caller still waits (`joining`) or has stopped (`late`). */
+    const turn: { state: 'waiting' | 'joining' | 'late' } = { state: 'waiting' }
+    const job = (async (): Promise<JoinedRun | undefined> => {
       const problem = createdProblem(sessionId, created)
       if (problem !== undefined) {
         this.logOnce(`ignored worktree ${shown}, which can't join a run: ${problem}`)
         return undefined
       }
       await this.ready()
-      return this.withSession(sessionId, () => this.#join(sessionId, created))
-    }, this.#hookMs, undefined,
-    `worktree ${shown} waited ${seconds(this.#hookMs)} for its chat's lock (another call of that chat holds it); it joins its run once the lock is free`)
+      return this.withSession(sessionId, () => {
+        if (turn.state === 'late') return this.#joinLate(sessionId, created, shown)
+        turn.state = 'joining'
+        return this.#join(sessionId, created)
+      })
+    })()
+    const settled = job.then(value => ({ value }), (error: unknown) => {
+      this.logOnce(`could not add worktree ${shown} to a run: ${describe(error)}`)
+      return { value: undefined }
+    })
+    const result = await within(settled, this.#hookMs)
+    if (result !== TIMED_OUT) return result.value
+    if (turn.state === 'joining') return (await settled).value
+    turn.state = 'late'
+    return undefined
+  }
+
+  /**
+   * A worktree whose hook gave up waiting for its chat's lock, which the worktree tool answered without a run: it joins only
+   * the run the chat drives in its project by then, and only while it still resolves. Never opens, switches or releases a
+   * run. One line says what became of it.
+   */
+  async #joinLate(sessionId: string, created: CreatedForRun, shown: string): Promise<undefined> {
+    const lead = `worktree ${shown} waited ${seconds(this.#hookMs)} for its chat's lock, so the worktree tool answered without a run;`
+    const run = this.store.drivenBy(sessionId)
+    if (run === undefined || !sameProject(run.project, created.project)) {
+      const driven = run === undefined ? 'no run' : `run ${run.id} in ${run.project}`
+      this.logOnce(`${lead} it wasn't added to one: by then this chat drove ${driven}, and a late worktree never opens or switches a run`)
+      return undefined
+    }
+    const workspaces = this.services.workspaces()
+    const resolved = workspaces === undefined ? undefined : await this.#resolve(created.path)
+    if (resolved === undefined) {
+      const why = workspaces === undefined ? 'dish-workspaces isn\'t running, so it can\'t be checked' : 'it no longer resolves to a worktree dish made (removed while it waited)'
+      this.logOnce(`${lead} it wasn't added to run ${run.id}: ${why}`)
+      return undefined
+    }
+    await this.harness(run, {
+      kind: 'task.opened', session: sessionId, task: created.slug, path: created.path, branch: created.branch, base: created.baseRef,
+      baseCommit: created.base,
+    })
+    this.#info(`${lead} it then joined run ${run.id} as task ${created.slug}`)
+    return undefined
   }
 
   async #join(sessionId: string, created: CreatedForRun): Promise<JoinedRun> {
@@ -611,13 +665,23 @@ export class Runs {
     if (workspaces === undefined) throw new Error(`dish-workspaces isn't running, so run \`${run.id}\`'s worktree can't be checked`)
     let resolved: unknown
     try {
-      resolved = await workspaces.resolve(run.worktree)
+      resolved = await within(workspaces.resolve(run.worktree), this.#lookupMs)
     } catch (error) {
       throw new Error(`run \`${run.id}\`'s worktree can't be checked: ${describe(error)}`, { cause: error })
     }
-    if (resolved === undefined || resolved === null) {
-      throw new Error(`run \`${run.id}\` can't be reopened: its worktree is gone (the sweep removes it once its pull request ${run.pr?.url ?? ''} is merged). Open a new run with \`run\` \`open\`.`)
+    if (resolved === TIMED_OUT) throw new Error(`run \`${run.id}\`'s worktree can't be checked: dish-workspaces took longer than ${seconds(this.#lookupMs)}`)
+    if (resolved !== undefined && resolved !== null) return
+    // A worktree dish made that fails its safety check resolves to nothing too: say why, as open_pr does.
+    let problem: unknown
+    try {
+      problem = await within(workspaces.resolveProblem(run.worktree), this.#lookupMs)
+    } catch {
+      problem = undefined
     }
+    if (isText(problem)) {
+      throw new Error(`run \`${run.id}\` can't be reopened: its worktree ${run.worktree} can't be used: ${describe(problem).replace(/\.+$/, '')}. Fix that, or open a new run with \`run\` \`open\`.`)
+    }
+    throw new Error(`run \`${run.id}\` can't be reopened: its worktree is gone (the sweep removes it once its pull request ${run.pr?.url ?? ''} is merged). Open a new run with \`run\` \`open\`.`)
   }
 
   /** Holding the run's lock: the goal, then `run.goal`. Gives the record as written. */

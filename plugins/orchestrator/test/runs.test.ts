@@ -4,18 +4,23 @@
  */
 
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { chmod, symlink } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { test } from 'node:test'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
+import { nextRound } from '../src/derive.ts'
 import { createListeners } from '../src/listeners.ts'
 import { Runs, mainSession } from '../src/runs.ts'
 import { RunStore } from '../src/store.ts'
 import type { Run } from '../src/store.ts'
 import {
-  BASE, HEAD, MASKED_TOKEN, OTHER_PROJECT, OTHER_SESSION, PROJECT, SESSION, TOKEN, childExec, deferred, delegated, mainExec, world,
+  BASE, HEAD, MASKED_TOKEN, OTHER_PROJECT, OTHER_SESSION, PROJECT, SESSION, TOKEN, childExec, deferred, delegated, mainExec, tempDir, world,
 } from './service-helpers.ts'
 import type { World } from './service-helpers.ts'
+
+const SRC = join(dirname(fileURLToPath(import.meta.url)), '..', 'src')
 
 /** A coder or reviewer delegated in `run` on `task`, heard by the listeners as crew publishes it. */
 async function start(w: World, run: Run, child: { id: string, role?: string, task?: string, reviews?: string, final?: true, worktree?: string }, options: { followUp?: boolean, sessionId?: string } = {}): Promise<void> {
@@ -210,7 +215,35 @@ test('place doesn\'t hang: a resolve that never answers is passed over, and a st
   const began = Date.now()
   assert.equal(await w.runs.place(SESSION, { worktree: run.worktree }), undefined)
   assert.ok(Date.now() - began < 5000)
-  assert.match(w.logs.join('\n'), /place.*took longer than/)
+  assert.match(w.logs.join('\n'), /place.*took longer than 0\.3 s.*a start goes on outside any run.*a follow-up keeps its child's run and task/)
+})
+
+test('a call past its time limit doesn\'t hold the process open at exit', async () => {
+  const dir = await tempDir()
+  const url = (file: string): string => pathToFileURL(join(SRC, file)).href
+  // A store whose load never ends, so place waits out its 30 s limit; the script then ends without awaiting it.
+  const script = [
+    `import { Runs } from ${JSON.stringify(url('runs.ts'))}`,
+    `import { RunStore } from ${JSON.stringify(url('store.ts'))}`,
+    `import { Ledger } from ${JSON.stringify(url('ledger.ts'))}`,
+    `const store = new RunStore(${JSON.stringify(join(dir, 'state'))})`,
+    'store.load = () => new Promise(() => {})',
+    'const none = () => undefined',
+    `const runs = new Runs({ store, ledger: new Ledger(${JSON.stringify(join(dir, 'data'))}), services: { workspaces: none, crew: none, gates: none, projects: none, agents: none }, now: Date.now, logger: { info() {}, warn() {} } })`,
+    'void runs.place("session-1", {})',
+    'void runs.driving("session-1")',
+  ].join('\n')
+  const began = Date.now()
+  const code = await new Promise<number | null>((settle, fail) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: dir, HISTFILE: join(dir, '.bash_history') }, stdio: 'ignore',
+    })
+    const killer = setTimeout(() => { child.kill() }, 20_000)
+    child.on('error', fail)
+    child.on('exit', (exit) => { clearTimeout(killer); settle(exit) })
+  })
+  assert.equal(code, 0)
+  assert.ok(Date.now() - began < 10_000, `the process stayed open ${Date.now() - began} ms`)
 })
 
 test('the order: a coder\'s delegated published with ctx.parallel, then place with no await between, counts it', async () => {
@@ -220,7 +253,11 @@ test('the order: a coder\'s delegated published with ctx.parallel, then place wi
   const listeners = createListeners(w.runs)
   ctx.on('dish-crew/delegated', (e) => { listeners.delegated(e) })
   void ctx.parallel('dish-crew/delegated', delegated({ id: 'c1', run: w.runs.refOf(run), task: 'fix-login', worktree: run.worktree }))
-  assert.deepEqual(await w.runs.place(SESSION, { worktree: run.worktree }), { run: w.runs.refOf(run), task: 'fix-login', round: 1 })
+  // No await between: the listener queued its append while the publish called it, so the ledger's queue already holds it.
+  const entries = w.runs.entries(run)
+  const placed = w.runs.place(SESSION, { worktree: run.worktree })
+  assert.equal(nextRound(await entries, 'fix-login'), 1)
+  assert.deepEqual(await placed, { run: w.runs.refOf(run), task: 'fix-login', round: 1 })
 })
 
 // --- worktreeCreated ------------------------------------------------------------------------------------------------
@@ -293,18 +330,84 @@ test('worktreeCreated: two at once in one session make one run and one task.open
   assert.deepEqual(await w.kinds(w.store.list()[0]!), ['run.opened', 'task.opened'])
 })
 
-test('worktreeCreated doesn\'t wait long for a session lock held elsewhere: it answers undefined, and the worktree joins once the lock is free', async () => {
+test('worktreeCreated doesn\'t wait long for a session lock held elsewhere: it answers undefined, and the worktree joins the chat\'s run once the lock is free', async () => {
   const w = await world({ limits: { hookMs: 100 } })
   const run = await w.open()
   const held = deferred()
   const holding = w.runs.withSession(SESSION, () => held.promise)
   const created = await w.created('api')
   assert.equal(await w.runs.worktreeCreated(SESSION, created), undefined)
-  assert.match(w.logs.join('\n'), /api.*waited/)
   held.resolve()
   await holding
-  await new Promise(settle => setTimeout(settle, 50))
+  await w.runs.withSession(SESSION, async () => {})
   assert.deepEqual(await w.kinds(run), ['run.opened', 'task.opened'])
+  const lines = w.logs.filter(line => line.includes('Acme/widget/api'))
+  assert.equal(lines.length, 1, w.logs.join('\n'))
+  assert.match(lines[0]!, /^info: worktree Acme\/widget\/api waited 0\.1 s for its chat's lock, so the worktree tool answered without a run; it then joined run 20261003-fix-login as task api$/)
+})
+
+/** Hold `SESSION`'s lock while `meanwhile` runs, let a worktree's hook time out, then free the lock and let the late hook finish. */
+async function lateHook(w: World, created: Awaited<ReturnType<World['created']>>, meanwhile: () => Promise<unknown>): Promise<void> {
+  const held = deferred()
+  const holding = w.runs.withSession(SESSION, async () => {
+    await held.promise
+    await meanwhile()
+  })
+  assert.equal(await w.runs.worktreeCreated(SESSION, created), undefined)
+  held.resolve()
+  await holding
+  // The late hook queued for the lock before this did: once this runs, it has finished.
+  await w.runs.withSession(SESSION, async () => {})
+  await w.ledger.flush()
+}
+
+test('a late hook never opens or switches a run: the chat\'s run changed project while it waited → no run opened, nothing released, one line', async () => {
+  const w = await world({ limits: { hookMs: 100 } })
+  const first = await w.open()
+  const created = await w.created('api')
+  let second: Run | undefined
+  await lateHook(w, created, async () => {
+    // The chat drives a run in another project by the time the lock is free (a `run resume`, say).
+    second = (await w.runs.openAround(SESSION, await w.created('gizmo', { project: OTHER_PROJECT }), { goal: 'Gizmo', how: 'run' })).run
+  })
+  assert.equal(w.store.list().length, 2)
+  assert.equal((await w.runs.driving(SESSION))?.id, second!.id)
+  assert.equal(w.record(second!)?.driver.session, SESSION)
+  assert.deepEqual(await w.kinds(first), ['run.opened'])
+  assert.deepEqual(await w.kinds(second!), ['run.opened'])
+  const lines = w.logs.filter(line => line.includes('Acme/widget/api'))
+  assert.equal(lines.length, 1, w.logs.join('\n'))
+  assert.match(lines[0]!, /^warn: worktree Acme\/widget\/api waited 0\.1 s for its chat's lock, so the worktree tool answered without a run; it wasn't added to one: by then this chat drove run 20261003-gizmo in Acme\/gadget, and a late worktree never opens or switches a run$/)
+})
+
+test('worktreeCreated: once the hook holds the lock, its caller waits for it, past the limit, and gets the run', async () => {
+  const w = await world({ limits: { hookMs: 100 } })
+  const run = await w.open()
+  // The run's ledger is held up (its queue busy): the hook takes the lock at once, then waits on the queue.
+  const held = deferred()
+  const holding = w.ledger.appendWith(run.project, run.id, async () => { await held.promise; return [] })
+  const created = await w.created('api')
+  const answer = w.runs.worktreeCreated(SESSION, created)
+  await new Promise(settle => setTimeout(settle, 300))
+  held.resolve()
+  await holding
+  assert.deepEqual(await answer, { id: run.id, opened: false })
+  assert.deepEqual(await w.kinds(run), ['run.opened', 'task.opened'])
+  assert.equal(w.logs.filter(line => line.includes('Acme/widget/api')).length, 0, w.logs.join('\n'))
+})
+
+test('a late hook never opens a run for a chat that drives none by then, and never adds a worktree removed while it waited', async () => {
+  const w = await world({ limits: { hookMs: 100 } })
+  const created = await w.created('api')
+  await lateHook(w, created, async () => {})
+  assert.deepEqual(w.store.list(), [])
+  assert.match(w.logs.join('\n'), /api waited .* it wasn't added to one: by then this chat drove no run, and a late worktree never opens or switches a run/)
+
+  const run = await w.open()
+  const gone = await w.created('gone')
+  await lateHook(w, gone, async () => { w.worktrees.delete(gone.path) })
+  assert.deepEqual(await w.kinds(run), ['run.opened'])
+  assert.match(w.logs.join('\n'), /gone waited .* it wasn't added to run 20261003-fix-login: it no longer resolves to a worktree dish made \(removed while it waited\)/)
 })
 
 // --- worktreeRemoved ------------------------------------------------------------------------------------------------
@@ -486,6 +589,25 @@ test('drive: a pr run whose worktree is gone, or with no dish-workspaces, is ref
   assert.deepEqual(w.record(run), before)
 })
 
+test('drive: a pr run whose worktree fails dish\'s safety check is refused with resolveProblem\'s reason; one whose resolve rejects can\'t be checked', async () => {
+  const w = await world()
+  const run = await w.open()
+  await w.runs.withRun(run, () => w.runs.close(run, SESSION, { state: 'pr', pr: { url: 'https://github.com/Acme/widget/pull/7', number: 7 } }))
+  const before = w.record(run)
+  w.worktrees.delete(run.worktree)
+  w.workspaces.impl.resolveProblem = async () => 'Acme/widget\'s clone failed dish\'s safety check: core.hooksPath is set'
+  await assert.rejects(w.runs.withSession(SESSION, () => w.runs.drive(SESSION, run, { takeover: false })), {
+    message: `run \`${run.id}\` can't be reopened: its worktree ${run.worktree} can't be used: Acme/widget's clone failed dish's safety check: core.hooksPath is set. Fix that, or open a new run with \`run\` \`open\`.`,
+  })
+  assert.deepEqual(w.workspaces.calls.resolveProblem, [[run.worktree]])
+  w.workspaces.impl.resolve = async () => { throw new Error(`git broke near ${TOKEN}`) }
+  await assert.rejects(w.runs.withSession(SESSION, () => w.runs.drive(SESSION, run, { takeover: false })), {
+    message: `run \`${run.id}\`'s worktree can't be checked: git broke near ${MASKED_TOKEN}`,
+  })
+  assert.deepEqual(w.record(run), before)
+  assert.deepEqual(await w.kinds(run), ['run.opened', 'run.closed'])
+})
+
 test('drive: the caller\'s other run is released, and given back', async () => {
   const w = await world()
   const a = await w.open({ session: OTHER_SESSION, slug: 'first' })
@@ -505,6 +627,11 @@ test('harness takes only the harness\'s kinds, and main only the main agent\'s; 
   await assert.rejects(w.runs.main(run, SESSION, { kind: 'gate.result' } as never), TypeError)
   await w.runs.main(run, SESSION, { kind: 'note', text: 'waiting', by: 'harness', at: 1, run: 'x' } as never)
   assert.deepEqual((await w.entries(run)).at(-1), { at: w.clock.now, run: run.id, kind: 'note', by: 'main', session: SESSION, text: 'waiting' })
+  // Neither takes its time, a cut mark or (main) its session from what it is given.
+  await w.runs.main(run, SESSION, { kind: 'note', text: 'forged', session: 'forged', cut: true, at: 1 } as never)
+  assert.deepEqual((await w.entries(run)).at(-1), { at: w.clock.now, run: run.id, kind: 'note', by: 'main', session: SESSION, text: 'forged' })
+  await w.runs.harness(run, { kind: 'task.removed', task: 'api', cut: true, at: 1 } as never)
+  assert.deepEqual((await w.entries(run)).at(-1), { at: w.clock.now, run: run.id, kind: 'task.removed', by: 'harness', task: 'api' })
 })
 
 test('setGoal, attachPlan and close: the record and the entries; close releases the driver, and a second close with pr replaces the pr', async () => {
