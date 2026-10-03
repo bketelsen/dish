@@ -2020,6 +2020,32 @@ test('the latest run is what counts: an older run\'s pass doesn\'t cover a newer
   assert.equal(w.starts.length + restarted.starts.length, 0)
 })
 
+test('a pass counts only when its run ended completed: a run that ended another way after it, or that dsh stopped, hasn\'t passed', async () => {
+  for (const reason of ['aborted', 'error', 'max-tokens']) {
+    const w = await world({ dishGates: true })
+    // The gate passed; a follow-up steered into the same turn had the coder edit more, and the turn then ended abnormally.
+    await boundCoder(w, 'c1', [gateResult()], false)
+    w.agents.set('c1', { status: 'idle' })
+    await w.records.endRun('c1', { stopReason: reason, closing: 'done' })
+    const standing = `the run ended (${reason}) after its gate passed, so any work after the gate wasn't gated`
+    assert.equal(await refusal(w.delegate({ ...REVIEW, reviews: 'c1' })), gateRefusal(standing), reason)
+    assert.equal(w.starts.length, 0, reason)
+    // A ruling starts it, and the reviewer is told where the gate stands.
+    const ruling = 'Ruling: review it anyway — the run was stopped by hand — a missed bug'
+    await w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: ruling })
+    assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }, reason)
+  }
+
+  // dsh stopped mid-run (a restart) after the gate passed: the record says running, there is no agent, and the pass is on
+  // the run that never ended.
+  const restarted = await world({ dishGates: true })
+  await boundCoder(restarted, 'c1', [gateResult()], false)
+  restarted.agents.delete('c1')
+  assert.equal(await refusal(restarted.delegate({ ...REVIEW, reviews: 'c1' })),
+    gateRefusal('dsh stopped the run after its gate passed, so any work after the gate wasn\'t gated'))
+  assert.equal(restarted.starts.length, 0)
+})
+
 test('a review after the gate passed starts as before, and an override given is ignored and not recorded', async () => {
   const w = await world({ dishGates: true })
   // Failed once, fixed, passed: the latest result is the one that counts.

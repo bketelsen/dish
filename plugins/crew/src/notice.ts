@@ -148,7 +148,10 @@ function fenced(text: string): string {
  * The notice's line on how a bound child's gate ended in `run`, from the run's last gate result, in the words of the gates
  * spec's "The finish notice":
  *
- * - passed: `Gate passed (round N).`
+ * - passed: `Gate passed (round N).`, in a run that ended `completed`. A run that ended another way after its gate passed (a
+ *   follow-up steered into the same turn had the coder go on, and the turn was aborted or failed) says `Gate passed earlier
+ *   in this run (round N), but the run ended (<reason>) after it, so any work after the gate wasn't gated.`: the review
+ *   check doesn't count that pass either;
  * - failed with `round >= maxRounds`: `Gate FAILED after N rounds (<command>, exit <code>); last lines:`, the excerpt in a
  *   code fence, and `Full log: <log>. Start a fix round with `to` or a fresh coder (escalation ladder).` A gate that hit
  *   its time limit says `stopped at its time limit` in place of the exit code;
@@ -170,6 +173,9 @@ export function gateLine(child: Pick<ChildRecord, 'worktree'>, run: RunRecord, g
   const because = reason === undefined ? '' : `: ${reason}`
   switch (result.outcome) {
     case 'passed':
+      if (run.stopReason !== 'completed') {
+        return `Gate passed earlier in this run (round ${result.round}), but the run ended (${oneLine(run.stopReason) ?? 'unknown'}) after it, so any work after the gate wasn't gated.`
+      }
       return `Gate passed (round ${result.round}).`
     case 'skipped':
       return `Gate skipped${because}.`

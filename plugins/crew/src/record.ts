@@ -333,7 +333,10 @@ function parseGates(value: unknown): GateResult[] | undefined {
 /**
  * The newest gate result of `record`: the run in progress's last, else (when no run is in progress) its latest run's last;
  * `undefined` if neither has one. An older run's result is never the latest run's: while a run is in progress (`last` is
- * `running`, a restart included) and has no result yet, there is none, not the previous run's.
+ * `running`, a restart included) and has no result yet, there is none, not the previous run's. A pass it gives counts for
+ * crew's review check and the finish notice only when its run ended `completed` (`gateStanding` in `delegate.ts`,
+ * `gateLine` in `notice.ts`): a run that ended another way after its gate passed, or one still in progress, may have gone
+ * on past the gate.
  */
 export function latestGate(record: ChildRecord): GateResult | undefined {
   return record.gates?.at(-1) ?? (record.last === 'running' ? undefined : record.runs.at(-1)?.gates?.at(-1))

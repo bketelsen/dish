@@ -169,7 +169,8 @@ interface GateResult {
 - **What hasn't passed:**
   - the latest result isn't `passed`;
   - the child is still running;
-  - its latest run has no gate result at all: an error or an abort ended it before its turn could, or dsh restarted mid-gate.
+  - its latest run has no gate result at all: an error or an abort ended it before its turn could, or dsh restarted mid-gate;
+  - the latest result is a pass, but its run didn't end `completed`: it was aborted or failed after the gate passed, or dsh stopped it. A follow-up steered into the turn the gate passed in has the coder go on in that turn, and only a normal end gates that work again.
 - **Re-reviews too.** A follow-up to a reviewer (`to`, which is how the skills re-review) runs the same check on the work it reviews.
 - **The override:** `gateOverride` is a new optional string on `delegate`.
   - **What counts as a ruling.** An empty string means none, as for every optional parameter. One with no ruling in it, such as `Ruling:` alone, is refused. Line breaks are folded into one line.
@@ -180,7 +181,7 @@ interface GateResult {
 ## The finish notice (crew)
 
 When a bound coder's run ends, crew's notice to the main agent adds one line, from the run's last result:
-- **after a pass:** "Gate passed (round N)."
+- **after a pass:** "Gate passed (round N)."; in a run that ended another way than `completed`, "Gate passed earlier in this run (round N), but the run ended (<reason>) after it, so any work after the gate wasn't gated."
 - **when rounds ran out:** "Gate FAILED after 3 rounds (`<gate>`, exit <code>); last lines: … Full log: <path>. Start a fix round with `to` or a fresh coder (escalation ladder)."
 - **after a failure with rounds left** (the run ended another way): "Gate failed in round N of 3 (`<gate>`, exit <code>), and the run ended before the coder finished again. Full log: <path>."
 - **after a skip:** "Gate skipped: the coder reported BLOCKED / NEEDS CONTEXT.", or another skip's reason.
@@ -278,6 +279,7 @@ What the build decided within this spec, or added to it, beyond the plan's corre
 
 **Crew.**
 - **`latestGate`** gives no result while a run is in progress and has none yet, never the previous run's.
+- **A pass counts only in a run that ended `completed`** (found in the final review). The gate passes, a follow-up is steered into the same turn and the coder edits more, then the turn is aborted or fails, or dsh restarts: the run's last result is still that pass, though the work after it was never gated. So the review check counts a pass only when its run ended `completed`, and otherwise says "the run ended (<reason>) after its gate passed, so any work after the gate wasn't gated" (or "dsh stopped the run after its gate passed, …" for a run still in progress), with the usual advice: a fix round or a ruling. The notice says "Gate passed earlier in this run (round N), but the run ended (<reason>) after it, …". `latestGate` itself is unchanged.
 - **The finish notice** says "Gate not run." for a bound coder's run with no result only while dish-gates runs. Without it no gate was going to run, so the line is left out.
 - **The review check's refusal** names the fix round's target (`to: "<id>"`), and for a coder still running says to wait for its finish notice. "No gate result" gives the likeliest cause as an example: "no gate result: it didn't run (for example, the coder ran before dish-gates was on)". Work done before dish-gates was installed needs a ruling to be reviewed.
 - **Rulings.** The placeholder copied back (`Ruling: what — why — cost if wrong`, with or without `Ruling:`) is no ruling, and is refused as `Ruling:` alone is. A re-review without `gateOverride` keeps the reviewer's ruling while the reviewed coder hasn't run since the ruling was given (its latest run ended before then, and it isn't running): the ruling was given on the standing it still has. A fix round, a crash or a resume of the coder ends it. The ruling's time is kept as `gateOverrideAt`: the reviewer's start for a ruling given then, the follow-up's time for one given on a re-review (found in the final review: comparing with the reviewer's start lost a ruling given on a re-review at the next one). A ruling recorded before `gateOverrideAt` was kept uses the reviewer's start.

@@ -47,7 +47,7 @@ While [`dish-gates`](../gates/) runs, a bound coder's work is gated each time it
 - **The brief.** A bound coder's block ends with: "When you finish, dish runs this project's gate (`<gate>`) in your worktree, and a failure comes back to you. If you're blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped." The gate comes from `dishGates.gateFor(project)`. Without dish-gates, or a gate, the block is as above.
 - **The record.** Each gate result is a `GateResult` (the turn, the round of `maxRounds`, `passed`, `failed`, `skipped` or `error`, the command, the exit code, whether it timed out, how long it took, the log, the output's last lines, and why for a skip or an error). dish-gates adds it with `records.addGate(child, result)`. A run in progress keeps its results on the child (`gates`), and they move onto the run when it ends (`runs[].gates`).
 - **The finish notice** of a bound coder says how its gate ended, after the report, from the run's last result:
-  - "Gate passed (round 2)."
+  - "Gate passed (round 2)." In a run that ended another way than `completed` (aborted, failed) after its gate passed: "Gate passed earlier in this run (round 2), but the run ended (aborted) after it, so any work after the gate wasn't gated."
   - "Gate FAILED after 3 rounds (`<gate>`, exit 1); last lines:", the output's last lines in a code fence, then "Full log: `<path>`. Start a fix round with `to` or a fresh coder (escalation ladder)." A gate that hit its time limit says "stopped at its time limit" in place of the exit code.
   - "Gate failed in round 1 of 3 (`<gate>`, exit 1), and the run ended before the coder finished again. Full log: `<path>`." The run ended some other way, such as an error.
   - "Gate skipped: the coder reported BLOCKED / NEEDS CONTEXT." or another skip's reason, such as "its worktree is gone, or its project is no longer registered".
@@ -56,7 +56,8 @@ While [`dish-gates`](../gates/) runs, a bound coder's work is gated each time it
 - **The review check.** A review of a bound coder's work, a reviewer started with `reviews: <child>` or a follow-up to a reviewer (a re-review), is refused while that coder's gate hasn't passed:
   - it is still running: wait for its finish notice;
   - its latest run's last result isn't a pass;
-  - or that run has none (an error or an abort ended it before its turn could, dsh restarted mid-gate, or it ran before dish-gates was on).
+  - or that run has none (an error or an abort ended it before its turn could, dsh restarted mid-gate, or it ran before dish-gates was on);
+  - or it is a pass, but the run didn't end `completed` after it: a follow-up steered into the same turn had the coder go on, and the turn was then aborted or failed, or dsh restarted. The work after the pass was never gated.
 
   The refusal says where the gate stands and what to do: "coder «add login» (child <id>)'s gate hasn't passed (skipped: the coder reported BLOCKED / NEEDS CONTEXT). Send it a fix round with `to: "<id>"`, or start the review anyway with `gateOverride: "Ruling: what — why — cost if wrong"`."
 - **`gateOverride`,** a `delegate` parameter, is the main agent's ruling to review work whose gate hasn't passed, on one line (line breaks are folded). It is recorded on the reviewer (`gateOverride` in `children.json`), and the reviewer gets a block after its task: "The harness's gate for the work you review (<role> «<title>», child <id>) hasn't passed: <where it stands>. The main agent started this review anyway, with this ruling: <ruling>". A follow-up with a ruling replaces the recorded one, and its text gets the same block.

@@ -341,15 +341,24 @@ interface Override {
 /**
  * Why `child`'s gate counts as not passed, for the review check, or `undefined` when it passed or isn't checked: dish-gates
  * isn't running, or the child isn't bound to a worktree. Not passed is: the child is still running; the latest result of its
- * latest run isn't a pass; or that run has none (an error or an abort ended it before its turn could, dsh stopped mid-gate,
- * or it ran before dish-gates was on).
+ * latest run isn't a pass; that run has none (an error or an abort ended it before its turn could, dsh stopped mid-gate,
+ * or it ran before dish-gates was on); or it is a pass, but the run didn't end `completed` after it. A follow-up steered
+ * into the turn the gate passed in has the coder go on in that turn; when the turn then ends normally the gate runs again,
+ * but when it is aborted or fails, or dsh stops it (the pass is still on the run in progress), the work after the pass was
+ * never gated.
  */
 function gateStanding(call: Call, child: ChildRecord): string | undefined {
   if (call.gates === undefined || child.worktree === undefined) return undefined
   if (isRunning(child, call.agents)) return STILL_RUNNING
   const latest = latestGate(child)
   if (latest === undefined) return `no gate result: it didn't run (for example, the ${child.role} ran before dish-gates was on)`
-  if (latest.outcome === 'passed') return undefined
+  if (latest.outcome === 'passed') {
+    // `latestGate` reads the run in progress first: a pass there is on a run that never ended.
+    if (child.gates?.at(-1) !== undefined) return 'dsh stopped the run after its gate passed, so any work after the gate wasn\'t gated'
+    const stopReason = child.runs.at(-1)?.stopReason
+    if (stopReason === 'completed') return undefined
+    return `the run ended (${oneLine(stopReason ?? '') || 'unknown'}) after its gate passed, so any work after the gate wasn't gated`
+  }
   if (latest.outcome === 'failed') return oneLine(`failed, round ${latest.round} of ${latest.maxRounds}${latest.log === null ? '' : `; log ${latest.log}`}`)
   const reason = latest.reason === undefined ? '' : oneLine(latest.reason)
   return reason === '' ? latest.outcome : `${latest.outcome}: ${reason}`

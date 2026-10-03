@@ -781,6 +781,21 @@ test('a pass: "Gate passed (round N)."', () => {
   assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 1 }), gate({ round: 2 })])), 'Gate passed (round 2).')
 })
 
+test('a pass in a run that then ended another way than completed says so: the work after the gate wasn\'t gated', () => {
+  for (const reason of ['aborted', 'error', 'max-tokens', 'refusal', 'unknown']) {
+    assert.equal(gateLine(BOUND, { ...runWith([gate({ outcome: 'failed', exitCode: 1, round: 1 }), gate({ round: 2 })]), stopReason: reason }),
+      `Gate passed earlier in this run (round 2), but the run ended (${reason}) after it, so any work after the gate wasn't gated.`, reason)
+  }
+  // Only a pass: a failure, a skip and an error read as before, whatever ended the run.
+  assert.equal(gateLine(BOUND, { ...runWith([gate({ outcome: 'skipped', command: '', exitCode: null, log: null })]), stopReason: 'aborted' }), 'Gate skipped.')
+  assert.equal(gateLine(BOUND, { ...runWith([gate({ outcome: 'error', exitCode: null, log: null })]), stopReason: 'error' }), 'Gate not run.')
+  assert.match(gateLine(BOUND, { ...runWith([gate({ outcome: 'failed', exitCode: 1, round: 3 })]), stopReason: 'aborted' })!, /^Gate FAILED after 3 rounds/)
+  // In the notice, after the report.
+  const child = { id: 'c1', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', worktree: BOUND.worktree }
+  assert.equal(noticeText(child, { ...runWith([gate()]), stopReason: 'aborted' }, 'dsh lead', 'It left no closing message.'),
+    'coder «add login» (claude-sonnet-5.5) was stopped. Report: `/data/1-coder-1.md`. Gate passed earlier in this run (round 1), but the run ended (aborted) after it, so any work after the gate wasn\'t gated. It left no closing message.')
+})
+
 test('rounds that ran out: the command, the exit code, the last lines in a fence, the log, and what to do next', () => {
   const failed = gate({ outcome: 'failed', exitCode: 2, round: 3, excerpt: 'FAIL src/login.test.ts\n1 failed' })
   assert.equal(
