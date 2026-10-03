@@ -6,8 +6,9 @@
  * A coder or a reviewer (`reportRole`: a child with `reviews` is a reviewer, role `coder` a coder) finishes with `report`, as its
  * last call. Its arguments are the role's structured report (`CoderReport`, `ReviewerReport` in `record.ts`). dsh-tools checks
  * them against the schema before `execute` runs (a mismatch is `invalid arguments: …`, naming the field). `execute` then makes
- * the checks a schema can't: a blank `summary`, a coder that isn't `done` without `blockedOn`, and a reviewer's `head` that isn't
- * a full sha (an abbreviated one could match another commit, and `open_pr` compares it with the head it pushes). All of them are
+ * the checks a schema can't: a blank `summary`, a coder that isn't `done` without `blockedOn`, and a reviewer's `head`, when it
+ * gives one, that isn't a full sha (an abbreviated one could match another commit, and `open_pr` compares it with the head it
+ * pushes; a review of work outside git gives none, and so never counts for `open_pr`). All of them are
  * said at once, and nothing is recorded. Otherwise the report is recorded on the child with `setReport` (masked there), the turn
  * is concluded (`exec.concludeTurn()`), and the tool's value is the stored report. A later call replaces an earlier one.
  *
@@ -533,7 +534,7 @@ const STEER_TEXT: Readonly<Record<ReportRole, string>> = {
     + '`blockedOn`, when you can\'t go on), a `summary` of what changed, for a person, and `commits`, `rulings`, `concerns` and '
     + '`notFixed` where they apply. The main agent reads your report, not your last message, and your turn ends when you call it.',
   reviewer: 'Finish by calling `report`: your `verdict` (`approved` or `changes_requested`), `head` (the full sha of the commit you '
-    + 'reviewed), a `summary`, and `findings`, each with its severity, file, line, summary and fix (an empty list for a clean '
+    + 'reviewed, when the work is in a git repository), a `summary`, and `findings`, each with its severity, file, line, summary and fix (an empty list for a clean '
     + 'review), with the `checks` you ran and, in a re-review, `addressed`. The main agent reads your report, not your last '
     + 'message, and your turn ends when you call it.',
 }
