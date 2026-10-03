@@ -12,7 +12,7 @@ import { join } from 'node:path'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { parse } from 'yaml'
-import { writeDishRows } from '../profile.ts'
+import { writeDishRows, writeSandboxRow } from '../profile.ts'
 import type { DishRowsOptions } from '../profile.ts'
 
 const CLI = fileURLToPath(new URL('../profile.ts', import.meta.url))
@@ -659,4 +659,33 @@ test('an anchored runner list that needs changing is refused', () => {
   const text = DISH_ROWS + `- id: sandbox\n  name: "@deepseek-ai/dsh-sandbox-local"\n  config:\n    runnerCommand: &r [/old]\n- id: other\n  config:\n    x: *r\n`
   assert.throws(() => writeDishRows(text, { ...OPTIONS, sandboxRunner: RUNNER }), /&r/)
   assert.throws(() => writeDishRows(text, { ...OPTIONS, sandboxRunner: null }), /&r/)
+})
+
+test('the sandbox row alone: --patch with only a sandbox flag leaves every other row as it is (the step before a rollback)', async () => {
+  const on = FIXTURE + DISH_ROWS + sandboxRow()
+  assert.equal(writeSandboxRow(on, null), FIXTURE + DISH_ROWS)
+  assert.equal(writeSandboxRow(FIXTURE, RUNNER), FIXTURE + sandboxRow(), 'no dish-config or preset row is added')
+  assert.equal(writeSandboxRow(FIXTURE, null), FIXTURE)
+  assert.throws(() => writeSandboxRow('', 'relative/runner'), /sandboxRunner/)
+
+  const path = await patchFile(on)
+  const off = await run(['--patch', path, '--no-sandbox-runner'])
+  assert.deepEqual({ code: off.code, stdout: off.stdout.trim() }, { code: 0, stdout: 'updated' })
+  assert.equal(await readFile(path, 'utf8'), FIXTURE + DISH_ROWS)
+  const again = await run(['--patch', path, '--no-sandbox-runner'])
+  assert.deepEqual({ code: again.code, stdout: again.stdout.trim() }, { code: 0, stdout: 'unchanged' })
+  const set = await run(['--patch', path, `--sandbox-runner=${RUNNER}`])
+  assert.deepEqual({ code: set.code, stdout: set.stdout.trim() }, { code: 0, stdout: 'updated' })
+  assert.equal(await readFile(path, 'utf8'), on)
+
+  for (const args of [
+    ['--patch', path, '--sandbox-runner', 'relative/runner'],
+    ['--patch', path, '--no-sandbox-runner', '--user-name', 'Only Me'],
+    ['--patch', path],
+  ]) {
+    const result = await run(args)
+    assert.equal(result.code, 2, args.join(' '))
+    assert.match(result.stderr, /usage: node deploy\/profile\.ts/)
+  }
+  assert.equal(await readFile(path, 'utf8'), on, 'a refused run writes nothing')
 })
