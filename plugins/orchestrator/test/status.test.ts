@@ -182,10 +182,16 @@ test('statusText: rulings, newest 20 first, then how many older; deferred findin
   assert.ok(start < deferredAt && deferredAt < notesAt && notesAt < all.findIndex(line => line.startsWith('`open_pr` now:')))
 })
 
-test('statusText: `open_pr` now, clean, not clean, and the head unreadable; the gate\'s last result at this head; the final review', () => {
+test('statusText: `open_pr` now, clean, clean with untracked files, not clean, and the head unreadable; the gate\'s last result at this head; the final review', () => {
   const clean = statusText(run(), summary({ finalReview: verdict() }), context({ gateAtHead: gate() }))
   assert.equal(lineOf(clean, '`open_pr` now:'),
     `\`open_pr\` now: head ${B7}, clean; the gate runs on that head when you call it (the last result at this head: passed, 5 min ago); the final review approved this head.`)
+  // Clean with untracked files, as `open_pr` asks (`{ untracked: 'ignore' }`): clean, and they're named.
+  const untracked = statusText(run(), summary(), context({ clean: { clean: true, untracked: ['clippy', 'coverage.out', 'and 3 more'] } }))
+  assert.equal(lineOf(untracked, '`open_pr` now:'),
+    `\`open_pr\` now: head ${B7}, clean (untracked, not pushed: clippy, coverage.out, and 3 more); the gate runs on that head when you call it; no final review approved this head (give \`reviewRuling\` to open past it).`)
+  const noneNamed = statusText(run(), summary(), context({ clean: { clean: true, untracked: [] } }))
+  assert.match(lineOf(noneNamed, '`open_pr` now:'), new RegExp(`^\`open_pr\` now: head ${B7}, clean; `))
   const dirty = statusText(run(), summary(), context({ clean: { clean: false, why: '2 files uncommitted' } }))
   assert.equal(lineOf(dirty, '`open_pr` now:'),
     `\`open_pr\` now: head ${B7}, not clean: 2 files uncommitted (it refuses until that's fixed); the gate runs on that head when you call it; no final review approved this head (give \`reviewRuling\` to open past it).`)

@@ -653,9 +653,15 @@ test('status: statusText over the ledger, the head and cleanliness from dish-wor
   })
   assert.deepEqual(w.workspaces.calls.compareBranch, [[PROJECT, 'fix-login']])
   assert.deepEqual(w.workspaces.calls.headOf.at(-1), [run.worktree])
-  assert.deepEqual(w.workspaces.calls.isClean.at(-1), [run.worktree])
+  // As `open_pr` asks: untracked files don't make it unclean.
+  assert.deepEqual(w.workspaces.calls.isClean.at(-1), [run.worktree, { untracked: 'ignore' }])
   assert.match(answer.text, /^Against GitHub \(just fetched\): 1 commit ahead of the default branch, 0 behind; dish\/fix-login isn't on GitHub yet\.$/m)
   assert.match(answer.text, new RegExp(`^\`open_pr\` now: head ${shortSha(HEAD)}, clean; the gate runs on that head when you call it \\(the last result at this head: passed, 10 min ago\\);`, 'm'))
+
+  // Clean with untracked files: named, as `open_pr`'s answer names them.
+  w.workspaces.impl.isClean = async (_path, options) => (options?.untracked === 'ignore' ? { clean: true, untracked: ['clippy'] } : { clean: false, why: '?? clippy' })
+  assert.match((await call(w, { action: 'status' })).text, new RegExp(`^\`open_pr\` now: head ${shortSha(HEAD)}, clean \\(untracked, not pushed: clippy\\); the gate runs on that head`, 'm'))
+  w.workspaces.impl.isClean = async () => ({ clean: true })
 
   // The counts as compareBranch gives them.
   w.workspaces.impl.compareBranch = async () => ({ behindDefault: 2, aheadOfDefault: 3, remoteAhead: 1 })

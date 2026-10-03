@@ -401,7 +401,10 @@ class RunTool {
   }
 }
 
-/** The run's worktree now: its head and whether it is clean, or why they can't be read. Never rejects. */
+/**
+ * The run's worktree now: its head and whether it is clean, or why they can't be read. Never rejects. Clean as `open_pr`
+ * checks it (`{ untracked: 'ignore' }`), so untracked files are named, not a refusal it wouldn't make.
+ */
 async function readWorktree(workspaces: WorkspacesReader | undefined, run: Run): Promise<Pick<StatusContext, 'head' | 'clean' | 'headProblem'>> {
   if (workspaces === undefined) return { headProblem: 'dish-workspaces isn\'t running' }
   const found: Pick<StatusContext, 'head' | 'clean' | 'headProblem'> = {}
@@ -413,7 +416,7 @@ async function readWorktree(workspaces: WorkspacesReader | undefined, run: Run):
     found.headProblem = describe(error)
   }
   try {
-    found.clean = await workspaces.isClean(run.worktree)
+    found.clean = await workspaces.isClean(run.worktree, { untracked: 'ignore' })
   } catch (error) {
     found.headProblem ??= describe(error)
   }

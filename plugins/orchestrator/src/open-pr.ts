@@ -162,13 +162,14 @@ function gatePhrase(gate: PrGate | null, gatesMissing: boolean): string {
   }
 }
 
-/** What the final review found, as one phrase after "no final review approved <head7>:". */
+/** What the final review found, as one phrase after "no final review approved <head7>:". Changes requested first, head or not. */
 function reviewPhrase(final: VerdictView | undefined): string {
   if (final === undefined) return 'there is none yet'
+  if (final.verdict === 'changes_requested') {
+    return `the latest final review (child ${final.child}) requested changes${final.head === undefined ? '' : ` at ${shortSha(final.head)}`}`
+  }
   if (final.head === undefined) return `the latest final review (child ${final.child}) gave no head: the reviewer must report the full sha of the head it approved`
-  return final.verdict === 'approved'
-    ? `the latest final review (child ${final.child}) approved ${shortSha(final.head)}, not this head`
-    : `the latest final review (child ${final.child}) requested changes at ${shortSha(final.head)}`
+  return `the latest final review (child ${final.child}) approved ${shortSha(final.head)}, not this head`
 }
 
 /** The failed checks, a phrase each: `pr.checked`'s `refused`. */

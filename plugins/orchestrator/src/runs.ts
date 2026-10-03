@@ -722,7 +722,7 @@ export class Runs {
     if (isText(problem)) {
       throw new Error(`run \`${run.id}\` can't be reopened: its worktree ${run.worktree} can't be used: ${describe(problem).replace(/\.+$/, '')}. Fix that, or open a new run with \`run\` \`open\`.`)
     }
-    throw new Error(`run \`${run.id}\` can't be reopened: its worktree is gone (the sweep removes it once its pull request ${run.pr?.url ?? ''} is merged). Open a new run with \`run\` \`open\`.`)
+    throw new Error(gone)
   }
 
   /** Holding the run's lock: the goal, then `run.goal`. Gives the record as written. */
