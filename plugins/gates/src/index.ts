@@ -28,9 +28,12 @@
  * cancels every gate that is running: nothing more is recorded, steered or published for it, and a `runAt` that was running
  * gives an `error`.
  *
- * **`dish-gates/result`** is published with `ctx.parallel` and awaited, inside `agent/turn-stopping`: its listeners run
- * before the coder's turn can close, and before that run's `subagent/end`. A listener's failure is logged once per distinct
- * message, and changes nothing; nothing is published once the plugin is going away.
+ * **`dish-gates/result`** is published with `ctx.parallel` inside `agent/turn-stopping`, while the gate holds the worktree's
+ * lock, and awaited for at most `EVENT_BUDGET_MS` (10 s), as crew bounds its own events: a listener that returns within it
+ * has run before the coder's turn can close, and before that run's `subagent/end`; one that takes longer is logged once,
+ * and dish-gates goes on without it, so a listener that waits for something that waits for the worktree (open_pr holds a
+ * run's lock while `runAt` waits for the worktree's) can't hold the coder's turn. A listener's failure is logged once per
+ * distinct message, and changes nothing; nothing rejects, and nothing is published once the plugin is going away.
  *
  * @module dish-gates
  */
@@ -99,6 +102,8 @@ declare module '@deepseek-ai/cordis' {
 export interface GatesInternals {
   /** dish's state directory; the logs go under `<state>/gates`. Default: `xdgPaths('dish').state`. */
   state?: string
+  /** How long a publish of `dish-gates/result` waits for its listeners. Default: `EVENT_BUDGET_MS`. */
+  eventBudgetMs?: number
   now?: () => number
   run?: typeof runGate
   /** dsh's own environment, for the gate's `PATH`. Default: `process.env`. */
@@ -107,6 +112,12 @@ export interface GatesInternals {
 
 /** How often the logs are pruned while the plugin runs, besides at start. */
 export const PRUNE_EVERY_MS = 86_400_000
+
+/**
+ * How long a publish of `dish-gates/result` waits for its listeners: 10 s, crew's `EVENT_BUDGET_MS`. A listener queues its
+ * work and returns; this is for one that doesn't.
+ */
+export const EVENT_BUDGET_MS = 10_000
 
 /** How many distinct failures (pruning, a dish-gates/result listener) are remembered as logged. */
 const TOLD_MAX = 100
@@ -122,6 +133,16 @@ function describe(error: unknown): string {
 /** Whether `error` is cordis refusing an effect because a plugin has been unloaded: a plugin that is going away didn't fail. */
 function unloaded(error: unknown): boolean {
   return (error as { code?: unknown } | null)?.code === 'INACTIVE_EFFECT'
+}
+
+/** `promise`, or a rejection once `ms` have passed (as crew's `within`). The timer does not keep the process alive. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => { reject(new Error(`no answer in ${ms} ms`)) }, ms)
+    timer.unref()
+  })
+  return Promise.race([promise, late]).finally(() => { clearTimeout(timer) })
 }
 
 export function apply(ctx: Context, config: Config): void {
@@ -151,8 +172,9 @@ export function start(ctx: Context, config: Config, internals: GatesInternals): 
   ctx.on('session/event', (session, event) => { heads.observe(session, event) })
   ctx.on('tools/result', (exec, result) => { heads.toolResult(exec, result) })
 
-  // `dish-gates/result`: every listener is called and settled (`ctx.parallel`), and awaited. A failure is logged once
-  // per distinct message, and never thrown.
+  // `dish-gates/result`: every listener is called and settled (`ctx.parallel`), and awaited for at most the budget. A
+  // failure, or listeners that outlast the budget, are logged once per distinct message, and never thrown.
+  const budgetMs = internals.eventBudgetMs ?? EVENT_BUDGET_MS
   const told = new Set<string>()
   const warnOnce = (message: string): void => {
     if (told.has(message) || told.size >= TOLD_MAX) return
@@ -165,12 +187,24 @@ export function start(ctx: Context, config: Config, internals: GatesInternals): 
   }
   const publish = async (event: GateResultEvent): Promise<void> => {
     if (!live) return
+    let outcome: Promise<{ error?: unknown }>
     try {
-      await ctx.parallel('dish-gates/result', event)
+      // Listeners are called now, synchronously (cordis' `parallel`); what is waited for is what they return. A failure
+      // that comes after the wait is over is settled here, never left unhandled.
+      outcome = ctx.parallel('dish-gates/result', event).then(() => ({}), (error: unknown) => ({ error }))
     } catch (error) {
-      for (const cause of error instanceof AggregateError ? error.errors : [error]) {
-        if (!unloaded(cause)) warnOnce(maskSecrets(`a dish-gates/result listener failed: ${describe(cause)}`))
-      }
+      outcome = Promise.resolve({ error })
+    }
+    let result: { error?: unknown }
+    try {
+      result = await within(outcome, budgetMs)
+    } catch {
+      warnOnce(`dish-gates/result listeners took longer than ${budgetMs / 1000} s; dish-gates went on without them`)
+      return
+    }
+    if (!('error' in result)) return
+    for (const cause of result.error instanceof AggregateError ? result.error.errors : [result.error]) {
+      if (!unloaded(cause)) warnOnce(maskSecrets(`a dish-gates/result listener failed: ${describe(cause)}`))
     }
   }
 

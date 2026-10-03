@@ -38,8 +38,9 @@
  *    steered either, so every steer adds a failure to the record and the rounds always run out. After a `report`, the steer
  *    asks for `report` again (`failureMessage`'s `reported`).
  * 10. **The event:** each result `addGate` kept is published once, right after it, on `dish-gates/result`, with the child's
- *    session (`deps.publish`, awaited: its listeners run before the turn can close). A result crew didn't keep, and a
- *    cancelled stop, publish nothing.
+ *    session (`deps.publish`, awaited; index.ts waits for the listeners at most `EVENT_BUDGET_MS`, so one that returns in
+ *    time runs before the turn can close, and none can hold it). A result crew didn't keep, and a cancelled stop, publish
+ *    nothing.
  *
  * **What goes where.** Only the payload's agent is used: its id for the record and the log, that agent for the steer, and
  * the payload's turn for the rounds. Every result is recorded with `addGate`, awaited inside `agent/turn-stopping`, which
@@ -148,7 +149,10 @@ export interface GateDeps {
   now?: () => number
   /** Tests. */
   run?: typeof runGate
-  /** Publish `dish-gates/result`. Never rejects: index.ts logs a listener's failure. */
+  /**
+   * Publish `dish-gates/result`. Never rejects: index.ts logs a listener's failure, and waits for the listeners at most
+   * `EVENT_BUDGET_MS`.
+   */
   publish(event: GateResultEvent): Promise<void>
   /** Shared with runAt. Default: one of its own. */
   locks?: WorktreeLocks

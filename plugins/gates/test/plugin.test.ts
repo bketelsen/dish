@@ -212,6 +212,8 @@ interface WorldOptions {
   crew?: boolean
   /** crew's `reportSteers` (default 0: crew never sends a coder back to call `report`, and a text ending is gated as before). */
   reportSteers?: number
+  /** dish-gates' wait for `dish-gates/result`'s listeners, when the internals are the default ones (default: the plugin's). */
+  eventBudgetMs?: number
   config?: Partial<Config>
   /** Internals for `start`; `null` mounts the plugin as dsh does, through `apply`, with no internals. */
   internals?: GatesInternals | null
@@ -249,7 +251,12 @@ async function world(options: WorldOptions = {}): Promise<World> {
   }) as unknown as Handle
   const shellHandle = provideStub(ctx, 'shell', shell) as unknown as Handle
   // dsh's environment for the gate's PATH: a scratch home with no mise shims, never the runner's.
-  const internals = options.internals === undefined ? { state, environment: () => ({ PATH: '/usr/bin:/bin', HOME: join(dir, 'home') }) } : options.internals
+  const internals = options.internals === undefined
+    ? {
+        state, environment: () => ({ PATH: '/usr/bin:/bin', HOME: join(dir, 'home') }),
+        ...options.eventBudgetMs === undefined ? {} : { eventBudgetMs: options.eventBudgetMs },
+      }
+    : options.internals
   const gatesHandle = mountGates(ctx, options.config ?? {}, internals)
   await Promise.all([workspaces, projects, shellHandle, gatesHandle])
   const handles = { ...crew === undefined ? {} : { crew }, gates: gatesHandle, workspaces, projects, shell: shellHandle }
@@ -558,6 +565,39 @@ test('a dish-gates/result listener gets the result after crew has it (it reads i
   } finally {
     await reader.dispose()
     await thrower.dispose()
+    await w.dispose()
+  }
+})
+
+test('a dish-gates/result listener held past the budget: the result is still recorded, the stop goes on, and it is logged once', async () => {
+  assert.equal(gates.EVENT_BUDGET_MS, 10_000)
+  const w = await world({ eventBudgetMs: 50 })
+  const held = deferred()
+  const heard: string[] = []
+  const slow = onResult(w.ctx, async (event) => {
+    heard.push(event.result.outcome)
+    await held.promise
+  })
+  try {
+    await slow
+    await w.coder('child-1')
+    const agent = w.agent('child-1')
+    w.shell.script.push(FAIL, PASS)
+    w.says(agent, 'done')
+    const started = Date.now()
+    await w.stop(agent)
+    w.says(agent, 'fixed')
+    await w.stop(agent)
+    assert.ok(Date.now() - started < 5_000, 'the stops didn\'t wait for the listener')
+    assert.deepEqual(heard, ['failed', 'passed'], 'the listener heard each result')
+    assert.deepEqual((await w.child('child-1')).gates?.map(result => [result.round, result.outcome]), [[1, 'failed'], [2, 'passed']])
+    assert.equal(agent.steers.length, 1, 'the failure was steered all the same')
+    assert.deepEqual(w.logs.filter(line => line.includes('took longer')), [
+      '[dish-gates] warn: dish-gates/result listeners took longer than 0.05 s; dish-gates went on without them',
+    ])
+  } finally {
+    held.resolve()
+    await slow.dispose()
     await w.dispose()
   }
 })
