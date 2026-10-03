@@ -39,7 +39,7 @@ When a crew coder bound to a worktree is about to end its turn, dish runs the pr
 
 - **Gates longer than 10 minutes.** A long build like snosi's image isn't a gate; use its lint or validate step. Open item 1 asks whether dish could wait longer itself.
 - **Gating the main agent's own work.** Its skills tell it to run the gate.
-- **Pushing, PRs and the escalation ladder beyond a turn's rounds** (step 7).
+- **Pushing, PRs and the escalation ladder beyond a turn's rounds** (step 7) (built in step 7: [orchestrator](orchestrator.md)).
 
 ## The hook
 
@@ -206,6 +206,8 @@ interface DishGates {
 }
 ```
 
+Since step 7 it also has `runAt`, for `open_pr` ([With structured reports](#with-structured-reports-step-7)).
+
 ## Configuration
 
 | Row | Field | Default | |
@@ -213,6 +215,17 @@ interface DishGates {
 | `dish-gates` | `maxRounds` | 3 | Gate runs per turn. The failure in the last one isn't sent back: the turn ends with it |
 | `dish-gates` | `tailLines` | 200 | Lines of output sent back (capped at 16 KB) |
 | `dish-gates` | `terminal` | true | Print this plugin's messages |
+
+## With structured reports (step 7)
+
+Step 7 ([orchestrator](orchestrator.md)) gives crew's coders a `report` tool that ends their turn, and `open_pr` a gate of its own. dish-gates changed to match; everything above still holds for a coder that ends with text.
+- **When a coder has finished.** A `report` call is a tool call, so the old rule ("the newest message holds tool calls: not finished") would never gate a coder that reports. dish-gates now also hears dsh-tools' `tools/result`: a successful `report` that concluded the turn keeps its `status` for the session, cleared at the next assistant message or `turn/start`. A coder is gated when (a) that `report` concluded the stop with `status: "done"`, or (b) its newest message holds no tool calls and `dishCrew.reportSteered(childId)` is false. `blocked` and `needs_context` are `skipped` ("the coder reported status blocked", "the coder reported status needs_context"), and the text isn't read then; the `BLOCKED:` and `NEEDS CONTEXT:` opt-outs stay for a coder that ends with text.
+- **`reportSteered`.** crew's `agent/turn-stopping` listener is prepended, so a coder it sends back to call `report` has its steer before dish-gates runs, and dish-gates leaves that stop alone: a report steer and a gate steer never both happen at one stop. With crew's `reportSteers: 0`, the rule is the one above.
+- **The steer after a `report`** ends: "Full log: `<path>`. Fix it in your worktree, then call `report` again: the new report replaces the one you made. The gate runs again when you do." and "If you're blocked, call `report` with `status: "blocked"` or `"needs_context"` and `blockedOn`, and the gate is skipped." Its sandbox hint ends "If it needs another directory, say so in your report's `concerns`."
+- **`head`.** Each `GateResult` carries `head`: the worktree's HEAD when the gate ran, read with `dishWorkspaces.headOf` once the worktree resolves (dish-gates runs no git), or `null` when it can't be read or isn't a full sha. Results from before step 7 have none.
+- **The event.** Each result `addGate` kept is published once on `dish-gates/result` (`{ childId, sessionId, result }`), with `ctx.parallel`, while the gate holds the worktree's lock. dish-gates waits at most 10 s for its listeners, then goes on and logs once, so a listener that waits for the worktree can't hold the coder's turn.
+- **`runAt(project, worktreePath, { sessionId, head?, signal? })`** gives `open_pr` the project's gate in a worktree dish made, at its HEAD, run as a coder's gate runs, in the same per-worktree lock. Given `head`, a worktree whose HEAD isn't that commit is an `error`, and nothing runs. It records nothing in crew's record, steers nothing and publishes nothing (`open_pr` records `pr.checked`); its log is `<state>/gates/<owner>/<repo>/<slug>/open_pr.log` (`open_pr.2.log`, …), and it logs "open_pr's gate for <owner>/<repo>/<slug> at <head12>: passed in … " (or "failed in … (exit N)") at info. It gives a `GateCheck` (`GateResult` without `turn`, `round` and `maxRounds`), and rejects only without a `sessionId` and when the caller's signal aborts.
+- **Not gated:** a reviewer's concluding `report`, which has no `status`. Only a writing reviewer bound to a worktree could hit it, and the shipped `crew.yaml` has none.
 
 ## Testing
 

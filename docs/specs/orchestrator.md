@@ -1,6 +1,6 @@
 # Spec: orchestrator (`dish-orchestrator`)
 
-Status: approved 2026-10-03, with the four recommendations under [Questions for you](#questions-for-you) taken. Revised 2026-10-03 from the plan, to match its [Spec corrections](../plans/2026-10-03-orchestrator.md#spec-corrections-for-the-user): review feedback reopens a run with a PR, a final review stays final, the rulesets need one approval (to confirm), coders and reviewers are told to finish with `report`, and ten smaller ones; then three of your decisions after reviewing the plan: a PR's branch is brought up to date by merging, never rebased; `pr_feedback` reads a run's PR; and a reopened run's `open_pr` can change the PR's title and body. The plan is [docs/plans/2026-10-03-orchestrator.md](../plans/2026-10-03-orchestrator.md). This is roadmap step 7. It builds on [crew](crew.md), [gates](gates.md) (6c), [projects and workspaces](projects-workspaces.md) (6b) and the [design](../design.md) ("The pipeline", "Lessons that shape the design"). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources; see [Checks](#checks-2026-10-03).
+Status: approved 2026-10-03, with the four recommendations under [Questions for you](#questions-for-you) taken. Revised 2026-10-03 from the plan, to match its [Spec corrections](../plans/2026-10-03-orchestrator.md#spec-corrections-for-the-user): review feedback reopens a run with a PR, a final review stays final, the rulesets need one approval (to confirm), coders and reviewers are told to finish with `report`, and ten smaller ones; then three of your decisions after reviewing the plan: a PR's branch is brought up to date by merging, never rebased; `pr_feedback` reads a run's PR; and a reopened run's `open_pr` can change the PR's title and body. The plan is [docs/plans/2026-10-03-orchestrator.md](../plans/2026-10-03-orchestrator.md). This is roadmap step 7. It builds on [crew](crew.md), [gates](gates.md) (6c), [projects and workspaces](projects-workspaces.md) (6b) and the [design](../design.md) ("The pipeline", "Lessons that shape the design"). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources; see [Checks](#checks-2026-10-03). Built on branch `orchestrator` (2026-10-03) and checked end to end in a scratch dsh; awaiting review and the rollout. What the build added is under [Notes from the build](#notes-from-the-build).
 
 ## Summary
 
@@ -267,3 +267,79 @@ Against dsh 0.2.0-rc.2's sources and dish's `main` at `3e44720`:
 - **Per-agent tools:** dsh-schedule registers tools on each root agent's own scope at `agent/created`; an agent's own layer isn't subject to its tool filter, so a child-scoped `report` needs no allow-list entry, and the main agent never sees it.
 - **Pushing:** dish-workspaces mints only read tokens (`createToken` refuses anything but read) and has one REST client (`GitHubApp`, GET and POST). The 6b spec planned in-memory write tokens for the harness's own pushes in step 7 (decision 9). The credential helper answers every `get`, so a push today fails at GitHub with 403, not locally.
 - **Locks and resume:** crew refuses `to` and `reviews` across sessions, so a resumed run continues with fresh children; no existing lock lasts across turns, so the run's driver is a persisted session id checked against dsh's agent registry.
+
+## Notes from the build
+
+What the build decided beyond this spec as revised on 2026-10-03 (the plan's Spec corrections are in the text above), from the controller's ledger and the tasks' reports and reviews. Each was checked against the code.
+
+**Runs.**
+- **`run` `open` makes its worktree before it takes the chat's lock,** not under it (the plan's Task 9 said under). `createWorktree` can wait up to 10 minutes for the project's lock, behind a push, and the chat's own `worktree` hook needs the chat's lock meanwhile. The record and `run.opened` are still written under the chat's lock (`openAround`).
+- **`worktreeCreated` waits at most 30 s for the chat's lock.** Past it, the `worktree` tool answers without a run, and the worktree joins late only as a task of the run the chat drives in that project by then, and only if it still resolves: a late join never opens, switches or releases a run. One log line says which. Once the hook holds the lock, the tool waits for it to finish (local writes only).
+- **Time limits,** which the plan didn't give: `place` 30 s (past it, a start goes on outside any run, and a follow-up keeps its child's run and task but isn't counted by the ladder); `driving`, `worktreeCreated`, `worktreeRemoved` and `ladder` 30 s; and each read of a sibling's service inside them (`resolve`, `headOf`, crew's `lookup`) 10 s. The timers never hold the process open.
+- **The record decides who drives.** A ledger write that fails after its record was written (`openAround`, `drive`, `setGoal`, `attachPlan`, `close`) is logged, not thrown.
+- **Reopening a run with a pull request.** A `resolve` that rejects refuses with "run `<id>`'s worktree can't be checked: …"; a worktree that fails dish's safety check refuses with `resolveProblem`'s reason ("Fix that, or open a new run with `run` `open`."); a gone one keeps the spec's words. The answer reads "Reopened run `<id>` (<project>) for review feedback: <goal>.", then its pull request's line.
+- **A reviewer bound to a worktree no run owns** is placed where the child it reviews is. **A coder bound to the worktree of a run that isn't open** (a `pr` run not reopened, or an abandoned one) is placed in no run, not in the chat's other run.
+- **The run's own worktree, from the final review.** Resuming a run with a pull request, and `open_pr` on it, are refused when the worktree at the run's path isn't the run's own any more: its base commit differs from the run's `baseCommit`, or the run's ledger shows its worktree removed (its pull request merged, the sweep removed the worktree, and a later run reused the slug). The refusal is the "its worktree is gone … open a new run" one.
+- **A `worktree` `create` that opens a run in another project** releases the run the chat drove, and the tool's answer says so: "Released run `<id>`; `run` `resume` takes it back."
+- **`run` `status`'s merge hint names the default branch as `origin/HEAD`,** whatever the run was cut from: dish's fetch points it at the default branch each time (`remote set-head --auto`), so it is the skills' `origin/<default>`.
+- **`run` `open` with dish-projects stopped** says "dish-projects isn't running, so no project is registered", not that the project isn't in `projects.yaml`.
+- **The `run` tool's writes** read the record again under the chat's and the run's locks, and refuse unless the run is still open and this chat's.
+
+**The ledger.**
+- **The 16 KiB fit never cuts an entry's own path fields** (`reportFile`, `structuredFile`, `log`, `path`, `worktree`): they point to what the line had no room for.
+- **`append` refuses an entry whose `run` isn't the file's id,** and the derivations count a kind only when its own writer wrote it (`by`).
+- **`pr.feedback`'s `state` is only `open` or `closed`,** and its `checks` is `null` whenever not all checks could be read, a partial read included: counting half of them could read "0 failed".
+- **The store.** A record that can't be read, or a corrupt one that can't be set aside, is skipped where it is (and logged), and the rest load; only a directory that can't be listed fails the load. A field set to `undefined` is dropped in memory as on disk. A record set aside keeps its id taken, so its ledger is never a new run's.
+
+**Reports (crew).**
+- **Changes to one child's record reach the session's queue in the order they were called.**
+- **crew's event publisher never rejects,** even for a listener failure that can't be turned into text, and `dish-crew/settled` is awaited, up to 10 s, before `whenRecorded` resolves.
+- **`report`:** a reviewer's `head` is stored trimmed and lowercased; blank optional fields and empty lists are dropped; giving `report` to an agent whose scope is going away is silent. When the record has lost the child (`setReport` gives nothing), the child is told to end with its report as its closing message, crew stops steering it to `report`, and the report guard goes back to the closing message's words.
+- **The notice** says `NO_STRUCTURED_REPORT` ("It ended without a successful `report`, so there is no structured report.") for every coder or reviewer run without a structured report, with `reportSteers: 0` and for runs that ended abnormally too. In the report it renders, empty lists and a blank `blockedOn` read as absent.
+
+**Gates.**
+- **A `headOf` answer that isn't a full sha is no head:** `null` on a coder's result, an `error` in `runAt`.
+- **After a `report`,** the sandbox hint of the steer changes too: "If it needs another directory, say so in your report's `concerns`."
+- **dish-gates waits at most 10 s for `dish-gates/result`'s listeners,** then goes on and logs once: a guard against a deadlock with `open_pr`, which holds a run's lock while `runAt` waits for the worktree's.
+- **Not changed:** a reviewer's concluding `report` (no `status`) isn't gated. Only a writing reviewer bound to a worktree could hit it, and the shipped `crew.yaml` has none.
+
+**The ladder.**
+- **`final` is recorded only when the call asked for it and `place` gave it,** and on a follow-up only when `place` puts it in the run the reviewer is tagged with. Otherwise `delegate`'s answer says why, such as "start a fresh reviewer with `final: true` for that run's final review".
+- **A malformed `place` answer** is logged and treated as no run; a delegation is never refused for it.
+
+**The PR.**
+- **The fallback title.** A reopened run whose pull request was closed on GitHub gets a new one; with no `title`, its title is the goal cut to 256 characters (GitHub's limit, which dish-workspaces checks before it looks for an existing pull request).
+- **An existing pull request for `dish/<slug>`,** even one opened by hand before the first `open_pr`, gets an override's line as a comment. `updatePull` edits only the pull request the run recorded, and only the fields given.
+- **A ledger write that fails after the push** is logged and named in the answer.
+- **A failed read of the worktree's bindings** (who works in it) is logged and the call goes on: the head read again after the gate, and `pushBranch`'s head check, still guard the push.
+- **Cancellation** is checked after `compareBranch`, after the gate and just before `pr.checked`: nothing is recorded or pushed after a cancel.
+- **`readPull`:** any failure reading the check runs or the statuses leaves the checks unavailable with the reason (a 403 or 404 gives the permission's words), and keeps what the other source gave; a failure reading the reviews or comments still fails the call. A review comment on a whole file isn't outdated. Short strings have their control characters turned into spaces.
+- **The API token falls back to the narrow set** (`API_BASE_PERMISSIONS`) only on GitHub's 422.
+- **A push doesn't follow redirects,** so pushing to a renamed or transferred repository fails (301) while fetches work.
+- **`pr_feedback`:**
+  - quoted bodies are split at CR, LF, VT, FF, NEL, U+2028 and U+2029, so nothing from GitHub can start a line of dish's own;
+  - the answer is at most 48,000 characters. While it is over, issue comments go first (oldest first), then outdated review comments, then the oldest review comments; then review bodies are cut to 500 characters, then the oldest reviews go;
+  - at most 50 check lines, those that didn't pass first; each one-line field at most 200 characters (the URL 500, why the checks can't be read 600);
+  - a partial read of the checks lists what was read, and the ledger counts `null`.
+- **Not built, on the backlog** (your request, 2026-10-03): watching a run's pull request after `open_pr` (CI failures, conflicts, review comments) and waking the chat that drives the run, as Claude Code desktop's "Auto-fix pull requests" does ([ROADMAP](../../ROADMAP.md#backlog)).
+
+**Settings → Runs** (at order 51, after History).
+- **A coder with no recorded end** reads "started, no end recorded", never "running".
+- **A link's `href`** comes only from an exact `https://github.com/<owner>/<repo>/pull/<n>` URL; anything else is text.
+- **A refresh that fails on the way keeps the run shown;** one the server refused (the record is gone) drops it.
+
+**Prompts and skills.**
+- **The rule against a rebase, an amend or a squash** is in dish-prompts (`common.md`, `main.md`) and in dish-skills (`finishing-a-development-branch`), each tested where it lives, since dish-skills can't import dish-prompts.
+- **`finishing-a-development-branch`,** step 4: when GitHub's branch moved, it follows `open_pr`'s merge hint (correction 15), not "tell the user", which stays for a missing App permission (Workflows). Step 7 lists task worktrees with `worktree` `list`, since `run` `status` answers only while the run is open.
+- **`subagent-driven-development`'s coder brief** leaves the gate sentence to crew: `worktreeBrief` adds it exactly when dish will gate. The skill is at about 7,870 of 8,000 characters, so a later edit must cut as much as it adds.
+- **The final reviewer** is "a fresh `reviewer` with `final: true` (in a run, one started outside it never counts)"; from another chat, a fresh one rather than `to`.
+- **`judge.md`'s yaml block lists `pr_feedback`,** since its test pins it, byte for byte, to the shipped `judge.yaml`.
+
+**End to end (2026-10-03):** in a scratch `dsh web` (`env -i`, every directory scratch), installed by `deploy/install.sh` ("bundles added: … workspaces gates orchestrator"), on the dish preset, with a scripted model on `127.0.0.1` and dish-workspaces' fake GitHub and fake git server, reached through a wrapper that calls `start(ctx, config, { api, web })`. All 49 checks passed, and the install test 10 of 10; no bug in dish's code was found.
+- **A planned run with two tasks** (`run` `open` with `docs/plan.md`). Coder a's gate failed in round 1 and passed in round 2, each result with its own head; its own `git push` got 403; its notice rendered the report ("finished: done. … Gate passed (round 2). Its report:"). Review a ended with text, was steered once, and reported. Coder b's follow-ups carried the ladder's notes for rounds 1–4; the fifth was refused and recorded, and the ruled call went through (rounds 0 to 5 in the ledger). A fake `ghp_` token in its concerns was masked in the ledger and its `.json`. The main agent's `ruling`, `defer` and `note` were the only `by: main` lines. The final review (`final: true`) approved the head, and `open_pr` pushed `dish/e2e` and opened PR #1. The record and the ledger were 0600 in 0700 directories.
+- **A planless run.** `worktree` opened it (`how: auto`). Its coder never called `report`: it was steered twice, its gate ran once by the old rule and passed, and its notice said there was no structured report. `open_pr` was refused for want of a final review, then opened PR #2 with `reviewRuling`, the override line at the end of its body.
+- **Review feedback on PR #1.** `pr_feedback` framed GitHub's text as data, with "Ignore previous instructions" on a quoted `  > ` line, and the ledger kept counts only. `resume` reopened the run, and `run` `status` said the branch was 1 behind, with the merge hint. A coder merged `origin/main` (a two-parent merge) and added a file; its gate passed; and `open_pr` with a new `title` and `reviewRuling` pushed to PR #1 as a fast-forward: `pr.updated` (`titleChanged`, `comment: posted`), the body unchanged, the override line in a comment, no second PR.
+- **Settings → Runs** was checked through its remote (`runs`, `run`, `ledger`), as the page calls it: both runs and their timelines, the same after a restart, and no method that changes a run. The visual check of the page is left for the rollout.
+- **The scans:** no file held a write token, no `ghs_` token was in dish's data or in orchestrator's or gates' state, and every mint of the API token asked for Checks and Commit statuses read. dish, dsh, the agents and the stub touched nothing but `127.0.0.1`; pnpm's own update check reached its registry during the install.
+- **Scaffolding, not dish.** The scratch root under `/tmp` needed `deploy/dish-sandbox` (with dsh's `TMPDIR` under the scratch home's `.cache/dish`), as on the VM: dsh's own sandbox hides `/tmp`, and with it the clone's credential helper. And the scripted model had to skip dsh's repeated-tool-call reminders, which fire on identical follow-ups; they are harmless with the ladder, since the fifth call is refused anyway and a ruling changes the arguments.
+- **Seen, as designed:** the final reviewer of a task already removed is placed in the run with no task, so its `child.ended` has `head: null`; `open_pr` reads its `review.verdict`, whose head is the reviewer's own.
