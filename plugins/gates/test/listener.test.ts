@@ -413,6 +413,24 @@ test('the message keeps the settings\' tailLines', async () => {
   assert.ok(!text.includes('line 450\n'))
 })
 
+test('settings that aren\'t whole numbers from 1 fall back: 3 rounds and a 200-line tail', async () => {
+  for (const settings of [{ maxRounds: 2.5, tailLines: Number.NaN }, { maxRounds: 0, tailLines: 0 }]) {
+    const w = await world()
+    await w.coder('c1')
+    w.settings.maxRounds = settings.maxRounds
+    w.settings.tailLines = settings.tailLines
+    const c1 = w.agent('c1')
+    const output = `${Array.from({ length: 500 }, (_, index) => `line ${index + 1}`).join('\n')}\n`
+    w.script.set('c1', [fail(output), fail(output), fail(output), fail(output)])
+    for (let stop = 0; stop < 4; stop++) await w.stop(c1, 7)
+    assert.equal(w.runs.length, 3, `runs with ${JSON.stringify(settings)}`)
+    assert.equal(c1.steers.length, 2, `steers with ${JSON.stringify(settings)}`)
+    const text = textOf(c1.steers[0]!)
+    assert.ok(text.includes('\nline 301\n'), 'a 200-line tail')
+    assert.ok(!text.includes('line 300\n'))
+  }
+})
+
 test('a timeout and a run with no exit code are failures', async () => {
   const w = await world()
   await w.coder('c1')

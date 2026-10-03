@@ -230,8 +230,8 @@ export function gateListener(deps: GateDeps): (payload: StoppingPayload) => Prom
     payload: StoppingPayload, signal: AbortSignal, id: string, worktreePath: string, known: { records: GateRecords, failures: number },
   ): Promise<void> => {
     const { agent, turn } = payload
-    let { records, failures } = known
     // Failed results recorded for this turn (the round is one more), kept current for an error recorded after a failure.
+    let { records, failures } = known
     let maxRounds = DEFAULT_MAX_ROUNDS
     let tailLines = DEFAULT_TAIL_LINES
 
