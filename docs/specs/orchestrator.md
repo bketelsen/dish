@@ -1,6 +1,6 @@
 # Spec: orchestrator (`dish-orchestrator`)
 
-Status: approved 2026-10-03, with the four recommendations under [Questions for you](#questions-for-you) taken. Revised 2026-10-03 from the plan, to match its [Spec corrections](../plans/2026-10-03-orchestrator.md#spec-corrections-for-the-user): review feedback reopens a run with a PR, a final review stays final, the rulesets need one approval (to confirm), coders and reviewers are told to finish with `report`, and ten smaller ones. The plan is [docs/plans/2026-10-03-orchestrator.md](../plans/2026-10-03-orchestrator.md). This is roadmap step 7. It builds on [crew](crew.md), [gates](gates.md) (6c), [projects and workspaces](projects-workspaces.md) (6b) and the [design](../design.md) ("The pipeline", "Lessons that shape the design"). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources; see [Checks](#checks-2026-10-03).
+Status: approved 2026-10-03, with the four recommendations under [Questions for you](#questions-for-you) taken. Revised 2026-10-03 from the plan, to match its [Spec corrections](../plans/2026-10-03-orchestrator.md#spec-corrections-for-the-user): review feedback reopens a run with a PR, a final review stays final, the rulesets need one approval (to confirm), coders and reviewers are told to finish with `report`, and ten smaller ones; then three of your decisions after reviewing the plan: a PR's branch is brought up to date by merging, never rebased; `pr_feedback` reads a run's PR; and a reopened run's `open_pr` can change the PR's title and body. The plan is [docs/plans/2026-10-03-orchestrator.md](../plans/2026-10-03-orchestrator.md). This is roadmap step 7. It builds on [crew](crew.md), [gates](gates.md) (6c), [projects and workspaces](projects-workspaces.md) (6b) and the [design](../design.md) ("The pipeline", "Lessons that shape the design"). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources; see [Checks](#checks-2026-10-03).
 
 ## Summary
 
@@ -10,6 +10,7 @@ Today the pipeline runs on prompts and skills, and the main agent keeps its own 
 - **Structured reports** for the coder and the reviewer: a `report` tool with a schema, which ends the child's turn. The coder's `status` and the reviewer's `verdict` are facts the harness reads, not prose the main agent retells.
 - **The escalation ladder's last rung, enforced.** From round 5 on a task, `delegate` refuses more coder work unless the call carries a ruling.
 - **`open_pr`.** dish pushes the run's branch and opens the PR, but only if the gate passes on the head and the final review approved that head, or a ruling overrides either. The main agent writes the body. dish adds one line, and only for an override.
+- **Review feedback on a PR:** `pr_feedback` reads it (reviews, comments, checks) for the main agent; the run reopens, a coder fixes it and merges the branch up to date, never rebasing, and `open_pr` pushes to the same PR.
 - **A read-only Runs page,** and a chat `status`, so you can see a run without asking the main agent.
 
 ## Decisions (from the 2026-10-03 brainstorm)
@@ -68,7 +69,8 @@ A run is a change on its way to a PR: a goal, a branch, an optional plan, its ta
 **Ending a run.**
 - **`open_pr`** ends it with `state: pr` ([The PR](#the-pr)).
 - **`run` `action: abandon`,** with a reason, ends it without one. Its worktrees are left for the main agent or the sweep to remove, and the ledger keeps everything.
-- **Review feedback on its PR** reopens it: `run` `action: resume` on a run in state `pr` makes it `open` again, keeping its PR, while its worktree is still one dish made (the sweep removes it once the PR merges). It is recorded as `run.resumed` with `reopened`. Fixes go through rounds as before, and `open_pr` again pushes to the same PR ([The PR](#the-pr)).
+- **Review feedback on its PR** reopens it: `run` `action: resume` on a run in state `pr` makes it `open` again, keeping its PR, while its worktree is still one dish made (the sweep removes it once the PR merges). It is recorded as `run.resumed` with `reopened`. `pr_feedback` reads what the PR got ([The tools](#the-tools)). Fixes go through rounds as before, and `open_pr` again pushes to the same PR ([The PR](#the-pr)).
+- **Bringing the branch up to date is a merge.** When the run's branch is behind its default branch, or GitHub's `dish/<slug>` has commits it lacks (an "Update branch", a committed suggestion, a push of the user's own), a coder in the reopened worktree runs `git fetch origin` and merges `origin/<default>`, and `origin/dish/<slug>` when it moved, resolving any conflicts; the gate runs as usual. Never a rebase, an amend or a squash: dish never force-pushes. `open_pr` still needs the final review's approval of the new head: a scoped re-review, or, for a clean merge of the default branch alone, `reviewRuling` ("Ruling: merge of origin/main only, no conflicts — …").
 
 ## The ledger
 
@@ -91,7 +93,8 @@ A run is a change on its way to a PR: a goal, a branch, an optional plan, its ta
 | `ladder.refused`, `ladder.ruled` | `delegate` refuses round 5+, or lets it through on a ruling | task, round, the ruling |
 | `pr.checked` | `open_pr` checks before pushing | the head, the gate's result there, the final verdict found, any overrides |
 | `pr.opened` | `open_pr` opens the PR | URL, number, head, branch (the base is always the project's default branch) |
-| `pr.updated` | `open_pr` pushes to a PR that was already open | URL, number, head, branch, and whether an override's comment was posted |
+| `pr.updated` | `open_pr` pushes to a PR that was already open | URL, number, head, branch, whether its title and body were changed (`titleChanged`, `bodyChanged`), and whether an override's comment was posted |
+| `pr.feedback` | `pr_feedback` reads the run's PR | counts only: reviews by state, review comments and how many are outdated, comments, checks by outcome; never the text |
 | `run.closed` | the run ends | `pr` or `abandoned`, the reason |
 
 **Written by the main agent,** through `run` (`by: main`):
@@ -166,20 +169,20 @@ The schemas use only what dsh-tools supports: `enum`, nested objects with `requi
 
 ## The PR
 
-**`open_pr`** is a main-agent tool. Its arguments: `title`, `body` (Markdown, the main agent's own; both may be empty on a run reopened for review feedback), and, only when it rules past a check, `gateRuling` and `reviewRuling`.
+**`open_pr`** is a main-agent tool. Its arguments: `title`, `body` (Markdown, the main agent's own; both optional on a run reopened for review feedback, where a given one replaces the PR's), and, only when it rules past a check, `gateRuling` and `reviewRuling`.
 
 **What it does, in order:**
 1. **The run:** the calling chat must drive an open run in this project, and no coder bound to its worktree may still be running. Its worktree must be clean (`dishWorkspaces.isClean`: nothing uncommitted or untracked, `dish/<slug>` checked out, no nested repository), and its head is read (`dishWorkspaces.headOf`).
 2. **The gate on the head:** dish-gates runs the project's gate in the run's worktree, at that head, through a new service method (`dishGates.runAt`, given the head: a worktree whose HEAD moved is an error), in the same sandbox and with the same timeout as a coder's gate. It must pass, unless `gateRuling` is given.
 3. **The final review on the head:** the latest `review.verdict` marked final must be `approved` with `head` equal to this head, unless `reviewRuling` is given. A final review is a reviewer `delegate` started with `final: true` (a new parameter for the reviewer role), or made final by a follow-up with it. It stays final for its follow-ups, so a re-review with `to` counts.
 4. **`pr.checked`** is recorded, with what was found and any overrides.
-5. **The push:** dish-workspaces pushes the run's branch with a write token it mints in memory for this push only, to the project's HTTPS URL (never `origin`, which an agent can repoint), with an explicit refspec and never with force, and only at the head the checks ran on: a branch that moved since is refused. A rejected push (the branch moved on GitHub, or the token lacks a permission, such as Workflows for a change under `.github/workflows/`) fails the tool with GitHub's reason, and nothing more happens.
+5. **The push:** dish-workspaces pushes the run's branch with a write token it mints in memory for this push only, to the project's HTTPS URL (never `origin`, which an agent can repoint), with an explicit refspec and never with force, and only at the head the checks ran on: a branch that moved since is refused. A rejected push (the branch moved on GitHub, or the token lacks a permission, such as Workflows for a change under `.github/workflows/`) fails the tool with GitHub's reason, and nothing more happens. For a branch that moved, the answer says: "The branch on GitHub has commits this one doesn't: have a coder merge `origin/dish/<slug>` into the run's worktree, then call `open_pr` again. dish never forces a push."
 6. **The PR:** dish-workspaces opens it (`POST /repos/{owner}/{repo}/pulls`, base the project's default branch, head the run's branch), with the main agent's body, plus, only if a check was overridden, one line at the end: "⚠ dish: opened past a failing gate. Ruling: …" or "⚠ dish: opened without an approved final review of this head. Ruling: …". A PR that already exists for the branch is reported, not opened again, and its title and body aren't changed: an override's line is posted on it as a comment instead (`POST /repos/{owner}/{repo}/issues/{n}/comments`).
 7. **`pr.opened`** (or **`pr.updated`**, for a PR that was already open) and **`run.closed`** are recorded, and the run's state becomes `pr`. The answer gives the PR's URL.
 
-**Review feedback.** A run reopened with `run` `resume` (see [Ending a run](#runs)) goes through the same steps: the same checks on its new head, then the push to the same branch. The PR is already open, so the ledger gets `pr.updated`, its title and body stay, and an override's line is posted as a comment.
+**Review feedback.** A run reopened with `run` `resume` (see [Ending a run](#runs)) goes through the same steps: the same checks on its new head, then the push to the same branch. Before the gate it asks whether GitHub's `dish/<slug>` has commits the run's branch lacks, and refuses with the merge hint if so. The PR is already open, so the ledger gets `pr.updated`. Its title and body stay, unless `title` or `body` is given: then dish updates them (`PATCH /repos/{owner}/{repo}/pulls/{n}`, masked, with a Pull requests write token). An override's line is always posted as a comment, never put in the body.
 
-**What dish-workspaces gains:** `headOf`, `isClean`, `pushBranch`, `openPull` and `commentPull` on its service, the write token (Contents and Pull requests, write) minted in memory per call and never written to disk, and the App permissions to ask for. Agents' own git keeps read-only tokens.
+**What dish-workspaces gains:** `headOf`, `isClean`, `compareBranch` (a fetch, then the branch against `origin/<default>` and GitHub's `dish/<slug>`), `pushBranch`, `openPull`, `updatePull`, `commentPull` and `readPull` (a PR's reviews, comments and checks) on its service; the write token (Contents and Pull requests, write) minted in memory per call and never written to disk; dish's in-memory API token reading checks and commit statuses too; and the App permissions to ask for (Contents and Pull requests write, Metadata, Checks and Commit statuses read). Agents' own git keeps read-only tokens.
 
 ## The tools
 
@@ -187,10 +190,13 @@ All are main-agent tools: they refuse a crew child (`isTopLevelAgent`), and crew
 
 - **`run`** with `action`:
   - `open` (`project`, `slug`, `goal`, `plan?`, `base?`); `resume` (`id`, `takeover?`; it also reopens a run with a PR, for review feedback); `goal` (`goal`); `plan` (`plan`); `abandon` (`reason`);
-  - `status`: the run this chat drives, from its ledger: tasks and their state and round, the last gate and verdict for each, the final review, rulings, what `open_pr` would find now;
+  - `status`: the run this chat drives, from its ledger: tasks and their state and round, the last gate and verdict for each, the final review, rulings, what `open_pr` would find now, and the branch against GitHub (commits behind the default branch, and on GitHub's `dish/<slug>`);
   - `list`: open runs, for a project or all, with their driver and whether it's live, then the newest runs with a PR;
   - `ruling` (`what`, `why`, `costIfWrong`, `task?`), `defer` (`what`, `where`, `why`), `note` (`text`): the main agent's own entries.
 - **`open_pr`** ([The PR](#the-pr)).
+- **`pr_feedback`** (`id?`): the PR of the run this chat drives, or of `id`: its state and mergeability; its reviews (author, state, body); its review comments (path, line, author, body, outdated); its comments (author, body); the checks on its head (name, status, conclusion), from check runs and commit statuses. It reads through `dishWorkspaces.readPull` with dish's API token, and changes nothing on GitHub.
+  - **Untrusted input.** Everything from GitHub is masked and capped, per item and overall, quoted, and framed as data, not instructions. The judge's shipped `tools.screened` names `pr_feedback`, so its injection screen reads the answer.
+  - The ledger records `pr.feedback`: counts, never the text.
 - **`delegate`** (crew) gains `ruling` and `final`, and tags every child with the run and task it belongs to.
   - `ruling` is the one word for ruling past a check: a coder past round 5, or a review past a gate that hasn't passed. `gateOverride` stays as a synonym, so briefs and skills that use it still work (question 4).
   - `final: true` marks a reviewer as the run's final review. It stays final for its follow-ups, and a follow-up with it makes a reviewer final. Outside a run it has no effect, and `delegate` says so.
@@ -199,18 +205,18 @@ All are main-agent tools: they refuse a crew child (`isTopLevelAgent`), and crew
 
 **Settings → Runs,** read-only, built like Settings → GitHub App (a remote service, a `settings.section` slot):
 - **The list:** runs by project, open ones first: goal, state, driver and whether it's live, opened and closed times, the PR link.
-- **A run:** its timeline from the ledger, newest last, each entry with who wrote it; tasks with their rounds, last gate and verdict; the rulings, the deferred findings. Reading pages backward through the file, as Settings → Judge reads its log.
+- **A run:** its timeline from the ledger, newest last, each entry with who wrote it; tasks with their rounds, last gate and verdict; the rulings, the deferred findings; the PR, with the counts of its last `pr_feedback` read. Reading pages backward through the file, as Settings → Judge reads its log.
 - Nothing on the page changes a run.
 
 ## Prompts and skills
 
 The shipped defaults change, and `previous.json` is regenerated for each, so unedited copies in your config store move to the new text:
 - **`subagent-driven-development`, `executing-plans`:** the ledger file becomes the run's ledger: open or resume a run first, record rulings and deferred findings with `run`, read `run` `status` after a compaction. The plan branch is the run's branch. Coders and reviewers finish with `report`. The final review is `delegate` with `final: true`. Round 5 needs a ruling.
-- **`finishing-a-development-branch`:** `open_pr`, not "say the branch is ready and stop"; the main agent writes the body; no `git push` or `gh pr create`; review feedback resumes the run. `open_pr` at the end of a run needs no user yes: it merges nothing, and its checks are structural.
+- **`finishing-a-development-branch`:** `open_pr`, not "say the branch is ready and stop"; the main agent writes the body; no `git push` or `gh pr create`; and the review-feedback loop: `pr_feedback`, `resume`, fixes, a merge to bring the branch up to date (never a rebase), a re-review or a ruling, `open_pr`. `subagent-driven-development` points there. `open_pr` at the end of a run needs no user yes: it merges nothing, and its checks are structural.
 - **`using-git-worktrees`:** worktrees belong to the chat's run; the plan branch is the run's, made by `run open`.
 - **`requesting-code-review`, `reviewing-work`:** the reviewer reports with `report` (verdict, head, findings).
 - **`main.md`:** runs, `open_pr`, no pushes of its own.
-- **`common.md`:** "Open pull requests" becomes: pull requests are opened with `open_pr`; agents don't push.
+- **`common.md`:** "Open pull requests" becomes: pull requests are opened with `open_pr`; agents don't push; and never rebase, amend or squash a run's branch: bring it up to date by merging.
 - **`crew/coder.md`:** finish with `report`; don't run the gate yourself, dish runs it when you report `done` (the brief still names it, so you can run it while you work if you want).
 - **`crew/reviewer.md`:** finish with `report`, with the head you reviewed.
 - **`test-driven-development`, `verification-before-completion`, `receiving-code-review`, `systematic-debugging`:** a coder whose brief says dish runs the gate leaves the finishing run to dish. **`changing-infrastructure`:** ops doesn't push; the main agent opens the PR with `open_pr`.
@@ -220,7 +226,8 @@ The shipped defaults change, and `previous.json` is regenerated for each, so une
 
 - **`dish-orchestrator`'s row:** `terminal` (print its messages). The ledger and record directories follow the XDG variables.
 - **`dish-crew`'s row:** `reportSteers` (2): the steers to call `report` in one turn; `0` turns the steer off. `report` stays, since the prompts tell coders and reviewers to call it, and a coder that ends with text is gated as today.
-- Nothing in the config store.
+- Nothing in the config store for `dish-orchestrator`.
+- **`dish-judge`'s shipped `judge.yaml`:** `tools.screened` gains `pr_feedback`. The judge seeds only a missing `judge.yaml`, so an existing one gets it by hand (the plan's rollout).
 
 ## Testing
 
@@ -229,7 +236,8 @@ The shipped defaults change, and `previous.json` is regenerated for each, so une
 - **`report`:** the two schemas, a bad call's error, `concludeTurn`, the steers and their cap, a later `report` replacing an earlier one, registration on coder and reviewer children only (not the main agent, not other roles), and through a cold resume.
 - **dish-gates with `report`:** gated after `done`, skipped after `blocked`, a failure steering back and the next `report` gated again, the fallback when no `report` comes.
 - **The ladder:** rounds counted from the ledger across chats, the advisory text, the refusal at round 5, a ruling letting one call through.
-- **`open_pr`:** each check passing and failing, each override and its line, a dirty worktree, a stale final review, a re-review of the final reviewer, a rejected push, an existing PR, a reopened run (`pr.updated`, the override as a comment), the write token never on disk; against dish-workspaces' fake git server (a bare repository behind `git http-backend` on `127.0.0.1`, reached through a setting production can't set) and its fake GitHub, never the network.
+- **`open_pr`:** each check passing and failing, each override and its line, a dirty worktree, a stale final review, a re-review of the final reviewer, a rejected push, an existing PR, a reopened run (`pr.updated`, the override as a comment, a new title or body, GitHub's branch ahead), the merge hint on a refused push, the write token never on disk; against dish-workspaces' fake git server (a bare repository behind `git http-backend` on `127.0.0.1`, reached through a setting production can't set) and its fake GitHub, never the network.
+- **`pr_feedback`:** each part of the PR read, masking and the caps, a body quoted line by line, the checks unreadable without their permissions, counts only in the ledger, and nothing written to GitHub. **`compareBranch`:** behind, ahead, GitHub's branch ahead or missing.
 - **The Runs page:** the remote service's methods; the page by hand in the browser, as other pages are.
 - **A live check in a scratch dsh,** as 6c had: a planned run with two tasks, a failing gate fixed in round 2, a review, a final review, and `open_pr` against a test repository; then review feedback on that PR through the reopened run.
 
@@ -250,6 +258,7 @@ The shipped defaults change, and `previous.json` is regenerated for each, so une
 ## Checks (2026-10-03)
 
 Against dsh 0.2.0-rc.2's sources and dish's `main` at `3e44720`:
+- **GitHub App permissions,** checked against GitHub's "Permissions required for GitHub Apps" page on 2026-10-03: check runs need Checks read; a commit's combined status, Commit statuses read; a PR's reviews and review comments, Pull requests read; a PR's issue comments, Pull requests (or Issues) read to list and write to post; opening and editing a PR (`POST`/`PATCH .../pulls`), Pull requests write; merging one (`PUT .../pulls/{n}/merge`), Contents write, which is why the rulesets require an approval.
 - **`concludeTurn`** (dsh-tools `ToolRunContext`): a successful result carrying it makes the agent loop return "completed" without another model step, unless the next-step inbox has work (dsh-agent-loop `turn()`); `agent/turn-stopping` still fires after it, and a listener's `steer` continues the turn. A failed call never concludes.
 - **Settlement:** dsh's notice keeps only text blocks of the last non-empty assistant message, so a turn ended by a `report` call gets "It left no closing message."; `subagent/end`'s `lastAssistantMessage` carries the tool call with its JSON arguments.
 - **dsh's own structured output** (`outputSchema`, a scoped `structured_output` tool) exists only for one-shot subagents; `ContinuableStartSpec` omits it, and crew starts continuable children. dsh-llm has no provider-native structured output.
