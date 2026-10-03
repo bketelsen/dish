@@ -1,10 +1,10 @@
 # Spec: a writable home in the sandbox
 
-Status: approved, 2026-10-02. To be built on branch `sandbox-home` from `main`. You asked for this after mise approvals kept piling up: "if we can sandbox this a little bit, i'm all for relaxing all of these crazy restrictions. My agents need to get work done."
+Status: merged as [bketelsen/dish#9](https://github.com/bketelsen/dish/pull/9) and deployed on 2026-10-03 (approved 2026-10-02). On the VM, `go test` in the sandbox then downloaded modules into `~/go` with no escalation. You asked for this after mise approvals kept piling up: "if we can sandbox this a little bit, i'm all for relaxing all of these crazy restrictions. My agents need to get work done."
 
-It replaces most of [mise approvals](https://github.com/bketelsen/dish/blob/mise-approvals/docs/specs/mise-approvals.md):
+It replaces most of mise approvals, whose spec, `docs/specs/mise-approvals.md`, is only on the unpushed local branch `mise-approvals`:
 - **Shelved:** the `dish-mise` wrapper, the judge's trusted rule and its checkbox. They stay unmerged on their branches.
-- **Kept:** fleet's part. It preinstalls the toolchains and trusts `~/work`, in a reworked fleet PR.
+- **Kept:** fleet's part. It preinstalls the toolchains and trusts `~/work`, reworked as [bketelsen/fleet#40](https://github.com/bketelsen/fleet/pull/40) and [bketelsen/fleet#41](https://github.com/bketelsen/fleet/pull/41), merged and applied on 2026-10-03.
 
 ## The problem
 
@@ -125,6 +125,8 @@ There is one implementer, then one review.
    - the escalation hint still appears for a protected path.
 
 ## The rollout (for you)
+
+Done on 2026-10-03: merged as [bketelsen/dish#9](https://github.com/bketelsen/dish/pull/9) and deployed, with fleet's PRs (step 5) applied the same day.
 
 1. Merge `sandbox-home`.
 2. On the VM, run `dish-update --apply` twice (corrected in the build).

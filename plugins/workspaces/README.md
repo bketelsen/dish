@@ -6,7 +6,7 @@ The mechanics behind dish's [projects](../projects/): the clones, the GitHub App
 - **Worktrees.** The `worktree` tool, for the main agent: one worktree per task, inside the clone, on `dish/<slug>`. Crew's `delegate` binds a coder to one. Merged ones are swept away.
 - **Settings â†’ GitHub App** takes the App's ID and private key, and tests them.
 
-The design is in the [spec](../../docs/specs/projects-workspaces.md) and the [plan](../../docs/plans/2026-10-02-projects.md). Its "Notes from the build" say what changed on the way. The Apps themselves are made by hand: the plan's [rollout](../../docs/plans/2026-10-02-projects.md#the-rollout-for-you) has the steps.
+The design is in the [spec](../../docs/specs/projects-workspaces.md) and the [plan](../../docs/plans/2026-10-02-projects.md). Its "Notes from the build" say what changed on the way. The Apps themselves are made by hand: the plan's [rollout](../../docs/plans/2026-10-02-projects.md#the-rollout-for-you) has the steps. Today there is one, the dev App `bketelsen-dish-dev`, and the VM uses it (since 2026-10-03); the prod App the rollout names, `bketelsen-dish`, hasn't been made.
 
 ## Install
 
@@ -61,7 +61,7 @@ dish-projects runs it one project at a time, and reports each step on Settings â
 
 A skip says why, and gives the command to run and where. In a fresh clone, setup is `bash -c <setup>` with stdin closed:
 - **Its environment** is dsh's, scrubbed as dsh scrubs every agent shell (no name with `KEY`, `PASSWORD`, `SECRET` or `TOKEN`, no `DSH_*`), with every `GIT_*` name and `SSH_ASKPASS` removed and `GIT_TERMINAL_PROMPT=0` added. dish's git settings (`SAFE_FLAGS`) are added as `GIT_CONFIG_COUNT` pairs, with `-c` precedence, and `GIT_GRAFT_FILE=/dev/null`, so the git that setup runs has hooks off too.
-- **Its tools** are the ones on its `PATH`: under the service, the unit's, so dish's own Node and pnpm (`/opt/dish/node/bin`), with `/usr/local/bin/mise` but not mise's tools. A repo whose tools come from mise needs a setup that goes through it, such as `mise trust && mise exec -- pnpm install --frozen-lockfile`: stdin is closed, so mise can't ask to trust the repo's config, and the clone only exists once onboarding has started, so it can't be trusted beforehand.
+- **Its tools** are the ones on its `PATH`: under the service, the unit's, so dish's own Node and pnpm (`/opt/dish/node/bin`), with `/usr/local/bin/mise` but not mise's tools. A repo whose tools come from mise needs a setup that goes through it, such as `mise trust && mise exec -- pnpm install --frozen-lockfile`: stdin is closed, so mise can't ask to trust the repo's config, and the clone only exists once onboarding has started, so it can't be trusted beforehand. On the VM, fleet's mise config for the account trusts configs under `~/work` ([bketelsen/fleet#40](https://github.com/bketelsen/fleet/pull/40) and [bketelsen/fleet#41](https://github.com/bketelsen/fleet/pull/41), 2026-10-03), so the `mise trust` isn't needed there. Keep it for dev's clones, which that rule doesn't cover.
 - **Its own process group,** sent TERM and then KILL after 5 seconds when `setupTimeout` passes, when the project is removed, or when dish stops.
 - **A failure** fails the project, with up to the last 20 lines of its masked log in the message (at most 900 characters in all), which ends "Retry won't run setup again in this clone: remove the clone and press Retry, or run it yourself in <clone>".
 
