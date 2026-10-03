@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -177,6 +177,21 @@ function assertRowsFirst(calls: DshCall[]): void {
   for (const call of adds) assert.equal(call.patchHasRow, true, `dsh ${call.args.join(' ')}: the patch file had no dish-config row yet`)
 }
 
+/** The first regular file under `dir` with more than one link, if any: a link into pnpm's store, or anything else. */
+function firstLinked(dir: string): string | undefined {
+  const pending = [dir]
+  while (pending.length > 0) {
+    const current = pending.pop()!
+    for (const name of readdirSync(current)) {
+      const path = join(current, name)
+      const entry = lstatSync(path)
+      if (entry.isDirectory()) pending.push(path)
+      else if (entry.isFile() && entry.nlink > 1) return path
+    }
+  }
+  return undefined
+}
+
 /** The account's own XDG directories hold nothing of dish's: no `dish` directory, so no config store. */
 async function assertNoStore(scratch: Scratch): Promise<void> {
   for (const [name, path] of Object.entries(scratch.xdg)) {
@@ -228,7 +243,15 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.match(first.stdout, /install: dish rows \(.*\): updated/)
   assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge web; already linked: none/)
   assert.match(first.stdout, /^install: sandbox home: off$/m)
+  assert.match(first.stdout, /^install: the profile's pnpm installs copy: updated$/m)
+  assert.match(first.stdout, /^install: links into pnpm's store replaced by copies: \d+$/m)
   assert.match(first.stdout, /install: profile changed/)
+  // dish's own installs are copies, not links into the store an agent's command can write.
+  const profileWorkspace = parse(await readFile(join(scratch.dshHome, 'profiles', 'web', 'pnpm-workspace.yaml'), 'utf8')) as Record<string, unknown>
+  assert.equal(profileWorkspace.packageImportMethod, 'clone-or-copy')
+  assert.equal(profileWorkspace.nodeLinker, 'hoisted', "dsh's own settings stay")
+  assert.equal(firstLinked(join(scratch.dshHome, 'profiles', 'web', 'node_modules')), undefined)
+  assert.equal(firstLinked(join(ROOT, 'node_modules')), undefined)
   const firstCalls = dshCalls(scratch)
   assert.equal(firstCalls.length, 8, 'one dsh command makes the profile, one links each bundle')
   assertIsolated(scratch, firstCalls)
@@ -245,6 +268,8 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.match(second.stdout, /install: dish rows \(.*\): unchanged/)
   assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge web/)
   assert.match(second.stdout, /install: no changes to the profile/)
+  assert.match(second.stdout, /^install: the profile's pnpm installs copy: unchanged$/m)
+  assert.match(second.stdout, /^install: links into pnpm's store replaced by copies: 0$/m)
   assert.equal(dshCalls(scratch).length, 8, 'the second run starts no dsh command')
   assert.equal(statSync(patch).mtimeMs, patchBefore, 'the patch file was not rewritten')
   assert.equal(statSync(manifest).mtimeMs, manifestBefore, "the profile's package.json was not rewritten")

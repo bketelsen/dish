@@ -11,3 +11,8 @@ allowBuilds:
   esbuild: true
   '@google/genai': false
   protobufjs: false
+
+# dish's own installs copy pnpm's store instead of hard-linking it (a reflink where the file system has them). On the
+# VM, sandboxed commands can write the store, and a file an agent changed there would change this checkout too
+# (deploy/pnpm-copies.ts, docs/specs/sandbox-home.md).
+packageImportMethod: clone-or-copy
