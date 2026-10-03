@@ -6,8 +6,9 @@
  * - **create** passes the calling chat's workspace (`exec.agent.session.header.cwd`) and the call's signal to
  *   `dishWorkspaces.createWorktree`, which refuses a project that isn't ready, a chat with no workspace, and a worktree
  *   outside it (a coder of that chat works in its sandbox, which is its workspace). Its answer is the path, the branch,
- *   the base commit and what setup did: in 6b setup doesn't run in a worktree (the user's A, 2026-10-02), so the answer tells
- *   the main agent to run the command in it itself, escalated (the judge allows it or asks the user), before it delegates.
+ *   the base commit and what setup did: in 6b setup doesn't run outside the sandbox in a worktree (the user's A, 2026-10-02), so
+ *   the answer tells the main agent to run the command in it, in the sandbox, before the work starts (itself, or by telling the
+ *   coder to run it first), and again escalated only if that fails with "Read-only file system" (the judge allows it or asks the user).
  * - **list** shows each worktree with the crew children bound to it (`dishCrew.worktreeBindings`); **remove** refuses
  *   one a running coder is bound to, even with `force`.
  * - The service's refusals reach the model as plain `Error`s with its message (masked already). Models fill every
@@ -95,7 +96,8 @@ const DESCRIPTION = 'Make, list and remove task worktrees in a registered projec
   + 'Use one worktree per task. `create` (`project`, `slug`, optional `base`) makes `<clone>/.worktrees/<slug>` on a new branch `dish/<slug>`, '
   + 'cut from `origin/<default branch>` unless you give `base` (a branch, tag or commit, such as `origin/dish/plan-x`); '
   + 'it works only in a chat whose workspace is that project\'s clone. Its answer gives the path, the branch, the base commit, and whether setup ran: '
-  + 'if it didn\'t, run the command it gives in the worktree yourself, escalated, before you delegate: a coder can\'t. '
+  + 'if it didn\'t, run the command it gives in the worktree, sandboxed, before the work starts (or tell the coder to run it first), '
+  + 'and escalate only if it fails with "Read-only file system" (a coder can\'t escalate, and reports it). '
   + 'Hand a worktree to a coder with `delegate`\'s `worktree` parameter (`<project>/<slug>`), never only in the task text: the binding is what lets the harness check its work. '
   + '`list` (optional `project`) shows each worktree: ahead and behind the default branch, dirty or clean, merged or not, whether dish made it, and the coder bound to it. '
   + '`remove` (`project`, `slug`, optional `force`) deletes a worktree dish made, and its branch; it refuses one that is unmerged or dirty unless `force`, '

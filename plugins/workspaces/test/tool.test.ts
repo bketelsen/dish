@@ -120,11 +120,12 @@ test('create passes the session\'s cwd and the call\'s signal, and answers the p
   assert.ok(text.includes('dish/fix-1'))
   assert.ok(text.includes(SHA))
   assert.match(text, /delegate/)
-  // What setup didn't do is said once, with how the main agent runs it: escalated, before it delegates.
+  // What setup didn't do is said once, with how it goes ahead: in the sandbox, before the work starts, escalated only if that fails.
   assert.equal(text.match(/setup didn't run/gi)?.length, 1, text)
   assert.ok(text.includes(`Setup didn't run outside the sandbox: a worktree picks up config from the clone, which agents can change. `
-    + `Before you delegate, run its setup yourself in ${CLONE}/.worktrees/fix-1, escalated (\`sandbox_permissions: "danger-full-access"\`), `
-    + 'so the judge allows it or asks the user: pnpm install. A coder can\'t.'), text)
+    + `Run it in ${CLONE}/.worktrees/fix-1 in the sandbox before the work starts (yourself, or tell the coder to run it first): pnpm install. `
+    + 'If it fails with "Read-only file system", run it again escalated (`sandbox_permissions: "danger-full-access"`), '
+    + 'so the judge allows it or asks the user; a coder can\'t escalate, and reports it instead.'), text)
 
   // A base, and a chat with no workspace (the service refuses that, not the tool).
   await tool.execute({ action: 'create', project: 'acme/widget', slug: 'fix-2', base: 'origin/dish/plan' }, exec({ cwd: null }))
