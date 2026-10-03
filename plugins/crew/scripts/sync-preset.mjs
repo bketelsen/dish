@@ -7,12 +7,17 @@
 //   --out <file>                          write or check <file> instead
 //
 // The standard file's plugin list is copied line for line, so its indentation,
-// comments, `!!js` tags and nested groups survive untouched. Three things change:
+// comments, `!!js` tags and nested groups survive untouched. Four things change:
 //   - the `persona` row becomes dish-prompts/persona;
 //   - the row dish-crew/delegate follows it, so the main agent has `delegate`;
 //   - the rows of dsh's own delegation (`subagent`, `subagent_fork` and the
 //     workflow engine) get `disabled: true`, so the main agent delegates through
-//     crew only. `send_message`, `interrupt_agent` and `list_agents` stay.
+//     crew only. `send_message`, `interrupt_agent` and `list_agents` stay;
+//   - the `tool-subagent-control` row becomes dish-crew/control, the same
+//     `send_message` and `interrupt_agent` without dsh's mark, so dsh adds no
+//     "send your result with send_message" note to a crew child's task. A row of
+//     dsh's package left in stops the generator: two `send_message` tools in one
+//     scope is a registration error.
 // A row of any other id whose package is one of dsh's delegation packages, and
 // that the preset leaves enabled, stops the generator, so a dsh upgrade can't
 // slip `subagent` back in.
@@ -60,6 +65,10 @@ const DELEGATION_PACKAGES = [
   '@deepseek-ai/dsh-tool-ralph',
   '@deepseek-ai/dsh-workflow-ptc',
 ]
+
+/** dsh's row for `send_message` and `interrupt_agent`, and the package it loads, which dish-crew/control stands in for. */
+const CONTROL_ID = 'tool-subagent-control'
+const CONTROL_PACKAGE = '@deepseek-ai/dsh-tool-subagent-control'
 
 /** The `insert` row around the list, in the standard file's own shape. The list goes under `plugins:`. */
 const WRAPPER = [
@@ -111,6 +120,46 @@ function disable(rows, id) {
   const name = keys.find(i => /^\s*name:/.test(rows[i]))
   if (name === undefined) throw new Error(`the \`${id}\` row in the standard preset has no \`name:\` line`)
   rows.splice(name + 1, 0, `${pad}disabled: true`)
+}
+
+/**
+ * Put `replacement` (rows' lines, indented from the dash) where the row `id` was, at its dash's indentation. The row may
+ * sit anywhere in the list, inside a group too, but there must be exactly one. Comments and blank lines after it, before
+ * the next row, stay.
+ *
+ * @param {string[]} rows the list's lines, changed in place
+ * @param {string} id the row's `id`
+ * @param {string[]} replacement the new row's lines, the first starting `- `, with no indentation of their own
+ */
+function replace(rows, id, replacement) {
+  const pattern = new RegExp(`^\\s*- id:\\s*['"]?${id}['"]?\\s*(#.*)?$`)
+  const found = rows.flatMap((line, i) => pattern.test(line) ? [i] : [])
+  if (found.length !== 1) throw new Error(`expected one \`${id}\` row in the standard preset, found ${found.length}`)
+  const start = found[0]
+  const dash = indentOf(rows[start])
+  let end = start + 1
+  while (end < rows.length && (isBlank(rows[end]) || isComment(rows[end]) || indentOf(rows[end]) > dash)) end++
+  // Trailing comments and blank lines belong to what follows.
+  while (end > start + 1 && (isBlank(rows[end - 1]) || isComment(rows[end - 1]))) end--
+  const pad = ' '.repeat(dash)
+  rows.splice(start, end - start, ...replacement.map(line => pad + line))
+}
+
+/**
+ * Refuse a row that loads dsh's own `send_message` (`tool-subagent-control`, whatever its id). dish-crew/control registers
+ * a `send_message` of its own in the same scope, and two of one name there is a registration error. Its `list-agents`
+ * subpath is another package name, so the `list_agents` row stays.
+ *
+ * @param {string[]} rows the list's lines
+ * @throws {Error} naming the first such line
+ */
+function refuseDshControl(rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const named = /^\s*(- )?name:\s*(['"]?)([^'"\s#]+)\2\s*(#.*)?$/.exec(rows[i])
+    if (named !== null && named[3] === CONTROL_PACKAGE) {
+      throw new Error(`line ${i + 1} of the dish preset's list loads ${CONTROL_PACKAGE}, whose \`send_message\` dish-crew/control replaces: two in one scope is a registration error. Find the row that brings it in.`)
+    }
+  }
 }
 
 /**
@@ -204,6 +253,8 @@ export function generate(standardText, version) {
   const rows = [...list.slice(0, start), ...persona, ...delegate, ...list.slice(last + 1)]
   for (const id of DISABLED) disable(rows, id)
   refuseEnabledDelegation(rows)
+  replace(rows, CONTROL_ID, ['- id: dish-crew-control', '  name: dish-crew/control'])
+  refuseDshControl(rows)
 
   // Under the wrapper the rows sit at LIST_INDENT. They already do, unless dsh
   // reshaped its file; then every line moves by the same amount.
@@ -218,13 +269,17 @@ export function generate(standardText, version) {
     '# (presets/standard.patch.yml). Do not edit it by hand: the next run replaces',
     '# it, and the drift test fails until the committed file matches.',
     '#',
-    "# The dish preset: the standard preset's plugin list, with three changes:",
+    "# The dish preset: the standard preset's plugin list, with four changes:",
     '#   - its `persona` row is replaced by dish-prompts/persona, so the main',
     "#     agent's prompts come from Settings → Prompts;",
     '#   - dish-crew/delegate follows it, which gives the main agent `delegate`;',
     "#   - dsh's own delegation (`subagent`, `subagent_fork` and the workflow",
     '#     engine) is disabled, so the main agent delegates through crew only.',
-    '#     `send_message`, `interrupt_agent` and `list_agents` stay.',
+    '#     `send_message`, `interrupt_agent` and `list_agents` stay;',
+    "#   - dsh's `tool-subagent-control` row is replaced by dish-crew/control:",
+    "#     the same `send_message` and `interrupt_agent`, without dsh's mark, so",
+    '#     dsh adds no "send your result with send_message" note to a crew',
+    "#     child's task.",
     '# Edits saved from Settings → Agent presets live in your profile and override',
     "# this row's `config.plugins` there.",
     '#',

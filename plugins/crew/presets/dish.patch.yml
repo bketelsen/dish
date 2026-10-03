@@ -2,13 +2,17 @@
 # (presets/standard.patch.yml). Do not edit it by hand: the next run replaces
 # it, and the drift test fails until the committed file matches.
 #
-# The dish preset: the standard preset's plugin list, with three changes:
+# The dish preset: the standard preset's plugin list, with four changes:
 #   - its `persona` row is replaced by dish-prompts/persona, so the main
 #     agent's prompts come from Settings → Prompts;
 #   - dish-crew/delegate follows it, which gives the main agent `delegate`;
 #   - dsh's own delegation (`subagent`, `subagent_fork` and the workflow
 #     engine) is disabled, so the main agent delegates through crew only.
-#     `send_message`, `interrupt_agent` and `list_agents` stay.
+#     `send_message`, `interrupt_agent` and `list_agents` stay;
+#   - dsh's `tool-subagent-control` row is replaced by dish-crew/control:
+#     the same `send_message` and `interrupt_agent`, without dsh's mark, so
+#     dsh adds no "send your result with send_message" note to a crew
+#     child's task.
 # Edits saved from Settings → Agent presets live in your profile and override
 # this row's `config.plugins` there.
 #
@@ -99,8 +103,8 @@
             isolate:
               workflowEngine: true
             config:
-              - id: tool-subagent-control
-                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: dish-crew-control
+                name: dish-crew/control
               - id: tool-subagent-list-agents
                 name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
               - id: tool-subagent

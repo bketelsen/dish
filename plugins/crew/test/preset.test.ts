@@ -16,6 +16,8 @@ const COMMITTED = join(PLUGIN, 'presets', 'dish.patch.yml')
 const SCRIPT = join(PLUGIN, 'scripts', 'sync-preset.mjs')
 
 const SYNC = 'pnpm --filter dish-crew sync-preset'
+/** dsh's row for `send_message` and `interrupt_agent`, which dish-crew/control replaces. */
+const CONTROL_NAME = "'@deepseek-ai/dsh-tool-subagent-control'"
 const PERSONA_NAME = "'@deepseek-ai/dsh-persona'"
 const DESCRIPTION = "The dish main agent: your prompts from Settings → Prompts, and a crew to delegate to, on the standard tool set without dsh's own delegation tools."
 
@@ -74,7 +76,9 @@ test('the dish preset swaps the persona row, adds the delegate row after it, and
   const output = generate(standard.text, standard.version)
   const names = listNames(standard.text)
   assert.equal(names.filter(name => name === PERSONA_NAME).length, 1, 'the standard preset has one persona row')
-  assert.deepEqual(listNames(output), names.flatMap(name => name === PERSONA_NAME ? ['dish-prompts/persona', 'dish-crew/delegate'] : [name]))
+  assert.deepEqual(listNames(output), names.flatMap(name => name === PERSONA_NAME
+    ? ['dish-prompts/persona', 'dish-crew/delegate']
+    : name === CONTROL_NAME ? ['dish-crew/control'] : [name]))
   assert.ok(!output.includes('@deepseek-ai/dsh-persona'), 'no stock persona row')
   assert.ok(!output.includes('You are a coding agent'), 'the stock persona config is gone')
   assert.equal(output.split('\n').filter(line => line.trim() === 'name: dish-prompts/persona').length, 1)
@@ -110,13 +114,16 @@ test('the four rows of dsh\'s own delegation are disabled, right after their nam
   }
 })
 
-test('the rows for send_message, interrupt_agent and list_agents stay enabled, as standard has them', () => {
+test('send_message and interrupt_agent come from dish-crew/control, where dsh\'s row was; list_agents stays as standard has it', () => {
   const output = generate(standard.text, standard.version)
-  for (const id of ['tool-subagent-control', 'tool-subagent-list-agents']) {
-    assert.deepEqual(rowLines(output, id), rowLines(standard.text, id), id)
-    assert.deepEqual(rowLines(output, id).filter(line => /^\s*disabled:/.test(line)), [], id)
-  }
-  assert.ok(rowLines(output, 'tool-subagent-control').some(line => line.includes('dsh-tool-subagent-control')))
+  const stock = rowLines(standard.text, 'tool-subagent-control')
+  const indent = stock[0]!.length - stock[0]!.trimStart().length
+  const pad = ' '.repeat(indent)
+  assert.deepEqual(rowLines(output, 'dish-crew-control'), [`${pad}- id: dish-crew-control`, `${pad}  name: dish-crew/control`])
+  assert.ok(!output.split('\n').some(line => /^\s*- id:\s*tool-subagent-control\s*$/.test(line)), 'dsh\'s row is gone')
+  assert.ok(!output.includes(`name: ${CONTROL_NAME}`), 'nothing loads dsh\'s send_message')
+  assert.deepEqual(rowLines(output, 'tool-subagent-list-agents'), rowLines(standard.text, 'tool-subagent-list-agents'))
+  assert.deepEqual(rowLines(output, 'tool-subagent-list-agents').filter(line => /^\s*disabled:/.test(line)), [])
   assert.ok(rowLines(output, 'tool-subagent-list-agents').some(line => line.includes('dsh-tool-subagent-control/list-agents')))
   assert.ok(output.includes('- id: delegation\n'), 'the delegation group stays')
 })
@@ -181,9 +188,11 @@ test('the dish preset parses as YAML with its !!js tags, and its list is the sta
 
   const persona = { id: 'dish-persona', name: 'dish-prompts/persona', config: { role: 'main' } }
   const delegate = { id: 'dish-crew-delegate', name: 'dish-crew/delegate' }
-  /** The standard list as the dish preset should have it: persona swapped, delegate after it, the four rows disabled. */
+  const control = { id: 'dish-crew-control', name: 'dish-crew/control' }
+  /** The standard list as the dish preset should have it: persona swapped, delegate after it, control swapped, the four rows disabled. */
   const expect = (entries: any[]): any[] => entries.flatMap(entry => {
     if (entry.id === 'persona') return [persona, delegate]
+    if (entry.id === 'tool-subagent-control') return [control]
     const copy = DISABLED_IDS.includes(entry.id) ? { ...entry, disabled: true } : entry
     return [Array.isArray(copy.config) ? { ...copy, config: expect(copy.config) } : copy]
   })
@@ -207,9 +216,10 @@ test('the dish preset parses as YAML with its !!js tags, and its list is the sta
   assert.deepEqual(delegation.map(([id]) => id).sort(), [...DISABLED_IDS, ...STOCK_DISABLED_IDS].sort(), 'the delegation packages have exactly these rows')
   assert.deepEqual(delegation.filter(([, disabled]) => disabled !== true).map(([id]) => id), [], 'every row of a delegation package is disabled: true')
   const ids = (entries: any[]): string[] => entries.flatMap(entry => [entry.id, ...(Array.isArray(entry.config) ? ids(entry.config) : [])])
-  assert.ok(ids(row.config.plugins).includes('tool-subagent-control'))
+  assert.ok(ids(row.config.plugins).includes('dish-crew-control'))
+  assert.ok(!ids(row.config.plugins).includes('tool-subagent-control'))
   assert.ok(ids(row.config.plugins).includes('tool-subagent-list-agents'))
-  assert.ok(!disabledIds(row.config.plugins).some(id => id.startsWith('tool-subagent-control') || id === 'tool-subagent-list-agents'))
+  assert.ok(!disabledIds(row.config.plugins).some(id => id === 'dish-crew-control' || id === 'tool-subagent-list-agents'))
   assert.ok(row.config.plugins.some((entry: { disabled?: unknown }) => typeof entry.disabled === 'object'), 'the !!js tags came through')
 })
 
@@ -335,8 +345,8 @@ const DELEGATION_OFF = [
   '            name: cordis:group',
   '            group: true',
   '            config:',
-  '              - id: tool-subagent-control',
-  "                name: '@deepseek-ai/dsh-tool-subagent-control'",
+  '              - id: dish-crew-control',
+  '                name: dish-crew/control',
   '              - id: tool-subagent',
   "                name: '@deepseek-ai/dsh-tool-subagent'",
   '                disabled: true',
@@ -496,6 +506,17 @@ test('a new row of a delegation package that is not disabled is refused, naming 
   }
   const sibling = ['              - id: tool-extra', "                name: '@deepseek-ai/dsh-tool-subagent'", '                config:', '                  provider: spawn']
   assert.throws(() => generate(standardOf([...PERSONA, ...DELEGATION, ...sibling]), '1.0.0'), /`tool-extra`/, 'the standard shape: a row with config')
+})
+
+test('a standard file without dsh\'s control row, or with dsh\'s send_message loaded a second time, is refused', () => {
+  const at = DELEGATION.findIndex(line => line.endsWith('- id: tool-subagent-control'))
+  const without = [...DELEGATION.slice(0, at), ...DELEGATION.slice(at + 2)]
+  assert.throws(() => generate(standardOf([...PERSONA, ...without]), '1.0.0'), /`tool-subagent-control`/)
+  // Another row of dsh's package, under any id, would register a second send_message beside dish-crew/control's.
+  const again = ['              - id: tool-other-control', `                name: ${CONTROL_NAME}`]
+  assert.throws(() => generate(standardOf([...PERSONA, ...DELEGATION, ...again]), '1.0.0'), /dsh-tool-subagent-control/)
+  // Its list-agents subpath is another package: that row stays.
+  assert.doesNotThrow(() => generate(standardOf([...PERSONA, ...DELEGATION, '              - id: tool-subagent-list-agents', "                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'"]), '1.0.0'))
 })
 
 test('a new row of a delegation package that is already disabled: true is accepted, and the control rows are not delegation rows', () => {

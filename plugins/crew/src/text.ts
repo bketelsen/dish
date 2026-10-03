@@ -9,7 +9,7 @@
 /**
  * What crew puts after a text block it writes into a message, before the next block: a blank line. dsh's adapters join a
  * message's text blocks with nothing between them (pi-ai's `flattenText` and `userContent`, and deepseek's), so without it
- * a model reads "create ok.txtYour worktree is…". The blocks themselves (`worktreeBrief`, `CLOSING_NOTE`, `noticeText`) stay
+ * a model reads "create ok.txtYour worktree is…". The blocks themselves (`worktreeBrief`, `closingNote`, `noticeText`) stay
  * as they are, byte for byte; only the assembly of a message adds it.
  */
 export const BLOCK_END = '\n\n'

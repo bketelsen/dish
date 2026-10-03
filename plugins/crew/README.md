@@ -121,12 +121,13 @@ Records not touched for 180 days are pruned at startup. A finish notice gives it
 
 ## The dish preset
 
-`presets/dish.patch.yml` is **generated** from the `standard` preset of the dsh you have installed. It differs in three ways:
+`presets/dish.patch.yml` is **generated** from the `standard` preset of the dsh you have installed. It differs in four ways:
 - the stock persona row is replaced by `dish-prompts/persona`;
 - the `dish-crew/delegate` row is added;
-- dsh's own delegation rows (`subagent`, `subagent_fork` and the workflow engine) are disabled.
+- dsh's own delegation rows (`subagent`, `subagent_fork` and the workflow engine) are disabled;
+- dsh's `tool-subagent-control` row is replaced by `dish-crew/control`: the same `send_message` and `interrupt_agent`, without the mark that has dsh append "send your result to that agent with send_message" to a child's task. `delegate`'s own note gives the child its parent's id instead.
 
-Any row from dsh's delegation packages left enabled fails the generator. The `subagent` row would otherwise install its tool into every agent on the preset, children included, where no filter reaches.
+Any row from dsh's delegation packages left enabled fails the generator, and so does a row that would still load `@deepseek-ai/dsh-tool-subagent-control` beside `dish-crew/control` (two `send_message` tools in one scope). The `subagent` row would otherwise install its tool into every agent on the preset, children included, where no filter reaches.
 
 After a dsh upgrade, a test fails if `standard` changed. Run:
 
@@ -147,7 +148,7 @@ pnpm --filter dish-crew sync-preset
 
 - **A start that fails still counts** toward `perSession`, a cancelled one included.
 - **`send_message` isn't checked against the limits.** It can still wake a finished child, and the woken child counts as running from then on. Fix rounds should go through `delegate` with `to`.
-- **The report guard reads length, then holds.** A crew child's first `send_message` over `messageLimit` characters is refused, whatever it says, and from then on every `send_message` of that child is refused until its run ends: it can't tell a report in pieces from a question, so a question a child is blocked on goes in its closing message, and you or the main agent follow up with `delegate` and `to`. A follow-up run starts with `send_message` open. Messages from the main agent and from other plugins' children, and any message sent while crew's record can't be read, are never refused. dsh adds a note to a child's task that tells it to send its result with `send_message` before it finishes; crew puts a note of its own in front of it saying not to, and the guard keeps a child that does anyway from sending a long one.
+- **The report guard reads length, then holds.** A crew child's first `send_message` over `messageLimit` characters is refused, whatever it says, and from then on every `send_message` of that child is refused until its run ends: it can't tell a report in pieces from a question, so a question a child is blocked on goes in its closing message, and you or the main agent follow up with `delegate` and `to`. A follow-up run starts with `send_message` open. Messages from the main agent and from other plugins' children, and any message sent while crew's record can't be read, are never refused. On the dish preset dsh no longer adds its note telling a child to send its result with `send_message` (`dish-crew/control`), and crew's own note says not to; the guard keeps a child that does anyway from sending a long one. On a preset saved in Settings that still loads dsh's `send_message`, dsh's note comes back after crew's, and crew's says so.
 - **Children share the main agent's working directory.** dsh 0.2.0-rc.2 has no per-child `cwd`. A bound coder starts in the chat's workspace too, and may write anywhere in it: its brief, not the sandbox, keeps it to its worktree.
 - **Children can't ask you anything.** dsh runs them with approval policy `never`.
 - **A crew child's approval requests are refused when `dish-judge` isn't loaded.** With `dish-judge`, a child is switched to approval policy `ask` and the judge answers it. If the judge is then disabled, uninstalled or unloaded, a child that had settled still has `ask` in its log, and a follow-up would resume it at `ask`. Without a guard, dsh would show its prompt in the child's own session, where nobody sees it, and nothing times it out. So crew refuses a crew child's request whenever `dish-judge` is absent. Other children, and the main agent, are untouched.

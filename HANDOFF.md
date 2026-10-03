@@ -99,7 +99,6 @@ Sessions are `session.v4.jsonl.zstd` under the workspace's directory, and a crew
 5. **`README.md:19`** says Settings → GitHub App takes dev's own App, which waits on the prod App decision.
 6. **Going public.** An audit on 2026-10-03 found no real secret anywhere in the history. Before flipping the repo to public, run, with direnv loaded, `git log --all --format=%h -S"${TYPESAFE_API_KEY:8:16}"`: no output means the key was never committed. The two `apikey_…` values in `packages/dish-kit/test/secrets.test.ts` should be the fakes their comment says they are. Also: delete the merged branches, turn off the wiki if unused, and skim the PR descriptions. Links to `bketelsen/fleet` go to a private repository.
 7. **[ROADMAP.md](ROADMAP.md)'s backlog.** The items that matter most in daily use:
-   - crew's own `send_message`, so children stop sending a "done" message before their report;
    - Chromium and `libxml2-utils` on the VM;
    - dev-server previews.
 8. **dsh issues worth filing upstream**, seen in sessions:

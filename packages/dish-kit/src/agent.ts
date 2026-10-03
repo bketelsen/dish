@@ -34,3 +34,12 @@ export function isTopLevelAgent(agent: AgentLike | undefined): boolean {
   const options = agent?.options as { subagentDepth?: unknown } | undefined
   return topLevel(header.delegationDepth) && topLevel(options?.subagentDepth) && header.origin !== 'subagent'
 }
+
+/**
+ * How the note about reporting that follows a crew child's brief begins: dsh's own return guidance for a continuable child
+ * ("Your parent agent id is …. Before you finish, send your result …", `withContinuableReturnGuidance` in `dsh-subagent`), and
+ * crew's closing note, which takes its place on the dish preset (`closingNote` in dish-crew). dish-judge reads a child's brief
+ * as the blocks of its first prompt before the first block that begins so: the task, a bound coder's worktree block, a
+ * reviewer's ruling, and not how to report.
+ */
+export const RETURN_NOTE_LEAD = 'Your parent agent id is '

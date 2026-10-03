@@ -19,7 +19,7 @@
  * 6. **The route** resolves (the model on its family's provider, else the file's, which is what the child starts on), and
  *    7. **the tools** the child may have (`allowList`) are not none.
  * 8. **The start or the send.** A new child's prompt is the task, and, if it has `send_message`, a note that its closing message
- *    is its report (`CLOSING_NOTE`). Each of crew's blocks ends with a blank line (`BLOCK_END`): dsh's adapters join a
+ *    is its report (`closingNote`). Each of crew's blocks ends with a blank line (`BLOCK_END`): dsh's adapters join a
  *    message's text blocks with nothing between them.
  *
  * From 4 to the end, a call holds its session's lock, so two calls in one step can't both pass the same check. A start
@@ -35,7 +35,7 @@
  * it takes a second lock keyed by the worktree (always after the session's, so two calls can't deadlock) and refuses a
  * worktree a running crew child is bound to (`dishCrew.worktreeBindings`), of any session; it holds that lock until the
  * child has started, as the session's lock is held, so two chats can't bind one worktree at once. The child is recorded with
- * the worktree (`ChildRecord.worktree`), and its prompt is the task, `worktreeBrief`, and `CLOSING_NOTE` last. A follow-up
+ * the worktree (`ChildRecord.worktree`), and its prompt is the task, `worktreeBrief`, and `closingNote` last. A follow-up
  * keeps its child's binding: a `worktree` that resolves elsewhere is refused, a bound child's worktree must still resolve,
  * the same worktree lock and check apply (less the child itself), and nothing is added to its text.
  *
@@ -81,7 +81,7 @@ import type {} from '@deepseek-ai/dsh-llm'
 import type { ContinuableStartSpec } from '@deepseek-ai/dsh-subagent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
-import { isTopLevelAgent, maskSecrets } from 'dish-kit'
+import { isTopLevelAgent, maskSecrets, RETURN_NOTE_LEAD } from 'dish-kit'
 import type { DishPrompts, Persona } from 'dish-prompts'
 import { allowList, visibleTools } from './allow.ts'
 import type { DishCrew, WorktreeBinding } from './index.ts'
@@ -113,14 +113,38 @@ const TITLE_LENGTH = 80
 const LISTED_CHILDREN = 6
 
 /**
- * Said to a new child after its task, when it has `send_message`: its closing message is its report. dsh appends a note of its own
- * after the prompt of a continuable child that has the tool (`withContinuableReturnGuidance` in `dsh-subagent`: "send your result to
- * that agent with send_message"), which is the opposite of how the crew reports, so this goes in front of it and says so. A follow-up
- * (`to`) gets nothing added: dsh appends nothing to it either. Both are recorded under "What dsh gives us" in the spec, so that a dsh upgrade re-checks them.
+ * Said to a new child after its task, when it has `send_message`: its parent's id, and that its closing message is its report.
+ * dsh appends a note of its own to a continuable child whose `send_message` is dsh's marked one (`withContinuableReturnGuidance`
+ * in `dsh-subagent`: "send your result to that agent with send_message"), the opposite of how the crew reports. On the dish
+ * preset the child's `send_message` is dish-crew/control's, which carries no mark, so dsh adds nothing and this note gives the
+ * parent's id in its place. A preset edited in Settings → Agent presets can still load dsh's row; then dsh's note follows this
+ * one, and `marked` has this one say so. It begins as dsh's does (`RETURN_NOTE_LEAD`), which is where dish-judge ends a child's
+ * brief. A follow-up (`to`) gets nothing added: dsh appends nothing to it either. Both are recorded under "What dsh gives us"
+ * in the spec, so that a dsh upgrade re-checks them.
  */
-export const CLOSING_NOTE = 'Your closing message is your report: when you finish, the main agent receives it in full, automatically. '
-  + 'So don\'t send your result with send_message, not even a summary or part of it, even though the note after this one says to. '
-  + 'Use send_message only for a short question you\'re blocked on while you work.'
+export function closingNote(parentId: string, marked: boolean): string {
+  const id = JSON.stringify(parentId)
+  return `${RETURN_NOTE_LEAD}${id}. Your closing message is your report: when you finish, the main agent receives it in full, automatically. `
+    + `So don't send your result with send_message, not even a summary or part of it${marked ? ', even though the note after this one says to' : ''}. `
+    + `Use send_message({ agent_id: ${id}, message: "…" }) only for a short question you're blocked on while you work.`
+}
+
+/** dsh's mark on its own `send_message` (`markAdjacentAgentSendMessageTool` in `dsh-subagent/internal`): a process-wide symbol. */
+const DSH_SEND_MESSAGE = Symbol.for('dsh.subagent.adjacentAgentSendMessageTool')
+
+/**
+ * Whether the `send_message` that `agent` sees is dsh's marked one, as `startContinuable` asks of the child (the child is on
+ * its parent's preset): a preset that still loads dsh's `tool-subagent-control`, as one saved in Settings can. `false` when
+ * it can't be read.
+ */
+function dshSendMessage(agent: Agent): boolean {
+  try {
+    const tool = agent.ctx.tools.get('send_message', agent) as unknown as Record<symbol, unknown> | undefined
+    return tool?.[DSH_SEND_MESSAGE] === true
+  } catch {
+    return false
+  }
+}
 
 /** The id of a session or a child, as dsh brands it. */
 type SessionId = NonNullable<ContinuableStartSpec['childId']>
@@ -670,12 +694,13 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     } catch (error) {
       throw new Error(`could not record the delegation, so nothing was started: ${describe(error)}. Try again, or tell the user.`, { cause: error })
     }
-    // The closing note stays last: it refers to the note dsh adds after it, under the same condition (the child has `send_message`).
-    // Each block ends with a blank line (`BLOCK_END`): dsh's adapters join text blocks with nothing between them.
+    // The closing note stays last: dish-judge ends a child's brief at it, and on a preset that loads dsh's own `send_message` it
+    // refers to the note dsh adds after it. Each block ends with a blank line (`BLOCK_END`): dsh's adapters join text blocks
+    // with nothing between them.
     const prompt = [{ type: 'text' as const, text: `${call.task}${BLOCK_END}` }]
     if (bound !== undefined) prompt.push({ type: 'text', text: `${worktreeBrief(bound, gate)}${BLOCK_END}` })
     if (override !== undefined) prompt.push({ type: 'text', text: `${override.block}${BLOCK_END}` })
-    if (allowed.allow.includes('send_message')) prompt.push({ type: 'text', text: `${CLOSING_NOTE}${BLOCK_END}` })
+    if (allowed.allow.includes('send_message')) prompt.push({ type: 'text', text: `${closingNote(call.sessionId, dshSendMessage(call.agent))}${BLOCK_END}` })
     try {
       await ctx.subagents.startContinuable({
         provider: call.crew.subagentProvider,
