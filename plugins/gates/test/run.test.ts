@@ -18,7 +18,7 @@ const WORKTREE = { path: '/w/acme/widget/.worktrees/fix-1', clone: '/w/acme/widg
 
 // --- a fake shell -------------------------------------------------------------------------------------------------
 
-type Outcome = Partial<Omit<ShellRunResult, 'stdout' | 'stderr'>> & { stdout?: string, stderr?: string, truncated?: boolean }
+type Outcome = Partial<Omit<ShellRunResult, 'stdout' | 'stderr'>> & { stdout?: string, stderr?: string, truncated?: boolean, spillPath?: string }
 
 interface FakeShell extends ShellLike {
   requests: ShellExecRequest[]
@@ -67,7 +67,7 @@ function fakeShell(options: {
           timedOut: given.timedOut ?? false,
           aborted: given.aborted ?? false,
           timeoutMs: given.timeoutMs ?? spec.timeoutMs,
-          stdout: { text: given.stdout ?? '', truncated: given.truncated ?? false },
+          stdout: { text: given.stdout ?? '', truncated: given.truncated ?? false, ...given.spillPath === undefined ? {} : { spillPath: given.spillPath } },
           stderr: { text: given.stderr ?? '', truncated: false },
           sandbox: { mode: 'workspace-write', denied: false, enforcement: 'full' },
         }
@@ -261,10 +261,22 @@ test('"Read-only file system" in the output is a denial', async () => {
   assert.equal(ran(other.result).denied, false)
 })
 
-test('output cut to its last 4 MiB: truncated, and the log says so', async () => {
-  const { result, log } = await gate(fakeShell({ outcome: { exitCode: 1, stdout: 'tail\n', truncated: true } }))
+test('output cut to its last 4 MiB: truncated, the log says so, and the cut first line goes before masking', async () => {
+  // The kept tail starts partway through a line: the rest of a token there would not be known to the mask.
+  const { result, log } = await gate(fakeShell({ outcome: { exitCode: 1, stdout: 'Rb0dyOfATokenWithoutItsPrefix123456\ntail\n', truncated: true } }))
   assert.equal(ran(result).truncated, true)
-  assert.match(await readFile(log, 'utf8'), /^# gate: make test\n# in: .*\n# ended: exit 1, after \d+ ms\n# output cut: only its last 4 MiB are kept\ntail\n$/)
+  const text = await readFile(log, 'utf8')
+  assert.match(text, /^# gate: make test\n# in: .*\n# ended: exit 1, after \d+ ms\n# output cut: only its last 4 MiB are kept\ntail\n$/)
+  assert.doesNotMatch(text, /b0dyOfAToken/)
+  assert.doesNotMatch(ran(result).output, /b0dyOfAToken/)
+})
+
+test('dsh\'s spill file of a cut run is removed: it is unmasked, and the gate keeps its own log', async () => {
+  const dir = await tempDir()
+  const spill = join(dir, 'stdout.spill')
+  await writeFile(spill, 'the whole stream, unmasked')
+  await gate(fakeShell({ outcome: { exitCode: 1, stdout: 'x\ntail\n', truncated: true, spillPath: spill } }))
+  await assert.rejects(readFile(spill, 'utf8'), { code: 'ENOENT' })
 })
 
 test('a log that can\'t be written: no log and why, and the result stands', async () => {
