@@ -12,6 +12,9 @@
  * `requests` records each request without its token: the path, the git service, the user name, the token's level
  * (`null` when refused) and the status sent.
  *
+ * `hold(service)` makes the next authorised `POST` of that service (a push's pack, for `git-receive-pack`) wait until
+ * the test releases it, so a test can look at the processes while a push is under way.
+ *
  * @module dish-workspaces/test/fake-git-http
  */
 
@@ -48,6 +51,11 @@ export interface FakeGitServer {
   /** The tokens it takes. The tests and Task 4's fake add minted tokens here. */
   tokens: Map<string, TokenLevel>
   requests: FakeGitRequest[]
+  /**
+   * The next authorised `POST` of `service` waits until `release()`; `reached` resolves when it arrives. Released by
+   * `close` too.
+   */
+  hold(service: 'git-upload-pack' | 'git-receive-pack'): { reached: Promise<void>, release(): void }
   close(): Promise<void>
 }
 
@@ -107,6 +115,9 @@ export async function startFakeGit(root: string): Promise<FakeGitServer> {
   const tokens = new Map<string, TokenLevel>()
   const requests: FakeGitRequest[] = []
   const children = new Set<ChildProcess>()
+  const holds: Array<{ service: string, arrived: () => void, released: Promise<void>, release: () => void }> = []
+  /** Every hold's release, claimed or not: `close` lets them all go. */
+  const releases: Array<() => void> = []
 
   /** http-backend's environment: CGI's variables, a scratch home, no system or global config, and only `PATH` of ours. */
   const backendEnv = (req: IncomingMessage, url: URL, pathInfo: string, user: string): Record<string, string> => {
@@ -203,6 +214,20 @@ export async function startFakeGit(root: string): Promise<FakeGitServer> {
       answer(req, res, record, 400, 'Bad path\n')
       return
     }
+    const held = req.method === 'POST' && closing === undefined ? holds.findIndex(item => item.service === service) : -1
+    if (held >= 0) {
+      const [item] = holds.splice(held, 1)
+      item!.arrived()
+      void item!.released.then(() => {
+        // Released by close, or after the client went (a push killed mid-way): no http-backend is started for it.
+        if (closing !== undefined || req.destroyed || res.destroyed) {
+          res.destroy()
+          return
+        }
+        backend(req, res, record, url, pathInfo, credential!.user)
+      })
+      return
+    }
     backend(req, res, record, url, pathInfo, credential!.user)
   })
 
@@ -221,8 +246,19 @@ export async function startFakeGit(root: string): Promise<FakeGitServer> {
     root,
     tokens,
     requests,
+    hold(service) {
+      let arrived = (): void => {}
+      const reached = new Promise<void>((resolve) => { arrived = resolve })
+      let release = (): void => {}
+      const released = new Promise<void>((resolve) => { release = resolve })
+      holds.push({ service, arrived, released, release })
+      releases.push(release)
+      return { reached, release }
+    },
     close() {
       closing ??= (async () => {
+        holds.splice(0)
+        for (const release of releases.splice(0)) release()
         for (const child of children) child.kill('SIGKILL')
         const closed = new Promise<void>(resolve => server.close(() => resolve()))
         server.closeAllConnections()

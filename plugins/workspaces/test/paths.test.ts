@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { lstat, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
-  clonePath, cloneStateFile, helperValue, projectStateDir, scratchRecordFile, setupLogFile, tokensDir, worktreePath,
+  clonePath, cloneStateFile, helperValue, projectStateDir, pushHelperValue, scratchRecordFile, setupLogFile, tokensDir, worktreePath,
   worktreeRecordFile, worktreeSetupLogFile, writeFileAtomic,
 } from '../src/paths.ts'
 import { tempDir } from './helpers.ts'
@@ -55,6 +55,20 @@ test("helperValue refuses a ', a newline or another control character in any par
   assert.throws(() => helperValue('/h', '/t', 'https://github.com\0'), /control/)
   assert.throws(() => helperValue('bin/helper', '/t', 'https://github.com'), /absolute/)
   assert.throws(() => helperValue('/h', 'tokens', 'https://github.com'), /absolute/)
+})
+
+test("pushHelperValue quotes the helper and the web origin, and refuses a ', a control character and a relative helper", () => {
+  assert.equal(
+    pushHelperValue('/opt/dish/plugins/workspaces/bin/git-credential-dish-push', 'https://github.com'),
+    "!/bin/sh '/opt/dish/plugins/workspaces/bin/git-credential-dish-push' 'https://github.com'",
+  )
+  assert.equal(pushHelperValue('/a b/$HOME/`x`;rm', 'http://127.0.0.1:4242'), "!/bin/sh '/a b/$HOME/`x`;rm' 'http://127.0.0.1:4242'")
+  assert.throws(() => pushHelperValue("/it's/helper", 'https://github.com'), /'/)
+  assert.throws(() => pushHelperValue('/h', "https://github.com'"), /'/)
+  assert.throws(() => pushHelperValue('/h\n', 'https://github.com'), /control/)
+  assert.throws(() => pushHelperValue('/h', 'https://github.com\r'), /control/)
+  assert.throws(() => pushHelperValue('/h', 'https://github.com\0'), /control/)
+  assert.throws(() => pushHelperValue('bin/git-credential-dish-push', 'https://github.com'), /absolute/)
 })
 
 test('writeFileAtomic writes the whole text, 0600 by default, in a directory it makes 0700', async () => {

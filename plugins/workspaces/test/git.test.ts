@@ -528,6 +528,66 @@ test("a clone whose .git git won't accept, inside another repository, fails: dis
   })
 })
 
+// --- a secret on fd 3 (step 7's push) -------------------------------------------------------------------------------
+
+test('a secret goes to fd 3, which git\'s children inherit, and nowhere else', async () => {
+  const dir = await tempDir()
+  await asDish(dir, async () => {
+    const out = (name: string): string => join(dir, name)
+    // The alias's shell copies fd 3 to a file, and its own and git's (its parent's) cmdline and environ beside it.
+    const leak = 'alias.leak=!cat <&3 > fd3; [ -S /proc/$$/fd/3 ] && echo socket > kind; '
+      + 'cat /proc/$$/environ > environ; cat /proc/$$/cmdline > cmdline; cat /proc/$PPID/environ > git-environ; cat /proc/$PPID/cmdline > git-cmdline; '
+      + 'cat /proc/$$/fd/3 > reopened 2>/dev/null; echo $? > reopen-status'
+    await gitOk(['-c', leak, 'leak'], { cwd: dir, env: NOSYSTEM, secret: TOKEN })
+    assert.equal(await readFile(out('fd3'), 'utf8'), `${TOKEN}\n`)
+    assert.equal(await readFile(out('kind'), 'utf8'), 'socket\n')
+    for (const name of ['environ', 'cmdline', 'git-environ', 'git-cmdline']) {
+      const text = await readFile(out(name), 'utf8')
+      assert.ok(text.length > 0, name)
+      assert.ok(!text.includes(TOKEN), `${name} holds the secret`)
+    }
+    // A socket can't be opened again through /proc: another process of the account can't read it that way.
+    assert.equal(await readFile(out('reopened'), 'utf8'), '')
+    assert.notEqual((await readFile(out('reopen-status'), 'utf8')).trim(), '0')
+
+    // A failure's message holds git's stderr, never the secret.
+    const error = await gitOk(['-c', 'alias.fail=!cat <&3 >/dev/null; echo "fatal: it failed" >&2; exit 3', 'fail'], { cwd: dir, env: NOSYSTEM, secret: TOKEN })
+      .catch((e: unknown) => e)
+    assert.ok(error instanceof GitError)
+    assert.match(error.message, /fatal: it failed/)
+    assert.ok(!error.message.includes(TOKEN) && !String(error.stack).includes(TOKEN))
+  })
+})
+
+test('a secret that isn\'t one line of printable ASCII is refused before git starts, and the refusal doesn\'t hold it', async () => {
+  const dir = await tempDir()
+  await asDish(dir, async () => {
+    const marker = join(dir, 'ran')
+    const mark = ['-c', `alias.mark=!touch '${marker}'`, 'mark']
+    for (const secret of ['', `${TOKEN}\n`, `two\n${TOKEN}`, `with ${TOKEN}`, `tab\t${TOKEN}`, `${TOKEN}é`, `${TOKEN}\0`, 'x'.repeat(4097), 42 as unknown as string]) {
+      const error = await git(mark, { cwd: dir, env: NOSYSTEM, secret }).catch((e: unknown) => e)
+      assert.ok(error instanceof Error, JSON.stringify(secret))
+      assert.equal(error.message, 'git: the secret must be one line of printable ASCII')
+      assert.ok(!String(error.stack).includes(TOKEN))
+      assert.equal(await exists(marker), false, `git ran for ${JSON.stringify(secret)}`)
+    }
+    // 4096 printable characters are one line.
+    assert.equal((await git(mark, { cwd: dir, env: NOSYSTEM, secret: 'x'.repeat(4096) })).code, 0)
+    assert.equal(await exists(marker), true)
+  })
+})
+
+test('without a secret, git\'s children have no fd 3', async () => {
+  const dir = await tempDir()
+  await asDish(dir, async () => {
+    const probe = ['-c', 'alias.probe=![ -e /proc/$$/fd/3 ]', 'probe']
+    assert.notEqual((await git(probe, { cwd: dir, env: NOSYSTEM })).code, 0)
+    assert.notEqual((await git(probe, { cwd: dir, env: NOSYSTEM, input: 'stdin only' })).code, 0)
+    // The probe's fixture: with a secret, fd 3 is there.
+    assert.equal((await git(probe, { cwd: dir, env: NOSYSTEM, secret: TOKEN })).code, 0)
+  })
+})
+
 // --- git() is the one way -------------------------------------------------------------------------------------------
 
 test("git.ts is the only module of dish-workspaces that runs git", async () => {

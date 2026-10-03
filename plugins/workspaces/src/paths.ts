@@ -84,6 +84,19 @@ export function helperValue(helper: string, tokens: string, web: string): string
 }
 
 /**
+ * The value of dish's push's `credential.helper` (given only on the push's command line): `!/bin/sh '<helper>' '<web>'`,
+ * with `helperValue`'s checks: no `'` and no control character in either part, and an absolute helper.
+ */
+export function pushHelperValue(helper: string, web: string): string {
+  for (const [what, part] of [['the push helper path', helper], ['the web origin', web]] as const) {
+    if (part.includes("'")) throw new Error(`${what} must not contain a ' (it is single-quoted for git's shell)`)
+    if (CONTROL.test(part)) throw new Error(`${what} must not contain a control character`)
+  }
+  if (!isAbsolute(helper)) throw new Error('the push helper path must be absolute')
+  return `!/bin/sh '${helper}' '${web}'`
+}
+
+/**
  * Write `text` to `file` whole or not at all: a temporary file beside it (created new, never through a link), its mode
  * set to `mode` (default 0600, whatever the umask), synced, then renamed over `file`. A link at `file` is replaced, not
  * followed. Directories it has to make are made 0700; existing ones are left as they are. On failure the temporary file

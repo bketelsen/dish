@@ -116,6 +116,18 @@ export interface WorktreeInfo extends Worktree {
 
 export interface CreatedWorktree extends Worktree {
   setup: SetupOutcome
+  /** The base as asked for: `origin/<default>`, or the caller's `base` (the record's `baseRef`). */
+  baseRef: string
+}
+
+/** A worktree's branch against GitHub's, as the last fetch left them (`Worktrees.compare`). */
+export interface BranchComparison {
+  /** Commits on origin/<default> the branch lacks. */
+  behindDefault: number
+  /** Commits on the branch origin/<default> lacks. */
+  aheadOfDefault: number
+  /** Commits on origin/dish/<slug> the branch lacks; null when GitHub has no such branch. */
+  remoteAhead: number | null
 }
 
 export interface WorktreeDeps {
@@ -232,7 +244,44 @@ export class Worktrees {
     if (landed !== path || await realpath(path).catch(() => undefined) !== path) {
       await this.#undo(project, clone, record, landed, path)
     }
-    return { project: project.name, slug, branch: record.branch, path, clone, base: commit, setup: worktreeSetup(project, path) }
+    return { project: project.name, slug, branch: record.branch, path, clone, base: commit, setup: worktreeSetup(project, path), baseRef }
+  }
+
+  /**
+   * HEAD's commit in the worktree at `path` (`checkWorktree` first: a refusal throws). Throws "worktree <slug>'s HEAD
+   * isn't a commit" when it isn't one.
+   */
+  async head(clone: string, path: string): Promise<string> {
+    const check = await checkWorktree(clone, path)
+    if (!check.ok) throw new Error(check.problem)
+    const sha = await commitOf(resolve(path), 'HEAD')
+    if (sha === undefined) throw new Error(`worktree ${shown(basename(path), 80)}'s HEAD isn't a commit`)
+    return sha
+  }
+
+  /** `refs/heads/<branch>`'s commit in the clone, or undefined. */
+  tip(clone: string, branch: string): Promise<string | undefined> {
+    return branchTip(clone, branch)
+  }
+
+  /**
+   * The local branch against `refs/remotes/origin/<default>` and `refs/remotes/origin/<branch>`, as the last fetch left
+   * them. Rejects when its branch is gone, or when git can't count (unlike `aheadBehind`, which gives zeros).
+   */
+  async compare(clone: string, branch: string, defaultBranch: string): Promise<BranchComparison> {
+    const tip = await branchTip(clone, branch)
+    if (tip === undefined) throw new Error(`its branch ${branch} is gone`)
+    const counts = await gitOk(['-C', clone, 'rev-list', '--left-right', '--count', `refs/remotes/origin/${defaultBranch}...${tip}`], this.#options())
+    const both = /^(\d+)\s+(\d+)\s*$/.exec(counts)
+    if (both === null) throw new Error(`git couldn't count ${branch} against origin/${defaultBranch}`)
+    const remote = await commitOf(clone, `refs/remotes/origin/${branch}`)
+    let remoteAhead: number | null = null
+    if (remote !== undefined) {
+      const ahead = /^(\d+)\s*$/.exec(await gitOk(['-C', clone, 'rev-list', '--count', `${tip}..${remote}`], this.#options()))
+      if (ahead === null) throw new Error(`git couldn't count origin/${branch} against ${branch}`)
+      remoteAhead = Number(ahead[1])
+    }
+    return { behindDefault: Number(both[1]), aheadOfDefault: Number(both[2]), remoteAhead }
   }
 
   /** Every linked worktree of the clone (not its main checkout), in git's order; `merged` is computed for managed ones only. */

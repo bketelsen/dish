@@ -1,6 +1,7 @@
 /**
  * A fake of GitHub's REST API for the GitHub App, on `127.0.0.1:0`: the App, its installations, installation tokens, the
- * bot user, and pull requests by commit. No test reaches GitHub.
+ * bot user, pull requests by commit, and (step 7) pull requests opened, listed, read, edited and commented on, with
+ * their reviews, review comments, issue comments, check runs and commit statuses. No test reaches GitHub.
  *
  * It checks what GitHub checks, so a client that gets something wrong fails here as it would there:
  * - every request carries the contract's headers (`Accept`, `X-GitHub-Api-Version`, `User-Agent`), else 400;
@@ -9,8 +10,11 @@
  * - `GET /users/<login>` is public, as on GitHub: it takes no credential, or a good installation token;
  * - the rest takes only an installation token it minted (`Authorization: token`) that hasn't expired (401), for a
  *   repository the token covers (404, as GitHub hides what a token can't see), with the permission the call needs (403);
- * - the App is read-only (the spec's decision 2): asking for any permission but `read`, or for one it lacks, is 422,
- *   and so is a repository the installation doesn't have.
+ * - a token request is 422 unless each level asked is `read` or `write` and at most the App's (`permissions`, read-only
+ *   by default, as 6b's Apps) and the installation's (what its owner accepted), with `read` below `write`; so is a
+ *   repository the installation doesn't have.
+ * - pull requests (`pullRequests`) are opened with `POST /repos/{o}/{r}/pulls` and live only here: the fake knows
+ *   nothing of the git server's branches. Their head commit is `headSha`, which a test sets.
  *
  * Tokens are `ghs_` and 36 letters and digits, and expire an hour after they are minted. Servers still open when the
  * test file finishes are closed then.
@@ -26,8 +30,15 @@ import type { AddressInfo } from 'node:net'
 import { after } from 'node:test'
 import type { PullSummary } from '../src/github.ts'
 
-/** What the App may ask for: read only, as both Apps are created in 6b. */
-const APP_PERMISSIONS: Readonly<Record<string, string>> = { contents: 'read', metadata: 'read', pull_requests: 'read' }
+/**
+ * What the App may ask for by default: read only, as both Apps are created in 6b, with Checks and Commit statuses read,
+ * which step 7's App has (the in-memory API token asks for them).
+ */
+export const APP_PERMISSIONS: Readonly<Record<string, string>> = Object.freeze({ contents: 'read', metadata: 'read', pull_requests: 'read', checks: 'read', statuses: 'read' })
+/** Step 7's App: Contents and Pull requests read and write; Metadata, Checks and Commit statuses read. */
+export const WRITE_APP_PERMISSIONS: Readonly<Record<string, string>> = Object.freeze({ contents: 'write', metadata: 'read', pull_requests: 'write', checks: 'read', statuses: 'read' })
+/** A level's rank: `read` below `write`. Anything else is no level the fake grants. */
+const RANK: Readonly<Record<string, number>> = { read: 1, write: 2 }
 const TOKEN_LIFE_MS = 3_600_000
 const ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
 
@@ -57,6 +68,50 @@ export interface FakeMint {
   permissions: Record<string, string>
 }
 
+/** A pull request the fake holds. Mutable: a test sets `headSha`, `mergeable`, `state` and the rest. */
+export interface FakePull {
+  /** `<owner>/<repo>`, lower-case. */
+  repo: string
+  number: number
+  title: string
+  body: string
+  /** The head branch (`dish/fix-1`), and its commit (all zeros until a test sets it). */
+  head: string
+  headSha: string
+  base: string
+  state: 'open' | 'closed'
+  merged: boolean
+  draft: boolean
+  mergeable: boolean | null
+  mergeableState: string
+}
+
+export interface FakeComment {
+  repo: string
+  number: number
+  body: string
+}
+
+export interface FakePullEdit {
+  repo: string
+  number: number
+  title?: string
+  body?: string
+}
+
+/** What `GET …/reviews`, `…/pulls/{n}/comments` and `…/issues/{n}/comments` serve: GitHub's JSON, as given. */
+export interface FakeFeedback {
+  reviews?: unknown[]
+  reviewComments?: unknown[]
+  issueComments?: unknown[]
+}
+
+/** What `GET …/commits/{sha}/check-runs` and `…/status` serve: GitHub's JSON items, as given. */
+export interface FakeChecks {
+  checkRuns?: unknown[]
+  statuses?: unknown[]
+}
+
 export interface FakeRequest {
   method: string
   /** The path and query, as sent. */
@@ -76,6 +131,16 @@ export interface FakeGitHub {
   pulls: Map<string, PullSummary[]>
   minted: FakeMint[]
   requests: FakeRequest[]
+  /** The pull requests opened (or put here by a test), in order. */
+  pullRequests: FakePull[]
+  /** The comments posted on pull requests' issues. */
+  comments: FakeComment[]
+  /** Each `PATCH` of a pull request: the fields it changed. */
+  pullEdits: FakePullEdit[]
+  /** Store reviews and comments of pull request `number` of `repo` (`owner/repo`), added to what it holds. */
+  feedback(repo: string, number: number, items: FakeFeedback): void
+  /** Store check runs and statuses of commit `sha` of `repo`, added to what it holds. */
+  checks(repo: string, sha: string, items: FakeChecks): void
   /** Called with every token it mints, e.g. to add it to `FakeGitServer.tokens`. */
   onToken(listener: (token: string, permissions: Record<string, string>) => void): void
   /** The next request for `path` (with or without its query) answers `status` with `body` (and `headers`) instead. */
@@ -117,7 +182,8 @@ function githubTime(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
 }
 
-export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: number, slug?: string }): Promise<FakeGitHub> {
+export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: number, slug?: string, permissions?: Readonly<Record<string, string>> }): Promise<FakeGitHub> {
+  const appPermissions: Readonly<Record<string, string>> = { ...(options.permissions ?? APP_PERMISSIONS) }
   const appId = options.appId ?? 4242
   const slug = options.slug ?? 'dish-test'
   const app = { id: appId, slug, name: `${slug} app` }
@@ -129,6 +195,13 @@ export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: n
   const listeners: Array<(token: string, permissions: Record<string, string>) => void> = []
   const failures: Array<{ path: string, status: number, body: object, headers: Record<string, string> }> = []
   const tokens = new Map<string, Minted>()
+  const pullRequests: FakePull[] = []
+  const comments: FakeComment[] = []
+  const pullEdits: FakePullEdit[] = []
+  const feedbackStore = new Map<string, Required<FakeFeedback>>()
+  const checksStore = new Map<string, Required<FakeChecks>>()
+  let nextPull = 1
+  let nextComment = 1
 
   /** The JWT's problem, or undefined for one GitHub would take. */
   const jwtProblem = (jwt: string): string | undefined => {
@@ -206,7 +279,7 @@ export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: n
         return
       }
       if (method === 'GET' && segments.length === 1) {
-        send(res, request, 200, { ...app, owner: { login: 'fake-owner' }, permissions: APP_PERMISSIONS })
+        send(res, request, 200, { ...app, owner: { login: 'fake-owner' }, permissions: appPermissions })
         return
       }
       if (method === 'GET' && segments.length === 2 && segments[1] === 'installations') {
@@ -236,9 +309,10 @@ export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: n
         const asked = isRecord(parsed) ? parsed : {}
         const repositories = Array.isArray(asked.repositories) ? asked.repositories.map(String) : []
         const permissions = isRecord(asked.permissions) ? Object.fromEntries(Object.entries(asked.permissions).map(([k, v]) => [k, String(v)])) : {}
-        const accepted = installation.permissions ?? APP_PERMISSIONS
+        const accepted = installation.permissions ?? appPermissions
         for (const [name, level] of Object.entries(permissions)) {
-          if (level !== 'read' || APP_PERMISSIONS[name] === undefined || accepted[name] === undefined) {
+          const asked = RANK[level]
+          if (asked === undefined || (RANK[appPermissions[name] ?? ''] ?? 0) < asked || (RANK[accepted[name] ?? ''] ?? 0) < asked) {
             send(res, request, 422, { message: 'The permissions requested are not granted to this installation.' })
             return
           }
@@ -334,6 +408,153 @@ export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: n
       return
     }
 
+    // The pull requests, their feedback and the checks (step 7): /repos/{o}/{r}/…, with a token that covers the repo.
+    if (segments[0] === 'repos' && segments.length >= 4) {
+      const [, owner, repo] = segments as [string, string, string]
+      const installation = [...installations.values()].find(item => item.id === held.installation)
+      if (installation === undefined || installation.account.toLowerCase() !== owner.toLowerCase()
+        || !held.repositories.some(name => name.toLowerCase() === repo.toLowerCase())) {
+        send(res, request, 404, { message: 'Not Found' })
+        return
+      }
+      const key = `${owner}/${repo}`.toLowerCase()
+      const rest = segments.slice(3)
+      const perPage = Math.min(100, Math.max(1, Number(url.searchParams.get('per_page') ?? '30') || 30))
+      const can = (name: string, level: 'read' | 'write'): boolean => (RANK[held.permissions[name] ?? ''] ?? 0) >= RANK[level]!
+      const refuse = (): void => send(res, request, 403, { message: 'Resource not accessible by integration' })
+      const parsed = (): Record<string, unknown> | undefined => {
+        try {
+          const value: unknown = body === '' ? {} : JSON.parse(body)
+          return isRecord(value) ? value : undefined
+        } catch {
+          return undefined
+        }
+      }
+      const pullOf = (number: string | undefined): FakePull | undefined =>
+        pullRequests.find(pull => pull.repo === key && String(pull.number) === number)
+      const pullJson = (pull: FakePull): Record<string, unknown> => ({
+        number: pull.number,
+        html_url: `https://github.com/${owner}/${repo}/pull/${pull.number}`,
+        state: pull.state,
+        title: pull.title,
+        body: pull.body,
+        merged: pull.merged,
+        draft: pull.draft,
+        mergeable: pull.mergeable,
+        mergeable_state: pull.mergeableState,
+        head: { ref: pull.head, sha: pull.headSha, label: `${installation.account}:${pull.head}` },
+        base: { ref: pull.base },
+      })
+
+      // POST /repos/{o}/{r}/pulls
+      if (method === 'POST' && rest.length === 1 && rest[0] === 'pulls') {
+        if (!can('pull_requests', 'write')) return refuse()
+        const asked = parsed()
+        if (asked === undefined) {
+          send(res, request, 400, { message: 'Problems parsing JSON' })
+          return
+        }
+        for (const field of ['title', 'head', 'base'] as const) {
+          if (typeof asked[field] !== 'string' || asked[field] === '') {
+            send(res, request, 422, { message: 'Validation Failed', errors: [{ resource: 'PullRequest', field, code: 'missing_field' }] })
+            return
+          }
+        }
+        const head = String(asked.head)
+        if (pullRequests.some(pull => pull.repo === key && pull.head === head && pull.state === 'open')) {
+          send(res, request, 422, {
+            message: 'Validation Failed',
+            errors: [{ resource: 'PullRequest', code: 'custom', message: `A pull request already exists for ${installation.account}:${head}.` }],
+          })
+          return
+        }
+        const pull: FakePull = {
+          repo: key, number: nextPull++, title: String(asked.title), body: typeof asked.body === 'string' ? asked.body : '',
+          head, headSha: '0'.repeat(40), base: String(asked.base), state: 'open', merged: false, draft: false, mergeable: null, mergeableState: 'unknown',
+        }
+        pullRequests.push(pull)
+        send(res, request, 201, pullJson(pull))
+        return
+      }
+      // GET /repos/{o}/{r}/pulls?head=<owner>:<branch>&state=…
+      if (method === 'GET' && rest.length === 1 && rest[0] === 'pulls') {
+        if (!can('pull_requests', 'read')) return refuse()
+        const head = url.searchParams.get('head')
+        const state = url.searchParams.get('state') ?? 'open'
+        const found = pullRequests.filter(pull => pull.repo === key
+          && (head === null || `${installation.account}:${pull.head}`.toLowerCase() === head.toLowerCase())
+          && (state === 'all' || pull.state === state))
+        send(res, request, 200, found.slice(0, perPage).map(pullJson))
+        return
+      }
+      // GET or PATCH /repos/{o}/{r}/pulls/{n}
+      if (rest.length === 2 && rest[0] === 'pulls' && (method === 'GET' || method === 'PATCH')) {
+        if (!can('pull_requests', method === 'GET' ? 'read' : 'write')) return refuse()
+        const pull = pullOf(rest[1])
+        if (pull === undefined) {
+          send(res, request, 404, { message: 'Not Found' })
+          return
+        }
+        if (method === 'PATCH') {
+          const asked = parsed()
+          if (asked === undefined) {
+            send(res, request, 400, { message: 'Problems parsing JSON' })
+            return
+          }
+          const edit: FakePullEdit = { repo: key, number: pull.number }
+          if (typeof asked.title === 'string') pull.title = edit.title = asked.title
+          if (typeof asked.body === 'string') pull.body = edit.body = asked.body
+          pullEdits.push(edit)
+        }
+        send(res, request, 200, pullJson(pull))
+        return
+      }
+      // GET /repos/{o}/{r}/pulls/{n}/reviews and …/comments, GET /repos/{o}/{r}/issues/{n}/comments
+      if (method === 'GET' && rest.length === 3 && (rest[0] === 'pulls' || rest[0] === 'issues')
+        && (rest[2] === 'reviews' || rest[2] === 'comments') && !(rest[0] === 'issues' && rest[2] === 'reviews')) {
+        if (!can('pull_requests', 'read')) return refuse()
+        if (pullOf(rest[1]) === undefined) {
+          send(res, request, 404, { message: 'Not Found' })
+          return
+        }
+        const stored = feedbackStore.get(`${key}#${rest[1]}`)
+        const items = rest[0] === 'issues' ? stored?.issueComments : rest[2] === 'reviews' ? stored?.reviews : stored?.reviewComments
+        send(res, request, 200, (items ?? []).slice(0, perPage))
+        return
+      }
+      // POST /repos/{o}/{r}/issues/{n}/comments
+      if (method === 'POST' && rest.length === 3 && rest[0] === 'issues' && rest[2] === 'comments') {
+        if (!can('pull_requests', 'write')) return refuse()
+        const pull = pullOf(rest[1])
+        if (pull === undefined) {
+          send(res, request, 404, { message: 'Not Found' })
+          return
+        }
+        const asked = parsed()
+        if (asked === undefined || typeof asked.body !== 'string' || asked.body === '') {
+          send(res, request, 422, { message: 'Validation Failed', errors: [{ resource: 'IssueComment', field: 'body', code: 'missing_field' }] })
+          return
+        }
+        comments.push({ repo: key, number: pull.number, body: asked.body })
+        const id = nextComment++
+        send(res, request, 201, { id, html_url: `https://github.com/${owner}/${repo}/pull/${pull.number}#issuecomment-${id}`, body: asked.body })
+        return
+      }
+      // GET /repos/{o}/{r}/commits/{sha}/check-runs and …/status
+      if (method === 'GET' && rest.length === 3 && rest[0] === 'commits' && (rest[2] === 'check-runs' || rest[2] === 'status')) {
+        if (!can(rest[2] === 'check-runs' ? 'checks' : 'statuses', 'read')) return refuse()
+        const stored = checksStore.get(`${key}@${rest[1]}`)
+        if (rest[2] === 'check-runs') {
+          const runs = stored?.checkRuns ?? []
+          send(res, request, 200, { total_count: runs.length, check_runs: runs.slice(0, perPage) })
+        } else {
+          const statuses = stored?.statuses ?? []
+          send(res, request, 200, { state: statuses.length === 0 ? 'pending' : 'success', sha: rest[1], total_count: statuses.length, statuses: statuses.slice(0, perPage) })
+        }
+        return
+      }
+    }
+
     send(res, request, 404, { message: 'Not Found' })
   }
 
@@ -357,6 +578,24 @@ export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: n
     pulls,
     minted,
     requests,
+    pullRequests,
+    comments,
+    pullEdits,
+    feedback: (repo, number, items) => {
+      const key = `${repo.toLowerCase()}#${number}`
+      const stored = feedbackStore.get(key) ?? { reviews: [], reviewComments: [], issueComments: [] }
+      stored.reviews.push(...(items.reviews ?? []))
+      stored.reviewComments.push(...(items.reviewComments ?? []))
+      stored.issueComments.push(...(items.issueComments ?? []))
+      feedbackStore.set(key, stored)
+    },
+    checks: (repo, sha, items) => {
+      const key = `${repo.toLowerCase()}@${sha}`
+      const stored = checksStore.get(key) ?? { checkRuns: [], statuses: [] }
+      stored.checkRuns.push(...(items.checkRuns ?? []))
+      stored.statuses.push(...(items.statuses ?? []))
+      checksStore.set(key, stored)
+    },
     onToken: (listener) => { listeners.push(listener) },
     failNext: (path, status, body = { message: `fake GitHub: HTTP ${status}` }, headers = {}) => {
       failures.push({ path, status, body, headers })

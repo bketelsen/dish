@@ -3,11 +3,11 @@ import { chmod, lstat, mkdir, readdir, readFile, rm, stat, writeFile } from 'nod
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { format } from 'node:util'
-import { GitHubApp } from '../src/github.ts'
+import { GitHubApp, PULL_PERMISSIONS, PUSH_PERMISSIONS } from '../src/github.ts'
 import { tokensDir } from '../src/paths.ts'
-import { API_PERMISSIONS, FILE_PERMISSIONS, REFRESH_BEFORE_MS, TokenManager } from '../src/tokens.ts'
+import { API_BASE_PERMISSIONS, API_PERMISSIONS, FILE_PERMISSIONS, REFRESH_BEFORE_MS, TokenManager } from '../src/tokens.ts'
 import type { OwnerRepos } from '../src/tokens.ts'
-import { startFakeGitHub, testKeys } from './fake-github-api.ts'
+import { WRITE_APP_PERMISSIONS, startFakeGitHub, testKeys } from './fake-github-api.ts'
 import type { FakeGitHub } from './fake-github-api.ts'
 import { tempDir } from './helpers.ts'
 
@@ -16,8 +16,8 @@ const keys = testKeys()
 interface FakeTimer { fn: () => void, ms: number, cleared: boolean, fired: boolean }
 
 /** A manager on a fake clock and fake timers, against a fresh fake GitHub with `acme` installed (id 77). */
-async function setup(repos: string[] = ['widget', 'gadget']) {
-  const fake = await startFakeGitHub({ publicKey: keys.publicKey })
+async function setup(repos: string[] = ['widget', 'gadget'], options: { write?: boolean } = {}) {
+  const fake = await startFakeGitHub({ publicKey: keys.publicKey, ...(options.write === true ? { permissions: WRITE_APP_PERMISSIONS } : {}) })
   fake.installations.set('acme', { id: 77, account: 'Acme', repos: new Set(repos) })
   const app = new GitHubApp(async () => ({ appId: String(fake.app.id), privateKey: keys.privateKeyPem }), { api: fake.api })
   const dir = await tempDir()
@@ -283,7 +283,7 @@ describe('TokenManager', () => {
     const token = await manager.apiToken('acme')
     assert.equal(fake.minted.length, 2)
     assert.deepEqual(fake.minted[1]!.permissions, { ...API_PERMISSIONS })
-    assert.deepEqual(fake.minted[1]!.permissions, { metadata: 'read', pull_requests: 'read' })
+    assert.deepEqual(fake.minted[1]!.permissions, { metadata: 'read', pull_requests: 'read', checks: 'read', statuses: 'read' })
     assert.equal(token, fake.minted[1]!.token)
     assert.deepEqual(await readdir(directory), before)
     for (const { text } of await filesUnder(dir)) assert.ok(!text.includes(token))
@@ -293,6 +293,105 @@ describe('TokenManager', () => {
     clock.now += 3_600_000 - REFRESH_BEFORE_MS + 1_000
     assert.notEqual(await manager.apiToken('acme'), token)
     assert.equal(fake.minted.length, 3)
+    await manager.close()
+    await assertNoTokenLeaks(fake, dir, directory, lines)
+  })
+
+  it("an installation that hasn't accepted checks and statuses gets API_BASE_PERMISSIONS, logged once; the sweep's pullsForCommit still works with it; the next mint near its expiry asks for the wide set again", async () => {
+    const { fake, app, dir, directory, lines, clock, manager } = await setup()
+    const installation = fake.installations.get('acme')!
+    installation.permissions = { contents: 'read', metadata: 'read', pull_requests: 'read' }
+    assert.deepEqual(API_BASE_PERMISSIONS, { metadata: 'read', pull_requests: 'read' })
+    await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget'] } }))
+    const mints = () => fake.requests.filter(request => request.path === '/app/installations/77/access_tokens').map(request => request.status)
+    const narrowLines = () => lines.filter(line => line.includes("hasn't accepted Checks and Commit statuses read"))
+    const token = await manager.apiToken('acme')
+    assert.deepEqual(mints(), [201, 422, 201], 'the file token, the wide set refused, the narrow one')
+    assert.deepEqual(fake.minted.at(-1)!.permissions, { ...API_BASE_PERMISSIONS })
+    assert.equal(token, fake.minted.at(-1)!.token)
+    assert.deepEqual(narrowLines(), [
+      "warn the dish App's installation for acme hasn't accepted Checks and Commit statuses read; pr_feedback shows no checks until it does (Settings → GitHub App)",
+    ])
+    // The sweep's read still works with it.
+    const tip = 'a'.repeat(40)
+    fake.pulls.set(tip, [{ number: 3, state: 'closed', mergedAt: '2026-10-01T10:00:00Z', headSha: tip, headRef: 'dish/x' }])
+    assert.deepEqual(await app.pullsForCommit('acme', 'widget', tip, token), fake.pulls.get(tip))
+    // Kept like the wide one: nothing is minted until its refresh window.
+    assert.equal(await manager.apiToken('acme'), token)
+    assert.deepEqual(mints(), [201, 422, 201])
+    // Near its expiry the wide set is asked for again; still refused, the narrow one again, not logged again.
+    clock.now += 3_600_000 - REFRESH_BEFORE_MS + 1_000
+    const again = await manager.apiToken('acme')
+    assert.notEqual(again, token)
+    assert.deepEqual(mints(), [201, 422, 201, 422, 201])
+    assert.equal(narrowLines().length, 1)
+    // Accepted on GitHub: the next mint gets the wide set.
+    delete installation.permissions
+    clock.now += 3_600_000
+    await manager.apiToken('acme')
+    assert.deepEqual(fake.minted.at(-1)!.permissions, { ...API_PERMISSIONS })
+    assert.deepEqual(mints(), [201, 422, 201, 422, 201, 201])
+    await manager.close()
+    await assertNoTokenLeaks(fake, dir, directory, lines)
+  })
+
+  it('writeToken mints a new token on each call for one repo with the asked permissions, and keeps nothing: no file, no cache, no timer', async () => {
+    const { fake, dir, directory, lines, pending, manager } = await setup(['widget', 'gadget'], { write: true })
+    await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget', 'gadget'] } }))
+    const files = await filesUnder(dir)
+    const timers = pending().length
+    const minted = fake.minted.length
+    const one = await manager.writeToken('acme', 'widget', PUSH_PERMISSIONS)
+    const two = await manager.writeToken('Acme', 'Widget', PUSH_PERMISSIONS)
+    const three = await manager.writeToken('acme', 'gadget', PULL_PERMISSIONS)
+    assert.equal(fake.minted.length, minted + 3)
+    assert.deepEqual(fake.minted.slice(-3).map(({ token, repositories, permissions }) => ({ token, repositories, permissions })), [
+      { token: one, repositories: ['widget'], permissions: { contents: 'write', metadata: 'read' } },
+      { token: two, repositories: ['Widget'], permissions: { contents: 'write', metadata: 'read' } },
+      { token: three, repositories: ['gadget'], permissions: { metadata: 'read', pull_requests: 'write' } },
+    ])
+    assert.equal(new Set([one, two, three]).size, 3)
+    // Nothing kept: no file changed, no timer set, and the API token is its own.
+    assert.deepEqual(await filesUnder(dir), files)
+    assert.equal(pending().length, timers)
+    const api = await manager.apiToken('acme')
+    assert.ok(![one, two, three].includes(api))
+    assert.deepEqual(fake.minted.at(-1)!.permissions, { ...API_PERMISSIONS })
+    for (const token of [one, two, three]) for (const line of lines) assert.ok(!line.includes(token))
+    await manager.close()
+    await assertNoTokenLeaks(fake, dir, directory, lines)
+  })
+
+  it("writeToken refuses an owner it doesn't hold and a repo none of its projects has, before minting", async () => {
+    const { fake, manager } = await setup(['widget', 'gadget', 'other'], { write: true })
+    await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget'] } }))
+    const minted = fake.minted.length
+    await assert.rejects(manager.writeToken('beta', 'widget', PUSH_PERMISSIONS), /beta/)
+    await assert.rejects(manager.writeToken('../x', 'widget', PUSH_PERMISSIONS), /not a GitHub owner/)
+    await assert.rejects(manager.writeToken('acme', 'gadget', PUSH_PERMISSIONS), /^Error: the dish App can't reach acme\/gadget: no project of dish has it installed$/)
+    await assert.rejects(manager.writeToken('acme', 'other', PULL_PERMISSIONS), /can't reach acme\/other/)
+    assert.equal(fake.minted.length, minted)
+    await manager.close()
+    await assert.rejects(manager.writeToken('acme', 'widget', PUSH_PERMISSIONS), /closed/)
+    assert.equal(fake.minted.length, minted)
+  })
+
+  it("writeToken's 422 says what the App needs, and holds no token", async () => {
+    const { fake, dir, directory, lines, manager } = await setup()
+    await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget'] } }))
+    const push = await manager.writeToken('acme', 'widget', PUSH_PERMISSIONS).catch((error: unknown) => error)
+    assert.ok(push instanceof Error)
+    assert.match(push.message, /^dish couldn't get a write token for acme\/widget: POST \/app\/installations\/77\/access_tokens answered HTTP 422: The permissions requested are not granted to this installation\. The dish App needs Contents read and write, and each installation must accept it \(Settings → GitHub App\)$/)
+    const pull = await manager.writeToken('acme', 'widget', PULL_PERMISSIONS).catch((error: unknown) => error)
+    assert.ok(pull instanceof Error)
+    assert.match(pull.message, /The dish App needs Pull requests read and write, and each installation must accept it/)
+    for (const { token } of fake.minted) {
+      assert.ok(!push.message.includes(token) && !pull.message.includes(token))
+      assert.ok(!String(push.stack).includes(token) && !String(pull.stack).includes(token))
+    }
+    // Another failure goes through as it is.
+    fake.failNext('/app/installations/77/access_tokens', 500, { message: 'boom' })
+    await assert.rejects(manager.writeToken('acme', 'widget', PUSH_PERMISSIONS), /^GitHubError: POST \/app\/installations\/77\/access_tokens answered HTTP 500: boom$/)
     await manager.close()
     await assertNoTokenLeaks(fake, dir, directory, lines)
   })
@@ -362,6 +461,7 @@ describe('TokenManager', () => {
         return realApp.createToken(...args)
       },
       installationFor: (owner: string, repo: string) => realApp.installationFor(owner, repo),
+      createWriteToken: (...args: Parameters<GitHubApp['createWriteToken']>) => realApp.createWriteToken(...args),
     }
     const realApp = new GitHubApp(async () => ({ appId: String(fake.app.id), privateKey: keys.privateKeyPem }), { api: fake.api })
     const slow = new TokenManager({ directory, app: slowApp, logger: { warn() {}, info() {} } })
@@ -382,6 +482,7 @@ describe('TokenManager', () => {
     const app = {
       createToken: async () => ({ token, expiresAt, permissions, repositories }),
       installationFor: async () => undefined,
+      createWriteToken: async () => { throw new Error('not in this test') },
     }
     const dir = await tempDir()
     for (let ticks = 0; ticks < 40; ticks++) {
