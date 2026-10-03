@@ -19,6 +19,15 @@
  * steps included; the listener lets those go by. The cut message itself never holds a tool call: dsh-llm's `BlockAssembler`
  * drops the tool calls of a `max-tokens` message, as they can't be run safely. So the stop at the cut is gated, once.
  *
+ * **A coder's `report`** (step 7). A crew coder finishes with crew's `report` tool, which records its structured report and
+ * concludes its turn. dsh-tools' `tools/result(exec, result)` tells of it (`toolResult`): a successful `report` that concluded
+ * the turn keeps its `status` on the session's closing, beside the head and the tool calls the session had. Its message holds
+ * the `report` call, so `toolCalls` is true, and its head can be an older message's: the listener goes by the status then, not
+ * by either. The order in dsh 0.2.0-rc.2 (`dsh-agent-loop`'s `step()`, `dsh-tools`' `notifyResult`) makes the status the stop's
+ * own: the step's `assistant/message` is appended before its tools run, so it can't clear the report it carries; `tools/result`
+ * is emitted, synchronously, before the result is committed; `agent/turn-stopping` fires after the step; and the next step's
+ * `assistant/message`, or the next `turn/start`, clears the report.
+ *
  * @module dish-gates/closing
  */
 
@@ -37,12 +46,27 @@ export function optsOut(head: string): boolean {
   return OPT_OUT.test(head)
 }
 
+/** crew's tool a coder finishes with (dish-crew's `REPORT_TOOL`; dish-gates imports no runtime code of crew's). */
+export const REPORT_TOOL = 'report'
+
+/** A coder report's `status` (dish-crew's `CoderStatus`). */
+export type ReportStatus = 'done' | 'blocked' | 'needs_context'
+
+/** Every `ReportStatus`, in that order. */
+export const REPORT_STATUSES: readonly ReportStatus[] = Object.freeze(['done', 'blocked', 'needs_context'] as const)
+
 /** What `ClosingHeads` keeps of a session's current turn. */
 export interface Closing {
   /** The head of the newest assistant message with text, or `''`. */
   head: string
   /** Whether the newest assistant message, text or not, holds `tool-call` blocks: the agent hasn't finished. */
   toolCalls: boolean
+  /** The `status` of a successful `report` that concluded the current turn since its newest assistant message; absent when none. */
+  report?: ReportStatus
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
 }
 
 const NONE: Closing = Object.freeze({ head: '', toolCalls: false })
@@ -58,8 +82,9 @@ export class ClosingHeads {
   /**
    * An `assistant/message` event: whether it holds tool calls, and, when it has text blocks, the head: their text joined
    * by a newline, leading whitespace dropped, its first `HEAD_CHARS` characters. A message with no text (only tool calls or
-   * reasoning, or only blanks) leaves the head before it. A `turn/start` clears both. Anything else is ignored. Never
-   * throws: it runs inside a session's append, where dsh would only log a throw, but that event's closing would be lost.
+   * reasoning, or only blanks) leaves the head before it. Either way the message replaces the entry, so a `report` before it
+   * goes. A `turn/start` clears the entry. Anything else is ignored. Never throws: it runs inside a session's append, where
+   * dsh would only log a throw, but that event's closing would be lost.
    */
   observe(session: object, event: unknown): void {
     try {
@@ -89,6 +114,31 @@ export class ClosingHeads {
       this.#closings.set(session, { head, toolCalls })
     } catch {
       // a malformed event, or one that throws when read: not a closing
+    }
+  }
+
+  /**
+   * dsh-tools' `tools/result(exec, result)`: a call named `report`, by an agent with a session object, `result.isError === false`,
+   * `result.concludesTurn === true`, and `result.value.status` one of `REPORT_STATUSES`: that status becomes the session's
+   * `report`, keeping its head and toolCalls. A later one replaces it. Anything else is ignored. Never throws: dsh contains a
+   * listener's throw, but the report would be lost.
+   */
+  toolResult(exec: unknown, result: unknown): void {
+    try {
+      if (!isObject(exec) || exec.name !== REPORT_TOOL) return
+      if (!isObject(result) || result.isError !== false || result.concludesTurn !== true) return
+      const agent = exec.agent
+      if (!isObject(agent)) return
+      const session = agent.session
+      if (!isObject(session)) return
+      const value = result.value
+      if (!isObject(value)) return
+      const status = value.status
+      if (!REPORT_STATUSES.includes(status as ReportStatus)) return
+      const { head, toolCalls } = this.closing(session)
+      this.#closings.set(session, { head, toolCalls, report: status as ReportStatus })
+    } catch {
+      // A malformed call or result, or one that throws when read: no report.
     }
   }
 

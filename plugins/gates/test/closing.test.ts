@@ -5,7 +5,7 @@ import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import SessionStore from '@deepseek-ai/dsh-session'
 import type { Session } from '@deepseek-ai/dsh-session'
-import { ClosingHeads, HEAD_CHARS, OPT_OUT, optsOut } from '../src/closing.ts'
+import { ClosingHeads, HEAD_CHARS, OPT_OUT, REPORT_STATUSES, REPORT_TOOL, optsOut } from '../src/closing.ts'
 
 const disposables: Array<{ dispose(): Promise<void> | void }> = []
 after(async () => {
@@ -222,6 +222,105 @@ test('a malformed event is ignored, and observe never throws', () => {
   assert.equal(heads.headOf(session), 'kept')
   assert.doesNotThrow(() => heads.observe(session, assistantEvent([text('after the bad ones')])))
   assert.equal(heads.headOf(session), 'after the bad ones')
+})
+
+// --- a coder's report, from dsh-tools' tools/result -------------------------------------------------
+
+/** `tools/result`'s two arguments for a `report` call by `agent`, as dsh-tools' registry gives them (the parts read, and more). */
+function reported(agent: unknown, value: unknown = { role: 'coder', turn: 1, at: 1, status: 'done', summary: 'did it' }, over: object = {}): [unknown, unknown] {
+  const exec = { callId: 'call-1', rootCallId: 'call-1', name: REPORT_TOOL, arguments: {}, agent, signal: new AbortController().signal }
+  const result = { isError: false, value, content: [{ type: 'text', text: 'Report recorded.' }], concludesTurn: true, ...over }
+  return [exec, result]
+}
+
+test('REPORT_TOOL and REPORT_STATUSES are crew\'s', () => {
+  assert.equal(REPORT_TOOL, 'report')
+  assert.deepEqual(REPORT_STATUSES, ['done', 'blocked', 'needs_context'])
+})
+
+test('toolResult: a successful report that concluded the turn keeps its status for that session', () => {
+  for (const status of REPORT_STATUSES) {
+    const heads = new ClosingHeads()
+    const session = {}
+    heads.observe(session, assistantEvent([call('report')]))
+    heads.toolResult(...reported({ id: 'c1', session }, { role: 'coder', turn: 1, at: 1, status, summary: 's' }))
+    assert.deepEqual(heads.closing(session), { head: '', toolCalls: true, report: status }, status)
+  }
+})
+
+test('toolResult ignores another tool, an error result, one without concludesTurn, an unknown status, an agent without a session, and malformed arguments', () => {
+  const heads = new ClosingHeads()
+  const session = {}
+  heads.observe(session, assistantEvent([text('Done.'), call('report')]))
+  const agent = { id: 'c1', session }
+  const [exec, result] = reported(agent)
+  const ignored: Array<[unknown, unknown]> = [
+    [{ ...exec as object, name: 'bash' }, result],
+    [{ ...exec as object, name: 'Report' }, result],
+    [exec, { isError: true, error: { message: 'invalid arguments' }, content: [] }],
+    [exec, { ...result as object, isError: undefined }],
+    [exec, { ...result as object, concludesTurn: undefined }],
+    [exec, { ...result as object, concludesTurn: false }],
+    [exec, { ...result as object, value: { role: 'coder', status: 'finished' } }],
+    [exec, { ...result as object, value: { role: 'reviewer', verdict: 'approved', head: 'a'.repeat(40) } }],
+    [exec, { ...result as object, value: null }],
+    [exec, { ...result as object, value: 'done' }],
+    [{ ...exec as object, agent: undefined }, result],
+    [{ ...exec as object, agent: { id: 'c1' } }, result],
+    [{ ...exec as object, agent: { id: 'c1', session: null } }, result],
+    [{ ...exec as object, agent: { id: 'c1', session: 'not an object' } }, result],
+    [undefined, result],
+    [null, null],
+    [exec, undefined],
+    ['report', 'done'],
+    [new Proxy({}, { get() { throw new Error('boom') } }), result],
+    [exec, new Proxy({}, { get() { throw new Error('boom') } })],
+    [{ name: 'report', get agent(): never { throw new Error('boom') } }, result],
+  ]
+  ignored.forEach(([e, r], index) => {
+    assert.doesNotThrow(() => heads.toolResult(e, r), `call ${index}`)
+    assert.deepEqual(heads.closing(session), { head: 'Done.', toolCalls: true }, `call ${index}`)
+  })
+})
+
+test('the next assistant message drops the report, with or without text; turn/start drops it; two sessions are kept apart', () => {
+  const heads = new ClosingHeads()
+  const a = {}
+  const b = {}
+  heads.observe(a, assistantEvent([text('Here is my work.'), call('report')]))
+  heads.toolResult(...reported({ id: 'a', session: a }))
+  assert.equal(heads.closing(a).report, 'done')
+  assert.equal(heads.closing(b).report, undefined, 'another session has none')
+
+  heads.observe(a, assistantEvent([call('bash')]))
+  assert.deepEqual(heads.closing(a), { head: 'Here is my work.', toolCalls: true }, 'a message of tool calls alone drops it')
+  heads.toolResult(...reported({ id: 'a', session: a }, { role: 'coder', turn: 1, at: 1, status: 'blocked', summary: 's', blockedOn: 'x' }))
+  assert.equal(heads.closing(a).report, 'blocked')
+  heads.observe(a, assistantEvent([text('Fixed it.')]))
+  assert.deepEqual(heads.closing(a), { head: 'Fixed it.', toolCalls: false }, 'a message with text drops it')
+
+  heads.toolResult(...reported({ id: 'a', session: a }))
+  heads.toolResult(...reported({ id: 'b', session: b }, { role: 'coder', turn: 1, at: 1, status: 'needs_context', summary: 's', blockedOn: 'y' }))
+  heads.observe(a, { type: 'turn/start', seq: 9, time: 2, data: { turn: 2 } })
+  assert.deepEqual(heads.closing(a), { head: '', toolCalls: false }, 'turn/start drops it')
+  assert.equal(heads.closing(b).report, 'needs_context', 'b keeps its own')
+})
+
+test('a report keeps the head and toolCalls the session had', () => {
+  const heads = new ClosingHeads()
+  const session = {}
+  heads.observe(session, assistantEvent([text('BLOCKED: an older message')]))
+  heads.observe(session, assistantEvent([call('report')]))
+  heads.toolResult(...reported({ id: 'c1', session }))
+  assert.deepEqual(heads.closing(session), { head: 'BLOCKED: an older message', toolCalls: true, report: 'done' })
+  assert.equal(heads.headOf(session), 'BLOCKED: an older message')
+  // A session it never saw a message for: the report alone.
+  const fresh = {}
+  heads.toolResult(...reported({ id: 'c2', session: fresh }))
+  assert.deepEqual(heads.closing(fresh), { head: '', toolCalls: false, report: 'done' })
+  // A later report replaces an earlier one.
+  heads.toolResult(...reported({ id: 'c2', session: fresh }, { role: 'coder', turn: 1, at: 2, status: 'blocked', summary: 's', blockedOn: 'z' }))
+  assert.equal(heads.closing(fresh).report, 'blocked')
 })
 
 // --- with a real session ----------------------------------------------------------------------------

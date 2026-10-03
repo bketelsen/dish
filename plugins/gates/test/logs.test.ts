@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { lstat, mkdir, readFile, readlink, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { gateLogFile, LOG_KEEP_MS, pruneLogs, writeLog } from '../src/logs.ts'
+import { checkLogFile, gateLogFile, LOG_KEEP_MS, pruneLogs, writeLog } from '../src/logs.ts'
 import { tempDir } from './helpers.ts'
 
 const CHILD = '0b6e9a52-3f0c-4c8e-9d1e-7a4f2b1c9e00'
@@ -38,6 +38,29 @@ test('a part that isn\'t one segment of [A-Za-z0-9._-], or is . or .., is refuse
   for (const [project, slug] of refused) {
     assert.throws(() => gateLogFile('/s', project, slug, CHILD, 1, 1), TypeError, `${project} ${slug}`)
   }
+})
+
+test('checkLogFile: <state>/gates/acme/widget/fix-1/open_pr.log, and gateLogFile\'s refusals (.., a slash in the owner, a slug outside the segment rule)', async () => {
+  assert.equal(checkLogFile('/s/dish', 'acme/widget', 'fix-1'), '/s/dish/gates/acme/widget/fix-1/open_pr.log')
+  assert.equal(checkLogFile('/s', 'Acme.Corp/my_repo-2', 'a'), '/s/gates/Acme.Corp/my_repo-2/a/open_pr.log')
+  const refused: Array<[string, string]> = [
+    ['../widget', 'fix-1'],
+    ['acme/..', 'fix-1'],
+    ['ac/me/widget', 'fix-1'],
+    ['acme', 'fix-1'],
+    ['acme/widget', '..'],
+    ['acme/widget', 'a/b'],
+    ['acme/widget', 'fix 1'],
+    ['acme/widget', ''],
+  ]
+  for (const [project, slug] of refused) {
+    assert.throws(() => checkLogFile('/s', project, slug), TypeError, `${project} ${slug}`)
+  }
+  // writeLog gives a second check of the same worktree the next name.
+  const state = await tempDir()
+  const file = checkLogFile(state, 'acme/widget', 'fix-1')
+  assert.equal(await writeLog(file, 'one\n'), file)
+  assert.equal(await writeLog(file, 'two\n'), join(state, 'gates', 'acme', 'widget', 'fix-1', 'open_pr.2.log'))
 })
 
 test('the turn and the round are whole numbers: a turn from 0, a round from 1', () => {

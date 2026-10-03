@@ -3,7 +3,8 @@
  *
  * A gate's log is `<state>/gates/<owner>/<repo>/<slug>/<child>-<turn>-<round>.log`, with `<state>` dish's state
  * directory (dish-kit's `xdgPaths('dish').state`). It holds a short header and the gate's kept output (at most 4 MiB),
- * masked before it gets here.
+ * masked before it gets here. open_pr's gate (`runAt`) logs to `open_pr.log` in the same directory, and each run after the
+ * first gets the next free name (`open_pr.2.log`, …), as any taken name does.
  *
  * - **Paths.** The parts are checked here, by dish-gates' own rule, since it imports no runtime code from dish-projects
  *   or dish-workspaces: the owner, the repo and the slug are each one path segment of `[A-Za-z0-9._-]`, not `.` or
@@ -60,6 +61,20 @@ export function gateLogFile(state: string, project: string, slug: string, child:
   if (!Number.isSafeInteger(turn) || turn < 0) throw new TypeError(`a gate log's turn must be a whole number from 0: ${turn}`)
   if (!Number.isSafeInteger(round) || round < 1) throw new TypeError(`a gate log's round must be a whole number from 1: ${round}`)
   return join(state, 'gates', owner, repo, slug, `${id}-${turn}-${round}.log`)
+}
+
+/**
+ * `<state>/gates/<owner>/<repo>/<slug>/open_pr.log`: the log of an open_pr gate (`runAt`), with `gateLogFile`'s checks of the
+ * owner, the repo and the slug. `writeLog` gives a taken name `.2`, `.3`, ….
+ * @throws TypeError for a refused part.
+ */
+export function checkLogFile(state: string, project: string, slug: string): string {
+  const parts = typeof project === 'string' ? project.split('/') : []
+  if (parts.length !== 2) throw new TypeError(`a gate log's project must be owner/repo: ${JSON.stringify(project)}`)
+  const owner = segment('owner', parts[0]!)
+  const repo = segment('repo', parts[1]!)
+  segment('slug', slug)
+  return join(state, 'gates', owner, repo, slug, 'open_pr.log')
 }
 
 /** `file`, or its `n`th name: `<stem>.<n>.log`. */

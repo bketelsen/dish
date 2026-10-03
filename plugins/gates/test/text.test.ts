@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { CONTEXT_SUMMARY_MAX_CHARS } from '@deepseek-ai/dsh-llm'
 import { maskSecrets } from 'dish-kit'
 import {
-  BLOCKED_REASON, DEFAULT_TAIL_LINES, EXCERPT_LINES, EXCERPT_MAX_CHARS, SUMMARY_MAX_CHARS, TAIL_MAX_BYTES,
+  BLOCKED_REASON, DEFAULT_TAIL_LINES, EXCERPT_LINES, EXCERPT_MAX_CHARS, REPORTED_REASON, SUMMARY_MAX_CHARS, TAIL_MAX_BYTES,
   duration, excerptOf, failureMessage, failureSummary, fenced, tailOf,
 } from '../src/text.ts'
 import type { Failure } from '../src/text.ts'
@@ -21,6 +21,7 @@ test('the constants are the plan\'s', () => {
   assert.equal(SUMMARY_MAX_CHARS, 120)
   assert.equal(SUMMARY_MAX_CHARS, CONTEXT_SUMMARY_MAX_CHARS, 'dsh bounds a notice summary at the same length')
   assert.equal(BLOCKED_REASON, 'the coder reported BLOCKED / NEEDS CONTEXT')
+  assert.deepEqual(REPORTED_REASON, { blocked: 'the coder reported status blocked', needs_context: 'the coder reported status needs_context' })
 })
 
 test('tailOf keeps the last lines', () => {
@@ -321,6 +322,62 @@ test('failureMessage is built only for a round that can be steered', () => {
   assert.throws(() => failureMessage(failure({ round: 4, maxRounds: 3 })), RangeError)
   assert.throws(() => failureMessage(failure({ round: 0, maxRounds: 3 })), RangeError)
   assert.doesNotThrow(() => failureMessage(failure({ round: 1, maxRounds: 2 })))
+})
+
+// --- failureMessage after a report (step 7) ---------------------------------------------------------
+
+const REPORT_FIX = 'Fix it in your worktree, then call `report` again: the new report replaces the one you made. The gate runs again when you do.'
+const REPORT_OPT_OUT = 'If you\'re blocked, call `report` with `status: "blocked"` or `"needs_context"` and `blockedOn`, and the gate is skipped.'
+
+test('failureMessage after a report asks for report again and gives report\'s opt-out, and holds no "closing message"', () => {
+  for (const denied of [false, true]) {
+    const message = failureMessage(failure({ reported: true, denied }))
+    assert.ok(message.includes(`Full log: \`/state/dish/gates/acme/widget/fix-1/c1-1-1.log\`. ${REPORT_FIX}\n`), message)
+    assert.ok(message.endsWith(`\n${REPORT_OPT_OUT}`), message)
+    assert.ok(!message.includes('closing message'), message)
+    assert.ok(!message.includes('BLOCKED:'), message)
+  }
+  // The rest is as it was: the first line, the output, the log.
+  const plain = failureMessage(failure())
+  const after = failureMessage(failure({ reported: true }))
+  assert.equal(FIRST(after), FIRST(plain))
+  assert.equal(bodyOf(after), bodyOf(plain))
+  // The sandbox's hint asks for the report, not the closing message.
+  assert.ok(failureMessage(failure({ reported: true, denied: true })).includes(
+    'except dish\'s own files, `~/.ssh`, git\'s config and shell startup files. If it needs another directory, say so in your report\'s `concerns`.'))
+})
+
+test('failureMessage without reported is today\'s text, byte for byte', () => {
+  for (const over of [{}, { round: 2 }, { denied: true }, { log: null, logProblem: 'EACCES' }]) {
+    assert.equal(failureMessage(failure({ ...over, reported: false })), failureMessage(failure(over)))
+  }
+  assert.equal(failureMessage(failure({ reported: false, round: 2 })), [
+    'The gate failed (round 2 of 3): `pnpm test` exited 1 after 42 s.',
+    'Last lines of its output:',
+    '```',
+    'FAIL src/a.test.ts',
+    '  expected 1, got 2',
+    '```',
+    'Full log: `/state/dish/gates/acme/widget/fix-1/c1-1-1.log`. Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do. '
+      + 'If it fails once more, your turn ends with the failure, and the main agent decides what\'s next.',
+    'If you\'re blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.',
+  ].join('\n'))
+})
+
+test('the next-to-last round\'s sentence follows the report fix sentence too', () => {
+  const sentence = 'If it fails once more, your turn ends with the failure, and the main agent decides what\'s next.'
+  assert.ok(failureMessage(failure({ reported: true, round: 2 })).includes(`${REPORT_FIX} ${sentence}\n`))
+  assert.ok(!failureMessage(failure({ reported: true, round: 1 })).includes(sentence))
+  assert.equal(failureMessage(failure({ reported: true, round: 2 })), [
+    'The gate failed (round 2 of 3): `pnpm test` exited 1 after 42 s.',
+    'Last lines of its output:',
+    '```',
+    'FAIL src/a.test.ts',
+    '  expected 1, got 2',
+    '```',
+    `Full log: \`/state/dish/gates/acme/widget/fix-1/c1-1-1.log\`. ${REPORT_FIX} ${sentence}`,
+    REPORT_OPT_OUT,
+  ].join('\n'))
 })
 
 // --- failureSummary ---------------------------------------------------------------------------------
