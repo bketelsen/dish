@@ -36,6 +36,11 @@ export const ANSWER_MAX = 48_000
 
 /** How a body's line is quoted. */
 const QUOTE = '  > '
+/**
+ * Every line break a renderer or a model may honour: CRLF, LF, CR, VT, FF, NEL, LS and PS. readPull blanks C0 controls
+ * but `\n`, so NEL (U+0085, past C0) and the two Unicode separators reach here; a body is quoted at each of them.
+ */
+const LINE_BREAKS = /\r\n|[\n\r\v\f\x85\u2028\u2029]/
 /** The most check lines the text gives. */
 const CHECK_LINES = 50
 /** What a review body is cut to when the text is still over the cap. */
@@ -76,7 +81,7 @@ function quoted(body: unknown, max?: number): string[] {
   let text = maskSecrets(typeof body === 'string' ? body : '').trimEnd()
   if (max !== undefined) text = cut(text, max)
   if (text.trim() === '') return []
-  return text.split(/\r\n|[\n\r\u2028\u2029]/).map(part => QUOTE + part)
+  return text.split(LINE_BREAKS).map(part => QUOTE + part)
 }
 
 function list<T>(value: readonly T[] | undefined): readonly T[] {

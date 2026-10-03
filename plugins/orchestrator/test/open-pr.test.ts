@@ -28,9 +28,9 @@ interface Setup {
 }
 
 /** A world with a run this chat drives (its worktree at HEAD, clean), and the tool over it. */
-async function setup(): Promise<Setup> {
+async function setup(options: { goal?: string } = {}): Promise<Setup> {
   const w = await world()
-  const run = await w.open()
+  const run = await w.open(options.goal === undefined ? {} : { goal: options.goal })
   return { w, run, tool: openPrTool(w.deps)! }
 }
 
@@ -76,8 +76,8 @@ async function entriesOf(w: World, run: Run, kind: string): Promise<Array<Record
 }
 
 /** A run with PR #7 that was closed by an open_pr and reopened by this chat for review feedback: its head moved to SHA_C, which the final reviewer approved; GitHub reports #7 as open. */
-async function reopened(): Promise<Setup & { pr: { url: string, number: number } }> {
-  const { w, run, tool } = await setup()
+async function reopened(options: { goal?: string } = {}): Promise<Setup & { pr: { url: string, number: number } }> {
+  const { w, run, tool } = await setup(options)
   const pr = { url: `https://github.com/${PROJECT}/pull/7`, number: 7 }
   const closed = await w.runs.withRun(run, () => w.runs.close(run, SESSION, { state: 'pr', pr }))
   const { how } = await w.runs.withSession(SESSION, () => w.runs.drive(SESSION, closed, { takeover: false }))
@@ -725,6 +725,84 @@ test('open_pr: a ledger line that can\'t be written is logged and named in the a
   } finally {
     w.runs.harness = original
   }
+})
+
+test('open_pr on a reopened run with a long goal and no title: the title openPull gets is the goal cut to 256', async () => {
+  const goal = `Fix the login redirect ${'x'.repeat(267)}`
+  const { w, run, tool, pr } = await reopened({ goal })
+  assert.equal(w.record(run)?.goal.length, 290)
+  // As dish-workspaces' openPull does: the title is checked before it looks for the open pull request.
+  w.workspaces.impl.openPull = async (_project, pull) => {
+    const length = Array.from(pull.title).length
+    if (length > TITLE_MAX) throw new Error(`the title is ${length} characters; GitHub takes at most 256`)
+    return { ...pr, existing: true }
+  }
+  const value = await call(tool, { title: '', body: '' })
+  assert.equal(value.number, 7)
+  const sent = w.workspaces.calls.openPull[0]![1].title
+  assert.ok(Array.from(sent).length <= TITLE_MAX, `${Array.from(sent).length}`)
+  assert.ok(sent.startsWith('Fix the login redirect xxx'))
+  assert.equal(w.workspaces.calls.updatePull.length, 0)
+})
+
+test('open_pr: cancelled after the gate, while the head and the ledger are read again, records nothing and pushes nothing', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  const controller = new AbortController()
+  let reads = 0
+  w.workspaces.impl.headOf = async () => {
+    reads += 1
+    if (reads === 2) controller.abort()
+    return HEAD
+  }
+  await refused(call(tool, {}, mainExec(SESSION, undefined, { signal: controller.signal })), 'open_pr was cancelled while the gate ran. Nothing was pushed.')
+  nothingWritten(w)
+  assert.deepEqual(await written(w, run), [])
+  assert.equal(w.record(run)?.state, 'open')
+})
+
+test('open_pr: a run store or a ledger that can\'t be read is refused masked, and nothing is pushed', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  const ready = w.runs.ready.bind(w.runs)
+  w.runs.ready = async () => { throw new Error(`EIO: i/o error ${TOKEN}`) }
+  let message = await refused(call(tool), `can't read the run records: EIO: i/o error ${MASKED_TOKEN}. Nothing was pushed.`)
+  assert.ok(!message.includes(TOKEN))
+  w.runs.ready = ready
+  const entries = w.runs.entries.bind(w.runs)
+  w.runs.entries = async () => { throw new Error(`EACCES: permission denied ${TOKEN}`) }
+  message = await refused(call(tool), `can't read the run's ledger: EACCES: permission denied ${MASKED_TOKEN}. Nothing was pushed.`)
+  assert.ok(!message.includes(TOKEN))
+  w.runs.entries = entries
+  nothingWritten(w)
+  assert.equal(w.record(run)?.state, 'open')
+})
+
+test('open_pr: a pull request opened outside dish gets the override line as a comment; its title and body are never edited', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  w.gates.impl.runAt = async () => gate({})
+  const url = `https://github.com/${PROJECT}/pull/40`
+  w.workspaces.impl.openPull = async () => ({ url, number: 40, existing: true })
+  const value = await call(tool, { title: 'Mine', body: 'My body', gateRuling: RULING })
+  assert.deepEqual(w.workspaces.calls.commentPull, [[PROJECT, 40, `${GATE_LINE}the flaky e2e suite — it fails on main too — a real failure could hide in it`]])
+  assert.equal(w.workspaces.calls.updatePull.length, 0)
+  const [updated] = await entriesOf(w, run, 'pr.updated')
+  assert.equal(updated!.comment, 'posted')
+  assert.equal(updated!.titleChanged, false)
+  assert.equal(updated!.bodyChanged, false)
+  assert.equal(value.text.split('\n')[2], 'dish posted the override line as a comment on it.')
+  assert.deepEqual(w.record(run)?.pr, { url, number: 40 })
+})
+
+test('open_pr: dish-crew\'s bindings that can\'t be read are logged, and the call goes on', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  w.crew.impl.worktreeBindings = async () => { throw new Error('crew records unreadable') }
+  const value = await call(tool)
+  assert.equal(value.number, 1)
+  assert.equal(w.workspaces.calls.pushBranch.length, 1)
+  assert.ok(w.logs.some(line => line.includes('could not ask dish-crew who works in') && line.includes('crew records unreadable')), w.logs.join('\n'))
 })
 
 /** The ledger entries' `by`: open_pr writes only the harness's. */

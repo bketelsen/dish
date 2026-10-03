@@ -271,7 +271,11 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
       // 2. The arguments.
       const asked = readArguments(args)
       // 3. The run.
-      await runs.ready()
+      try {
+        await runs.ready()
+      } catch (error) {
+        throw fail(`can't read the run records: ${describe(error).replace(/\.+$/, '')}. ${NOTHING}`, error)
+      }
       const driven = runs.store.drivenBy(session)
       if (driven === undefined) throw new Error(NO_RUN)
       if (driven.pr === undefined) {
@@ -397,10 +401,17 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
     }
 
     // 12. The final review on the head: read now, after the gate, so a verdict that came meanwhile counts.
-    const entries = await runs.entries(run)
+    let entries: Awaited<ReturnType<typeof runs.entries>>
+    try {
+      entries = await runs.entries(run)
+    } catch (error) {
+      throw fail(`can't read the run's ledger: ${describe(error).replace(/\.+$/, '')}. ${NOTHING}`, error)
+    }
     const final = latestFinal(entries)
     const reviewOk = final?.verdict === 'approved' && sameHead(final.head, head)
     const finalSeen: PrFinal | null = final === undefined ? null : { child: final.child, verdict: final.verdict, head: final.head, at: final.at }
+    // A cancel during the reads since the gate: nothing is recorded, as for one during it.
+    if (aborted(signal)) throw new Error(`open_pr was cancelled while the gate ran. ${NOTHING}`)
 
     if (moved !== undefined) {
       await record(runs, run, {
@@ -436,8 +447,10 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
       throw fail(`${sentence(describe(error))} Nothing else was done; the run stays open.`, error)
     }
 
-    // 16. The pull request; a reopened run's falls back to its goal and an empty body if GitHub's was closed.
-    const title = maskSecrets(asked.title ?? run.goal)
+    // 16. The pull request; a reopened run's falls back to its goal and an empty body if GitHub's was closed. The goal is one
+    // line and masked already, but up to 300 characters: cut to the 256 openPull takes (it checks before it looks for the
+    // open pull request, so a longer one would fail the call after the push).
+    const title = asked.title !== undefined ? maskSecrets(asked.title) : cut(run.goal, TITLE_MAX)
     let pull: { url: string, number: number, existing: boolean }
     try {
       pull = await workspaces.openPull(run.project, { head: run.branch, title, body: prBody(asked.body ?? '', overrides) })
