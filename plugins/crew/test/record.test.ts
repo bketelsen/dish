@@ -4,8 +4,10 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { CrewRecords, STOP_REASON_STATUS, TEMP_GRACE_MS, closingOf, isRunning, reportContent, statusFor } from '../src/record.ts'
-import type { ChildRecord, NewChild } from '../src/record.ts'
+import { CrewRecords, GATE_OUTCOMES, STOP_REASON_STATUS, TEMP_GRACE_MS, closingOf, gateProblem, isRunning, latestGate, reportContent, statusFor } from '../src/record.ts'
+import type { ChildRecord, GateResult, NewChild } from '../src/record.ts'
+import * as crewIndex from '../src/index.ts'
+import type { GateOutcome as IndexGateOutcome, GateResult as IndexGateResult } from '../src/index.ts'
 import { tempDir } from './helpers.ts'
 
 const HOUR = 60 * 60 * 1000
@@ -18,6 +20,14 @@ function sha(text: string): string {
 
 function newChild(id: string, overrides: Partial<NewChild> = {}): NewChild {
   return { id, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', startedAt: STARTED, ...overrides }
+}
+
+/** A gate result as dish-gates records one: a failure in round 1 of turn 1, unless `overrides` says otherwise. */
+function gate(overrides: Partial<GateResult> = {}): GateResult {
+  return {
+    turn: 1, round: 1, maxRounds: 3, outcome: 'failed', command: 'pnpm test', exitCode: 1, timedOut: false, durationMs: 4200,
+    log: '/state/dish/gates/acme/widget/fix-1/c1-1-1.log', excerpt: 'not ok 1 - adds\n# fail 1', at: STARTED + 1000, ...overrides,
+  }
 }
 
 interface Fixture {
@@ -625,6 +635,13 @@ const BAD_FILES: Array<[string, string | ((good: any) => unknown)]> = [
   ['a run with a stopReason that is not a string', (good) => { good.children[0].runs[0].stopReason = 2; return good }],
   ['a run with an error that is not a string', (good) => { good.children[0].runs[0].error = {}; return good }],
   ['a run with a report that is not a string', (good) => { good.children[0].runs[0].report = null; return good }],
+  ['a gates on the child that is not a list', (good) => { good.children[0].gates = 'none'; return good }],
+  ['a gate on the child that is malformed', (good) => { good.children[0].gates = [{ ...gate(), outcome: 'maybe' }]; return good }],
+  ['a gate on the child that is not an object', (good) => { good.children[0].gates = [gate(), 7]; return good }],
+  ['a gates on a run that is not a list', (good) => { good.children[0].runs[0].gates = {}; return good }],
+  ['a gate on a run that is malformed', (good) => { good.children[0].runs[0].gates = [{ ...gate(), round: 0 }]; return good }],
+  ['a gateOverride that is not a string', (good) => { good.children[0].gateOverride = 5; return good }],
+  ['a gateOverride that is null', (good) => { good.children[0].gateOverride = null; return good }],
 ]
 
 for (const [what, make] of BAD_FILES) {
@@ -975,4 +992,295 @@ test('endRun writes reportContent of the closing message', async () => {
   const b = await records.endRun('c2', { stopReason: 'completed', closing: ' \n' })
   assert.equal(await readFile(a!.report, 'utf8'), reportContent('Text\nmore'))
   assert.equal(await readFile(b!.report, 'utf8'), reportContent(''))
+})
+
+// --- gates ----------------------------------------------------------------------------------------
+
+const TREE_GATED = '/work/acme/widget/.worktrees/fix-1'
+
+/** A whole child record, for `latestGate`: running, with no runs, unless `overrides` says otherwise. */
+function childRecord(overrides: Partial<ChildRecord> = {}): ChildRecord {
+  return {
+    id: 'c1', n: 1, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', worktree: TREE_GATED,
+    startedAt: STARTED, followUps: 0, runs: [], last: 'running', ...overrides,
+  }
+}
+
+test('addGate keeps a running child\'s results on the child, in order, and they are still there after a restart', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
+  const failed = gate()
+  const passed = gate({ round: 2, outcome: 'passed', exitCode: 0, excerpt: '# pass 12', log: '/state/dish/gates/acme/widget/fix-1/c1-1-2.log', at: STARTED + 2000 })
+  assert.equal(await records.addGate('c1', failed), true)
+  assert.equal(await records.addGate('c1', passed), true)
+  const found = await records.lookup('c1')
+  assert.deepEqual(found?.record.gates, [failed, passed])
+  // The run is still in progress: nothing is filed, and the child is running as it was.
+  assert.deepEqual(found?.record.runs, [])
+  assert.equal(found?.record.last, 'running')
+  assert.equal(found?.record.worktree, TREE_GATED)
+  const { records: restarted, corrupt } = reopen(directory)
+  assert.deepEqual((await restarted.lookup('c1'))?.record.gates, [failed, passed])
+  assert.deepEqual(corrupt, [])
+})
+
+test('addGate stores a copy, with only a gate\'s own fields, and a reason only when there is one', async () => {
+  const { records } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
+  const given = { ...gate({ outcome: 'error', command: '', exitCode: null, log: null, excerpt: '', reason: 'dish-workspaces isn\'t running' }), extra: 'dropped' }
+  const adding = records.addGate('c1', given)
+  given.reason = 'changed afterwards'
+  assert.equal(await adding, true)
+  const [stored] = (await records.lookup('c1'))!.record.gates!
+  assert.ok(!('extra' in stored!))
+  assert.equal(stored!.reason, 'dish-workspaces isn\'t running')
+  assert.equal(stored!.log, null)
+  assert.equal(stored!.exitCode, null)
+  await records.addGate('c1', gate({ round: 2 }))
+  const second = (await records.lookup('c1'))!.record.gates![1]!
+  assert.ok(!('reason' in second))
+  // What a lookup gives is a copy too.
+  const looked = await records.lookup('c1')
+  looked!.record.gates![0]!.outcome = 'passed'
+  assert.equal((await records.lookup('c1'))!.record.gates![0]!.outcome, 'error')
+})
+
+test('endRun moves the run\'s gate results onto the run it files, and the next run starts with none', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
+  const first = gate()
+  const second = gate({ round: 2, outcome: 'passed', exitCode: 0 })
+  await records.addGate('c1', first)
+  await records.addGate('c1', second)
+  await records.endRun('c1', { stopReason: 'completed', closing: 'done' })
+  let record = (await records.lookup('c1'))!.record
+  assert.ok(!('gates' in record), JSON.stringify(record))
+  assert.deepEqual(record.runs[0]!.gates, [first, second])
+  assert.deepEqual(latestGate(record), second)
+
+  // A follow-up's run, gated once in its own turn: its run holds that result and no other, and the first run keeps its own.
+  await records.addFollowUp('c1')
+  record = (await records.lookup('c1'))!.record
+  assert.ok(!('gates' in record))
+  const third = gate({ turn: 2, at: STARTED + 9000 })
+  await records.addGate('c1', third)
+  await records.endRun('c1', { stopReason: 'completed', closing: 'fixed' })
+  record = (await records.lookup('c1'))!.record
+  assert.deepEqual(record.runs.map(run => run.gates), [[first, second], [third]])
+
+  // A run with no gate result is filed without the field.
+  await records.addFollowUp('c1')
+  await records.endRun('c1', { stopReason: 'aborted', closing: '' })
+  record = (await records.lookup('c1'))!.record
+  assert.ok(!('gates' in record.runs[2]!), JSON.stringify(record.runs[2]))
+  assert.equal(latestGate(record), undefined)
+
+  // And on disk, after a restart.
+  const file = JSON.parse(await readFile(join(sessionDir(directory, 's1'), 'children.json'), 'utf8'))
+  assert.ok(!('gates' in file.children[0]))
+  const { records: restarted } = reopen(directory)
+  assert.deepEqual((await restarted.lookup('c1'))!.record.runs.map(run => run.gates), [[first, second], [third], undefined])
+})
+
+test('a run that ends between two gates: the gate after it goes on the next run, not the one that ended', async () => {
+  const { records } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
+  await records.addGate('c1', gate())
+  await records.endRun('c1', { stopReason: 'error', error: 'the model went away', closing: '' })
+  await records.startRun('c1')
+  const next = gate({ turn: 2, outcome: 'passed', exitCode: 0 })
+  await records.addGate('c1', next)
+  const record = (await records.lookup('c1'))!.record
+  assert.deepEqual(record.runs[0]!.gates, [gate()])
+  assert.deepEqual(record.gates, [next])
+})
+
+test('addGate for a child that is not recorded is false and writes nothing, whatever the id', async () => {
+  const { records, directory } = await fixture()
+  assert.equal(await records.addGate('nobody', gate()), false)
+  assert.equal(await records.addGate('', gate()), false)
+  assert.equal(await records.addGate(undefined as never, gate()), false)
+  assert.equal(await exists(join(directory, 'sessions')), false)
+  assert.equal(await exists(join(directory, 'by-child')), false)
+})
+
+/** Gate results that are not one, each with the field its problem names. */
+const BAD_GATES: Array<[string, unknown]> = [
+  ['outcome', { ...gate(), outcome: 'maybe' }],
+  ['round', gate({ round: 0 })],
+  ['round', gate({ round: 1.5 })],
+  ['turn', (({ turn: _turn, ...rest }) => rest)(gate())],
+  ['turn', gate({ turn: -1 })],
+  ['maxRounds', gate({ maxRounds: 0 })],
+  ['excerpt', { ...gate(), excerpt: 5 }],
+  ['command', { ...gate(), command: undefined }],
+  ['exitCode', { ...gate(), exitCode: '1' }],
+  ['exitCode', gate({ exitCode: Number.NaN })],
+  ['timedOut', { ...gate(), timedOut: 'no' }],
+  ['durationMs', gate({ durationMs: Number.POSITIVE_INFINITY })],
+  ['log', { ...gate(), log: 5 }],
+  ['log', (({ log: _log, ...rest }) => rest)(gate())],
+  ['reason', { ...gate(), reason: null }],
+  ['at', { ...gate(), at: 'now' }],
+  ['an object', null],
+  ['an object', 'failed'],
+  ['an object', [gate()]],
+]
+
+test('gateProblem says what is wrong with a gate result, and nothing for one that is right', () => {
+  assert.equal(gateProblem(gate()), undefined)
+  for (const outcome of GATE_OUTCOMES) assert.equal(gateProblem(gate({ outcome })), undefined, outcome)
+  assert.deepEqual([...GATE_OUTCOMES], ['passed', 'failed', 'skipped', 'error'])
+  assert.equal(gateProblem(gate({ exitCode: null, log: null, command: '', excerpt: '', reason: 'not gated: x' })), undefined)
+  // A round past maxRounds is a result dish-gates can record (a worktree that stopped resolving after the last round).
+  assert.equal(gateProblem(gate({ round: 4, maxRounds: 3, outcome: 'error' })), undefined)
+  for (const [field, value] of BAD_GATES) {
+    const problem = gateProblem(value)
+    assert.equal(typeof problem, 'string', JSON.stringify(value))
+    assert.ok(problem!.includes(field), `${problem} should name ${field}`)
+  }
+})
+
+test('a malformed gate result is a TypeError, and the record is left byte for byte', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
+  await records.addGate('c1', gate())
+  const file = join(sessionDir(directory, 's1'), 'children.json')
+  const before = await readFile(file)
+  const { mtimeMs } = await stat(file)
+  for (const [field, value] of BAD_GATES) {
+    await assert.rejects(records.addGate('c1', value as GateResult), (error: unknown) => {
+      assert.ok(error instanceof TypeError, String(error))
+      assert.match(error.message, /^addGate needs a gate result: /)
+      assert.ok(error.message.includes(field), error.message)
+      return true
+    })
+  }
+  // Refused before anything was looked up: a child nobody recorded is refused the same way.
+  await assert.rejects(records.addGate('nobody', { ...gate(), outcome: 'maybe' } as unknown as GateResult), TypeError)
+  assert.deepEqual(await readFile(file), before)
+  assert.equal((await stat(file)).mtimeMs, mtimeMs)
+  assert.deepEqual((await readdir(sessionDir(directory, 's1'))).filter(name => name.endsWith('.tmp')), [])
+})
+
+test('a children.json written before gates existed still parses: no gates, no gateOverride, and runs without them', async () => {
+  const { records, directory, corrupt } = await fixture()
+  const dir = sessionDir(directory, 's1')
+  await mkdir(dir, { recursive: true })
+  const old = {
+    sessionId: 's1',
+    children: [
+      {
+        id: 'c1', n: 1, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', worktree: TREE_GATED,
+        startedAt: STARTED, followUps: 0, runs: [{ endedAt: STARTED + 1, stopReason: 'completed', report: '/r/1-coder-1.md' }], last: 'finished',
+      },
+      { id: 'c2', n: 2, role: 'reviewer', title: 'review', model: 'gpt-5.6-sol', family: 'openai', reviews: 'c1', startedAt: STARTED, followUps: 0, runs: [], last: 'running' },
+    ],
+  }
+  await writeFile(join(dir, 'children.json'), JSON.stringify(old))
+  const [coder, reviewer] = await records.children('s1')
+  assert.deepEqual(corrupt, [])
+  assert.ok(!('gates' in coder!))
+  assert.ok(!('gates' in coder!.runs[0]!))
+  assert.ok(!('gateOverride' in reviewer!))
+  assert.equal(latestGate(coder!), undefined)
+})
+
+test('a gate\'s unknown fields are dropped when the record is read, on the child and on a run', async () => {
+  const { records, directory, corrupt } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
+  await records.endRun('c1', { stopReason: 'completed', closing: 'x' })
+  const file = join(sessionDir(directory, 's1'), 'children.json')
+  const good = JSON.parse(await readFile(file, 'utf8'))
+  good.children[0].runs[0].gates = [{ ...gate(), later: 1 }]
+  good.children[0].gates = [{ ...gate({ turn: 2 }), later: 2 }]
+  await writeFile(file, JSON.stringify(good))
+  const record = (await records.lookup('c1'))!.record
+  assert.deepEqual(corrupt, [])
+  assert.deepEqual(record.runs[0]!.gates, [gate()])
+  assert.deepEqual(record.gates, [gate({ turn: 2 })])
+})
+
+test('latestGate: the run in progress\'s last result, else the latest run\'s last, else none', () => {
+  const a = gate({ turn: 1, round: 1 })
+  const b = gate({ turn: 1, round: 2, outcome: 'passed', exitCode: 0 })
+  const c = gate({ turn: 2, round: 1 })
+  const run = (gates?: GateResult[]) => ({ endedAt: STARTED, stopReason: 'completed', report: '/r.md', ...gates === undefined ? {} : { gates } })
+  // The run in progress is newer than any run that ended.
+  assert.equal(latestGate(childRecord({ gates: [a, c], runs: [run([b])] })), c)
+  // With none in progress (or an empty list), the latest run's last.
+  assert.equal(latestGate(childRecord({ runs: [run([c]), run([a, b])], last: 'finished' })), b)
+  assert.equal(latestGate(childRecord({ gates: [], runs: [run([a, b])], last: 'finished' })), b)
+  // The latest run had none: an older run's result isn't this run's.
+  assert.equal(latestGate(childRecord({ runs: [run([b]), run()], last: 'failed' })), undefined)
+  assert.equal(latestGate(childRecord()), undefined)
+  assert.equal(latestGate(childRecord({ runs: [run([])] })), undefined)
+})
+
+test('addChild records a gateOverride when it is given, and none when it is not', async () => {
+  const { records, directory } = await fixture()
+  const ruling = 'Ruling: review it anyway — the failing test is a known flake — a real bug slips through'
+  const reviewer = await records.addChild('s1', newChild('r1', { role: 'reviewer', reviews: 'c1', gateOverride: ruling }))
+  assert.equal(reviewer.gateOverride, ruling)
+  const plain = await records.addChild('s1', newChild('r2', { role: 'reviewer', reviews: 'c1' }))
+  assert.ok(!('gateOverride' in plain))
+  const { records: restarted } = reopen(directory)
+  assert.equal((await restarted.lookup('r1'))!.record.gateOverride, ruling)
+  assert.ok(!('gateOverride' in (await restarted.lookup('r2'))!.record))
+  for (const gateOverride of [5, null, ['Ruling: x']]) {
+    await assert.rejects(records.addChild('s1', { ...newChild('r3'), gateOverride } as unknown as NewChild), /gateOverride must be a string/, String(gateOverride))
+  }
+  assert.equal(await records.lookup('r3'), undefined)
+})
+
+test('addFollowUp with a gateOverride records the ruling, a later one replaces it, and one without keeps it', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('r1', { role: 'reviewer', reviews: 'c1' }))
+  await records.endRun('r1', { stopReason: 'completed', closing: 'LGTM' })
+  await records.addFollowUp('r1', { gateOverride: 'Ruling: first — why — cost' })
+  let record = (await records.lookup('r1'))!.record
+  assert.equal(record.gateOverride, 'Ruling: first — why — cost')
+  assert.equal(record.followUps, 1)
+  assert.equal(record.last, 'running')
+  await records.addFollowUp('r1', { gateOverride: 'Ruling: second — why — cost' })
+  await records.addFollowUp('r1')
+  await records.addFollowUp('r1', {})
+  record = (await records.lookup('r1'))!.record
+  assert.equal(record.gateOverride, 'Ruling: second — why — cost')
+  assert.equal(record.followUps, 4)
+  // Not a string: refused before anything is written.
+  const file = join(sessionDir(directory, 's1'), 'children.json')
+  const before = await readFile(file)
+  await assert.rejects(records.addFollowUp('r1', { gateOverride: 5 as unknown as string }), /gateOverride must be a string/)
+  assert.deepEqual(await readFile(file), before)
+  // A child that is not recorded is still ignored.
+  await records.addFollowUp('nobody', { gateOverride: 'Ruling: x — y — z' })
+})
+
+test('addGate and addFollowUp made at once both land, with each other and with another child\'s', async () => {
+  const { records } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
+  await records.addChild('s1', newChild('r1', { role: 'reviewer', reviews: 'c1' }))
+  const results = [1, 2, 3, 4, 5].map(round => gate({ round, maxRounds: 5 }))
+  await Promise.all([
+    ...results.map(result => records.addGate('c1', result)),
+    records.addFollowUp('c1'),
+    records.addFollowUp('r1', { gateOverride: 'Ruling: go — flake — a bug' }),
+    records.addFollowUp('c1'),
+  ])
+  const coder = (await records.lookup('c1'))!.record
+  const reviewer = (await records.lookup('r1'))!.record
+  assert.deepEqual([...coder.gates!].sort((x, y) => x.round - y.round), results)
+  assert.equal(coder.followUps, 2)
+  assert.equal(reviewer.gateOverride, 'Ruling: go — flake — a bug')
+  assert.equal(reviewer.followUps, 1)
+  assert.ok(!('gates' in reviewer))
+})
+
+test('the package exports the gate types and helpers', () => {
+  assert.equal(crewIndex.gateProblem, gateProblem)
+  assert.equal(crewIndex.latestGate, latestGate)
+  const outcome: IndexGateOutcome = 'skipped'
+  const result: IndexGateResult = gate({ outcome })
+  assert.equal(crewIndex.gateProblem(result), undefined)
 })

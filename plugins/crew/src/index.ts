@@ -5,7 +5,8 @@
  * reads what is provided here. The plugin:
  *
  * - provides the `dishCrew` service: `settings()` is the `crew.yaml` in the config store as it is now (see
- *   `settings.ts`), `records` is the crew's own record of its children and their reports (see `record.ts`),
+ *   `settings.ts`), `records` is the crew's own record of its children, their reports and the gate results dish-gates
+ *   records for coders bound to a worktree (`addGate`; see `record.ts`),
  *   `whenRecorded(child)` is the run of that child that is being recorded now, if there is one, and
  *   `worktreeBindings(path)` is the children bound to a worktree, with whether each is running (for `delegate`, and for
  *   dish-workspaces' `list`, `remove` and sweep);
@@ -43,8 +44,8 @@ import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from './sett
 import type { CrewSettings } from './settings.ts'
 
 export type { CrewSettings, FamilySettings, Limits, ParseResult, RoleSettings, Tier } from './settings.ts'
-export type { ChildRecord, ChildStatus, EndedRun, LiveAgents, NewChild, RunEnd, RunRecord } from './record.ts'
-export { CrewRecords, isRunning, statusFor } from './record.ts'
+export type { ChildRecord, ChildStatus, EndedRun, GateOutcome, GateResult, LiveAgents, NewChild, RunEnd, RunRecord } from './record.ts'
+export { CrewRecords, gateProblem, isRunning, latestGate, statusFor } from './record.ts'
 
 export const name = 'dish-crew'
 
