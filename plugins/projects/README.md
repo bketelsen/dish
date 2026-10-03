@@ -44,7 +44,7 @@ projects:
 | `role` | required | One line on what the repo is. |
 | `gate` | required | The command 6c's gates run. |
 | `gateTimeout` | required | `<n>s`, `<n>m` or `<n>h`, from 10s to 10m (dsh's shell caps a run at 10 minutes). |
-| `setup` | optional | A command run once, in dish's own fresh clone, outside the sandbox (see [dish-workspaces](../workspaces/README.md#setup)). It gets dish's own Node and pnpm (the unit's `PATH`), so a repo whose tools come from mise needs it to go through mise, such as `mise exec -- pnpm install --frozen-lockfile`. |
+| `setup` | optional | A command run once, in dish's own fresh clone, outside the sandbox (see [dish-workspaces](../workspaces/README.md#setup)). It gets dish's own Node and pnpm (the unit's `PATH`), so a repo whose tools come from mise needs it to go through mise, such as `mise trust && mise exec -- pnpm install --frozen-lockfile`. |
 | `setupTimeout` | optional | From 10s to 1h; 15m when absent. |
 | `gateEnv` | optional | Variables for the gate: names like `FOO_BAR`, never `DSH_*` or a name with `KEY`, `TOKEN`, `SECRET` or `PASSWORD` in it. Values are one line, and may use `<clone>` and `<worktree>`, which 6c expands. |
 
@@ -72,7 +72,7 @@ Status messages are masked (dish-kit's `maskSecrets`) and cut to 1000 characters
 
 Between Skills and the GitHub App card, in Settings' nav.
 - **The list:** each project with its family, role and a status chip, "setup skipped" with its reason, the last fetch (and its error), and its workspace. A broken `projects.yaml` (a hand edit in the store's repository) shows its problem above the list, pointing at History. In a narrow window the list becomes a dropdown.
-- **Add and edit:** the six text fields (`setup` is a text area, whose hint says it runs with dish's own Node and pnpm, and to go through mise for a mise repo: `mise exec -- pnpm install --frozen-lockfile`, after `mise trust` if mise asks), rows for `gateEnv`, and a note for the commit. The form is checked 300 ms after you stop typing, with the same sentence the store would refuse it with. **Save** (Ctrl/Cmd+S) writes as you. If the file changed after you opened it, your edits stay, with **Reload** and **Keep mine**. The name is fixed once a project exists.
+- **Add and edit:** the six text fields (`setup` is a text area, whose hint says it runs with dish's own Node and pnpm, and to go through mise for a mise repo: `mise trust && mise exec -- pnpm install --frozen-lockfile`, since setup's stdin is closed and the clone only exists once onboarding has started), rows for `gateEnv`, and a note for the commit. The form is checked 300 ms after you stop typing, with the same sentence the store would refuse it with. **Save** (Ctrl/Cmd+S) writes as you. If the file changed after you opened it, your edits stay, with **Reload** and **Keep mine**. The name is fixed once a project exists.
 - **Remove** asks inline: "Remove <name> from projects.yaml? Its clone at <path> and its workspace stay; dish stops fetching, sweeping and gating it."
 - **Retry** is offered on a ready or failed project, never one queued or onboarding. On a ready one it onboards again: it adopts the clone, skips setup with the command to run, and registers the workspace again, which brings back one you removed. On a failed one it adopts dish's clone too, so a failed setup isn't run again (above).
 - **Proposals:** "N proposals for projects.yaml: review them on History". You accept them there.

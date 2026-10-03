@@ -83,7 +83,7 @@ incus exec minideb:dish --project dish -- dish-update --apply <ref>    # roll ba
 incus exec minideb:dish --project dish -- su - dish -c 'cd ~/dish && env -i HOME="$HOME" PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin pnpm exec dsh plugin --profile web remove dish-workspaces dish-projects'
 ```
 
-Then roll back with `dish-update --apply <ref>`. The clones under `~/work` and dish's records stay, and a later update to a commit with the two plugins links them again.
+Then roll back with `dish-update --apply <ref>`. The clones under `~/work` and dish's records stay, and a later update to a commit with the two plugins links them again. Until then, the clones' credential helper (`~/dish/plugins/workspaces/bin/git-credential-dish`) is gone, so agents' git can't fetch a private repo in them.
 
 `minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`. The scripts' own hints, such as `run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)`, give that form for Minideb itself; from the desktop, add the `minideb:` remote.
 
@@ -249,7 +249,7 @@ dish's projects ([`dish-projects`](../plugins/projects/) and [`dish-workspaces`]
 - **The key** is kept in dsh's credential file (`~/.dsh/.credentials.yaml`), never in the config store, and never shown again.
 - **Agents' git** gets a read token for the projects' repos through a credential helper each clone's config names, so `git fetch` works and `git push` is refused. Only the harness will push (step 7).
 - **The clones** are `~/work/<owner>/<repo>`. A clone already there is adopted if its origin is the repo on GitHub; one with a deploy-key alias origin (`git@github-dish:…`, from before 6b) isn't. Onboarding names it; move it aside.
-- **Setup** (a project's `setup`, such as `pnpm install`) runs outside the sandbox only in dish's own fresh clone, at onboarding, with the unit's `PATH` (dish's Node and pnpm; a repo on mise needs `mise exec -- …`). In a task worktree, the main agent runs it escalated, which the judge may allow or put to you.
+- **Setup** (a project's `setup`, such as `pnpm install`) runs outside the sandbox only in dish's own fresh clone, at onboarding, with the unit's `PATH` (dish's Node and pnpm; a repo on mise needs a setup such as `mise trust && mise exec -- pnpm install --frozen-lockfile`). In a task worktree, the main agent runs it escalated, which the judge may allow or put to you.
 
 ## Prod and dev
 
