@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { CrewRecords, STOP_REASON_STATUS, TEMP_GRACE_MS, closingOf, reportContent, statusFor } from '../src/record.ts'
+import { CrewRecords, STOP_REASON_STATUS, TEMP_GRACE_MS, closingOf, isRunning, reportContent, statusFor } from '../src/record.ts'
 import type { ChildRecord, NewChild } from '../src/record.ts'
 import { tempDir } from './helpers.ts'
 
@@ -135,6 +135,123 @@ test('what a caller gets back is a copy: changing it does not change the record'
     id: 'c1', n: 1, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic',
     startedAt: STARTED, followUps: 0, runs: [], last: 'running',
   }])
+})
+
+// --- worktrees ------------------------------------------------------------------------------------
+
+const TREE = '/work/frostyard/snosi/.worktrees/fix-1'
+const OTHER_TREE = '/work/frostyard/snosi/.worktrees/fix-2'
+
+test('a child bound to a worktree keeps its path in the record; an unbound child has no worktree field', async () => {
+  const { records } = await fixture()
+  const bound = await records.addChild('s1', newChild('c1', { worktree: TREE }))
+  assert.deepEqual(bound, {
+    id: 'c1', n: 1, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', worktree: TREE,
+    startedAt: STARTED, followUps: 0, runs: [], last: 'running',
+  })
+  const unbound = await records.addChild('s1', newChild('c2', { role: 'researcher' }))
+  assert.ok(!('worktree' in unbound))
+  assert.equal((await records.lookup('c1'))?.record.worktree, TREE)
+  assert.deepEqual(await records.children('s1'), [bound, unbound])
+})
+
+test('the binding survives a restart, and a run ending or a follow-up does not change it', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE }))
+  await records.endRun('c1', { stopReason: 'completed', closing: 'done' })
+  await records.addFollowUp('c1')
+  const { records: restarted } = reopen(directory)
+  const found = await restarted.lookup('c1')
+  assert.equal(found?.record.worktree, TREE)
+  assert.equal(found?.record.followUps, 1)
+  const file = JSON.parse(await readFile(join(sessionDir(directory, 's1'), 'children.json'), 'utf8'))
+  assert.equal(file.children[0].worktree, TREE)
+})
+
+test('a children.json written before worktrees existed still parses, and its children are unbound', async () => {
+  const { records, directory, corrupt } = await fixture()
+  const dir = sessionDir(directory, 's1')
+  await mkdir(dir, { recursive: true })
+  const old = {
+    sessionId: 's1',
+    children: [{ id: 'c1', n: 1, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', startedAt: STARTED, followUps: 0, runs: [], last: 'finished' }],
+  }
+  await writeFile(join(dir, 'children.json'), JSON.stringify(old))
+  const [child] = await records.children('s1')
+  assert.equal(child?.id, 'c1')
+  assert.ok(!('worktree' in child!))
+  assert.deepEqual(corrupt, [])
+})
+
+test('addChild refuses a worktree that is not an absolute path, and writes nothing', async () => {
+  const { records, directory } = await fixture()
+  for (const worktree of [5, '', 'relative/path', null]) {
+    await assert.rejects(records.addChild('s1', { ...newChild('c1'), worktree } as unknown as NewChild), /worktree must be an absolute path/, String(worktree))
+  }
+  assert.equal(await exists(join(directory, 'sessions')), false)
+})
+
+test('boundTo finds every child bound to a worktree, across sessions, with its session, oldest first', async () => {
+  const { records } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE, startedAt: STARTED + 2 }))
+  await records.addChild('s1', newChild('c2', { worktree: OTHER_TREE }))
+  await records.addChild('s1', newChild('c3', { role: 'researcher' }))
+  await records.addChild('s2', newChild('c4', { worktree: TREE, startedAt: STARTED + 1 }))
+  await records.endRun('c4', { stopReason: 'completed', closing: 'done' })
+  const found = await records.boundTo(TREE)
+  assert.deepEqual(found.map(({ sessionId, record }) => [sessionId, record.id, record.last]), [['s2', 'c4', 'finished'], ['s1', 'c1', 'running']])
+  assert.deepEqual((await records.boundTo(OTHER_TREE)).map(({ record }) => record.id), ['c2'])
+  // Compared exactly: no prefix, no trailing slash, no case folding.
+  assert.deepEqual(await records.boundTo('/work/frostyard/snosi/.worktrees'), [])
+  assert.deepEqual(await records.boundTo(`${TREE}/`), [])
+  assert.deepEqual(await records.boundTo(TREE.toUpperCase()), [])
+  // What a caller gets is a copy.
+  found[0]!.record.title = 'changed'
+  assert.equal((await records.lookup('c4'))?.record.title, 'add login')
+})
+
+test('boundTo is empty with no record at all, and with records but none bound there', async () => {
+  const empty = await fixture()
+  assert.deepEqual(await empty.records.boundTo(TREE), [])
+  const { records } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  assert.deepEqual(await records.boundTo(TREE), [])
+  assert.deepEqual(await records.boundTo(''), [])
+})
+
+test('boundTo skips what is not a session, and sets aside a corrupt session as every read does', async () => {
+  const { records, directory, corrupt } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE }))
+  await records.addChild('s2', newChild('c2', { worktree: TREE }))
+  await writeFile(join(sessionDir(directory, 's2'), 'children.json'), '{ broken')
+  await mkdir(join(directory, 'sessions', 'not-a-hash'), { recursive: true })
+  await writeFile(join(directory, 'sessions', 'not-a-hash', 'children.json'), JSON.stringify({ sessionId: 'x', children: [] }))
+  assert.deepEqual((await records.boundTo(TREE)).map(({ record }) => record.id), ['c1'])
+  assert.deepEqual(corrupt.map(([session]) => session), [sha('s2')])
+})
+
+test('isRunning: a stepping agent, or a record that says running with its agent there; without a registry, the record\'s word', async () => {
+  const { records } = await fixture()
+  const running = await records.addChild('s1', newChild('c1'))
+  await records.addChild('s1', newChild('c2'))
+  await records.endRun('c2', { stopReason: 'completed', closing: 'done' })
+  const [, finished] = await records.children('s1')
+  const agents = (live: Record<string, string>) => ({ get: (id: string) => Object.hasOwn(live, id) ? { status: live[id] } : undefined })
+  assert.equal(isRunning(running, agents({ c1: 'running' })), true)
+  assert.equal(isRunning(running, agents({ c1: 'idle' })), true, 'accepted, not stepping yet')
+  assert.equal(isRunning(running, agents({})), false, 'a crash\'s record')
+  assert.equal(isRunning(finished!, agents({ c2: 'running' })), true, 'woken')
+  assert.equal(isRunning(finished!, agents({ c2: 'idle' })), false)
+  assert.equal(isRunning(running, undefined), true)
+  assert.equal(isRunning(finished!, undefined), false)
+})
+
+test('boundTo waits for the writes queued before it', async () => {
+  const { records } = await fixture()
+  const adding = records.addChild('s1', newChild('c1', { worktree: TREE }))
+  const found = records.boundTo(TREE)
+  await adding
+  assert.deepEqual((await found).map(({ record }) => record.id), ['c1'])
 })
 
 // --- follow-ups -----------------------------------------------------------------------------------
@@ -498,6 +615,8 @@ const BAD_FILES: Array<[string, string | ((good: any) => unknown)]> = [
   ['a model that is not a string', (good) => { good.children[0].model = []; return good }],
   ['a family that is not a string', (good) => { delete good.children[0].family; return good }],
   ['a reviews that is not a string', (good) => { good.children[0].reviews = 3; return good }],
+  ['a worktree that is not a string', (good) => { good.children[0].worktree = ['/work/a/b/.worktrees/x']; return good }],
+  ['a worktree that is null', (good) => { good.children[0].worktree = null; return good }],
   ['a followUps that is not a number', (good) => { good.children[0].followUps = '0'; return good }],
   ['a last that is not a status', (good) => { good.children[0].last = 'paused'; return good }],
   ['runs that is not a list', (good) => { good.children[0].runs = 'none'; return good }],

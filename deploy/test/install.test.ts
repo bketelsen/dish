@@ -34,7 +34,7 @@ const SKIP = INTEGRATION ? false : 'set DISH_INSTALL_TEST=1 to run the install a
 const REMOTE = 'git@github-dish-config.invalid:example/store.git'
 const USER_NAME = 'Dish Test'
 const USER_EMAIL = 'dish-test@example.invalid'
-const BUNDLES = ['dish-copilot', 'dish-config', 'dish-prompts', 'dish-skills', 'dish-crew', 'dish-judge', 'dish-web']
+const BUNDLES = ['dish-copilot', 'dish-config', 'dish-prompts', 'dish-skills', 'dish-crew', 'dish-judge', 'dish-web', 'dish-projects', 'dish-workspaces']
 
 const execFileAsync = promisify(execFile)
 
@@ -214,10 +214,10 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(first.code, 0, first.stderr)
   assert.match(first.stdout, /install: profile web at .*: created/)
   assert.match(first.stdout, /install: dish rows \(.*\): updated/)
-  assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge web; already linked: none/)
+  assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge web projects workspaces; already linked: none/)
   assert.match(first.stdout, /install: profile changed/)
   const firstCalls = dshCalls(scratch)
-  assert.equal(firstCalls.length, 8, 'one dsh command makes the profile, one links each bundle')
+  assert.equal(firstCalls.length, 1 + BUNDLES.length, 'one dsh command makes the profile, one links each bundle')
   assertIsolated(scratch, firstCalls)
   assertRowsFirst(firstCalls)
   assert.deepEqual(await readdir(scratch.tmp), [], "the install's throwaway directory is removed")
@@ -230,9 +230,9 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(second.code, 0, second.stderr)
   assert.match(second.stdout, /install: profile web at .*: existing/)
   assert.match(second.stdout, /install: dish rows \(.*\): unchanged/)
-  assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge web/)
+  assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge web projects workspaces/)
   assert.match(second.stdout, /install: no changes to the profile/)
-  assert.equal(dshCalls(scratch).length, 8, 'the second run starts no dsh command')
+  assert.equal(dshCalls(scratch).length, 1 + BUNDLES.length, 'the second run starts no dsh command')
   assert.equal(statSync(patch).mtimeMs, patchBefore, 'the patch file was not rewritten')
   assert.equal(statSync(manifest).mtimeMs, manifestBefore, "the profile's package.json was not rewritten")
   assert.equal(await readFile(patch, 'utf8'), patchText)
@@ -262,9 +262,9 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(removal.code, 0, removal.stderr)
   const repair = await run(INSTALL, [], scratch)
   assert.equal(repair.code, 0, repair.stderr)
-  assert.match(repair.stdout, /bundles added: judge; already linked: copilot config prompts skills crew web\n/)
+  assert.match(repair.stdout, /bundles added: judge; already linked: copilot config prompts skills crew web projects workspaces\n/)
   assert.match(repair.stdout, /install: dish rows \(.*\): unchanged/)
-  const repairCalls = dshCalls(scratch).slice(8)
+  const repairCalls = dshCalls(scratch).slice(1 + BUNDLES.length)
   assert.equal(repairCalls.length, 2, 'the removal, and one `plugin add`')
   assert.equal(repairCalls[0].instanceHome, undefined, 'the removal ran without DSH_DISH_HOME')
   assertIsolated(scratch, repairCalls.slice(1))

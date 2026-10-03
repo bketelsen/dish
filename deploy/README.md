@@ -8,14 +8,14 @@ The design is in the [deploy spec](../docs/specs/deploy.md) and the [ops spec](.
 
 - **The service.** `dsh web`, as `dish-web.service`: a systemd user unit of the unprivileged `dish` account, which has linger on. Its one sudo right is fleet's apt wrapper (see [Security notes](#security-notes)).
 - **The binary.** The unit runs the checkout's own dsh, its script `~/dish/node_modules/@deepseek-ai/dsh/lib/bin.js` under `/opt/dish/node/bin/node`. That is neither `pnpm dsh` nor the `node_modules/.bin/dsh` shim, which sets a `NODE_PATH` into the checkout (see [Prod and dev](#prod-and-dev)). Only `pnpm dsh` goes through the launcher, which defaults to dev. `pnpm dev` runs `scripts/dev.ts`, which is dev only, and `pnpm test`, `build` and `typecheck` use neither. The service is prod because it never goes through the launcher.
-- **The working directory** is `~/work`, not the live checkout: dsh's fallback root for the sandbox, and where it reads a `.env`. dsh's web UI starts every chat in a workspace, so chats stay out of the checkout as long as no workspace points at it. General chats use a scratch workspace inside `~/work` (see [One-time steps on the VM](#one-time-steps-on-the-vm)).
+- **The working directory** is `~/work`, not the live checkout: dsh's fallback root for the sandbox, and where it reads a `.env`. It is also the work root of [`dish-workspaces`](../plugins/workspaces/): each project's clone is `~/work/<owner>/<repo>`, with its task worktrees in `.worktrees/`, and `~/work/scratch` is the scratch workspace for general chats. dsh's web UI starts every chat in a workspace, so chats stay out of the checkout as long as no workspace points at it.
 - **The port.** It listens on `127.0.0.1:3080` only. Nothing listens on the VM's own address.
 - **The address.** `tailscale serve` puts it at `https://dish.<tailnet>.ts.net`, with a tailnet certificate. The tailnet needs HTTPS certificates enabled in the admin console first.
 - **The code.** A checkout of `bketelsen/dish` at `~dish/dish`, with the profile at `~dish/.dsh/profiles/web`.
 - **The state.** It lives in `dish`'s home:
   - `~/.dsh`: dsh's sessions and its credential file;
   - `~/.config/dish/config.git`: the config store, pushed to `bketelsen/dish-config`. The VM is its only pusher;
-  - `~/.local/state/dish`: the judge's decision log, and `deploy/`, `update.sh`'s lock and record of the last start;
+  - `~/.local/state/dish`: the judge's decision log; `deploy/`, `update.sh`'s lock and record of the last start; `projects/status.json`, each project's onboarding status; and `workspaces/`, each clone's and worktree's record, setup logs, and the GitHub App's read tokens (`workspaces/tokens/<owner>`, 0600, removed when dsh stops);
   - `~/.local/share/dish`: crew's records.
 
 ## What the files here do
@@ -47,7 +47,7 @@ Its steps, in order:
    - **The `dish-config` row** gets `remote`, `userName` and `userEmail`, and nothing else.
    - **The `agent-preset-registry` row** makes the `dish` preset the default for new tasks, when no default is chosen yet.
    - Other rows, comments and key order stay as they are. A file that is already right is not rewritten.
-4. **The bundles.** For copilot, config, prompts, skills, crew, judge and web, in that order, `pnpm exec dsh plugin --profile <profile> add ./plugins/<name>`, only when the profile doesn't link it yet. That is dsh's own binary, not the launcher, so the profile is the one `DSH_HOME` names.
+4. **The bundles.** For copilot, config, prompts, skills, crew, judge, web, projects and workspaces, in that order (projects after config, whose store it uses, and workspaces after projects, whose types it imports), `pnpm exec dsh plugin --profile <profile> add ./plugins/<name>`, only when the profile doesn't link it yet. That is dsh's own binary, not the launcher, so the profile is the one `DSH_HOME` names.
 
 It prints what it did, and its last line is `install: no changes to the profile` or `install: profile changed`. On a failure it stops and names the step on stderr, as `install: FAILED at step: …`. It prints nothing secret.
 
@@ -76,6 +76,14 @@ incus exec minideb:dish --project dish -- dish-update                  # dry run
 incus exec minideb:dish --project dish -- dish-update --apply          # update to origin/main
 incus exec minideb:dish --project dish -- dish-update --apply <ref>    # roll back to a commit or tag
 ```
+
+**Rolling back past 6b,** to a commit without `plugins/projects` and `plugins/workspaces`, takes one step first: remove their two bundles from the profile while the checkout still has them. An older `install.sh` doesn't know them, so the profile would keep linking two directories the rollback removes. Run it as `dish`, with only the unit's `HOME` and `PATH`, as `update.sh` does (see the store-pin contract under [install.sh](#installsh)):
+
+```sh
+incus exec minideb:dish --project dish -- su - dish -c 'cd ~/dish && env -i HOME="$HOME" PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin pnpm exec dsh plugin --profile web remove dish-workspaces dish-projects'
+```
+
+Then roll back with `dish-update --apply <ref>`. The clones under `~/work` and dish's records stay, and a later update to a commit with the two plugins links them again. Until then, the clones' credential helper (`~/dish/plugins/workspaces/bin/git-credential-dish`) is gone, so agents' git can't fetch a private repo in them.
 
 `minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`. The scripts' own hints, such as `run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)`, give that form for Minideb itself; from the desktop, add the `minideb:` remote.
 
@@ -230,9 +238,18 @@ Then open `http://127.0.0.1:3081/?token=…`, with the token from `dish-url`'s l
 Each is entered on `https://dish.<tailnet>.ts.net`, or through the tunnel if `dish-web` isn't working, so nothing passes through fleet or Git. dsh keeps the sign-ins in `~dish/.dsh/.credentials.yaml`, and they survive restarts and updates.
 - **Copilot, the first sign-in.** On a fresh install Settings → Models has no Copilot provider yet: dish-copilot adds the `github-copilot` route only after a first sign-in. Until then its sign-in card sits in the Models page's footer, titled "GitHub Copilot". Sign in there and approve the device code at <https://github.com/login/device>. The route and its models appear, and the footer card goes. Later sign-ins, after a sign-out, use the card on the Copilot provider.
 - **TypeSafe.** Paste the key on **Settings → Judge**. Without it the judge fails closed: the main agent asks you for every shell command, and a crew child's is refused.
-- **A workspace for general chats.** dsh's web UI starts every chat in a workspace. It has no chat without one, and no default setting: a new chat goes to the current chat's workspace, else the one used last. Add one for general work at `/home/dish/work/scratch`: "Add workspace…" (in the workspace chip, or the sidebar's "+"), "Edit path" to `/home/dish/work`, "New folder" `scratch`, then Open. Not `~/work` itself: a workspace's folder is where agents write without asking, dsh reads `~/work/.env` when the service starts, and step 6b's clones live under `~/work`. Step 6b's onboarding registers the scratch workspace itself.
+- **A workspace for general chats.** dsh's web UI starts every chat in a workspace. It has no chat without one, and no default setting: a new chat goes to the current chat's workspace, else the one used last. `dish-workspaces` registers `/home/dish/work/scratch` as "scratch" once, at its first start (one you added by hand after 6a is adopted, with its title). Not `~/work` itself: a workspace's folder is where agents write without asking, dsh reads `~/work/.env` when the service starts, and the projects' clones live under `~/work`. A scratch workspace you remove stays removed; delete `~/.local/state/dish/workspaces/scratch` to have it registered again at the next start.
+- **The GitHub App.** See [The GitHub App](#the-github-app).
 - **No workspace for the live checkout.** Remove any workspace for `/home/dish/dish` (its row's menu in the sidebar). That removes only the record: the checkout stays, and its chats move to "Ungrouped". Don't continue those chats; they still run in the checkout, where agents could write the deployed code without asking.
 - **The model.** A new chat may start on DeepSeek's own model, which has no key here. Pick a Copilot model (e.g. GPT-6.1 Sol) from the model menu.
+
+## The GitHub App
+
+dish's projects ([`dish-projects`](../plugins/projects/) and [`dish-workspaces`](../plugins/workspaces/), step 6b) clone and fetch through a GitHub App, read-only for now. Prod and dev each have their own (the rollout names them `bketelsen-dish`, installed on `bketelsen` and `frostyard` for selected repos, and `bketelsen-dish-dev`, on a test repo only). You make them on GitHub, paste each App's ID and private key on **Settings → GitHub App**, and add projects on **Settings → Projects**. The plan's [rollout](../docs/plans/2026-10-02-projects.md#the-rollout-for-you) has the steps and the checks.
+- **The key** is kept in dsh's credential file (`~/.dsh/.credentials.yaml`), never in the config store, and never shown again.
+- **Agents' git** gets a read token for the projects' repos through a credential helper each clone's config names, so `git fetch` works and `git push` is refused. Only the harness will push (step 7).
+- **The clones** are `~/work/<owner>/<repo>`. A clone already there is adopted if its origin is the repo on GitHub; one with a deploy-key alias origin (`git@github-dish:…`, from before 6b) isn't. Onboarding names it; move it aside.
+- **Setup** (a project's `setup`, such as `pnpm install`) runs outside the sandbox only in dish's own fresh clone, at onboarding, with the unit's `PATH` (dish's Node and pnpm; a repo on mise needs a setup such as `mise trust && mise exec -- pnpm install --frozen-lockfile`). In a task worktree, the main agent runs it escalated, which the judge may allow or put to you.
 
 ## Prod and dev
 
@@ -256,8 +273,9 @@ dish has two configurations. Only the VM's service is prod; everything else is d
   - **Where it stops.** Anything an agent writes into the checkout runs at the next start: dsh's own files, `scripts/env.ts`, and for `pnpm dsh` and `pnpm dev` a `node_modules/.bin/node`, which pnpm finds first for the scripts' `node`. That waits for a restart, where a `bash` or a module planted for `PATH` or `NODE_PATH` took effect in the running dsh at once, for every later command.
 - **`DSH_DISH_HOME`** moves all four of dish's directories at once (dish-kit's `xdgPaths`), ahead of `XDG_*`. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands.
 - **The service is prod** because its unit runs dsh's script directly, with the account's defaults. It sets no `DISH_ENV`: dsh would pass it on, and every agent's `pnpm dsh` would be prod.
-- **Where the guarantee stops.** Dev is the default for `pnpm dsh` (the launcher) and `pnpm dev` only. dsh gives every agent shell the running dsh's own `DSH_HOME` (`dsh-shell-env`), and on the VM that is prod's `~/.dsh`. So `deploy/install.sh`, `pnpm exec dsh` or `node_modules/.bin/dsh`, run directly in an agent's shell on the VM, use prod's profile, and, with `DSH_DISH_HOME` dropped from agent shells, prod's `~/.config/dish` too. The environment doesn't stop that. What stops a write there is the sandbox: `~/.dsh` and `~/.config/dish` lie outside the workspace, so the command needs dsh's write escalation, which asks you (or the judge, for a crew child). A guard is a non-goal ([ops spec](../docs/specs/ops.md#the-boundary-of-the-guarantee), decision 1).
+- **Where the guarantee stops.** Dev is the default for `pnpm dsh` (the launcher) and `pnpm dev` only. dsh gives every agent shell the running dsh's own `DSH_HOME` (`dsh-shell-env`), and on the VM that is prod's `~/.dsh`. So `deploy/install.sh`, `pnpm exec dsh` or `node_modules/.bin/dsh`, run directly in an agent's shell on the VM, use prod's profile, and, with `DSH_DISH_HOME` dropped from agent shells, prod's `~/.config/dish` too. The environment doesn't stop that. What stops a write there is the sandbox: `~/.dsh` and `~/.config/dish` lie outside the workspace, so the command needs dsh's write escalation, which the judge may allow or put to you (for a crew child, the judge allows it or it is refused). A guard is a non-goal ([ops spec](../docs/specs/ops.md#the-boundary-of-the-guarantee), decision 1).
 - **`pnpm dev`** installs dish into dev's profile with `install.sh`, with `DISH_REMOTE=''` whatever the environment says, then serves it on `127.0.0.1:3090` and prints `dev: open <url>`. Its dsh, and so every agent shell under it, gets none of `install.sh`'s inputs: `DISH_REMOTE`, `DISH_USER_*` and `DISH_PROFILE` are removed, and `DISH_ENV=dev` is set. It refuses `DISH_ENV=prod`. The [README](../README.md#setup) has how to use and stop it.
+- **Dev's work root is inside the checkout.** Dev's clones are under `<checkout>/.dev/work`, inside the dish checkout's git repository and its pnpm workspace (the checkout's `pnpm-workspace.yaml`). A tool that looks in parent directories finds the checkout: `pnpm install` in a dev project with no `pnpm-workspace.yaml` of its own installs the dish checkout instead. For such a project, make its setup `pnpm install --ignore-workspace`, or use a test repo with its own workspace file. dish's own git stops looking at the clone (`GIT_CEILING_DIRECTORIES`).
 - **Dev on the VM** listens on the VM's loopback, like the service. Reach it with a tunnel to `127.0.0.1:3090`, the same way as the [fallback tunnel](#fallback-a-tunnel), then open the link `pnpm dev` printed:
 
   ```sh
@@ -288,10 +306,10 @@ The first run builds the tree and creates the profile. A second run, with the sa
 ## Security notes
 
 - **Agents run as `dish`.** Its one sudo right is fleet's apt wrapper, `/usr/local/sbin/dish-apt-get`: `sudo /usr/local/sbin/dish-apt-get update`, or `install <package>…`. It takes plain Debian package names only, and runs `apt-get -o APT::Cmd::Pattern-Only=true install --yes --no-install-recommends --no-remove <names>`: each name is exactly that package, and nothing installed is removed to make room. Everything else, options, paths, `.deb` files and versions included, is refused. A package's maintainer scripts still run as root, so each install is a real grant.
-- **sudo works only in an escalated command.** dsh's sandbox runs with `NoNewPrivs`, so sudo can't raise privileges inside it. An install is an agent command that dsh runs outside the sandbox: the main agent asks you, and a crew child's is refused unless the judge approves.
+- **sudo works only in an escalated command.** dsh's sandbox runs with `NoNewPrivs`, so sudo can't raise privileges inside it. An install is an agent command that dsh runs outside the sandbox: for the main agent the judge may allow it or ask you, and a crew child's is refused unless the judge allows it.
 - **mise** is `/usr/local/bin/mise`, pinned and root-owned by fleet, so it can't update itself. The tools it installs live in `dish`'s home. Its shims aren't on the unit's `PATH`, so agents run tools with `mise exec`.
-- **Clones of dish under `~/work`** use the read-only deploy key, until step 6b's GitHub App.
+- **Clones under `~/work`** fetch with the GitHub App's read token, through the credential helper. The token files in `~/.local/state/dish/workspaces/tokens/` are readable by agents: read-only, an hour each, and only for the projects' repos.
 - **Never run `deploy/*.sh` as root by their paths.** `dish` can write them. Root's way in is `dish-update` and `dish-url`.
-- **The sandbox confines writes, not reads.** An agent's shell can read anything `dish` can, including the deploy keys in `~/.ssh` (one of them read-write for `dish-config`) and `~/.dsh/.credentials.yaml` (the Copilot sign-in, the TypeSafe key and the browser-session secret). File modes don't help, since the agent is the same user. The desktop has the same exposure.
+- **The sandbox confines writes, not reads.** An agent's shell can read anything `dish` can, including the deploy keys in `~/.ssh` (one of them read-write for `dish-config`) and `~/.dsh/.credentials.yaml` (the Copilot sign-in, the TypeSafe key, the browser-session secret and the GitHub App's private key, which is why the App is read-only for now). File modes don't help, since the agent is the same user. The desktop has the same exposure.
 - **The judge's gate is the guard.** Reading a credential file doesn't serve a coding task, so the gate asks you, or refuses for a crew child. Secrets are masked in the judge's log and in what is sent to TypeSafe.
 - **The backup holds the credential file.** The VM's nightly backup captures it, so the NAS copy is as sensitive as the VM.
