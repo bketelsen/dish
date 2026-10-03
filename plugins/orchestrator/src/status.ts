@@ -70,12 +70,11 @@ function pullSentence(run: Run, summary: RunSummary, now: number): string {
 }
 
 /**
- * The default branch as a ref to merge: the run's own base when it is `origin/<one name>` (`createWorktree`'s default is
- * `origin/<default>`), else `origin/HEAD`, which dish's fetch keeps pointing at the default branch.
+ * The default branch as the merge hint names it: always `origin/HEAD`, which dish's fetch points at the default branch each
+ * time (`remote set-head --auto`). Never the run's own base: `behindDefault` counts against the default branch, the pull
+ * request targets it, and the record can't tell a base that was asked for (`origin/develop`) from the default.
  */
-function defaultRef(run: Run): string {
-  return /^origin\/[^/]+$/.test(run.base) && run.base !== 'origin/HEAD' ? `\`${run.base}\`` : 'the default branch (`origin/HEAD`)'
-}
+const DEFAULT_BRANCH = 'the default branch (`origin/HEAD`)'
 
 /** The branch against GitHub: one line, and a second with the merge hint when it is behind either. */
 function branchLines(run: Run, branch: StatusContext['branch']): string[] {
@@ -89,7 +88,7 @@ function branchLines(run: Run, branch: StatusContext['branch']): string[] {
   const lines = [`Against GitHub (just fetched): ${count(branch.aheadOfDefault, 'commit')} ahead of the default branch, ${branch.behindDefault} behind; ${remote}`]
   const remoteAhead = branch.remoteAhead !== null && branch.remoteAhead > 0
   if (branch.behindDefault > 0 || remoteAhead) {
-    lines.push(`To bring it up to date, have a coder fetch and merge ${defaultRef(run)}${remoteAhead ? ` and \`origin/${run.branch}\`` : ''} into the run's worktree. `
+    lines.push(`To bring it up to date, have a coder fetch and merge ${DEFAULT_BRANCH}${remoteAhead ? ` and \`origin/${run.branch}\`` : ''} into the run's worktree. `
       + 'Never rebase, amend or squash: dish never forces a push.')
   }
   return lines

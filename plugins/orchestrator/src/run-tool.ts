@@ -220,8 +220,10 @@ class RunTool {
     }
     const workspaces = this.#services.workspaces()
     if (workspaces === undefined) throw new Error('dish-workspaces isn\'t running, so the run\'s worktree can\'t be made')
-    const registered = await this.#services.projects()?.get(project)
-    if (registered === undefined) throw new Error(`${shown(project)} isn't in projects.yaml`)
+    // dish-workspaces' own words when dish-projects is stopped: projects.yaml itself may be fine.
+    const projects = this.#services.projects()
+    if (projects === undefined) throw new Error('dish-projects isn\'t running, so no project is registered')
+    if (await projects.get(project) === undefined) throw new Error(`${shown(project)} isn't in projects.yaml`)
 
     // Made before the session's lock: createWorktree waits for the project's lock, and calls no hook (Task 6).
     const created = await workspaces.createWorktree(project, slug, given(args.base), { cwd: exec.agent?.session?.header?.cwd, signal: exec.signal })
@@ -258,9 +260,10 @@ class RunTool {
     const releasedPart = result.released === undefined ? '' : ` Released run \`${result.released.id}\`.`
     const lines: string[] = []
     if (result.how === 'reopened') {
-      const pr = run.pr === undefined ? 'its pull request' : `its pull request #${run.pr.number} (${run.pr.url})`
-      lines.push(`Reopened run \`${run.id}\` (${run.project}) for review feedback: ${pr} stays open. Fix what the review asks in rounds, as before; `
-        + `then \`open_pr\` runs the same checks and pushes the new head to that pull request.${releasedPart}`)
+      const pr = run.pr === undefined ? 'Its pull request' : `Its pull request #${run.pr.number} (${run.pr.url})`
+      lines.push(`Reopened run \`${run.id}\` (${run.project}) for review feedback: ${sentence(run.goal)}`,
+        `${pr} stays open. Fix what the review asks in rounds, as before; then \`open_pr\` runs the same checks and pushes the new head to that `
+          + `pull request.${releasedPart}`)
     } else {
       const how = result.how === 'already'
         ? 'You already drive it.'

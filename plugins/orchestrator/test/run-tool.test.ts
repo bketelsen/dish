@@ -12,7 +12,10 @@ import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { CreatedWorktree } from 'dish-workspaces'
 import { summarize } from '../src/derive.ts'
 import { ACTIONS, MAIN_ONLY, NO_RUN, planProblem, runTool } from '../src/run-tool.ts'
+import { Ledger } from '../src/ledger.ts'
+import { Runs } from '../src/runs.ts'
 import { listText, statusText } from '../src/status.ts'
+import { RunStore } from '../src/store.ts'
 import type { Run } from '../src/store.ts'
 import { shortSession, shortSha } from '../src/text.ts'
 import {
@@ -125,6 +128,24 @@ test('the caller: a crew child, and an agent with no id, are refused for every a
   assert.deepEqual(w.store.list(), before.runs)
   assert.deepEqual(w.record(run), before.record)
   assert.deepEqual(await w.entries(run), before.entries)
+
+  // Over a core that isn't loaded yet (the world's is): the caller is checked before the store is read.
+  const store = new RunStore(w.state)
+  let loads = 0
+  const load = store.load.bind(store)
+  store.load = () => {
+    loads += 1
+    return load()
+  }
+  const runs = new Runs({ store, ledger: new Ledger(w.data), services: w.services, now: () => NOW, logger: { info() {}, warn() {} } })
+  const fresh = runTool({ runs, services: w.services })
+  for (const exec of [childExec({ cwd: w.dir }), noId]) {
+    for (const action of ACTIONS) {
+      await assert.rejects(fresh.execute({ ...EVERY_ARGUMENT, action }, exec), { message: MAIN_ONLY }, action)
+    }
+  }
+  assert.equal(loads, 0)
+  assert.equal(runs.loaded, false)
 })
 
 // --- open ------------------------------------------------------------------------------------------------------------
@@ -230,7 +251,7 @@ test('open: createWorktree\'s refusal passes through, masked, and nothing is rec
   await assert.rejects(readdir(w.data), { code: 'ENOENT' })
 })
 
-test('open: each refusal of its arguments, of a project not in projects.yaml, and without dish-workspaces; none makes a worktree', async () => {
+test('open: each refusal of its arguments, of a project not in projects.yaml, and without dish-projects or dish-workspaces; none makes a worktree', async () => {
   const w = await world()
   // A key given as undefined is left out: the model sends JSON.
   const open = (args: Record<string, unknown>) => call(w, Object.fromEntries(Object.entries({ action: 'open', project: PROJECT, slug: 'fix-login', goal: GOAL, ...args })
@@ -245,6 +266,10 @@ test('open: each refusal of its arguments, of a project not in projects.yaml, an
   await assert.rejects(open({ goal: '' }), { message: '`goal` is required for open: what the change is for, in one line' })
   await assert.rejects(open({ project: 'widget' }), { message: '"widget" isn\'t a project name: `owner/repo`' })
   await assert.rejects(open({ project: 'Acme/nope' }), { message: 'Acme/nope isn\'t in projects.yaml' })
+  // dish-projects stopped: no file to send the user to check.
+  w.absent.add('projects')
+  await assert.rejects(open({}), { message: 'dish-projects isn\'t running, so no project is registered' })
+  w.absent.delete('projects')
   w.absent.add('workspaces')
   await assert.rejects(open({}), { message: 'dish-workspaces isn\'t running, so the run\'s worktree can\'t be made' })
   assert.deepEqual(w.workspaces.calls.createWorktree, [])
@@ -326,7 +351,8 @@ test('resume: a run with a pull request reopens for review feedback; refused onc
   const w = await world()
   const pr = await prRun(w)
   assert.deepEqual(await lines(w, { action: 'resume', id: pr.id }), [
-    `Reopened run \`${pr.id}\` (${PROJECT}) for review feedback: its pull request #3 (${PR_URL}) stays open. `
+    `Reopened run \`${pr.id}\` (${PROJECT}) for review feedback: ${GOAL}.`,
+    `Its pull request #3 (${PR_URL}) stays open. `
       + 'Fix what the review asks in rounds, as before; then `open_pr` runs the same checks and pushes the new head to that pull request.',
     READ_STATUS,
   ])
@@ -465,6 +491,23 @@ test('the writes read the run again under its lock: a run closed while the call 
   assert.deepEqual(await w.kinds(run), ['run.opened', 'run.closed'])
 })
 
+test('the writes read the run again under its lock: a run another chat took over while the call waited gives NO_RUN, and nothing is written', async () => {
+  const w = await world()
+  const run = await openRun(w)
+  const gate = deferred()
+  const held = w.runs.withRun(run, async () => {
+    await gate.promise
+    await w.store.update(run.project, run.id, current => ({ ...current, driver: { session: OTHER_SESSION, since: NOW + 1 } }))
+  })
+  const pending = call(w, { action: 'note', text: 'meant for my run' })
+  await new Promise(settle => setTimeout(settle, 30))
+  gate.resolve()
+  await held
+  await assert.rejects(pending, { message: NO_RUN })
+  assert.deepEqual(await w.kinds(run), ['run.opened'])
+  assert.equal(w.record(run)?.driver.session, OTHER_SESSION)
+})
+
 // --- ruling, defer, note -----------------------------------------------------------------------------------------------
 
 test('ruling, defer and note: by main, with the session; the answers', async () => {
@@ -570,7 +613,7 @@ test('status: statusText over the ledger, the head and cleanliness from dish-wor
   w.workspaces.impl.compareBranch = async () => ({ behindDefault: 2, aheadOfDefault: 3, remoteAhead: 1 })
   const behind = (await call(w, { action: 'status' })).text
   assert.match(behind, /^Against GitHub \(just fetched\): 3 commits ahead of the default branch, 2 behind; GitHub's dish\/fix-login has 1 commit this one lacks\.$/m)
-  assert.match(behind, /^To bring it up to date, have a coder fetch and merge `origin\/main` and `origin\/dish\/fix-login` into the run's worktree\./m)
+  assert.match(behind, /^To bring it up to date, have a coder fetch and merge the default branch \(`origin\/HEAD`\) and `origin\/dish\/fix-login` into the run's worktree\./m)
   // No lock is held: status answers while the run's lock is busy.
   const gate = deferred()
   const held = w.runs.withRun(run, () => gate.promise)

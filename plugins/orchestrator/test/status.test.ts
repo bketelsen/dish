@@ -90,17 +90,20 @@ test('statusText: the branch against GitHub: level, behind, GitHub\'s branch ahe
 
   const behind = statusText(run(), summary(), context({ branch: { behindDefault: 4, aheadOfDefault: 2, remoteAhead: null } }))
   assert.equal(lineOf(behind, 'Against GitHub'), 'Against GitHub (just fetched): 2 commits ahead of the default branch, 4 behind; dish/fix-login isn\'t on GitHub yet.')
-  assert.equal(lineOf(behind, 'To bring it up to date'), `To bring it up to date, have a coder fetch and merge \`origin/main\` into the run's worktree. ${merge}`)
+  assert.equal(lineOf(behind, 'To bring it up to date'), `To bring it up to date, have a coder fetch and merge the default branch (\`origin/HEAD\`) into the run's worktree. ${merge}`)
 
   const moved = statusText(run(), summary(), context({ branch: { behindDefault: 0, aheadOfDefault: 2, remoteAhead: 3 } }))
   assert.equal(lineOf(moved, 'Against GitHub'), 'Against GitHub (just fetched): 2 commits ahead of the default branch, 0 behind; GitHub\'s dish/fix-login has 3 commits this one lacks.')
   assert.equal(lineOf(moved, 'To bring it up to date'),
-    `To bring it up to date, have a coder fetch and merge \`origin/main\` and \`origin/dish/fix-login\` into the run's worktree. ${merge}`)
+    `To bring it up to date, have a coder fetch and merge the default branch (\`origin/HEAD\`) and \`origin/dish/fix-login\` into the run's worktree. ${merge}`)
   assert.match(lineOf(statusText(run(), summary(), context({ branch: { behindDefault: 0, aheadOfDefault: 2, remoteAhead: 1 } })), 'Against GitHub'), /has 1 commit this one lacks\.$/)
 
-  // A run cut from something that isn't plainly the default branch names the default branch by origin/HEAD.
-  const planned = statusText(run({ base: 'origin/dish/plan-x' }), summary(), context({ branch: { behindDefault: 1, aheadOfDefault: 0, remoteAhead: null } }))
-  assert.match(lineOf(planned, 'To bring it up to date'), /merge the default branch \(`origin\/HEAD`\) into the run's worktree/)
+  // Whatever the run was cut from, the hint names the default branch by origin/HEAD: behind counts against it, and the PR
+  // targets it. The record can't tell a base asked for (origin/develop) from the default (origin/main).
+  for (const base of ['origin/develop', 'origin/dish/plan-x', 'main', 'v1.2.0']) {
+    const cut = statusText(run({ base }), summary(), context({ branch: { behindDefault: 1, aheadOfDefault: 0, remoteAhead: null } }))
+    assert.equal(lineOf(cut, 'To bring it up to date'), `To bring it up to date, have a coder fetch and merge the default branch (\`origin/HEAD\`) into the run's worktree. ${merge}`, base)
+  }
 
   const unknown = statusText(run(), summary(), context({ branch: { problem: 'pnpm isn\'t ready (cloning); see Settings → Projects' } }))
   assert.equal(lineOf(unknown, 'Against GitHub'), 'Against GitHub: can\'t tell (pnpm isn\'t ready (cloning); see Settings → Projects).')
