@@ -82,9 +82,9 @@ Sessions are `session.v4.jsonl.zstd` under the workspace's directory, and a crew
 
 ## Next
 
-1. **6c `gates`** ([spec](docs/specs/gates.md), [plan](docs/plans/2026-10-03-gates.md)): built; awaiting the merge and the rollout. It is on branch `gates`, and was checked end to end in a scratch dsh (the spec's "Notes from the build"). When a crew coder bound to a worktree is about to finish, `dish-gates` runs the project's gate there in the sandbox, sends a failure back (at most 3 gate runs a turn; the third failure ends the turn), and records the result in crew's record. The finish notice says how the gate ended, and a review of work whose gate didn't pass needs the main agent's `gateOverride` ruling. The rollout is the plan's [last section](docs/plans/2026-10-03-gates.md#the-rollout-for-you):
-   - deploy: one `dish-update --apply`, which adds the `dish-gates` bundle and restarts;
-   - give `bketelsen/clippy` a gate on Settings → Projects (`mise exec -- go vet ./... && mise exec -- go test ./...`, `5m`), and check that it passes on `main`;
+1. **6c `gates`** ([spec](docs/specs/gates.md), [plan](docs/plans/2026-10-03-gates.md)): merged and deployed to the VM on 2026-10-03, and checked end to end in a scratch dsh (the spec's "Notes from the build"). When a crew coder bound to a worktree is about to finish, `dish-gates` runs the project's gate there in the sandbox, sends a failure back (at most 3 gate runs a turn; the third failure ends the turn), and records the result in crew's record. The finish notice says how the gate ended, and a review of work whose gate didn't pass needs the main agent's `gateOverride` ruling. The rollout is the plan's [last section](docs/plans/2026-10-03-gates.md#the-rollout-for-you):
+   - done: the deploy (`dish-update --apply` added the `dish-gates` bundle and restarted);
+   - `bketelsen/clippy`'s gate is `go build` (10m). It works as is: a gate's `PATH` ends with mise's shims, so bare `go` resolves through mise. Consider `go vet ./... && go test ./...` with `5m`;
    - the live check: a failing gate fixed in round 2, a review, and a blocked coder whose review needs a ruling.
 
    Then tell the next session how long each gate took, and whether the coder also ran the gate itself: until step 7 drops the coder's own run, a gate runs twice.
