@@ -14,7 +14,7 @@ import type { SubagentRunEndInfo, SubagentRunInfo } from '@deepseek-ai/dsh-subag
 import type { DishConfigService } from 'dish-config'
 import { computePrevious, xdgPaths } from 'dish-kit'
 import * as plugin from '../src/index.ts'
-import type { DishCrew } from '../src/index.ts'
+import type { CoderReport, CrewSettled, DishCrew } from '../src/index.ts'
 import { CrewRecords } from '../src/record.ts'
 import type { NewChild, RunEnd } from '../src/record.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, PREVIOUS_HASHES, parseSettings } from '../src/settings.ts'
@@ -630,7 +630,7 @@ test('an agent/error and a subagent/end for a crew child are recorded: the repor
     ])
     const recorded = await ctx.dishCrew.whenRecorded('c1')
     const report = sessionPath(where, 's1', '1-coder-1.md')
-    assert.deepEqual(recorded, { report })
+    assert.equal(recorded?.report, report)
     assert.equal(await readFile(report, 'utf8'), 'I got as far as the router.\n\nThen the API stopped answering.\n')
     const [child] = await ctx.dishCrew.records.children('s1')
     assert.equal(child!.last, 'failed')
@@ -713,7 +713,7 @@ test('whenRecorded is the run being recorded: there as soon as the event is, the
     ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'x' }])
     const pending = ctx.dishCrew.whenRecorded('c1')
     assert.ok(pending instanceof Promise)
-    assert.deepEqual(await pending, { report: sessionPath(where, 's1', '1-coder-1.md') })
+    assert.equal((await pending)?.report, sessionPath(where, 's1', '1-coder-1.md'))
     assert.equal(ctx.dishCrew.whenRecorded('c1'), undefined)
   } finally {
     await handle.dispose()
@@ -1076,5 +1076,180 @@ test('withEnv hides an inherited DSH_DISH_HOME, so XDG_* steer dish in its body,
   } finally {
     if (inherited === undefined) delete process.env.DSH_DISH_HOME
     else process.env.DSH_DISH_HOME = inherited
+  }
+})
+
+// --- dish-crew/settled and the notice's id (step 7) -----------------------------------------------
+
+const REPORT: CoderReport = { role: 'coder', turn: 1, at: 1_700_000_000_000, status: 'done', summary: 'Added the login form.', commits: ['a'.repeat(40)] }
+
+/** dsh's settlement notice for child `sender`, as it enters the parent's inbox. */
+function settlement(sender: string, id: string): unknown {
+  return {
+    id, role: 'user', content: [{ type: 'text', text: `Subagent ${sender} finished.` }],
+    source: { kind: 'subagent-settled', form: 'notice', summary: `Subagent ${sender} finished.`, senderSessionId: sender },
+  }
+}
+
+function inserted(ctx: Context, message: unknown): void {
+  ctx.emit('agent/inbox/inserted', { agent: agentOf('main'), message } as never)
+}
+
+test('dish-crew/settled: after subagent/end files a crew child\'s run, it carries the session, the filed child and the run, with its report', async () => {
+  const where = await dirs()
+  const { ctx, handle, logs } = await mounted(where)
+  const heard: CrewSettled[] = []
+  ctx.on('dish-crew/settled', (event) => { heard.push(event) })
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    const stored = await ctx.dishCrew.records.setReport('c1', REPORT)
+    ended(ctx, 'c1', 'completed', [{ type: 'tool_use', id: 't1', name: 'report', input: {} }])
+    const recorded = await ctx.dishCrew.whenRecorded('c1')
+    assert.equal(heard.length, 1)
+    const [event] = heard
+    const { record } = (await ctx.dishCrew.records.lookup('c1'))!
+    assert.equal(event!.sessionId, 's1')
+    assert.deepEqual(event!.child, record)
+    assert.deepEqual(event!.run, record.runs.at(-1))
+    assert.deepEqual(event!.run.structured, stored)
+    assert.equal(event!.run.structuredFile, sessionPath(where, 's1', '1-coder-1.json'))
+    assert.equal(recorded?.report, sessionPath(where, 's1', '1-coder-1.md'))
+    // A run without a report is published too, without one.
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'and again' }])
+    await ctx.dishCrew.whenRecorded('c1')
+    assert.equal(heard.length, 2)
+    assert.ok(!('structured' in heard[1]!.run))
+    assert.deepEqual(logs, [])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('whenRecorded resolves only once the dish-crew/settled listeners have, and a child\'s next end waits as well', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const order: string[] = []
+  ctx.on('dish-crew/settled', async (event) => {
+    order.push(`heard ${event.run.report.split('/').pop()}`)
+    if (event.child.runs.length === 1) await held
+  })
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'first' }])
+    let resolved = false
+    void ctx.dishCrew.whenRecorded('c1')!.then(() => { resolved = true })
+    await waitFor('the listener', () => order.length === 1 || undefined)
+    for (let n = 0; n < 5; n++) await turn()
+    assert.equal(resolved, false)
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'second' }])
+    for (let n = 0; n < 5; n++) await turn()
+    assert.deepEqual(order, ['heard 1-coder-1.md'], 'the second end waits for the first one\'s listeners')
+    release()
+    await ctx.dishCrew.whenRecorded('c1')
+    assert.equal(resolved, true)
+    assert.deepEqual(order, ['heard 1-coder-1.md', 'heard 1-coder-2.md'])
+  } finally {
+    release()
+    await handle.dispose()
+  }
+})
+
+test('a dish-crew/settled listener that throws is logged, and the run is filed', async () => {
+  const where = await dirs()
+  const { ctx, handle, logs } = await mounted(where)
+  ctx.on('dish-crew/settled', () => { throw new Error('the ledger is full') })
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'done' }])
+    const recorded = await ctx.dishCrew.whenRecorded('c1')
+    assert.equal(recorded?.report, sessionPath(where, 's1', '1-coder-1.md'))
+    assert.equal((await ctx.dishCrew.records.lookup('c1'))!.record.runs.length, 1)
+    assert.deepEqual(logs, ['[dish-crew] warn: a dish-crew/settled listener failed: the ledger is full'])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('an agent crew didn\'t start gets no dish-crew/settled', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  const heard: CrewSettled[] = []
+  ctx.on('dish-crew/settled', (event) => { heard.push(event) })
+  try {
+    ended(ctx, 'stranger', 'completed', [{ type: 'text', text: 'not ours' }])
+    assert.equal(await ctx.dishCrew.whenRecorded('stranger'), undefined)
+    assert.deepEqual(heard, [])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('the notice\'s id: a settlement for c1 in the parent\'s inbox, then c1\'s end in the same tick, puts the id on the run', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    inserted(ctx, settlement('c1', 'msg-1'))
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'done' }])
+    const recorded = await ctx.dishCrew.whenRecorded('c1')
+    assert.equal(recorded?.run.notice, 'msg-1')
+    assert.equal((await ctx.dishCrew.records.lookup('c1'))!.record.runs[0]!.notice, 'msg-1')
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('the notice\'s id: an end in a later turn gets none, and one child\'s notice never lands on another\'s run', async () => {
+  const where = await dirs()
+  const { ctx, handle } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    await ctx.dishCrew.records.addChild('s1', crewChild('c2', { role: 'researcher' }))
+    inserted(ctx, settlement('c1', 'msg-late'))
+    await turn()
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'done' }])
+    assert.ok(!('notice' in (await ctx.dishCrew.whenRecorded('c1'))!.run))
+
+    inserted(ctx, settlement('c2', 'msg-c2'))
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'again' }])
+    ended(ctx, 'c2', 'completed', [{ type: 'text', text: 'found it' }])
+    assert.ok(!('notice' in (await ctx.dishCrew.whenRecorded('c1'))!.run))
+    assert.equal((await ctx.dishCrew.whenRecorded('c2'))?.run.notice, 'msg-c2')
+    // Taken: the next end of c2 in the same run of the loop has none.
+    inserted(ctx, settlement('c2', 'msg-c2b'))
+    ended(ctx, 'c2', 'completed', [{ type: 'text', text: 'one' }])
+    ended(ctx, 'c2', 'completed', [{ type: 'text', text: 'two' }])
+    await ctx.dishCrew.whenRecorded('c2')
+    const { runs } = (await ctx.dishCrew.records.lookup('c2'))!.record
+    assert.deepEqual(runs.map(run => run.notice), ['msg-c2', 'msg-c2b', undefined])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('the notice\'s id: other messages and malformed payloads are ignored, and nothing throws', async () => {
+  const where = await dirs()
+  const { ctx, handle, logs } = await mounted(where)
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1'))
+    const payloads: unknown[] = [
+      undefined, null, 5, {}, { message: null }, { message: 'text' },
+      { message: { id: 'm1', source: { kind: 'user' } } },
+      { message: { id: 'm2', source: { kind: 'agent-message', senderSessionId: 'c1' } } },
+      { message: { id: 'm3', source: { kind: 'subagent-settled', senderSessionId: '' } } },
+      { message: { id: 'm4', source: { kind: 'subagent-settled', senderSessionId: 5 } } },
+      { message: { id: 5, source: { kind: 'subagent-settled', senderSessionId: 'c1' } } },
+      { message: { source: { kind: 'subagent-settled', senderSessionId: 'c1' } } },
+      { message: { id: 'm5', source: null } },
+      { message: { id: 'm6' } },
+    ]
+    for (const payload of payloads) assert.doesNotThrow(() => { ctx.emit('agent/inbox/inserted', payload as never) }, JSON.stringify(payload))
+    ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'done' }])
+    assert.ok(!('notice' in (await ctx.dishCrew.whenRecorded('c1'))!.run))
+    assert.deepEqual(logs, [])
+  } finally {
+    await handle.dispose()
   }
 })

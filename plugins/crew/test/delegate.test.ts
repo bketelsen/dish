@@ -11,6 +11,7 @@ import type { ContinuableStartSpec } from '@deepseek-ai/dsh-subagent'
 import { maskSecrets, RETURN_NOTE_LEAD } from 'dish-kit'
 import * as promptsPlugin from 'dish-prompts'
 import * as row from '../src/delegate.ts'
+import type { CrewDelegated, CrewSettled } from '../src/events.ts'
 import { CrewRecords, isRunning } from '../src/record.ts'
 import type { ChildRecord, GateResult } from '../src/record.ts'
 import { BLOCK_END, gateOverrideBrief, worktreeBrief } from '../src/text.ts'
@@ -2326,4 +2327,124 @@ test('a re-review keeps the reviewer\'s ruling while the coder hasn\'t run since
   await early.records.endRun('c1', { stopReason: 'completed', closing: 'done' })
   assert.match(await refusal(early.delegate({ ...REVIEW, task: 'Again.', to: started.child })), /gate hasn't passed \(failed, round 3 of 3/)
   assert.equal(early.sends.length, 0)
+})
+
+// --- dish-crew/delegated and dish-crew/settled (step 7) ----------------------------------------------
+
+test('a start publishes dish-crew/delegated once, with the recorded child, before dsh starts it', async () => {
+  const w = await world()
+  const heard: Array<{ event: CrewDelegated, found: ChildRecord | undefined, starts: number }> = []
+  w.ctx.on('dish-crew/delegated', async (event) => {
+    const found = (await w.records.lookup(event.child.id))?.record
+    heard.push({ event, found, starts: w.starts.length })
+  })
+  const result = await w.delegate(CODER)
+  assert.equal(heard.length, 1)
+  const [{ event, found, starts }] = heard as [typeof heard[0]]
+  assert.equal(event.sessionId, SESSION)
+  assert.equal(event.followUp, false)
+  assert.equal(event.child.id, result.child)
+  assert.equal(event.child.role, 'coder')
+  assert.deepEqual(event.child, found)
+  assert.deepEqual(event.child, (await w.records.lookup(result.child))?.record)
+  assert.equal(starts, 0, 'dsh hadn\'t started the child yet')
+  assert.equal(w.starts.length, 1)
+})
+
+test('a dish-crew/delegated listener held on a promise holds delegate\'s answer, and dsh\'s start', async () => {
+  const w = await world()
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  w.ctx.on('dish-crew/delegated', () => held)
+  let answered = false
+  const answer = w.delegate(CODER).then((value) => {
+    answered = true
+    return value
+  })
+  await new Promise(resolve => setTimeout(resolve, 30))
+  assert.equal(answered, false)
+  assert.equal(w.starts.length, 0)
+  release()
+  await answer
+  assert.equal(w.starts.length, 1)
+})
+
+test('a follow-up publishes dish-crew/delegated with followUp: true and the counted child', async () => {
+  const w = await world()
+  const started = await w.delegate(CODER)
+  w.agents.set(started.child, { status: 'idle' })
+  await w.records.endRun(started.child, { stopReason: 'completed', closing: 'done' })
+  const heard: CrewDelegated[] = []
+  w.ctx.on('dish-crew/delegated', (event) => { heard.push(event) })
+  await w.delegate({ role: 'coder', task: 'Fix the findings.', to: started.child })
+  assert.equal(heard.length, 1)
+  const [event] = heard as [CrewDelegated]
+  assert.equal(event.followUp, true)
+  assert.equal(event.sessionId, SESSION)
+  assert.equal(event.child.id, started.child)
+  assert.equal(event.child.followUps, 1)
+  assert.equal(event.child.last, 'running')
+  assert.deepEqual(event.child, (await w.records.lookup(started.child))?.record)
+  assert.equal(w.sends.length, 1)
+})
+
+test('a follow-up whose count can\'t be recorded or read back still publishes, with the child as it would be', async () => {
+  const w = await world()
+  const logs = watchLogs(w.ctx)
+  const started = await w.delegate(RESEARCHER)
+  w.agents.set(started.child, { status: 'idle' })
+  await w.records.endRun(started.child, { stopReason: 'completed', closing: 'x' })
+  const before = (await w.records.lookup(started.child))!.record
+  const records = w.records as { addFollowUp: unknown, lookup: unknown }
+  records.addFollowUp = async () => {
+    records.lookup = async () => { throw new Error('disk gone') }
+    throw new Error('disk full')
+  }
+  const heard: CrewDelegated[] = []
+  w.ctx.on('dish-crew/delegated', (event) => { heard.push(event) })
+  await w.delegate({ ...RESEARCHER, to: started.child })
+  assert.deepEqual(heard.map(event => event.child), [{ ...before, followUps: 1, last: 'running' }])
+  assert.equal(heard[0]!.followUp, true)
+  assert.ok(logs.some(line => /disk full/.test(line)), logs.join('\n'))
+})
+
+test('a start dsh refuses publishes dish-crew/delegated, then dish-crew/settled for the failed run', async () => {
+  const w = await world()
+  const events: string[] = []
+  let settled: CrewSettled | undefined
+  w.ctx.on('dish-crew/delegated', (event) => { events.push(`delegated ${event.child.id}`) })
+  w.ctx.on('dish-crew/settled', (event) => {
+    events.push(`settled ${event.child.id}`)
+    settled = event
+  })
+  w.stub.startFails = new Error('provider spawn is down')
+  await refusal(w.delegate(CODER))
+  const [child] = await w.records.children(SESSION)
+  assert.deepEqual(events, [`delegated ${child!.id}`, `settled ${child!.id}`])
+  assert.equal(settled!.sessionId, SESSION)
+  assert.equal(settled!.run.stopReason, 'error')
+  assert.equal(settled!.run.error, 'provider spawn is down')
+  assert.deepEqual(settled!.child, child)
+  assert.equal(settled!.child.last, 'failed')
+  assert.deepEqual(settled!.run, child!.runs.at(-1))
+})
+
+test('a refusal at the limits publishes nothing', async () => {
+  const w = await world()
+  await w.delegate(CODER)
+  const heard: string[] = []
+  w.ctx.on('dish-crew/delegated', () => { heard.push('delegated') })
+  w.ctx.on('dish-crew/settled', () => { heard.push('settled') })
+  assert.match(await refusal(w.delegate({ role: 'ops', title: 'deploy it', task: 'Deploy.' })), /^a coder is running/)
+  assert.deepEqual(heard, [])
+})
+
+test('a dish-crew/delegated listener that throws is logged, and the delegation stands', async () => {
+  const w = await world()
+  const logs = watchLogs(w.ctx)
+  w.ctx.on('dish-crew/delegated', () => { throw new Error('the ledger is full') })
+  const result = await w.delegate(CODER)
+  assert.equal(w.starts.length, 1)
+  assert.equal((await w.records.lookup(result.child))?.record.id, result.child)
+  assert.ok(logs.includes('[dish-crew] warn: a dish-crew/delegated listener failed: the ledger is full'), logs.join('\n'))
 })
