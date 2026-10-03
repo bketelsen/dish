@@ -132,7 +132,7 @@ Empty strings are treated as absent. The checks run in this order, before anythi
 
    Either way, the record is written.
 
-**`send_message`** stays available for quick questions in both directions: a child asking the main agent something, or the main agent nudging a child. A crew child can't use it to send its report: a long message is refused, and `send_message` is then closed to that child until its run ends (see [Report guard](#report-guard)). The limits are enforced on `delegate` only. The main agent's prompt says fix rounds go through `delegate` with `to`, not `send_message`. While everything shares one directory, the writer rule depends on that prompt; step 6's worktrees make it moot.
+**`send_message`** stays available for quick questions in both directions: a child asking the main agent something, or the main agent nudging a child. A crew child can't use it to send its report: a long message is refused, and `send_message` is then closed to that child until its run ends (see [Report guard](#report-guard)). The limits are enforced on `delegate` only. The main agent's prompt says fix rounds go through `delegate` with `to`, not `send_message`. While everything shares one directory, the writer rule depends on that prompt. 6b's worktrees didn't change that: a bound coder still works in the chat's workspace, kept to its worktree by its brief.
 
 ## Tools
 

@@ -32,7 +32,7 @@ Status: draft, from the brainstorm on 2026-09-30. It records what we decided and
 | Data | `$XDG_DATA_HOME/dish/` | `vault/` (memory, its own git repo pushed to a private GitHub repo), `ledgers/` (until `orchestrator` (step 7) owns the ledger, the shipped skills keep a plan's ledger at `.worktrees/<plan>-ledger.md` in the repo, git-ignored), initiative status, crew's records | the vault via git; ledgers append-only |
 | Work | the work root: `~/work` (the service's working directory) | the projects' clones, `<owner>/<repo>`, each with its task worktrees in `.worktrees/<slug>`, and the `scratch` workspace for general chats. Not under `$XDG_DATA_HOME`: these are dsh workspaces, where agents write | each clone is its repo's git |
 | State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs; the projects' onboarding status, each clone's and worktree's record, setup logs, and the read-token files (`workspaces/`) | no |
-| Cache | `$XDG_CACHE_HOME/dish/` | Copilot model catalog cache (currently in `~/.dsh`; it will move), fetched pages | no |
+| Cache | `$XDG_CACHE_HOME/dish/` | Copilot model catalog cache (`copilot-models.json`), fetched pages | no |
 
 One instance's dish directories move together: when `DSH_DISH_HOME` is set to an absolute path, dish-kit's `xdgPaths` puts all four at `$DSH_DISH_HOME/{config,state,data,cache}/dish`, ahead of the XDG variables, and `workRoot()` puts the work root at `$DSH_DISH_HOME/work`. Dev, the default for everything but the VM's service, sets it to `<checkout>/.dev`; prod uses the defaults above. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands. See the [ops spec](specs/ops.md).
 
@@ -204,7 +204,7 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
 
 1. ~~**Config backup.**~~ Settled 2026-10-01: the store pushes `main` to the private `bketelsen/dish-config` after every commit, from one machine at a time.
 2. **dsh's own home.** `~/.dsh` mixes dsh's config and data. Leave it, or point `DSH_HOME` somewhere XDG-shaped?
-3. **The VM.** OS, provisioning, and the service unit. Deferred from the brainstorm.
+3. ~~**The VM.**~~ Settled 2026-10-01: a Debian 13 VM on Minideb, provisioned by fleet with OpenTofu and Ansible, running `dsh web` as a systemd user unit (see the [deploy spec](specs/deploy.md) and the [ops spec](specs/ops.md)).
 4. **Gate environment.** Sandbox, timeouts, and whether gates need network or secrets.
 5. ~~**Main-agent preset vs global `delegate`.**~~ Settled 2026-10-01: `delegate` is a row in the dish preset, which `crew` owns until `orchestrator` (see the [crew spec](specs/crew.md)).
 6. **Public access with GitHub sign-in, instead of Tailscale only** (raised 2026-09-30, to settle at deployment). You may make dish publicly reachable, signing in with GitHub and allowing only your account and members of the `frostyard` org, so others can use it. This would reopen several decisions:

@@ -1,6 +1,6 @@
 # Spec: gates (`dish-gates`)
 
-Status: draft 2026-10-02, for review. This is roadmap step 6c. It builds on [projects and workspaces](projects-workspaces.md) (6b: the registry's `gate` and `gateTimeout`, worktrees, and `delegate`'s worktree binding), [crew](crew.md) and the [design](../design.md) ("Gates (structural)").
+Status: approved 2026-10-02; the plan and the build come next. It was written before [sandbox-home](sandbox-home.md), [bketelsen/dish#10](https://github.com/bketelsen/dish/pull/10) and [bketelsen/dish#11](https://github.com/bketelsen/dish/pull/11), so check it against them in the plan. This is roadmap step 6c. It builds on [projects and workspaces](projects-workspaces.md) (6b: the registry's `gate` and `gateTimeout`, worktrees, and `delegate`'s worktree binding), [crew](crew.md) and the [design](../design.md) ("Gates (structural)").
 
 ## Summary
 

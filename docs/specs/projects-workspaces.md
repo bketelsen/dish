@@ -1,6 +1,13 @@
 # Spec: projects and workspaces (`dish-projects`, `dish-workspaces`)
 
-Status: built on branch `projects` (2026-10-02), awaiting review and the rollout. Approved 2026-10-02; revised before the plan by its checks (what changed, and the evidence, is under [Checks](#checks-2026-10-02)). Two findings were then decided by you, both as recommended ([Decided after the checks](#decided-after-the-checks)), and the build's reviews narrowed the first further. What the build changed is under [Notes from the build](#notes-from-the-build), and the [known limits](#known-limits) are gathered at the end. This is roadmap step 6b. It builds on [ops](ops.md) (step 6a: prod and dev, and the `~/work` root), the [config store](config-store.md), [crew](crew.md) and the [design](../design.md) ("Project families", "Plugins and contracts"). The plan is [docs/plans/2026-10-02-projects.md](../plans/2026-10-02-projects.md).
+Status: merged as [bketelsen/dish#7](https://github.com/bketelsen/dish/pull/7) and deployed to the VM on 2026-10-03 (the rollout is [below](#rollout-2026-10-03)). Approved 2026-10-02; revised before the plan by its checks (what changed, and the evidence, is under [Checks](#checks-2026-10-02)). Two findings were then decided by you, both as recommended ([Decided after the checks](#decided-after-the-checks)), and the build's reviews narrowed the first further. What the build changed is under [Notes from the build](#notes-from-the-build), and the [known limits](#known-limits) are gathered at the end. This is roadmap step 6b. It builds on [ops](ops.md) (step 6a: prod and dev, and the `~/work` root), the [config store](config-store.md), [crew](crew.md) and the [design](../design.md) ("Project families", "Plugins and contracts"). The plan is [docs/plans/2026-10-02-projects.md](../plans/2026-10-02-projects.md).
+
+## Rollout (2026-10-03)
+
+- **One App, for now.** The VM uses the dev App, `bketelsen-dish-dev`, read-only. The separate prod App of decision 7, `bketelsen-dish` in the plan's rollout, hasn't been made.
+- **Your chat test passed,** on the project `bketelsen/clippy`: `git fetch`, `worktree` create and list, a bound coder committing as `bketelsen-dish-dev[bot]`, `remove` with `force`, and `git push` refused with 403.
+- **Not reported yet:** the squash-merge sweep check, step 8 of the plan's [rollout](../plans/2026-10-02-projects.md#the-rollout-for-you).
+- **Since the merge,** a worktree's setup runs in the sandbox ([bketelsen/dish#10](https://github.com/bketelsen/dish/pull/10)), as [Notes from the build](#notes-from-the-build) say.
 
 ## Summary
 

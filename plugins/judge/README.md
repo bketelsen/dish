@@ -48,8 +48,10 @@ tools:
 - **Runs:** `git status`, `npm test`, `npm run build`, `pnpm install`, `git push --dry-run`.
 - **Asks you or is refused:**
   - `git push`, `npm publish`, `rm -rf build/`, `echo > file` and `curl … | sh`;
-  - any command that doesn't serve the task, such as `cat ~/.aws/credentials`;
+  - any command that may write and doesn't serve the task;
   - `npm install` with full sandbox access.
+
+Since 2026-10-03 ([bketelsen/dish#11](https://github.com/bketelsen/dish/pull/11)), a command the judge reads as read-only at `readOnly` or above runs whatever `serves_task` says. So an off-task read, such as `cat ~/.aws/credentials`, asks you (or is refused, for a child) only when the judge doesn't read it as read-only.
 
 ## When the judge is unavailable
 

@@ -1,6 +1,10 @@
 # Spec: dish ops (prod and dev, updates)
 
-Status: built on branch `ops`, 2026-10-02; awaiting review and the rollout. Revised before the plan by its checks (what changed, and the evidence, is under [Checks](#checks-2026-10-02)), and during the build (see [Notes from the build](#notes-from-the-build)). This is roadmap step 6a, the first part of step 6. It builds on the [deploy spec](deploy.md), whose rollout notes describe today's setup. The plan is [docs/plans/2026-10-02-ops.md](../plans/2026-10-02-ops.md).
+Status: merged 2026-10-02 (`df9c4b1`) and rolled out the same day ([Rollout](#rollout)). Revised before the plan by its checks (what changed, and the evidence, is under [Checks](#checks-2026-10-02)), and during the build (see [Notes from the build](#notes-from-the-build)). This is roadmap step 6a, the first part of step 6. It builds on the [deploy spec](deploy.md), whose rollout notes describe the setup before it. The plan is [docs/plans/2026-10-02-ops.md](../plans/2026-10-02-ops.md).
+
+Since then:
+- **The unit runs dsh's script** under `/opt/dish/node/bin/node`, not the `node_modules/.bin/dsh` shim ([bketelsen/dish#6](https://github.com/bketelsen/dish/pull/6)), so no `NODE_PATH` into the checkout reaches agents. [deploy/README.md](../../deploy/README.md#prod-and-dev) has it.
+- **The VM's sandbox can write the home directory,** less a protected list ([sandbox-home](sandbox-home.md), 2026-10-03). So installs into the home directory (mise's tools, pnpm's store) no longer need an escalation there, which decision 7 and "pnpm" under [The contract](#the-contract) assumed. `sudo` still does.
 
 ## Summary
 
@@ -233,6 +237,8 @@ Run it as `incus exec minideb:dish --project dish -- dish-url`, fleet's root-own
 **Deploy key:** the read-only key for `bketelsen/dish` stays. `~/work` clones of dish use it too, until step 6b's GitHub App.
 
 ## Rollout
+
+Done on 2026-10-02: fleet's two PRs merged, then the guest play and `dish-update --apply`.
 
 The order matters. A dish whose `pnpm dsh` goes through the launcher, started by the old unit's `pnpm dsh web`, would come up on an empty dev store.
 1. Merge 6a in dish, as one merge. The new unit, which runs dsh directly, ships in the same merge that routes `pnpm dsh` through the launcher.

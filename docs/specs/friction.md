@@ -1,6 +1,6 @@
 # Spec: friction fixes from the first local-model session
 
-Status: built on branch `friction`, 2026-10-02; awaiting review and the rollout (the plan is [docs/plans/2026-10-02-friction.md](../plans/2026-10-02-friction.md); what differed from this spec is under [Notes from the build](#notes-from-the-build)). **Task 5 did not run:** [question 2](#questions-for-you) was settled on option C, `main.md`'s rule, which is built. Option A, crew's own `send_message`, is on the roadmap's backlog for after 6b merges. Option B, the 600-character guard, was not taken and is **not done**; you can still ask for it. It comes from a review of the 2026-10-02 session in which `qwen3.8-flash-next` (provider `selfie`) ran as dish's main agent and built an Astro blog with five crew children. You approved items 1–4 of the review's proposal; this spec fixes them, corrected by the [Checks](#checks-2026-10-02) against dsh 0.2.0-rc.2's sources. It changes `dish-judge`, `dish-prompts` and `dish-crew`, and nothing outside them.
+Status: merged 2026-10-02 (`8545e8d`) and deployed to the VM (the plan is [docs/plans/2026-10-02-friction.md](../plans/2026-10-02-friction.md); what differed from this spec is under [Notes from the build](#notes-from-the-build)). **Task 5 did not run:** [question 2](#questions-for-you) was settled on option C, `main.md`'s rule, which is built. Option A, crew's own `send_message`, is on the roadmap's backlog; 6b, which it waited for, merged 2026-10-03. Option B, the 600-character guard, was not taken and is **not done**; you can still ask for it. It comes from a review of the 2026-10-02 session in which `qwen3.8-flash-next` (provider `selfie`) ran as dish's main agent and built an Astro blog with five crew children. You approved items 1–4 of the review's proposal; this spec fixes them, corrected by the [Checks](#checks-2026-10-02) against dsh 0.2.0-rc.2's sources. It changes `dish-judge`, `dish-prompts` and `dish-crew`, and nothing outside them.
 
 The review (the "friction report") numbers its findings A1–A5, B6–B10, C11–C14, D15–D19 and E20–E24, and its recommendations 1–13. They are cited that way below.
 
@@ -60,7 +60,7 @@ export function clipMiddle(text: string, max: number): string
 
 ## The prompt texts
 
-These are the shipped defaults, word for word. Lines not shown are unchanged.
+These are the shipped defaults, word for word. Lines not shown are unchanged. Since [sandbox-home](sandbox-home.md) (2026-10-03), `common.md`'s "This machine" says the VM's home directory is writable, so installs there need no escalation; the shipped file has today's text.
 
 ### `plugins/prompts/defaults/common.md`
 
@@ -143,6 +143,7 @@ Only the coder gets it, as approved. The architect, the writer and ops also have
 ## Follow-ups (not in this branch)
 
 - **VM tools, in fleet** (rec. 10): `libxml2-utils` and a headless chromium; a Node LTS and pnpm preinstalled with mise; a way to preview dev servers (B10). "This machine" changes when they land.
+  *Outcome:* Node, pnpm, Go and Python are preinstalled with mise since [bketelsen/fleet#40](https://github.com/bketelsen/fleet/pull/40) and [bketelsen/fleet#41](https://github.com/bketelsen/fleet/pull/41) (2026-10-03). The rest is on the roadmap's backlog.
 - **Preview ports** for `mise run preview` from your browser.
 - **A placeholder key for `selfie`** (rec. 11), so a first turn and the title generator work: your model config, not dish's code.
 - **dsh issues to file** (rec. 12), as corrected by the checks:
@@ -153,10 +154,10 @@ Only the coder gets it, as approved. The architect, the writer and ops also have
   - dropped: `{{model}}` (dsh's own sections get the selection; dish's row read too early) and "EROFS lacks the marker" (dsh marks it; the agent's `2>&1 | tail` hid it).
 - **Your Astro project** (rec. 13): the pnpm store in `astroapp/.mise/`, the commit hash in the spec (`9450db1`), the invented RSS email.
 - **Two approvals for one escalated command?** For the main agent, the gate's own `ask` and then the tool's escalation request both look like they fall through to you (the answerer's `ask` row). The rollout checks it with one `mise install`; if it asks twice, the answerer could let your yes to the gate's ask cover that call's escalation.
-  *Outcome:* it asked twice. **Done** (2026-10-02, branch `one-approval`): the gate's ask now shows the escalation (the mode and the whole justification), and your yes to it covers that call's escalation request, once; see [the judge spec](judge.md#the-approval-answerer).
+  *Outcome:* it asked twice. **Done** (2026-10-02, branch `one-approval`, merged as `8a1ff3d`): the gate's ask now shows the escalation (the mode and the whole justification), and your yes to it covers that call's escalation request, once; see [the judge spec](judge.md#the-approval-answerer).
 - **A no-op escalation reads as one.** The GPT reviewer sent `sandbox_permissions: "workspace-write"` (its mode already) on 9 calls. dsh ignores it (`dsh-tool-bash` `lib/index.js:238`), but the gate puts the escalation question to the judge. The gate could drop a `sandbox_permissions` equal to the session's mode.
 - **The `write`/`edit` bullet** for the architect, the writer and ops, which also edit files.
-- **Crew's own `send_message`** (question 2, option A), after 6b merges, so that dsh's "send your result" note isn't appended to children.
+- **Crew's own `send_message`** (question 2, option A), so that dsh's "send your result" note isn't appended to children. It waited for 6b, which merged 2026-10-03.
 - **A headless browser and `libxml2-utils` on the VM**, and **a way to open an agent's dev server from your browser** (a second `tailscale serve` port to a fixed local port, named in `common.md`). Both are asked for in the roadmap's backlog; the first is the VM-tools item above, the second the preview-ports item.
 
 ## Questions for you
