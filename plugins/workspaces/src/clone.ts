@@ -43,8 +43,8 @@
  * Known limits:
  * - the spec's check-then-act race: the last checks and the rename are two steps (as are the clone check and the next
  *   git command), so an agent swapping `.git` for a link in the microseconds between them could have the rename land
- *   in the directory it linked to. Closed fully only when dish's work in a clone runs inside the sandbox (6c's
- *   sandboxed runner);
+ *   in the directory it linked to. dish's own git in a clone runs outside the sandbox, so this stays open (dish-gates runs
+ *   the gate in the sandbox, but not dish's git);
  * - the location checks read Linux's `/proc/self/fd`: elsewhere they refuse, and dish configures no clone;
  * - a temporary directory left by a crash (dish killed mid-clone) stays: dish can't tell it from one it didn't make.
  *   It is `.<repo>.cloning-<8 hex>` beside the clone, for the user to remove.
