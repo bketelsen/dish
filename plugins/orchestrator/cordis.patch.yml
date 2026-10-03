@@ -1,0 +1,12 @@
+# The orchestrator's host plugin (the dishRuns service). It owns runs (a change on
+# its way to a pull request, one chat driving it at a time, resumable, and
+# reopened for review feedback) and a ledger per run that the harness writes;
+# registers the main agent's `run`, `open_pr` and `pr_feedback` tools; and gives
+# Settings → Runs, a read-only page. It is a host plugin: it hears crew's and
+# dish-gates' events, and reads `dishCrew`, `dishWorkspaces`, `dishGates`,
+# `dishProjects` and dsh's `agents` with `ctx.get` on each use, so there is no
+# order to keep. Config row: `terminal` (print the plugin's own log lines to the
+# terminal).
+- insert:
+    - id: dish-orchestrator
+      name: dish-orchestrator
