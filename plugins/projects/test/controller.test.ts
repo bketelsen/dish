@@ -1214,6 +1214,28 @@ test('focus: after an action that takes away the control that had it, the page i
   assert.equal(focusedTo(state(), before), 'page')
 })
 
+test('focus: after Add, the request comes once the new project is in the list, so its heading is there to take it', async () => {
+  const made = await opened()
+  const { page, state } = made
+  await page.face.startAdd()
+  await fillAdd(made, 'acme/new')
+  // What the page holds at the moment it is asked to move focus.
+  const asked: Array<{ to: string, listed: boolean, selected: string | undefined, form: boolean }> = []
+  let seq = state().focus?.seq
+  const stop = page.face.hooks.page.subscribe(() => {
+    const now = page.getState()
+    if (now.focus === undefined || now.focus.seq === seq) return
+    seq = now.focus.seq
+    asked.push({ to: now.focus.to, listed: names(now).includes('acme/new'), selected: now.selected, form: now.form !== null })
+  })
+  try {
+    await page.face.save()
+  } finally {
+    stop()
+  }
+  assert.deepEqual(asked, [{ to: 'project', listed: true, selected: 'acme/new', form: false }])
+})
+
 test('dismiss clears the notice', async () => {
   const { page, state } = await opened()
   await page.face.retry('acme/gadget')

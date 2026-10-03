@@ -27,8 +27,9 @@
  *   itself, isn't canonical), removes what git just made where git put it, and refuses; if that removal fails, it says
  *   so and keeps the branch and the record. The check and the add are still two steps.
  * - **Removal checks, then acts:** right before `git worktree remove`, `discard` checks again that `.worktrees` is a
- *   real directory and the worktree's path its own real path, but a link swapped in between that check and git's
- *   removal is still followed.
+ *   real directory and the worktree's path its own real path (for a worktree whose directory is gone: that `.worktrees`
+ *   isn't a link and nothing is at the path again), but a link swapped in between that check and git's removal is
+ *   still followed.
  *
  * Nothing here takes the project's lock: the service runs `create`, `remove` and the sweep under it.
  *
@@ -417,7 +418,8 @@ export class Worktrees {
    * has its branch checked out. Then, with something at the path, `checkWorktree` again, and right before the removal
    * `.worktrees` a real directory and the path its own real path once more (`stillInPlace`), then `git worktree remove`
    * on the resolved path (`--force` only with `force`); with nothing there, `git worktree remove` on the path only if git
-   * still has an entry for it (never `git worktree prune`, which would drop other worktrees' entries too). Then the branch,
+   * still has an entry for it, `.worktrees` isn't a link (`worktreesLink`) and nothing is at the path again (never `git
+   * worktree prune`, which would drop other worktrees' entries too). Then the branch,
    * only if it is still at the tip `inspect` found (`update-ref -d <ref> <tip>`), so a commit made since stays; then the
    * record and its setup log.
    */
@@ -441,6 +443,10 @@ export class Worktrees {
       if (moved !== undefined) throw new Error(`worktree ${record.slug} can't be removed: ${moved}; dish keeps it, its branch and its record`)
       await gitOk(['-C', clone, 'worktree', 'remove', ...(force ? ['--force'] : []), path], this.#options())
     } else if (entries.some(entry => entry.at(path))) {
+      // Right before the removal, as above: git follows a link swapped in for `.worktrees` since `inspect`, to whatever is
+      // at the path through it, so `.worktrees` must not be one, and nothing may be at the path again.
+      const moved = await worktreesLink(clone) ?? (await present(path) ? `something is at ${path} again` : undefined)
+      if (moved !== undefined) throw new Error(`worktree ${record.slug} can't be removed: ${moved}; dish keeps it, its branch and its record`)
       // git 2.47 removes the entry of a worktree whose directory is gone, and only that one, without --force.
       await gitOk(['-C', clone, 'worktree', 'remove', path], this.#options())
     }
@@ -629,11 +635,21 @@ async function isDirectory(path: string): Promise<boolean> {
  * lead git to delete what the link reaches. Still a check, then an act: a swap between the two is a known limit.
  */
 async function stillInPlace(clone: string, path: string): Promise<string | undefined> {
-  const dir = join(clone, '.worktrees')
-  if (!await isDirectory(dir)) return `${dir} is not a directory (a link?)`
+  const link = await worktreesLink(clone)
+  if (link !== undefined) return link
   const real = await realpath(path).catch(() => undefined)
   if (real !== path) return `${path} resolves to ${shown(real ?? 'nothing', 200)}, not itself (a link on the way?)`
   return undefined
+}
+
+/**
+ * Why `<clone>/.worktrees` may not be gone through right before a removal: it is there, and not a real directory (a
+ * link swapped in). Not being there at all is fine: there is nothing to follow (a worktree gone by hand, `.worktrees`
+ * with it). The part of `stillInPlace` that still applies when the worktree's path is gone.
+ */
+async function worktreesLink(clone: string): Promise<string | undefined> {
+  const dir = join(clone, '.worktrees')
+  return await present(dir) && !await isDirectory(dir) ? `${dir} is not a directory (a link?)` : undefined
 }
 
 /** Whether anything (a link included) is at `path`. */

@@ -808,8 +808,9 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     }
     closeForm()
     patch({ selected: name })
-    focusOn('project')
     await refreshProjects()
+    // After the read: a project just added is in the list only now, and so is its heading.
+    focusOn('project')
   }
 
   const askRemove = (name: string): void => {

@@ -136,7 +136,7 @@ export function Form({ state, form, actions }: { state: PageState, form: FormSta
         <TextField
           id="dish-projects-setup"
           label="Setup (optional)"
-          hint="Run in a fresh clone when the project is onboarded, outside the sandbox. Skipped in a clone that is already there. It may have several lines. It runs with dish's own Node and pnpm: for a repo whose tools mise manages, run them through mise, as mise exec -- pnpm install --frozen-lockfile (after mise trust, if mise asks for it)."
+          hint="Run in a fresh clone when the project is onboarded, outside the sandbox. Skipped in a clone that is already there. It may have several lines. It runs with dish's own Node and pnpm: for a repo whose tools mise manages, write it as mise trust && mise exec -- pnpm install --frozen-lockfile (setup has no terminal, so the trust has to be in the command)."
           value={form.fields.setup}
           placeholder="pnpm install --frozen-lockfile"
           multiline

@@ -558,6 +558,40 @@ test('discard: a .worktrees swapped for a link after inspect, with git\'s record
   assert.deepEqual(await recordNames(f), ['swap.json'])
 })
 
+test('discard: a worktree found gone whose .worktrees is then swapped for a link (where it now is) is refused, and it stays', async () => {
+  const f = await worktreeFixture()
+  await create(f, 'gone')
+  const elsewhere = await tempDir()
+  // Moved away by hand: inspect finds nothing at the path, and git's entry still names it.
+  await rename(join(f.clone, '.worktrees', 'gone'), join(elsewhere, 'gone'))
+  const worktrees = f.worktrees()
+  const record = await recordOf(f, 'gone')
+  const state = await f.call(() => worktrees.inspect(f.project, record))
+  assert.equal(state.exists, false)
+  // Then .worktrees becomes a link to where it went: git's entry resolves there, and would remove it.
+  await rename(join(f.clone, '.worktrees'), join(f.clone, '.worktrees-was'))
+  await symlink(elsewhere, join(f.clone, '.worktrees'))
+  await assert.rejects(f.call(() => worktrees.discard(f.project, state, false)), /worktree gone can't be removed: .*\.worktrees is not a directory/)
+  assert.ok(await exists(join(elsewhere, 'gone', 'README.md')), 'what the link reaches stays')
+  assert.ok(await hasBranch(f, 'dish/gone'))
+  assert.deepEqual(await recordNames(f), ['gone.json'])
+})
+
+test('discard: a worktree whose directory is gone, with .worktrees as it was or gone too, still has its entry, branch and record removed', async () => {
+  const f = await worktreeFixture()
+  for (const [slug, take] of [['one', 'worktree'], ['two', '.worktrees']] as const) {
+    await create(f, slug)
+    await rm(take === 'worktree' ? join(f.clone, '.worktrees', slug) : join(f.clone, '.worktrees'), { recursive: true })
+    const worktrees = f.worktrees()
+    const state = await f.call(async () => worktrees.inspect(f.project, await recordOf(f, slug)))
+    assert.equal(state.exists, false)
+    await f.call(() => worktrees.discard(f.project, state, false))
+    assert.ok(!await hasBranch(f, `dish/${slug}`), slug)
+    assert.ok(!(await f.git(['worktree', 'list', '--porcelain'])).includes(`/${slug}\n`), slug)
+  }
+  assert.deepEqual(await recordNames(f), [])
+})
+
 // --- resolve --------------------------------------------------------------------------------------------------------
 
 test('resolve: by <project>/<slug> in any case of the project, and by path (canonical, through a link, with a trailing /)', async () => {
