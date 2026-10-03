@@ -173,26 +173,76 @@ test('a failing setup\'s message keeps its last lines within what dish-projects 
   assert.match(error.message, /remove the clone and press Retry, or run it yourself in \S+$/)
 })
 
-test('a fresh clone at a path a dsh workspace already points at (one kept from before) skips setup, giving the command', async () => {
+test('Retry after the clone was deleted by hand: a fresh clone, setup runs, and the project keeps its own workspace', async () => {
+  const run = await prepare()
+  try {
+    const setup = 'echo ran >> .setup-ran'
+    const first = await onboard(run, { setup })
+    assert.ok('id' in first.workspace)
+    await rm(first.clone, { recursive: true })
+    // dsh's workspace for the project is still at the path: it is the one dish recorded, so setup runs. (A project
+    // removed and added again keeps its record too, so its kept workspace is the same case.)
+    const again = await onboard(run, { setup })
+    assert.equal(again.adopted, false, 'a fresh clone')
+    assert.equal(again.setup.ran, true)
+    assert.equal(await readFile(join(again.clone, '.setup-ran'), 'utf8'), 'ran\n')
+    assert.deepEqual(again.workspace, first.workspace)
+    assert.equal((await run.registry!.registry.list()).length, 1)
+  } finally {
+    await run.registry?.stop()
+  }
+})
+
+test('a fresh clone at a path where a workspace dish didn\'t record points skips setup, giving the command', async () => {
   const run = await prepare()
   const { world } = run
   try {
-    // The project was onboarded once, removed, its clone deleted by hand: its workspace stays in dsh.
+    const setup = 'echo ran >> .setup-ran'
+    const first = await onboard(run, { setup })
+    assert.ok('id' in first.workspace)
+    // The user removed dish's workspace in dsh and added the folder again by hand: another workspace at the path.
+    await run.registry!.registry.delete(first.workspace.id as never)
+    const other = await run.registry!.registry.create(first.clone, 'by hand')
+    await rm(first.clone, { recursive: true })
+    const again = await onboard(run, { setup })
+    assert.equal(again.adopted, false, 'a fresh clone')
+    assert.deepEqual(again.setup, { ran: false, reason: skipReason('a dsh workspace already points at this path', again.clone, setup) })
+    assert.equal(await exists(join(again.clone, '.setup-ran')), false)
+    assert.deepEqual(again.workspace, { id: other.id })
+    const state = await readCloneState(cloneStateFile(world.state, 'acme', 'widget'))
+    assert.deepEqual({ ...state?.setup, at: 0 }, { at: 0, ran: false, exitCode: null, timedOut: false, reason: again.setup.ran ? '' : again.setup.reason })
+  } finally {
+    await run.registry?.stop()
+  }
+})
+
+test('when dish can\'t tell whose workspace is at the path (no record from before, or a registry that fails), setup runs in its fresh clone', async () => {
+  const run = await prepare()
+  const { world } = run
+  try {
+    // A workspace at the path, and no clone state at all: it may be the project's own (dish's state was lost).
     const path = join(world.workRoot, 'acme', 'widget')
     await mkdir(path, { recursive: true })
     const kept = await run.registry!.registry.create(path, 'acme/widget')
     await rm(path, { recursive: true })
-    const setup = 'echo ran >> .setup-ran'
-    const result = await onboard(run, { setup })
-    assert.equal(result.adopted, false, 'a fresh clone')
-    assert.deepEqual(result.setup, { ran: false, reason: skipReason('a dsh workspace already points at this path', result.clone, setup) })
-    assert.equal(await exists(join(result.clone, '.setup-ran')), false)
+    const result = await onboard(run, { setup: 'echo ran >> .setup-ran' })
+    assert.equal(result.adopted, false)
+    assert.equal(result.setup.ran, true)
     assert.deepEqual(result.workspace, { id: kept.id })
-    const state = await readCloneState(cloneStateFile(world.state, 'acme', 'widget'))
-    assert.deepEqual({ ...state?.setup, at: 0 }, { at: 0, ran: false, exitCode: null, timedOut: false, reason: result.setup.ran ? '' : result.setup.reason })
   } finally {
     await run.registry?.stop()
   }
+  const failing = await prepare({ registry: false })
+  failing.deps.registry = () => ({
+    resolveByPath: async () => { throw new Error('the registry is broken') },
+    create: async () => { throw new Error('the registry is broken') },
+    get: () => undefined,
+    list: () => [],
+  }) as unknown as WorkspaceRegistryLike
+  const error = await failsAt(onboard(failing, { setup: 'echo ran >> .setup-ran' }), 'workspace')
+  assert.match(error.message, /the registry is broken/)
+  const state = await readCloneState(cloneStateFile(failing.world.state, 'acme', 'widget'))
+  assert.equal(state?.setup?.ran, true, 'setup ran before the workspace step failed')
 })
 
 test('a setup that runs past its time is killed, and fails the project', async () => {

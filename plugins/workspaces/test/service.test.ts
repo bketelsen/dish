@@ -448,21 +448,25 @@ function requestsFor(run: Setup, repo: string, from: number): string[] {
   return run.world.git.requests.slice(from).map(request => request.path).filter(path => path.startsWith(`/${repo}.git/`))
 }
 
-test('prepare of a project whose clone was deleted by hand says so, and that Retry clones it again', async () => {
-  const run = await setup()
+test('a ready project whose clone was deleted by hand: prepare says so, and Retry makes a fresh clone, runs setup and keeps its workspace', async () => {
+  const run = await setup({ registry: true })
   try {
-    await run.service.onboard(widget)
-    run.projects.set('acme/widget', 'ready')
+    const project = projectOf('acme/widget', { setup: 'echo ran >> .setup-ran' })
+    run.projects.add(project, 'ready')
+    const first = await run.service.onboard(project)
+    assert.ok('id' in first.workspace)
     const clone = join(run.world.workRoot, 'acme', 'widget')
     await rm(clone, { recursive: true, force: true })
-    await assert.rejects(run.service.prepare(widget), (error: Error) => {
+    await assert.rejects(run.service.prepare(project), (error: Error) => {
       assert.equal(error.message, `the clone at ${clone} is gone; press Retry on Settings → Projects to clone it again`)
       return true
     })
-    // Retry onboards it again: a fresh clone.
-    const again = await run.service.onboard(widget)
+    // Retry onboards it again: a fresh clone, where setup runs; the workspace dsh kept at the path is the project's own.
+    const again = await run.service.onboard(project)
     assert.equal(again.adopted, false)
-    assert.ok(await exists(join(clone, '.git')))
+    assert.equal(again.setup.ran, true)
+    assert.equal(await readFile(join(clone, '.setup-ran'), 'utf8'), 'ran\n')
+    assert.deepEqual(again.workspace, first.workspace)
   } finally {
     await teardown(run)
   }

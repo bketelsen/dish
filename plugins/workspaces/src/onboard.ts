@@ -10,9 +10,10 @@
  *    still onboards), then `configureClone`.
  * 4. **setup:** outside the sandbox only in a clone dish has just made (its own fresh clone of GitHub's default branch).
  *    An adopted clone (adopting, or Retry) is skipped with the command to run: an existing checkout's ignored files
- *    can't be trusted (the spec's "Fresh checkouts only"). So is a fresh clone at a path a dsh workspace already points
- *    at (one kept after the project was removed and its clone deleted): chats in that workspace could write in the
- *    clone while setup runs. A setup that fails says how to run it again: Retry adopts the clone and skips setup.
+ *    can't be trusted (the spec's "Fresh checkouts only"). So is a fresh clone at a path where a dsh workspace other
+ *    than the project's own points (`otherWorkspaceAt`): chats in that workspace could write in the clone while setup
+ *    runs. The project's own (a Retry after its clone was deleted by hand) doesn't stop setup, and neither does one
+ *    dish can't place. A setup that fails says how to run it again: Retry adopts the clone and skips setup.
  * 5. **workspace:** registered with dsh's workspace registry, titled with the project's name, and recorded; without a
  *    registry (a profile other than `web`), skipped, to be registered when one appears. The signal is checked first, so
  *    a project removed while it onboarded never gets a workspace.
@@ -46,7 +47,7 @@ export type { OnboardStep } from './clone.ts'
 export const NO_REGISTRY = 'no workspace registry in this profile'
 /** Why setup doesn't run in an adopted clone. */
 export const EXISTING_CHECKOUT = 'it is an existing checkout'
-/** Why setup doesn't run in a fresh clone that a dsh workspace already points at. */
+/** Why setup doesn't run in a fresh clone that a dsh workspace other than the project's own points at. */
 export const WORKSPACE_THERE = 'a dsh workspace already points at this path'
 /** What to do about setup's failure: Retry adopts the clone and skips setup. */
 const AFTER_FAILURE = "Retry won't run setup again in this clone: remove the clone and press Retry, or run it yourself in"
@@ -138,6 +139,8 @@ export async function onboardProject(
 
   // What dish knew of the clone before; a corrupt file starts over.
   let state: CloneState | undefined = await readCloneState(file)
+  // What dish recorded before this onboarding (its workspace among it), for step 4.
+  const before = state
   if (state === undefined && await present(file)) deps.logger.warn('the clone state of %s was unreadable; it starts over', project.name)
   const save = async (next: CloneState): Promise<void> => {
     state = next
@@ -196,7 +199,7 @@ export async function onboardProject(
   let setup: SetupOutcome
   if (project.setup === undefined) {
     setup = { ran: false, reason: 'no setup' }
-  } else if (adopted || await workspaceAt(deps.registry(), clone)) {
+  } else if (adopted || await otherWorkspaceAt(deps.registry(), clone, before)) {
     setup = { ran: false, reason: skipReason(adopted ? EXISTING_CHECKOUT : WORKSPACE_THERE, clone, project.setup) }
     await save({ ...state!, setup: { at: Date.now(), ran: false, exitCode: null, timedOut: false, reason: setup.reason } }).catch((error: unknown) => {
       throw asStepError('setup', error)
@@ -236,16 +239,25 @@ export async function onboardProject(
 }
 
 /**
- * Whether dsh's workspace registry (when this profile has one) has a workspace at `clone`: one kept from before, which
- * dish didn't make for this onboarding. A registry that can't be asked fails the step, and setup doesn't run.
+ * Whether a dsh workspace that isn't the project's own points at `clone`, the fresh clone dish just made: the registry
+ * (when this profile has one) has a workspace at the path, and dish's record from before this onboarding (`before`, its
+ * `clone.json`) names another workspace, or none. dish records every workspace it registers for a project there, and
+ * the record outlives the clone, so the project's own workspace (a Retry after the clone was deleted by hand) is told
+ * apart from one made by hand or kept by someone else. A project removed and added again keeps its record too: its
+ * kept workspace counts as its own.
+ *
+ * When dish can't tell (no record from before, which may be state that was lost, or a registry that can't be asked),
+ * this is false and setup runs: the clone is fresh, and dish made it.
  */
-async function workspaceAt(registry: WorkspaceRegistryLike | undefined, clone: string): Promise<boolean> {
-  if (registry === undefined) return false
+async function otherWorkspaceAt(registry: WorkspaceRegistryLike | undefined, clone: string, before: CloneState | undefined): Promise<boolean> {
+  if (registry === undefined || before === undefined) return false
+  let found: { id: string } | undefined
   try {
-    return await registry.resolveByPath(clone) !== undefined
-  } catch (error) {
-    throw new OnboardError('setup', `couldn't ask dsh's workspace registry whether a workspace points at ${clone}: ${messageOf(error)}`)
+    found = await registry.resolveByPath(clone)
+  } catch {
+    return false
   }
+  return found !== undefined && found.id !== before.workspace?.id
 }
 
 /** The service's owner map with `project`'s repo in its owner's set, under `installation`. */

@@ -38,6 +38,7 @@ In a chat whose workspace is a project's clone ([`dish-workspaces`](../workspace
 - **Crew checks it before anything starts:** the role writes (a reviewer is given the path in its task instead), `dish-workspaces` is running and knows the worktree, the worktree is inside the chat's workspace (a child works in its parent's sandbox, and couldn't write anywhere else), and no running crew child, of any chat, is bound to it.
 - **The child is bound:** its record keeps the worktree's path (`worktree` in `children.json`), and its brief gets a block after the task naming the worktree and its branch, and telling it to work only there.
 - **Follow-ups keep the binding** and add nothing to the text. One that names another worktree is refused, and so is one to a child whose worktree has been merged or removed: start a new coder.
+- **A worktree dish made that fails a check is refused with the reason.** When `resolve` gives nothing, crew asks `dishWorkspaces.resolveProblem(ref)` why: the project's clone, or the worktree itself, failed dish's safety check (with the finding), or its branch is gone. A start says "worktree `<ref>` can't be bound: <reason>. Nothing was started or sent; tell the user."; a follow-up to a bound child says its worktree "can't be used: <reason>" instead of calling it gone. Without a reason (a worktree dish doesn't know), the refusals are as above.
 - **`dishCrew.worktreeBindings(path)`** lists the children bound to a worktree, with whether each is running, for `dish-workspaces`' `list`, `remove` and sweep.
 
 ## crew.yaml
