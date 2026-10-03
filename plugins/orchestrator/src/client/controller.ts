@@ -10,6 +10,10 @@
  *
  * **Read only.** Nothing here changes a run: the remote has no call that could.
  *
+ * **A failure keeps what it can.** When a run is read again and the server refuses it (its record was set aside, say), the
+ * run and its timeline go, with the refusal in their place. When the read failed on the way (the carrier, a throw), what was
+ * shown stays, with the error beside it: the person keeps reading, and Refresh tries again.
+ *
  * Answers that arrive after the person has moved on (another run, the list, a newer read) are dropped, by a counter per kind
  * of answer, and the controller can be thrown away (`dispose`): the scope that made it ends when the remote goes, and a call
  * still out then changes nothing.
@@ -79,7 +83,8 @@ export interface RunsController {
 
 // --- calls ---------------------------------------------------------------------------------------
 
-type Settled<T> = { ok: true, value: T } | { ok: false, notice: Notice }
+/** `refused`: the server said no (an `Outcome` refusal); else the call failed on the way. */
+type Settled<T> = { ok: true, value: T } | { ok: false, notice: Notice, refused?: true }
 
 /** Wait for a call and fold a failure (the carrier's, or a throw) into a `Notice`. Never throws. */
 async function settlePlain<T>(task: () => Promise<RemoteResult<T>>): Promise<Settled<T>> {
@@ -96,7 +101,7 @@ async function settle<T>(task: () => Promise<RemoteResult<Outcome<T>>>): Promise
   const result = await settlePlain(task)
   if (!result.ok) return result
   const outcome = result.value
-  return outcome.ok ? { ok: true, value: outcome.value } : { ok: false, notice: failureNotice(outcome.code, outcome.message) }
+  return outcome.ok ? { ok: true, value: outcome.value } : { ok: false, notice: failureNotice(outcome.code, outcome.message), refused: true }
 }
 
 /** A minimal snapshot store: what `createSnapshotStore` is, without the engine behind it that Node can't load. */
@@ -157,27 +162,35 @@ export function createRunsPage(api: RunsApi): RunsController {
     patchList({ load: 'ready', rows: result.value, error: undefined })
   }
 
-  /** Read the selected run's detail. What it showed stays until the answer is in hand. */
+  /**
+   * Read the selected run's detail. What it showed stays until the answer is in hand, and after it when the read failed on
+   * the way; a refusal takes it away.
+   */
   const loadDetail = async (project: string, id: string): Promise<void> => {
     const generation = ++detailGeneration
     patchDetail({ load: 'loading', error: undefined })
     const result = await settle(() => api.run(project, id))
     if (disposed || generation !== detailGeneration) return
     if (!result.ok) {
-      patchDetail({ load: 'error', value: undefined, error: result.notice })
+      patchDetail(result.refused === true ? { load: 'error', value: undefined, error: result.notice } : { load: 'error', error: result.notice })
       return
     }
     patchDetail({ load: 'ready', value: result.value, error: undefined })
   }
 
-  /** Read the newest page of the selected run's ledger. What it showed stays until the answer is in hand. */
+  /**
+   * Read the newest page of the selected run's ledger. What it showed stays until the answer is in hand, and after it when the
+   * read failed on the way; a refusal takes it away.
+   */
   const loadTimeline = async (project: string, id: string): Promise<void> => {
     const generation = ++timelineGeneration
     patchTimeline({ load: 'loading', error: undefined, more: 'idle', moreError: undefined })
     const result = await settle(() => api.ledger(project, id, TIMELINE_PAGE, ''))
     if (disposed || generation !== timelineGeneration) return
     if (!result.ok) {
-      patchTimeline({ load: 'error', lines: [], next: undefined, skipped: 0, capped: false, error: result.notice })
+      patchTimeline(result.refused === true
+        ? { load: 'error', lines: [], next: undefined, skipped: 0, capped: false, error: result.notice }
+        : { load: 'error', error: result.notice })
       return
     }
     const page = result.value
@@ -212,7 +225,9 @@ export function createRunsPage(api: RunsApi): RunsController {
   const loadOlder = async (): Promise<void> => {
     const selected = get().selected
     const timeline = get().timeline
-    if (disposed || selected === undefined || timeline.next === undefined || timeline.load !== 'ready' || timeline.more === 'loading') return
+    // A timeline kept after a read that failed on the way (`error`, with its lines) still has its cursor: older pages load.
+    if (disposed || selected === undefined || timeline.next === undefined || timeline.lines.length === 0) return
+    if (timeline.load === 'idle' || timeline.load === 'loading' || timeline.more === 'loading') return
     const generation = timelineGeneration
     patchTimeline({ more: 'loading', moreError: undefined })
     const result = await settle(() => api.ledger(selected.project, selected.id, TIMELINE_PAGE, timeline.next ?? ''))

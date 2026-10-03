@@ -305,6 +305,76 @@ test('a refusal becomes a notice with the server\'s message: the run, and its ti
   assert.ok(`${state().timeline.error!.text} ${state().timeline.error!.detail ?? ''}`.includes('before must be the next of a page that read gave'))
 })
 
+test('a refresh whose carrier fails keeps the run and its timeline in view, with the error; the next read that works clears it', async () => {
+  const { api, page, state } = make()
+  await page.face.select(PROJECT, '20261003-alpha')
+  api.down.add('run 20261003-alpha')
+  api.down.add('ledger 20261003-alpha ')
+  await page.face.refresh()
+  const failed = state()
+  assert.equal(failed.detail.load, 'error')
+  assert.equal(failed.detail.value?.id, '20261003-alpha')
+  assert.deepEqual(failed.detail.error, { text: 'Something went wrong talking to dish-orchestrator', detail: 'gateway offline' })
+  assert.equal(failed.timeline.load, 'error')
+  assert.deepEqual(failed.timeline.lines.map(line => line.fields.text), ['20261003-alpha 0', '20261003-alpha 1', '20261003-alpha 2'])
+  assert.deepEqual(failed.timeline.error, { text: 'Something went wrong talking to dish-orchestrator', detail: 'gateway offline' })
+  assert.deepEqual(failed.selected, { project: PROJECT, id: '20261003-alpha' })
+
+  api.down.clear()
+  await page.face.refresh()
+  assert.equal(state().detail.load, 'ready')
+  assert.equal(state().detail.error, undefined)
+  assert.equal(state().timeline.load, 'ready')
+  assert.equal(state().timeline.error, undefined)
+  assert.equal(state().timeline.lines.length, 3)
+})
+
+test('a timeline kept after a refresh that failed on the way still loads older pages', async () => {
+  const { api, page, state } = make()
+  await page.face.select(PROJECT, '20261003-beta')
+  api.down.add('ledger 20261003-beta ')
+  await page.face.refresh()
+  assert.equal(state().timeline.load, 'error')
+  assert.equal(state().timeline.lines.length, TIMELINE_PAGE)
+  assert.equal(state().timeline.next, String(TIMELINE_PAGE))
+  await page.face.loadOlder()
+  assert.equal(state().timeline.lines.length, 250)
+  assert.equal(state().timeline.lines[0]!.fields.text, '20261003-beta 0')
+  assert.equal(state().timeline.next, undefined)
+})
+
+test('a refresh whose remote throws keeps what was shown too: it is the page\'s own failure, not the server\'s', async () => {
+  const { api, page, state } = make()
+  await page.face.select(PROJECT, '20261003-beta')
+  await page.face.loadOlder()
+  const run = api.run.bind(api)
+  const ledger = api.ledger.bind(api)
+  api.run = async () => { throw new Error('boom') }
+  api.ledger = async () => { throw new Error('bang') }
+  await page.face.refresh()
+  assert.equal(state().detail.value?.id, '20261003-beta')
+  assert.equal(state().detail.error?.detail, 'boom')
+  assert.equal(state().timeline.lines.length, 250)
+  assert.equal(state().timeline.error?.detail, 'bang')
+  api.run = run
+  api.ledger = ledger
+})
+
+test('a refresh the server refuses drops the run and its timeline: the record is gone (set aside), and the refusal says so', async () => {
+  const { api, page, state } = make()
+  await page.face.select(PROJECT, '20261003-alpha')
+  api.refusals.set('run 20261003-alpha', { code: 'NOT_FOUND', message: `no run ${PROJECT}/20261003-alpha` })
+  api.refusals.set('ledger 20261003-alpha ', { code: 'NOT_FOUND', message: `no run ${PROJECT}/20261003-alpha` })
+  await page.face.refresh()
+  assert.equal(state().detail.load, 'error')
+  assert.equal(state().detail.value, undefined)
+  assert.equal(state().detail.error?.detail, `no run ${PROJECT}/20261003-alpha`)
+  assert.equal(state().timeline.load, 'error')
+  assert.deepEqual(state().timeline.lines, [])
+  assert.equal(state().timeline.next, undefined)
+  assert.equal(state().timeline.error?.detail, `no run ${PROJECT}/20261003-alpha`)
+})
+
 test('a carrier that fails is said as the page\'s own failure, for the list, the run, the timeline and an older page', async () => {
   const { api, page, state } = make()
   api.down.add('runs')

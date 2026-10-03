@@ -58,6 +58,8 @@ function RunSection({ state, selected, now, actions }: { state: PageState, selec
   if (detail.value !== undefined) {
     return (
       <section className="dish-runs-card" aria-label={`Run ${selected.id}`}>
+        {/* A read that failed on the way keeps the run in view: the error goes above it. */}
+        {detail.error !== undefined && <LoadError notice={detail.error} retry={() => { void actions.refresh() }} />}
         <RunView detail={detail.value} timeline={timeline} now={now} back={() => { actions.back() }} loadOlder={() => { void actions.loadOlder() }} />
       </section>
     )

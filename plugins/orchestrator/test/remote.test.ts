@@ -5,18 +5,20 @@
  */
 
 import assert from 'node:assert/strict'
-import { appendFile, lstat, readdir } from 'node:fs/promises'
-import { join, relative } from 'node:path'
+import { access, appendFile, lstat, mkdir, readdir, writeFile } from 'node:fs/promises'
+import { dirname, join, relative } from 'node:path'
 import { test } from 'node:test'
+import type { Context } from '@deepseek-ai/cordis'
 import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
 import { summarize } from '../src/derive.ts'
 import type { LedgerEntry } from '../src/entries.ts'
+import type { Config } from '../src/index.ts'
 import type { ErrorCode, LedgerLine, Outcome, RunRow } from '../src/protocol.ts'
 import { RunsRemote, SERVICE } from '../src/remote.ts'
 import type { Run } from '../src/store.ts'
 import { HOUR, MINUTE, everyKind } from './helpers.ts'
 import { MASKED_TOKEN, NOW, OTHER_PROJECT, OTHER_SESSION, PROJECT, SESSION, SHA_A, TOKEN, pluginWorld, waitFor } from './service-helpers.ts'
-import type { PluginWorld } from './service-helpers.ts'
+import type { Handle, PluginWorld } from './service-helpers.ts'
 
 /** Run `body` with the plugin mounted, and its remote. */
 async function withRemote(body: (w: PluginWorld, remote: RunsRemote) => Promise<void>): Promise<void> {
@@ -309,6 +311,55 @@ test('a token planted raw in a ledger file, past the ledger\'s own mask, reaches
     }
     assert.equal(page.lines[0]!.fields.text, `the token is ${MASKED_TOKEN}`)
     assert.equal(detail.summary.notes[0]!.text, `the token is ${MASKED_TOKEN}`)
+  })
+})
+
+/**
+ * dish-orchestrator mounted again in `w.ctx`, over the world's own directories: a fresh store, which loads what is on disk now
+ * (a record written by hand, say). The world's `dispose` takes the new one away.
+ */
+async function remount(w: PluginWorld): Promise<RunsRemote> {
+  await w.handles.plugin!.dispose()
+  const plugin = await import('../src/index.ts')
+  const handle = w.ctx.plugin({
+    name: plugin.name,
+    Config: plugin.Config,
+    apply: (own: Context, config: Config) => { plugin.start(own, config, { state: w.state, data: w.data, now: () => w.clock.now }) },
+  } as never, { terminal: false } as never) as unknown as Handle
+  await handle
+  w.handles.plugin = handle
+  await waitFor('the remote', () => w.ctx.get('dishRunsRemote') !== undefined)
+  return w.ctx.get('dishRunsRemote') as RunsRemote
+}
+
+test('a token in a record written by hand, past the store\'s own mask, reaches the page masked: goal, reason and plan, in runs and run', async () => {
+  await withRemote(async (w) => {
+    const id = '20261003-planted'
+    const file = join(w.state, 'orchestrator', 'Acme', 'widget', 'runs', `${id}.json`)
+    const record: Run = {
+      id, project: PROJECT, slug: 'planted', goal: `the goal holds ${TOKEN}`, plan: { path: `docs/${TOKEN}/plan.md`, commit: SHA_A },
+      branch: 'dish/planted', worktree: join(w.dir, 'work', 'planted'), base: 'origin/main', baseCommit: SHA_A,
+      state: 'abandoned', reason: `the reason holds ${TOKEN}`, driver: { session: '', since: NOW }, openedAt: NOW, closedAt: NOW + HOUR,
+    }
+    await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+    await writeFile(file, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 })
+    const remote = await remount(w)
+
+    const rows = await remote.runs()
+    const detail = ok(await remote.run(PROJECT, id))
+    // The store took the record as it is: it wasn't set aside as corrupt.
+    await access(file)
+    assert.deepEqual(rows.map(row => row.id), [id])
+    for (const value of [rows, detail]) {
+      const text = JSON.stringify(value)
+      assert.ok(!text.includes('ghs_'), text.slice(0, 400))
+      assert.ok(text.includes(MASKED_TOKEN))
+    }
+    assert.equal(rows[0]!.goal, `the goal holds ${MASKED_TOKEN}`)
+    assert.equal(rows[0]!.reason, `the reason holds ${MASKED_TOKEN}`)
+    assert.equal(detail.goal, `the goal holds ${MASKED_TOKEN}`)
+    assert.equal(detail.reason, `the reason holds ${MASKED_TOKEN}`)
+    assert.ok(detail.plan !== undefined && detail.plan.path.includes(MASKED_TOKEN) && !detail.plan.path.includes('ghs_'), JSON.stringify(detail.plan))
   })
 })
 
