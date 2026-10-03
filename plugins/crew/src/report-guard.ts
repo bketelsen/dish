@@ -44,6 +44,10 @@
  * holding it: the guard cannot tell a report in pieces from a question, so a child that has been refused once does not get another
  * send. A question it is blocked on goes in its closing message, and the main agent follows up with `delegate` and `to`.
  *
+ * A child crew gave `report` (a coder or a reviewer, step 7: `reports`) reads the same two refusals with `report` in place of its
+ * closing message, since its prompt tells it to finish with `report` and "your closing message is your report" would tell it the
+ * opposite. Every other child reads the two texts above, byte for byte, as does every child when `reports` is absent or throws.
+ *
  * ### The hold
  *
  * The ids of refused crew children are kept in a bounded set (`MAX_REFUSED`, oldest out), so the check in 3 is a lookup in memory:
@@ -94,6 +98,11 @@ export interface ReportGuardDeps {
   tell?: (message: string) => void
   /** How long a lookup may take. */
   budgetMs?: number
+  /**
+   * Whether this crew instance gave `agent` its `report` (`ReportRegistrar.roleOf`). Read for the refusal's words only: a throw is
+   * false. Default: never.
+   */
+  reports?(agent: unknown): boolean
 }
 
 /** The `tools/pre-execute` listener, and the way to tell it that a child's run has ended. */
@@ -116,6 +125,20 @@ const REFUSED = 'Not sent: this is your result, and in this crew your closing me
 /** What it reads for every later `send_message` in the same run. */
 const CLOSED = 'Not sent: send_message is closed to you until you finish, because your report was refused here once already. '
   + 'Put everything for the main agent in your closing message, and finish.'
+
+/**
+ * The first refusal, for a child crew gave `report`: `REFUSED` with `report` in place of the closing message. Said by
+ * `report-guard.test.ts` word for word.
+ */
+const REFUSED_REPORT = 'Not sent: this is your result, and in this crew you report with `report`. '
+  + 'It reaches the main agent in full, automatically, when you call it, whatever your task says about sending your result with send_message. '
+  + 'Don\'t resend it shorter or in parts: send_message is closed to you until you finish. '
+  + 'Finish the work and call `report`. '
+  + 'If this was a question you\'re blocked on, put it in your report instead; the main agent will follow up.'
+
+/** Every later one in the same run, for a child crew gave `report`. */
+const CLOSED_REPORT = 'Not sent: send_message is closed to you until you finish, because your report was refused here once already. '
+  + 'Put everything for the main agent in your `report`, and finish.'
 
 /** The call's `message`, if it is a string; `undefined` for anything else, and for arguments that can't be read. */
 function messageOf(args: unknown): string | undefined {
@@ -149,6 +172,14 @@ export function reportGuard(deps: ReportGuardDeps): ReportGuard {
     refused.add(id)
     while (refused.size > MAX_REFUSED) refused.delete(refused.values().next().value!)
   }
+  /** Whether `agent` reports with `report`: which words a refusal carries. A `reports` that throws is no. */
+  const reportsWith = (agent: unknown): boolean => {
+    try {
+      return deps.reports?.(agent) === true
+    } catch {
+      return false
+    }
+  }
 
   const guard = async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
     if (!(limit > 0)) return next()
@@ -169,7 +200,7 @@ export function reportGuard(deps: ReportGuardDeps): ReportGuard {
     } catch {
       id = undefined
     }
-    if (id !== undefined && refused.has(id)) return { kind: 'deny', reason: CLOSED }
+    if (id !== undefined && refused.has(id)) return { kind: 'deny', reason: reportsWith(agent) ? CLOSED_REPORT : CLOSED }
 
     const message = messageOf(exec.arguments)
     if (message === undefined || message.length <= limit) return next()
@@ -184,7 +215,7 @@ export function reportGuard(deps: ReportGuardDeps): ReportGuard {
     }
     if (!known) return next()
     hold(id)
-    return { kind: 'deny', reason: REFUSED }
+    return { kind: 'deny', reason: reportsWith(agent) ? REFUSED_REPORT : REFUSED }
   }
 
   return Object.assign(guard, {

@@ -229,7 +229,7 @@ async function world(options: WorldOptions = {}): Promise<World> {
   const project = { current: PROJECT as Project | undefined }
   const crew = options.crew === false
     ? undefined
-    : ctx.plugin(crewPlugin, { terminal: false, dataDirectory: crewData } as crewPlugin.Config) as unknown as Handle
+    : ctx.plugin(crewPlugin, { terminal: false, dataDirectory: crewData, reportSteers: 0 } as crewPlugin.Config) as unknown as Handle
   if (crew !== undefined) await crew
   const workspaces = provideStub(ctx, 'dishWorkspaces', {
     resolve: async (path: string) => path === FIX1 ? worktreeOf(path) : undefined,

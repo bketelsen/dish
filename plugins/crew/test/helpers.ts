@@ -4,6 +4,9 @@ import { join } from 'node:path'
 import { after } from 'node:test'
 import { format } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
+import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import { createScope } from '@deepseek-ai/dsh-scope'
+import { ToolRuntime } from '@deepseek-ai/dsh-tools'
 import * as configPlugin from 'dish-config'
 import type { DishConfigService } from 'dish-config'
 import { dump, load } from 'js-yaml'
@@ -135,4 +138,57 @@ export async function provideStub(ctx: Context, name: string, value: unknown): P
     name: `stub-${name}`,
     apply(own: Context) { (own as unknown as { provide(name: string, value: unknown): void }).provide(name, value) },
   } as never, undefined as never)
+}
+
+/** An agent as dsh makes one, on a scope of its own: what crew's host listeners and dsh's tool registry use of it. */
+export interface ScopedAgent {
+  id: string
+  /** The agent's own scope: a tool registered here is the agent's alone. */
+  ctx: Context
+  session: { id: string, header: Record<string, unknown> }
+  options: Record<string, unknown>
+  /** What was steered to it, in order. */
+  steers: UserMessage[]
+  steer(message: UserMessage): void
+}
+
+/** Agents on scopes of their own, over dsh's real tool registry in `ctx`. */
+export interface AgentScopes {
+  /** A top-level agent: the main agent of session `id`. */
+  main(id: string): ScopedAgent
+  /** A child (`delegationDepth: 1`, `origin: 'subagent'`) of session `id`: a new agent object each call, as a cold resume makes. */
+  child(id: string): ScopedAgent
+  /** Take the scopes, the registry and its stubs away. */
+  dispose(): Promise<void>
+}
+
+/**
+ * dsh's `ToolRuntime` in `ctx`, with a `systemPrompt` stub and a `scope-owner` plugin injecting `tools`, and agents made with
+ * dsh-scope's `createScope` on that owner, as dsh makes them (built like delegate.test.ts's `world()`). The agent object is
+ * the scope's key, so `ctx.tools.get(name, agent)` is the agent's view of the registry.
+ */
+export async function agentScopes(ctx: Context): Promise<AgentScopes> {
+  const handles: Array<{ dispose(): unknown }> = []
+  handles.push(await provideStub(ctx, 'systemPrompt', { tools() {}, section() {}, context() {}, getSectionOrder: () => 1, getContextOrder: () => 1 }))
+  handles.push(await ctx.plugin(ToolRuntime, {}) as unknown as { dispose(): unknown })
+  let owner!: Context
+  handles.push(await ctx.plugin({ name: 'scope-owner', inject: ['tools'], apply(own: Context) { owner = own } } as never, undefined as never) as unknown as { dispose(): unknown })
+  const make = (id: string, header: Record<string, unknown>): ScopedAgent => {
+    const steers: UserMessage[] = []
+    const agent = {
+      id, session: { id, header: { id, cwd: '/w', ...header } }, options: {}, steers,
+      steer(message: UserMessage) { steers.push(message) },
+    } as unknown as ScopedAgent
+    const scope = createScope(owner, agent)
+    handles.push(scope)
+    agent.ctx = scope.ctx
+    return agent
+  }
+  return {
+    main: id => make(id, {}),
+    child: id => make(id, { delegationDepth: 1, origin: 'subagent', parentSession: 'main-1' }),
+    async dispose() {
+      for (const handle of handles.splice(0).reverse()) await handle.dispose()
+    },
+  }
 }
