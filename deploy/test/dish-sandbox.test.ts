@@ -165,10 +165,11 @@ async function made(box: Box): Promise<string[]> {
 const PROTECTED_DIRS = [
   '.dsh', '.config/dish', '.local/share/dish', '.local/state/dish', '.cache/dish',
   '.ssh', '.gnupg', '.config/git', '.config/systemd', '.local/share/systemd', '.config/environment.d', '.config/autostart',
-  '.config/mise',
+  '.local/share/bash-completion', '.config/mise', '.config/pnpm', 'node_modules', '.node_modules', '.node_libraries',
 ]
 const PROTECTED_FILES = [
   '.gitconfig', '.git-credentials', '.pam_environment', '.bashrc', '.bash_profile', '.bash_login', '.bash_logout', '.profile',
+  '.bash_aliases', '.bash_completion', '.npmrc',
 ]
 
 /** A shell script that tries to write each path (a directory gets a new file, a file gets a line) and reports each. */
@@ -473,13 +474,51 @@ test('no bwrap at /usr/bin/bwrap or /usr/local/bin/bwrap is its own failure, in 
 
 test("bwrap's own failures are runner failures too", { skip: SKIP }, async () => {
   const box = await makeBox()
-  // A protected path that is a link to nothing: there is nothing to bind, and bwrap says so.
-  await symlink(join(box.dir, 'missing'), join(box.home, '.gitconfig'))
-  const result = await bash(box, 'echo ran')
+  // A workspace that isn't there: dsh's own bind of it fails, and bwrap says so.
+  const confined = await confine([SCRIPT], ['bash', '-c', 'echo ran'], 'workspace-write', join(box.dir, 'no-such-workspace'))
+  assertScratch(box, box.env)
+  const [file, ...args] = confined.argv
+  const result = { ...await exec(file!, args, box.home, box.env), confined }
   assert.equal(result.code, 1)
   assert.match(result.stderr, /^bwrap: /m)
   assert.equal(verdict(result), 'runner')
-  assert.ok(!existsSync(join(box.dir, 'missing')), 'nothing is made through a link')
+})
+
+test('a protected path that is a symbolic link, or sits under one, stops every call with a message naming it', { skip: SKIP }, async () => {
+  const cases: Array<[string, (home: string, dir: string) => Promise<void>, RegExp]> = [
+    ['a link to a file', async (home) => {
+      await mkdir(join(home, 'dots'))
+      await writeFile(join(home, 'dots', 'gitconfig'), '[user]\n')
+      await symlink('dots/gitconfig', join(home, '.gitconfig'))
+    }, /\/\.gitconfig is a symbolic link, on the protected list, so it can't be protected/],
+    ['a link to nothing', async (home, dir) => {
+      await symlink(join(dir, 'missing'), join(home, '.bashrc'))
+    }, /\/\.bashrc is a symbolic link, on the protected list/],
+    ['a directory above one', async (home) => {
+      await mkdir(join(home, 'dots', 'config'), { recursive: true })
+      await symlink('dots/config', join(home, '.config'))
+    }, /\/\.config is a symbolic link, a directory above the protected .*\/\.config\/\S+, so it can't be protected/],
+  ]
+  for (const [why, arrange, message] of cases) {
+    const box = await makeBox()
+    await arrange(box.home, box.dir)
+    const result = await bash(box, 'echo ran')
+    assert.equal(result.code, 1, why)
+    assert.equal(result.stdout, '', why)
+    assert.match(result.stderr, /^dish-sandbox: /, why)
+    assert.match(result.stderr, message, why)
+    assert.equal(verdict(result), 'runner', why)
+    assert.ok(!existsSync(join(box.dir, 'missing')), `${why}: nothing is made through a link`)
+    assert.deepEqual(await readdir(join(box.home, 'dots')).catch(() => []).then((names) => names.filter((name) => name !== 'gitconfig' && name !== 'config')), [], why)
+  }
+})
+
+test('a workspace at or under a protected path is read-only: the protections come last', { skip: SKIP }, async () => {
+  const box = await makeBox({ checkout: true })
+  box.workspace = join(box.home, 'checkout')
+  const result = await bash(box, 'touch file')
+  assert.match(result.stderr, /Read-only file system/)
+  assert.equal(verdict(result), 'denied')
 })
 
 test('the script runs under bash -p, is executable, and names no path of this machine', async () => {

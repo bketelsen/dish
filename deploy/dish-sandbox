@@ -18,7 +18,9 @@
 # - workspace-write mode (dsh's profile has `--tmpfs /tmp`): just before the first `--` it adds `--bind $HOME $HOME`,
 #   then a writable bind of each directory between $HOME and a protected path onto itself, then
 #   `--ro-bind <p> <p>` for each protected path. The home bind comes after dsh's `--ro-bind / /` and its workspace bind,
-#   so it wins over both, and the workspace stays writable, since it is the same directory. The protections come last.
+#   so it wins over both, and the workspace stays writable, since it is the same directory. The protections come last,
+#   so a workspace at or under a protected path (the checkout, say) is read-only. The home is bound by its real path
+#   (`pwd -P`), since bwrap can't mount on a symbolic link.
 #
 # The protected list. These stay read-only, whether they exist yet or not:
 # - dish and dsh themselves: $DSH_HOME (dsh gives every shell call its own), and ~/.dsh, dsh's default home, wherever
@@ -29,26 +31,34 @@
 #   anyway); and dish's checkout, this file's ../, so that no agent can change this file.
 # - credentials and git: ~/.ssh, ~/.gnupg, ~/.gitconfig, ~/.config/git and ~/.git-credentials. dish's own git reads the
 #   account's global config outside the sandbox, where a credential.helper or url.*.insteadOf would run or redirect.
-# - what runs later outside the sandbox without anyone acting: ~/.config/systemd and ~/.local/share/systemd (user
-#   units; the account has linger), ~/.config/environment.d, ~/.config/autostart, ~/.pam_environment, the shell's
-#   startup files ~/.bashrc, ~/.bash_profile, ~/.bash_login, ~/.bash_logout and ~/.profile, and ~/.config/mise, the
-#   global mise config that fleet's play runs mise with.
+# - files that run later outside the sandbox without anyone acting: ~/.config/systemd and ~/.local/share/systemd (user
+#   units; the account has linger), ~/.config/environment.d, ~/.config/autostart, ~/.pam_environment; the shell's
+#   startup files ~/.bashrc, ~/.bash_profile, ~/.bash_login, ~/.bash_logout and ~/.profile, and what Debian's .bashrc
+#   and bash-completion read, ~/.bash_aliases, ~/.bash_completion and ~/.local/share/bash-completion; ~/.config/mise,
+#   the global mise config that fleet's play runs mise with; ~/.config/pnpm and ~/.npmrc, which pnpm reads when
+#   install.sh and dsh's plugin manager run it (a scriptShell there would run for every script); and ~/node_modules,
+#   ~/.node_modules and ~/.node_libraries, where node looks for a module that dish's own node_modules doesn't have
+#   (dsh's `ws` asks for `bufferutil`, `debug` for `supports-color`).
+#   This list doesn't stop a command that asks the account's systemd user manager to run something: the session bus is
+#   open (deploy/README.md, Security notes).
 # - each `--protect <path>` (an absolute path, or ~/...), from the profile row.
 # Only paths under $HOME are bound: everything else is read-only already, since the sandbox's / is.
 #
 # A protected path that is missing is made first, outside the sandbox and as the account, so that no sandboxed command
 # can make it either: a directory as an empty 0700 directory, a file as an empty 0600 file, a --protect path as a
-# directory. An empty file behaves like a missing one, with one exception: a login bash reads only the first of
-# ~/.bash_profile, ~/.bash_login and ~/.profile, so an empty ~/.bash_profile would hide ~/.profile. A missing
-# ~/.bash_profile is so made to read the one bash read before (~/.bash_login when it exists, else ~/.profile).
+# directory. A path on the list is frozen as it is: whatever it holds stays, read-only. An empty file behaves like a
+# missing one, with one exception: a login bash reads only the first of ~/.bash_profile, ~/.bash_login and ~/.profile,
+# so an empty ~/.bash_profile would hide ~/.profile. A missing ~/.bash_profile is so made to read the one bash read
+# before (~/.bash_login when it exists, else ~/.profile).
 #
 # The writable binds of the directories in between (~/.config, ~/.local, ~/.local/share, and so on) make each one a
 # mount point. Without them, `mv ~/.config ~/.old && mkdir -p ~/.config/git` would move a protected directory out of
 # the way and put a new one in its place, since a directory that holds a mount point can still be renamed. A mount
 # point can't be moved or removed ("Device or resource busy"), and it stays as writable as before.
 #
-# Limits. A protected path, or a directory above one, that is a symbolic link is protected where it points, but the
-# link itself can be replaced, since a mount can't sit on a link. On the VM none is. Reads were never confined.
+# A protected path, or a directory between home and one, that is a symbolic link can't be protected: bwrap can't mount
+# on a link, and a link in a writable directory can be replaced. The script stops with a message naming it, rather than
+# leave bwrap to fail on every command. On the VM none is. Reads were never confined.
 #
 # This file runs outside the sandbox, before every sandboxed command, with the environment dsh gives the command.
 # So it looks nothing up on PATH (a directory on it may be writable now): bwrap is /usr/bin/bwrap or
@@ -56,7 +66,8 @@
 # bash from reading BASH_ENV or importing functions, and the environment reaches the command unchanged.
 #
 # Its own failures print `dish-sandbox: <reason>` on stderr and exit 1: no HOME, a relative HOME (or /, or one that
-# is not a directory), no `--`, a --protect that is not absolute or ~/..., a protected path it can't make, or no bwrap.
+# is not a directory), no `--`, a --protect that is not absolute or ~/..., a protected path that is a symbolic link or
+# sits under one, a protected path it can't make, or no bwrap.
 # The profile row's runnerFailureSignatures, `bwrap: ` and `dish-sandbox: `, have dsh report such a run as one that
 # did not run, not as the command's own failure. read-only mode needs only bwrap and the `--`.
 
@@ -188,7 +199,15 @@ want login "$home/.bash_profile"
 want file "$home/.bash_login"
 want file "$home/.bash_logout"
 want file "$home/.profile"
+want file "$home/.bash_aliases"
+want file "$home/.bash_completion"
+want dir "$home/.local/share/bash-completion"
 want dir "$home/.config/mise"
+want dir "$home/.config/pnpm"
+want file "$home/.npmrc"
+want dir "$home/node_modules"
+want dir "$home/.node_modules"
+want dir "$home/.node_libraries"
 
 for path in "${protect_args[@]}"; do
   # shellcheck disable=SC2088 # a literal ~/, which this expands itself
@@ -214,11 +233,12 @@ make_directory() {
 }
 
 # A new file with mode 0600 holding <text>, made only if nothing is there: noclobber opens it with O_EXCL, so it never
-# writes through a link. Something that appeared meanwhile is fine.
+# writes through a link. A file that appeared meanwhile is fine; a link is refused.
 make_file() {
   if ! (umask 077 && set -o noclobber && printf '%s' "$2" >"$1") 2>/dev/null && [ ! -e "$1" ] && [ ! -L "$1" ]; then
     fail "can't make $1"
   fi
+  refuse_link "$1" 'on the protected list'
 }
 
 # What a login bash read before ~/.bash_profile existed: ~/.bash_login when there is one, else ~/.profile.
@@ -230,6 +250,11 @@ login_text() {
     "# A login bash reads only the first of ~/.bash_profile, ~/.bash_login and ~/.profile, so this reads the one" \
     "# it read before." \
     "if [ -r ~/$next ]; then . ~/$next; fi"
+}
+
+# Fail on a symbolic link at <path>: bwrap can't mount on one, and the link itself could be replaced.
+refuse_link() {
+  if [ -L "$1" ]; then fail "$1 is a symbolic link, $2, so it can't be protected: replace it with what it points to"; fi
 }
 
 declare -A pinned=() protected=()
@@ -245,7 +270,18 @@ for i in "${!paths[@]}"; do
   else
     continue
   fi
-  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+  # Each directory between home and the path, shallowest first, so that a deeper one is not bound over.
+  between=()
+  rest=${path#"$top"/}
+  at=$top
+  while [[ $rest == */* ]]; do
+    at+=/${rest%%/*}
+    rest=${rest#*/}
+    refuse_link "$at" "a directory above the protected $path"
+    between+=("$at")
+  done
+  refuse_link "$path" 'on the protected list'
+  if [ ! -e "$path" ]; then
     case ${kinds[i]} in
       dir) make_directory "$path" ;;
       file)
@@ -258,12 +294,7 @@ for i in "${!paths[@]}"; do
         ;;
     esac
   fi
-  # Each directory between home and the path, shallowest first, so that a deeper one is not bound over.
-  rest=${path#"$top"/}
-  at=$top
-  while [[ $rest == */* ]]; do
-    at+=/${rest%%/*}
-    rest=${rest#*/}
+  for at in "${between[@]}"; do
     if [ -z "${pinned[$at]+x}" ]; then
       pinned[$at]=1
       pins+=(--bind "$at" "$at")
@@ -275,4 +306,5 @@ for i in "${!paths[@]}"; do
   fi
 done
 
-run_bwrap "${profile[@]}" --bind "$home" "$home" "${pins[@]}" "${protections[@]}" -- "$@"
+# The home by its real path: bwrap can't mount on a symbolic link, and the other paths reach it through theirs.
+run_bwrap "${profile[@]}" --bind "$home_real" "$home_real" "${pins[@]}" "${protections[@]}" -- "$@"
