@@ -1,7 +1,8 @@
 /**
  * The text dish-crew writes: the two small things every refusal does to text it doesn't control (cut a name short, and list
- * names), the block a bound coder's brief gets (`worktreeBrief`), the block a reviewer gets when the main agent overrode
- * the gate of the work it reviews (`gateOverrideBrief`), and what goes between the blocks of a message (`BLOCK_END`).
+ * names), the block a bound child's brief gets (`worktreeBrief`, which speaks of `report` to a coder), the block a reviewer
+ * gets when the main agent overrode the gate of the work it reviews (`gateOverrideBrief`), and what goes between the blocks
+ * of a message (`BLOCK_END`).
  *
  * @module dish-crew/text
  */
@@ -9,8 +10,8 @@
 /**
  * What crew puts after a text block it writes into a message, before the next block: a blank line. dsh's adapters join a
  * message's text blocks with nothing between them (pi-ai's `flattenText` and `userContent`, and deepseek's), so without it
- * a model reads "create ok.txtYour worktree is…". The blocks themselves (`worktreeBrief`, `closingNote`, `noticeText`) stay
- * as they are, byte for byte; only the assembly of a message adds it.
+ * a model reads "create ok.txtYour worktree is…". The blocks themselves (`worktreeBrief`, `closingNote`, `reportNote`,
+ * `noticeText`) stay as they are, byte for byte; only the assembly of a message adds it.
  */
 export const BLOCK_END = '\n\n'
 
@@ -36,19 +37,28 @@ export function listed(names: readonly string[], max = LISTED, cut?: number): st
 }
 
 /**
- * The block added to a bound coder's prompt, after its task and before the closing note: where its worktree is, and that it
- * works only there. dsh gives a child its parent's `cwd` (the chat's workspace, the clone), so this is what points it at the
- * worktree. The one place the block is built.
+ * The block added to a bound child's prompt (a role that writes), after its task and before the closing note: where its
+ * worktree is, and that it works only there. dsh gives a child its parent's `cwd` (the chat's workspace, the clone), so this
+ * is what points it at the worktree. The one place the block is built.
  *
  * With `gate` (projects.yaml's, which `delegate` reads from `dishGates.gateFor` while dish-gates runs), the block goes on to
- * say that dish runs it when the coder finishes, and how to opt out when blocked. Without one, or with one that has nothing
- * in it, the block is 6b's, byte for byte.
+ * say that dish runs it when the child finishes, and how to opt out when blocked:
+ * - with `reports` (the child is a coder, which finishes with crew's `report` tool, step 7): when it reports
+ *   `status: "done"`, and it opts out by reporting `blocked` or `needs_context` with `blockedOn`;
+ * - without (a bound writer, ops or architect): 6c's text, byte for byte, which opts out with `BLOCKED:` or `NEEDS CONTEXT:`
+ *   at the start of the closing message.
+ *
+ * Without a gate, or with one that has nothing in it, the block is 6b's, byte for byte, whatever `reports` says.
  */
-export function worktreeBrief(worktree: { path: string, branch: string }, gate?: string): string {
+export function worktreeBrief(worktree: { path: string, branch: string }, gate?: string, reports?: boolean): string {
   const { path, branch } = worktree
   const block = `Your worktree is \`${path}\` on branch \`${branch}\`. Work only there: use absolute paths, and \`git -C ${path}\` or \`cd ${path} &&\` in commands. `
     + 'The main agent\'s own checkout is not yours to change.'
   if (gate === undefined || gate.trim() === '') return block
+  if (reports === true) {
+    return `${block} When you finish with \`report\` and \`status: "done"\`, dish runs this project's gate (\`${gate}\`) in your worktree, and a failure comes back to you. `
+      + 'If you\'re blocked, report `status: "blocked"` or `"needs_context"` with `blockedOn`, and the gate is skipped.'
+  }
   return `${block} When you finish, dish runs this project's gate (\`${gate}\`) in your worktree, and a failure comes back to you. `
     + 'If you\'re blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.'
 }
