@@ -35,7 +35,8 @@ import { worktreeTool } from './tool.ts'
 
 export type { AppStatus, InstallationInfo } from './protocol.ts'
 export type {
-  CloneInfo, CreatedForRun, DishWorkspaces, OpenedPull, PullFeedback, RunsHooks, WorkspacesInternals, WorkspacesService,
+  CleanOptions, Cleanliness, CloneInfo, CreatedForRun, DishWorkspaces, OpenedPull, PullFeedback, RunsHooks, WorkspacesInternals,
+  WorkspacesService,
 } from './service.ts'
 export type { BranchComparison, CreatedWorktree, Worktree, WorktreeInfo } from './worktrees.ts'
 export type { SweepResult } from './sweep.ts'
@@ -107,7 +108,7 @@ export function start(ctx: Context, config: Config, internals: WorkspacesInterna
     sweep: project => service.sweep(project),
     appStatus: test => service.appStatus(test),
     headOf: pathOrRef => service.headOf(pathOrRef),
-    isClean: pathOrRef => service.isClean(pathOrRef),
+    isClean: (pathOrRef, options) => service.isClean(pathOrRef, options),
     compareBranch: (project, slug) => service.compareBranch(project, slug),
     pushBranch: (project, slug, options) => service.pushBranch(project, slug, options),
     openPull: (project, pull) => service.openPull(project, pull),

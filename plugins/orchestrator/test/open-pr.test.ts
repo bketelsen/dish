@@ -244,6 +244,57 @@ test('open_pr: a worktree that isn\'t clean (with why), and isClean rejecting', 
   assert.deepEqual(await written(w, run), [])
 })
 
+/** open_pr's line for untracked files, naming `names`. */
+function untrackedLine(names: string): string {
+  return `Untracked, not in the pull request: ${names}. If the project's gate writes them, have a coder add them to \`.gitignore\`; `
+    + 'if one should be in the pull request, have a coder commit it and call `open_pr` again.'
+}
+
+test('open_pr: a gate that leaves untracked files (a `go build` binary) doesn\'t loop: the PR opens, and the answer names them', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  // What git would say: the worktree is clean but for what the gate wrote, which `untracked: 'ignore'` names.
+  let built = false
+  w.workspaces.impl.isClean = async (_path, options) => {
+    if (options?.untracked !== 'ignore') return built ? { clean: false, why: '?? clippy' } : { clean: true }
+    return built ? { clean: true, untracked: ['clippy'] } : { clean: true }
+  }
+  const runAt = w.gates.impl.runAt
+  w.gates.impl.runAt = async (...args) => {
+    built = true
+    return runAt(...args)
+  }
+  const value = await call(tool)
+  assert.deepEqual(w.workspaces.calls.isClean, [[run.worktree, { untracked: 'ignore' }], [run.worktree, { untracked: 'ignore' }]])
+  assert.equal(w.workspaces.calls.pushBranch.length, 1)
+  assert.equal(value.number, 1)
+  const lines = value.text.split('\n')
+  assert.equal(lines.at(-1), untrackedLine('clippy'))
+  assert.equal(lines.filter(text => text.startsWith('Untracked')).length, 1)
+  assert.deepEqual(await written(w, run), ['pr.checked', 'pr.opened', 'run.closed'])
+})
+
+test('open_pr: untracked files before the gate are named in a refusal too; none, no line', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  w.workspaces.impl.isClean = async () => ({ clean: true, untracked: ['coverage.out', 'reports/', 'and 3 more'] })
+  w.gates.impl.runAt = async () => gate({})
+  const message = await refused(call(tool), '- the gate failed with exit 1')
+  assert.equal(message.split('\n').at(-1), untrackedLine('coverage.out, reports/, and 3 more'))
+  nothingWritten(w)
+  // A tracked change after the gate still refuses as before, naming the untracked files the first check saw.
+  let cleans = 0
+  w.workspaces.impl.isClean = async () => (cleans++ === 0 ? { clean: true, untracked: ['clippy'] } : { clean: false, why: 'src/a.ts changed' })
+  w.gates.impl.runAt = async () => gate({ outcome: 'passed', exitCode: 0 })
+  const changed = await refused(call(tool), 'the run\'s worktree changed while the gate ran (new uncommitted changes: src/a.ts changed): call open_pr again. Nothing was pushed.')
+  assert.equal(changed.split('\n').at(-1), untrackedLine('clippy'))
+  nothingWritten(w)
+  // Nothing untracked: no line, either way.
+  w.workspaces.impl.isClean = async () => ({ clean: true })
+  const plain = await call(tool)
+  assert.ok(!plain.text.includes('Untracked'), plain.text)
+})
+
 test('open_pr: a head that can\'t be read, undefined or a rejection', async () => {
   const { w, run, tool } = await setup()
   await verdict(w, run)

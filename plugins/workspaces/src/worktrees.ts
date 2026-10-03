@@ -438,8 +438,13 @@ export class Worktrees {
    * repositories, whose own edits `--ignore-submodules=dirty` hides and whose history removal would delete: a gitlink
    * in its index, or a `.git` in a folder git tracks (one in an untracked folder shows in `status`; one in an ignored
    * folder is an ignored file, a known limit).
+   *
+   * With `options.untracked` (open_pr's: a gate may leave output git doesn't ignore), untracked files don't count: their
+   * paths, as git lists them (relative, an untracked folder once, as `<folder>/`), are added to it, unmasked. A tracked
+   * change (staged or not), another branch and a nested worktree still count, and so does a nested repository in an
+   * untracked folder: `status --untracked-files=all` lists each one as its own `<folder>/`.
    */
-  async dirty(clone: string, path: string, branch?: string): Promise<string | undefined> {
+  async dirty(clone: string, path: string, branch?: string, options?: { untracked?: string[] }): Promise<string | undefined> {
     const check = await checkWorktree(clone, path)
     if (!check.ok) throw new Error(check.problem)
     const dir = resolve(path)
@@ -448,8 +453,26 @@ export class Worktrees {
       const ref = head.code === 0 ? head.stdout.trim() : undefined
       if (ref !== `refs/heads/${branch}`) return ref === undefined ? `a detached HEAD, not ${branch}, is checked out` : `${shown(ref.replace(/^refs\/heads\//, ''), 100)}, not ${branch}, is checked out`
     }
+    const collected = options?.untracked
     const status = await gitOk(['-C', dir, '--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=normal', '--ignore-submodules=dirty'], this.#options())
-    const changed = status.split('\0').filter(entry => entry !== '')
+    let changed = status.split('\0').filter(entry => entry !== '')
+    const untracked: string[] = []
+    if (collected !== undefined) {
+      // A listing this long may have been cut, and a tracked change with it.
+      if (status.length >= GIT_OUTPUT_CAP - 16) return 'too many changes to check'
+      const tracked: string[] = []
+      for (let at = 0; at < changed.length; at += 1) {
+        const entry = changed[at]!
+        if (entry.startsWith('?? ')) {
+          untracked.push(entry.slice(3))
+          continue
+        }
+        tracked.push(entry)
+        // A rename's or a copy's source path follows it, as a field of its own.
+        if (/^(?:[RC].|.[RC]) /.test(entry)) at += 1
+      }
+      changed = tracked
+    }
     if (changed.length > 0) return `${shown(changed[0]!, 120)}${changed.length > 1 ? ` and ${changed.length - 1} more` : ''}`
     const inner = nestedWorktree(await worktreeEntries(clone), dir)
     if (inner !== undefined) return `it holds another worktree (${shown(inner, 200)})`
@@ -461,6 +484,15 @@ export class Worktrees {
     for (const folder of folders.split('\0')) {
       if (folder !== '' && await present(join(dir, folder, '.git'))) return `it has a nested repository (${shown(folder, 100)})`
     }
+    if (collected !== undefined && untracked.some(entry => entry.endsWith('/'))) {
+      // git lists an untracked folder once, whatever is in it; listing every untracked file shows each nested repository
+      // in one (a folder with a `.git`) as its own `<folder>/`, and nothing else ends with `/`.
+      const all = await gitOk(['-C', dir, '--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all', '--ignore-submodules=dirty'], this.#options())
+      if (all.length >= GIT_OUTPUT_CAP - 16) return 'too many untracked files to check for nested repositories'
+      const repository = all.split('\0').find(entry => entry.startsWith('?? ') && entry.endsWith('/'))
+      if (repository !== undefined) return `it has a nested repository (${shown(repository.slice(3), 100)})`
+    }
+    collected?.push(...untracked)
     return undefined
   }
 

@@ -21,6 +21,9 @@
  * - **The ledger.** `pr.checked` is written whether the checks passed or not (but not for a refusal before the gate, nor when
  *   cancelled); then `pr.opened` or `pr.updated`, and `run.closed` (through `close`). A ledger line that can't be written is
  *   logged and named in the answer: the record and GitHub are the truth, so it fails nothing.
+ * - **Untracked files never block it.** Both cleanliness checks ask `isClean` with `{ untracked: 'ignore' }`: a gate's
+ *   output git doesn't ignore (a `go build` binary, a coverage file) would otherwise refuse every call after the first. Only
+ *   commits are pushed, so they aren't in the pull request; the answer, or the refusal, after the first check names them.
  *
  * @module dish-orchestrator/open-pr
  */
@@ -57,17 +60,40 @@ const STRING = { type: 'string', required: true } as const
 
 const DESCRIPTION = [
   'Push the run this chat drives and open its pull request (main agent only). This is the only way anything is pushed: never `git push` or `gh pr create`.',
-  '- **What it needs:** the run\'s worktree clean. It runs the project\'s gate on the worktree\'s head, and needs the latest final review (a reviewer started with `delegate`\'s `final: true`) to have approved that same head.',
+  '- **What it needs:** the run\'s worktree clean (untracked files aside: they aren\'t pushed, and the answer names them). It runs the project\'s gate on the worktree\'s head, and needs the latest final review (a reviewer started with `delegate`\'s `final: true`) to have approved that same head.',
   '- **What you write:** `title` and `body` (Markdown), for a reviewer.',
   '- **Only when you rule past a check:** `gateRuling` (the gate didn\'t pass) or `reviewRuling` (no approved final review of this head), each `Ruling: what — why — cost if wrong`. dish then adds one line saying so at the end of the body.',
   '- **Review feedback:** on a run you reopened with `run` `resume`, it runs the same checks and pushes the new head to the same pull request. Its title and body stay unless you give `title` or `body`; an override\'s line is posted as a comment. If GitHub\'s branch has commits the run\'s lacks (an "Update branch", a committed suggestion), have a coder merge `origin/dish/<slug>` into the run\'s worktree first: dish never force-pushes, and never rebases.',
   '- A refused check pushes nothing. It takes as long as the gate. It ends the run.',
 ].join('\n')
 
+/** The line naming the untracked files the checks saw (masked, as dish-workspaces gives them), which the push leaves out. */
+export function untrackedLine(names: readonly string[]): string {
+  return maskSecrets(`Untracked, not in the pull request: ${names.map(name => line(String(name), 200)).join(', ')}. `
+    + 'If the project\'s gate writes them, have a coder add them to `.gitignore`; if one should be in the pull request, have a coder commit it and call `open_pr` again.')
+}
+
+/** `error` with the untracked line after its message, when the checks saw untracked files. */
+function namingUntracked(error: unknown, untracked: readonly string[] | undefined): unknown {
+  if (untracked === undefined || untracked.length === 0 || !(error instanceof Error)) return error
+  error.message = `${error.message}\n${untrackedLine(untracked)}`
+  return error
+}
+
 /** The two overrides, each a ruling's body (masked, one line, at most 1000 characters), only for a check that didn't pass. */
 export interface Overrides {
   gate?: string
   review?: string
+}
+
+/** What the checks saw along the way, for the answer or the refusal: the untracked files `isClean` named. */
+interface Seen {
+  untracked?: string[]
+}
+
+/** The untracked paths of a clean `isClean` answer, or undefined for none. */
+function untrackedOf(clean: { clean: true, untracked?: string[] }): string[] | undefined {
+  return Array.isArray(clean.untracked) && clean.untracked.length > 0 ? clean.untracked : undefined
 }
 
 /** What the checks found, as `refusalText` reads it. */
@@ -284,12 +310,17 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
         if (asked.body === undefined) throw new Error('`body` is required: the pull request\'s description in Markdown, at most 60,000 characters')
       }
       // 4. The lock: everything after this holds the run's.
-      return runs.withRun(driven, () => openUnderLock(session, driven, asked, exec.signal))
+      const seen: Seen = {}
+      try {
+        return await runs.withRun(driven, () => openUnderLock(session, driven, asked, exec.signal, seen))
+      } catch (error) {
+        throw namingUntracked(error, seen.untracked)
+      }
     },
   })
 
-  /** Steps 4 to 19, holding the run's lock. */
-  async function openUnderLock(session: string, driven: Run, asked: ReturnType<typeof readArguments>, signal: AbortSignal | undefined): Promise<OpenedValue> {
+  /** Steps 4 to 19, holding the run's lock. `seen` gets the untracked files the checks saw, for a refusal's last line. */
+  async function openUnderLock(session: string, driven: Run, asked: ReturnType<typeof readArguments>, signal: AbortSignal | undefined, seen: Seen): Promise<OpenedValue> {
     const run = runs.store.get(driven.project, driven.id)
     if (run === undefined || run.state !== 'open' || run.driver.session !== session) throw fail(noLongerDriven(driven, run, session))
 
@@ -345,16 +376,17 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
       throw fail(`the run's worktree ${run.worktree} can't be pushed: it is gone (the worktree there now was cut from ${other}, not the run's ${shortSha(run.baseCommit)}). ${NOTHING}`)
     }
 
-    // 8. Clean.
+    // 8. Clean, but for untracked files: they aren't pushed, and the answer names them.
     let clean: Awaited<ReturnType<typeof workspaces.isClean>>
     try {
-      clean = await workspaces.isClean(run.worktree)
+      clean = await workspaces.isClean(run.worktree, { untracked: 'ignore' })
     } catch (error) {
       throw fail(`can't tell whether the run's worktree is clean: ${describe(error).replace(/\.+$/, '')}. ${NOTHING}`, error)
     }
     if (!clean.clean) {
       throw fail(`the run's worktree isn't clean (${line(clean.why)}): commit or remove the changes in a coder's round, then call open_pr again. ${NOTHING}`)
     }
+    seen.untracked = untrackedOf(clean)
 
     // 9. The head, read once: the gate runs on it, and only it is pushed.
     let head: string | undefined
@@ -406,8 +438,10 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
       const again = await workspaces.headOf(run.worktree)
       if (again !== head) moved = `${shortSha(head)} → ${typeof again === 'string' && again !== '' ? shortSha(again) : 'none'}`
       else {
-        const still = await workspaces.isClean(run.worktree)
+        // Untracked files the gate wrote (its build's output) don't count: only a tracked change does.
+        const still = await workspaces.isClean(run.worktree, { untracked: 'ignore' })
         if (!still.clean) moved = `new uncommitted changes: ${line(still.why)}`
+        else seen.untracked = untrackedOf(still)
       }
     } catch (error) {
       moved = `it can't be read again: ${describe(error)}`
@@ -540,6 +574,7 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
     }
     lines.push(`Run \`${run.id}\` is closed. Humans merge; dish removes the run's worktrees once the PR is merged. Review feedback: \`run\` \`resume\` reopens it.`)
     lines.push(...unrecorded)
+    if (seen.untracked !== undefined && seen.untracked.length > 0) lines.push(untrackedLine(seen.untracked))
     return { url, number, existing: pull.existing, head, text: maskSecrets(lines.join('\n')) }
   }
 }
