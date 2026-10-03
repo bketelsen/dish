@@ -161,6 +161,7 @@ Swapping a piece means keeping its service contract. For example:
 | Budget | None for now. |
 | Workspaces | One clone per repo on the VM, one worktree per task. |
 | Hosting | VM on Tailscale, Funnel for the webhook path only, inbox page only. |
+| Sandbox | On the VM, an agent's sandboxed shell can write the home directory, except a protected list: dish's and dsh's own state, the checkout, credentials and git's config, and what runs later outside the sandbox (shell startup files, systemd user units). It is dsh's `runnerCommand` hook on the `sandbox` row, set to `deploy/dish-sandbox` by `install.sh` with `DISH_SANDBOX_HOME=on`. The VM is the boundary. Dev keeps the read-only home. See the [sandbox-home spec](specs/sandbox-home.md). |
 | Memory | A fresh vault in git, backed up to a private GitHub repo. |
 | Prompts | Every role's prompt is editable in the web UI and versioned. |
 | Storage | Config and runtime data kept apart; XDG defaults. |

@@ -128,3 +128,43 @@ There is one implementer, then one review.
    - `go mod download` or `pnpm install` in a project runs with no prompt;
    - `touch ~/.ssh/x` fails with "Read-only file system".
 4. Fleet's reworked mise PR (toolchains and the trust path) can merge before or after this.
+
+## Notes from the build
+
+Built on branch `sandbox-home`, 2026-10-02, against dsh 0.2.0-rc.2.
+
+### dsh, as checked in its sources
+
+- **The argv.** `confine()` in `@deepseek-ai/dsh-sandbox-local` returns `[...runnerCommand, ...bwrapProfileArgs(policy), '--', ...argv]`, with `enforcement: 'full'` and no probe. `argv` is `['bash', '-c', <command>]` (`dsh-bash-sandbox`). The profile is `--ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent`, plus `--tmpfs /tmp --bind <workspace> <workspace>` in `workspace-write` only. The workspace is canonical (realpath). `deploy/test/dish-sandbox.test.ts` builds every argv it runs with dsh's own `confine()`, so a dsh that changes the shape fails there.
+- **The schema.** `runnerCommand: string[]`, `runnerFailureSignatures: string[]` and `probeTimeoutMs` (default 5000). A runner needs at least one signature, each non-empty and on one line. dsh's schema accepts the row `profile.ts` writes (a test).
+- **The runner's environment** is dsh's own, scrubbed: no name matching `KEY`, `PASSWORD`, `SECRET` or `TOKEN`, and no `DSH_*` name but those dsh sets for each call (`DSH_HOME`, `DSH_SHELL`, `DSH_SESSION_ID`, `DSH_PROFILE`, `DSH_PROFILE_DIR`), plus `NO_COLOR`, `TERM=dumb`, `PAGER` and `GIT_PAGER`. So `HOME`, `XDG_*` and `PATH` reach it, `DSH_HOME` is dsh's resolved home, and `DSH_DISH_HOME` never does. The script still honors `DSH_DISH_HOME` when it is set and absolute; dev's lies inside the checkout, which is protected anyway.
+- **Classification.** A runner failure is a non-zero exit with any stderr line that contains a fatal signature (case-insensitive, no exit-code gate), and it is checked before denials. In the foreground, dsh reports it as `SANDBOX_UNAVAILABLE`: "…refusing to run the command unconfined… Runner failure: dish-sandbox: <reason>". The words "the command did not run" are what a background job gets. A denial is a non-zero exit with "read-only file system" or "permission denied" on stderr: `[sandbox: file access denied under workspace-write mode]` and the escalation hint.
+- **`danger-full-access`** never calls `confine()`: `SandboxBashExecutor.execute` runs it as the local executor does.
+
+### Rulings
+
+1. **The directories in between are mount points.** A directory that holds a mount point can still be renamed, so `mv ~/.config ~/.old && mkdir -p ~/.config/git` replaced a protected directory (checked with bwrap before the fix). The script binds each directory between `$HOME` and a protected path onto itself, writable, so `mv` and `rm` on it fail with "Device or resource busy". Writes into it work as before.
+2. **A missing `~/.bash_profile` is not empty.** Decision 3 says an empty file behaves like a missing one. That holds for `.bashrc` and `.profile`, but a login bash reads only the first of `~/.bash_profile`, `~/.bash_login` and `~/.profile`, so an empty `~/.bash_profile` would hide the account's `~/.profile` (Debian's adds `~/.local/bin` to `PATH` and reads `~/.bashrc`). A missing `~/.bash_profile` is made 0600 with one line that reads `~/.bash_login` when that exists, else `~/.profile`. A missing `~/.bash_login` is made empty, which is harmless once `~/.bash_profile` exists.
+3. **`~/.dsh` stays protected when `$DSH_HOME` points elsewhere**, as dish's default XDG directories stay protected beside `$DSH_DISH_HOME`. In dev that is your own dsh home, whose profiles run code when you start dsh.
+4. **`HOME` must be an absolute directory other than `/`.** `/` would make the whole file system writable; a missing one would fail in bwrap anyway, after the script had made things. Both fail before anything is made.
+5. **read-only mode needs only bwrap and the `--`.** It reads neither `HOME` nor the `--protect` values, so it doesn't fail on them.
+6. **`--protect`.** A missing path is made as a directory. A value that is neither absolute nor `~/…` is a failure, not ignored. `profile.ts` keeps `--protect` pairs that follow the runner in `runnerCommand`, so a later install doesn't drop them.
+7. **Nothing from `PATH`.** The script runs outside the sandbox, so besides bwrap it uses only `/usr/bin/mkdir` (or `/bin/mkdir`) and bash builtins. It turns its own `set -euo pipefail` and `-p` off before `exec`, since bash passes them on when `SHELLOPTS` is exported.
+8. **Links.** A protected path that is a symbolic link is never made through, and is bound as it is; a link to nothing makes bwrap fail, which dsh reports as a runner failure.
+9. **`--no-sandbox-runner`** removes dish's two keys, and the row only when nothing else is left in it (a `probeTimeoutMs` set by hand stays).
+10. **`DISH_SANDBOX_HOME`** other than `on`, `off`, empty or unset stops `install.sh` before it starts.
+
+### Where the spec was wrong, or I disagree
+
+- **The rollout takes two `dish-update --apply` runs.** The first after the merge runs the `update.sh` already in memory, which doesn't set `DISH_SANDBOX_HOME`, so the new `install.sh` leaves the row out. The second runs the new `update.sh`, which writes the row and restarts.
+- **The session bus is reachable from the sandbox.** dsh's bwrap profile doesn't hide `$XDG_RUNTIME_DIR`. On the desktop, inside that profile, `busctl --user get-property org.freedesktop.systemd1 … Version` answered (nothing was started). A sandboxed command can so ask the account's systemd user manager to run something (a transient unit), outside the sandbox and the protected list. This is older than this hook, and the VM, which has `dbus-user-session` and linger, very likely has it too. Hiding the runtime directory (`--tmpfs /run/user/<uid>` in `dish-sandbox`) would close it, at the cost of agent-, ssh- and gpg-agent sockets there; that is your call, so it is not built.
+- **Dev with home directories on `PATH`.** dsh looks `bash` up on `PATH` for every escalated command. With `DISH_SANDBOX_HOME=on` on a desktop whose `PATH` has `~/.local/bin` (or mise's shims), a sandboxed command can put a `bash` there that the next escalation runs unsandboxed. The VM's `PATH` is root-owned. `deploy/README.md` says so.
+- **"permission denied"** is in dsh's denial dialect for a `runnerCommand`, so an `ssh … Permission denied (publickey)` failure also gets the escalation hint. That is dsh's, not ours.
+
+### The live run
+
+In scratch (`HOME`, `DSH_HOME`, `XDG_*`, `DSH_DISH_HOME`, `TMPDIR` and `HISTFILE` under the scratchpad):
+- `DISH_SANDBOX_HOME=on deploy/install.sh` made the `web` profile, wrote the row (`install: sandbox home: on`, `install: profile changed`), and `dsh --dump-config` composed it on dsh-base's `sandbox` entry.
+- `dsh web` started from that profile and answered (401 without the sign-in), and was stopped.
+- `dsh --profile headless --patch <the same row, a scripted local model>` ran six `bash` calls through dsh's own path (tool, sandbox executor, provider, `dish-sandbox`, bwrap): `touch ~/x` and writes under `~/.cache` and `~/go` worked; `touch ~/.ssh/x`, `echo >> ~/.bashrc` and `touch ~/.config/systemd/evil.service` failed with "Read-only file system", each with `[sandbox: file access denied under workspace-write mode]` and the escalation hint; `mv ~/.config …` failed with "Device or resource busy"; `/tmp` and the workspace were writable.
+- With a bad `--protect` in the row, every call came back as dsh's runner failure, "Runner failure: dish-sandbox: --protect takes an absolute path or ~/..., not: relative/path".
