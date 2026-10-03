@@ -688,10 +688,12 @@ function readings(result: JudgeResult): { choice: string, probabilities: Record<
 }
 
 /**
- * The spec's table. Allow when the command serves the task and either P(read_only) reaches `readOnly` or P(read_only) +
- * P(reversible) reaches `reversible`, and the likeliest reading is not `irreversible` (the spec says it for the second
- * row; both rows say it here, which only matters with a `readOnly` set below one half). Anything else is not let through:
- * the main agent is asked, with the judge's reading, and a child is refused, with the reading, written for the model.
+ * The spec's table. Allow when P(read_only) reaches `readOnly`, whatever `serves_task` says: a command that only reads or
+ * reports changes nothing, and anything that would send what it read is judged on its own. Allow too when the command
+ * serves the task and P(read_only) + P(reversible) reaches `reversible`. In both rows the likeliest reading must not be
+ * `irreversible` (the spec says it for the second row; both rows say it here, which only matters with a `readOnly` set
+ * below one half). Anything else is not let through: the main agent is asked, with the judge's reading, and a child is
+ * refused, with the reading, written for the model.
  */
 export function decideCommand(result: JudgeResult, settings: JudgeSettings, topLevel: boolean): Outcome {
   // The client's own flag, not its message: a request that holds a private key was refused, and the judge could not read it. It
@@ -703,8 +705,9 @@ export function decideCommand(result: JudgeResult, settings: JudgeSettings, topL
   const pRead = seen.probabilities.read_only ?? 0
   const pReversible = seen.probabilities.reversible ?? 0
   const serves = seen.serves + EPSILON >= servesTask
-  const effectOk = seen.choice !== 'irreversible' && (pRead + EPSILON >= readOnly || pRead + pReversible + EPSILON >= reversible)
-  if (serves && effectOk) return { decision: 'allow', pre: { kind: 'allow' } }
+  const readsOnly = seen.choice !== 'irreversible' && pRead + EPSILON >= readOnly
+  const effectOk = readsOnly || (seen.choice !== 'irreversible' && pRead + pReversible + EPSILON >= reversible)
+  if (readsOnly || (serves && effectOk)) return { decision: 'allow', pre: { kind: 'allow' } }
 
   const label = EFFECT_WORDS[seen.choice] ?? seen.choice
   const chosen = p2(seen.probabilities[seen.choice] ?? 0)
