@@ -102,7 +102,7 @@ A gate runs in the sandbox the coder's own commands run in, with dsh's environme
 - **Where the sandbox can't write the home directory** (dev without `DISH_SANDBOX_HOME=on`), a project points its caches into the clone with `gateEnv`, for example `GOCACHE: <clone>/.worktrees/.cache/go-build`.
 - **In dev with `DISH_SANDBOX_HOME=on`,** clones under `<checkout>/.dev/work` sit inside the protected checkout. They're read-only to every sandboxed command, a gate included (sandbox-home's known limit).
 
-`gateEnv` in `projects.yaml` is a map of variable names to values, and `<clone>` and `<worktree>` are expanded in the values. 6b's registry validates it: it refuses names that look like secrets, such as `*TOKEN*` or `*KEY*`, and `DSH_*` names.
+`gateEnv` in `projects.yaml` is a map of variable names to values, and `<clone>` and `<worktree>` are expanded in the values. 6b's registry validates it: it refuses names that look like secrets, such as `*TOKEN*` or `*KEY*`, and `DSH_*` names. 6c added `HOME` and `LD_*` (from the final review): the gate's environment reaches `dish-sandbox`, outside the sandbox, which works out its protected list from `HOME`, and `LD_PRELOAD` would load code into it. `XDG_*` stays allowed (a cache can go into the clone), and `dish-sandbox` protects dish's four default directories wherever `XDG_*` points.
 
 ### Outcomes
 

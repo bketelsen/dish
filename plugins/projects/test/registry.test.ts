@@ -487,6 +487,21 @@ test('gateEnv refuses names starting with DSH_, in any case', () => {
   }
 })
 
+test('gateEnv refuses HOME and LD_ names: they would move what the sandbox runner protects, or load code into it', () => {
+  assert.equal(problemOf(one({ gateEnv: { HOME: '/tmp/elsewhere' } })),
+    'projects.yaml: acme/widget: gateEnv can\'t set "HOME": dish\'s sandbox runner works out what it protects from it')
+  for (const name of ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'LD_']) {
+    assert.equal(
+      problemOf(one({ gateEnv: { [name]: 'x' } })),
+      `projects.yaml: acme/widget: gateEnv can't set "${name}": names starting with LD_ change how programs load, dish's sandbox runner included, outside the sandbox`,
+      name,
+    )
+  }
+  // Names that merely resemble them are fine, and XDG_CACHE_HOME stays a gate's to move.
+  const resembling = { LDFLAGS: '-s', OLD_LD_X: '1', HOMEPAGE: 'x', MY_HOME: '/x', XDG_CACHE_HOME: '<clone>/.worktrees/.cache' }
+  assert.deepEqual(only(one({ gateEnv: resembling })).gateEnv, resembling)
+})
+
 test('gateEnv refuses names that look like secrets, in any case', () => {
   for (const name of ['GH_TOKEN', 'API_KEY', 'KEY', 'DB_PASSWORD', 'MY_SECRET', 'token', 'apikey', 'PassWord', 'Secret_X', 'MONKEY', 'NPM_TOKEN_X', 'AWS_SECRET_ACCESS_KEY']) {
     assert.equal(

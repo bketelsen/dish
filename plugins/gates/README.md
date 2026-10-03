@@ -62,7 +62,7 @@ A gate runs in the sandbox the coder's own commands run in, with dsh's environme
 - **In dev,** without `DISH_SANDBOX_HOME=on`, the home directory is read-only to a gate. A project whose gate writes a cache points it into the clone with `gateEnv`, such as `GOCACHE: <clone>/.worktrees/.cache/go-build`.
 - **In dev with `DISH_SANDBOX_HOME=on`,** dev's clones under `<checkout>/.dev/work` sit inside the protected checkout, so they are read-only to every sandboxed command, a gate included (sandbox-home's known limit). Gate dev projects without it.
 
-`gateEnv` is checked by [`dish-projects`](../projects/README.md#projectsyaml) when it is saved: no `DSH_*` names, and no names that look like secrets. Its values are never logged, recorded or sent to the coder.
+`gateEnv` is checked by [`dish-projects`](../projects/README.md#projectsyaml) when it is saved: no `DSH_*` names, no names that look like secrets, and no `HOME` or `LD_*` (they reach the sandbox runner, which runs outside the sandbox). `XDG_*` may move a cache; the sandbox runner protects dish's own directories wherever it points. Its values are never logged, recorded or sent to the coder.
 
 ## The message to the coder
 

@@ -36,7 +36,7 @@ This is most of the friction from the qwen session, and it would hit every Go pr
 3. **The protected list.** These stay read-only, whether or not they exist yet:
    - **dish and dsh themselves:**
      - `$DSH_HOME` (default `~/.dsh`: the profile, sessions and credentials);
-     - dish's four XDG directories, `${XDG_CONFIG_HOME:-~/.config}/dish`, `${XDG_DATA_HOME:-~/.local/share}/dish`, `${XDG_STATE_HOME:-~/.local/state}/dish` and `${XDG_CACHE_HOME:-~/.cache}/dish`;
+     - dish's four XDG directories, `${XDG_CONFIG_HOME:-~/.config}/dish`, `${XDG_DATA_HOME:-~/.local/share}/dish`, `${XDG_STATE_HOME:-~/.local/state}/dish` and `${XDG_CACHE_HOME:-~/.cache}/dish`, and the four defaults (`~/.config/dish` and so on) whatever `XDG_*` says: a gate's environment (`gateEnv`, 6c) can move `XDG_*`, and dish on the VM keeps its files in the defaults;
      - `$DSH_DISH_HOME` when it's set;
      - dish's checkout, which is the script's own repository root.
    - **Credentials and git:** `~/.ssh`, `~/.gnupg`, `~/.gitconfig`, `~/.config/git` and `~/.git-credentials`.

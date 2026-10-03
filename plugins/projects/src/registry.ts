@@ -228,6 +228,11 @@ function readEnv(data: Record<string, unknown>): Record<string, string> | undefi
       refuse(`gateEnv names a variable ${quote(name)} that isn't a name (letters, digits and underscores, not starting with a digit)`)
     }
     if (name.toUpperCase().startsWith(DSH_PREFIX)) refuse(`gateEnv can't set ${quote(name)}: dsh reserves names starting with DSH_`)
+    // A gate's environment reaches dish's sandbox runner (deploy/dish-sandbox), which runs outside the sandbox.
+    if (name === 'HOME') refuse(`gateEnv can't set ${quote(name)}: dish's sandbox runner works out what it protects from it`)
+    if (name.startsWith('LD_')) {
+      refuse(`gateEnv can't set ${quote(name)}: names starting with LD_ change how programs load, dish's sandbox runner included, outside the sandbox`)
+    }
     if (SECRET_NAME.test(name)) refuse(`gateEnv can't set ${quote(name)}: a name with KEY, PASSWORD, SECRET or TOKEN in it looks like a secret`)
     if (typeof text !== 'string') refuse(`gateEnv.${name} must be a string`)
     if (/[\r\n]/.test(text)) refuse(`gateEnv.${name} must be one line`)
