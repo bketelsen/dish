@@ -94,6 +94,8 @@ const CHILDREN_MAX = 1000
 const RULING_MAX = 1000
 
 const TIMED_OUT: unique symbol = Symbol('timed out')
+/** What `#owner` gives for a worktree that only a run that isn't open owns. */
+const CLOSED_OWNER: unique symbol = Symbol('owned by a run that isn\'t open')
 
 /** `promise`, or TIMED_OUT once `ms` have passed. The timer goes when either settles. */
 function within<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
@@ -369,8 +371,9 @@ export class Runs {
 
   /**
    * Where a child `delegate` is starting or following up belongs: a bound child in the run that owns its worktree, a
-   * reviewer where the child it reviews is, anything else in the run the session drives; undefined for no open run. Takes
-   * no lock. Never rejects (a failure is logged, and gives undefined).
+   * reviewer where the child it reviews is, anything else in the run the session drives; undefined for no open run. A
+   * worktree that only a run that isn't open owns (a `pr` run not reopened, an abandoned one) is that run's work, so a child
+   * bound to it is in no run, never the session's. Takes no lock. Never rejects (a failure is logged, and gives undefined).
    */
   place(sessionId: string, target: PlaceTarget): Promise<Placement | undefined> {
     return this.#guarded(`place a delegation of session ${String(sessionId)} in a run`, () => this.#place(sessionId, target), this.#placeMs, undefined,
@@ -384,7 +387,12 @@ export class Runs {
     const worktree = typeof asked.worktree === 'string' ? given(asked.worktree) : undefined
     const reviews = typeof asked.reviews === 'string' ? given(asked.reviews) : undefined
     let found: Found | undefined
-    if (worktree !== undefined) found = await this.#owner(worktree)
+    if (worktree !== undefined) {
+      const owner = await this.#owner(worktree)
+      // Tagged with the session's run, its entries would land in a run whose branch it never touched.
+      if (owner === CLOSED_OWNER) return undefined
+      found = owner
+    }
     if (found === undefined && reviews !== undefined && reviews !== 'main') found = await this.#reviewed(reviews)
     if (found === undefined) {
       const run = isText(sessionId) ? this.store.drivenBy(sessionId) : undefined
@@ -400,8 +408,12 @@ export class Runs {
     return placement
   }
 
-  /** The open run whose open tasks hold `worktree` (a path, or `<owner>/<repo>/<slug>`), newest first; with its task. */
-  async #owner(worktree: string): Promise<Found | undefined> {
+  /**
+   * The open run whose open tasks hold `worktree` (a path, or `<owner>/<repo>/<slug>`), newest first; with its task. When no
+   * open run has it and a run that isn't open does (a `pr` run not reopened, an abandoned one), CLOSED_OWNER. Those runs are
+   * searched only after the open ones, and one whose ledger can't be read is passed over.
+   */
+  async #owner(worktree: string): Promise<Found | typeof CLOSED_OWNER | undefined> {
     const resolved = await this.#resolve(worktree)
     const absolute = isAbsolute(worktree)
     const paths = new Set<string>([worktree])
@@ -409,12 +421,23 @@ export class Runs {
     if (resolved !== undefined) paths.add(resolved.path)
     const asRef = absolute ? undefined : worktreeRef(worktree)
     const project = resolved?.project
-    const candidates = this.store.list().filter(run => run.state === 'open' && (project === undefined || sameProject(run.project, project)))
-    for (const run of candidates) {
-      const entries = await this.entries(run)
+    const holds = (run: Run, entries: readonly LedgerEntry[]): string | undefined => {
       for (const [slug, path] of openTasks(run, entries)) {
-        if (paths.has(path) || (asRef !== undefined && slug === asRef.slug && sameProject(run.project, asRef.project))) return { run, task: slug, entries }
+        if (paths.has(path) || (asRef !== undefined && slug === asRef.slug && sameProject(run.project, asRef.project))) return slug
       }
+      return undefined
+    }
+    const candidates = this.store.list().filter(run => project === undefined || sameProject(run.project, project))
+    for (const run of candidates) {
+      if (run.state !== 'open') continue
+      const entries = await this.entries(run)
+      const task = holds(run, entries)
+      if (task !== undefined) return { run, task, entries }
+    }
+    for (const run of candidates) {
+      if (run.state === 'open') continue
+      const entries = await this.entries(run).catch(() => undefined)
+      if (entries !== undefined && holds(run, entries) !== undefined) return CLOSED_OWNER
     }
     return undefined
   }
