@@ -7,26 +7,31 @@
  *   `.dev/`. The launcher sets `DSH_HOME=<checkout>/.dev/dsh`, `DSH_DISH_HOME=<checkout>/.dev` and `DISH_ENV=dev`,
  *   replacing inherited values (dsh gives every agent shell a `DSH_HOME` of its own, and the agent's `pnpm dsh` must
  *   not follow it).
- * - **prod** (`DISH_ENV=prod`): the environment passes through, but for `PATH`. Only the VM's service is prod, and it
- *   does not come here: its unit runs the checkout's dsh binary directly with the account's defaults, because dsh hands
- *   its own environment to every agent shell and a `DISH_ENV=prod` on the service would make every agent's `pnpm dsh`
- *   prod.
+ * - **prod** (`DISH_ENV=prod`): the environment passes through, but for `PATH` and `NODE_PATH`. Only the VM's service
+ *   is prod, and it does not come here: its unit runs the checkout's dsh directly with the account's defaults, because
+ *   dsh hands its own environment to every agent shell and a `DISH_ENV=prod` on the service would make every agent's
+ *   `pnpm dsh` prod.
  * - Any other `DISH_ENV` is refused.
  *
  * In both modes a bare command is looked up in the checkout's `node_modules/.bin` first, by its absolute path, so `dsh`
  * is the checkout's whatever runs this. That directory never goes on the command's `PATH`, and neither does any other
  * directory an agent could write (`agentPath`): dsh hands its `PATH` to every agent shell, and finds `bash` on it for
- * every command an agent runs, approved escalations outside the sandbox included. The launcher sets no `XDG_*` variable
- * and nothing of pnpm's: `DSH_DISH_HOME` moves dish's directories instead (dish-kit's `xdgPaths`), and the pnpm store
- * stays the account's. Both `XDG_*` and pnpm's names would reach every agent shell (dsh drops only `DSH_*` names and
- * names that look like secrets), which would move `gh`'s and git's configuration, and give pnpm another store.
+ * every command an agent runs, approved escalations outside the sandbox included. `dsh` itself is not started through
+ * its shim there, but as its own script, by the node that runs this (`invocation`), and neither mode passes `NODE_PATH`
+ * on (`withoutNodePath`): the shim sets one that names the checkout's `node_modules/.pnpm/node_modules`, which would
+ * reach every agent shell the same way, for every CommonJS program an agent runs to load a module from.
+ *
+ * The launcher sets no `XDG_*` variable and nothing of pnpm's: `DSH_DISH_HOME` moves dish's directories instead
+ * (dish-kit's `xdgPaths`), and the pnpm store stays the account's. Both `XDG_*` and pnpm's names would reach every agent
+ * shell (dsh drops only `DSH_*` names and names that look like secrets), which would move `gh`'s and git's
+ * configuration, and give pnpm another store.
  *
  *   node scripts/env.ts dsh web --host 127.0.0.1 --port 3090
  */
 
 import { spawn } from 'node:child_process'
 import { constants as fsConstants, realpathSync } from 'node:fs'
-import { access, chmod, mkdir, stat } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, stat } from 'node:fs/promises'
 import { constants } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -101,23 +106,38 @@ export function agentPath(root: string, path: string | undefined): string {
 }
 
 /**
+ * A copy of `env` without `NODE_PATH`. Node's CommonJS `require` looks a bare name up in each of its directories when
+ * no `node_modules` above the requiring file has it, and dsh hands it to every agent shell (it drops only `DSH_*` and
+ * names that look like secrets), so a writable directory there is one an agent can plant a module in for any later
+ * CommonJS program to load, approved escalations outside the sandbox included. pnpm's shim for `dsh` sets one that
+ * names the checkout's `node_modules/.pnpm/node_modules`, and an inherited one is the same: an agent shell under a dsh
+ * started through that shim has it. dsh needs none: it is ES modules, which never read `NODE_PATH`, and every package
+ * it loads resolves from where it lies.
+ */
+function withoutNodePath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result = { ...env }
+  delete result.NODE_PATH
+  return result
+}
+
+/**
  * `env` plus exactly: `DSH_HOME=<root>/.dev/dsh`, `DSH_DISH_HOME=<root>/.dev`, `DISH_ENV=dev` and
- * `PATH=agentPath(root, PATH)`. Inherited values of those names are replaced. Nothing else is added, changed or
- * removed, and `env` itself is not modified.
+ * `PATH=agentPath(root, PATH)`, less `NODE_PATH` (`withoutNodePath`). Inherited values of those names are replaced.
+ * Nothing else is added, changed or removed, and `env` itself is not modified.
  */
 export function devEnvironment(root: string, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return {
+  return withoutNodePath({
     ...env,
     DSH_HOME: join(root, '.dev', 'dsh'),
     DSH_DISH_HOME: join(root, '.dev'),
     DISH_ENV: 'dev',
     PATH: agentPath(root, env.PATH),
-  }
+  })
 }
 
-/** dev → `devEnvironment`; prod → `env` with only `PATH` changed, to `agentPath(root, PATH)`. */
+/** dev → `devEnvironment`; prod → `env` with `PATH` changed, to `agentPath(root, PATH)`, and `NODE_PATH` removed. */
 export function environmentFor(mode: Mode, root: string, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return mode === 'dev' ? devEnvironment(root, env) : { ...env, PATH: agentPath(root, env.PATH) }
+  return mode === 'dev' ? devEnvironment(root, env) : withoutNodePath({ ...env, PATH: agentPath(root, env.PATH) })
 }
 
 /**
@@ -134,6 +154,36 @@ export async function resolveCommand(root: string, command: string): Promise<str
     // Not there, or not executable: the PATH lookup decides.
   }
   return command
+}
+
+/**
+ * dsh's own script in the checkout, `<root>/node_modules/@deepseek-ai/dsh/<bin>`, with `bin` from its package.json:
+ * the file pnpm's `node_modules/.bin/dsh` shim runs. Undefined when the checkout has no dsh, or names no such file.
+ */
+export async function dshEntry(root: string): Promise<string | undefined> {
+  const pkg = join(root, 'node_modules', '@deepseek-ai', 'dsh')
+  try {
+    const { bin } = JSON.parse(await readFile(join(pkg, 'package.json'), 'utf8')) as { bin?: unknown }
+    const script = typeof bin === 'string' ? bin : (bin as Record<string, unknown> | null | undefined)?.dsh
+    if (typeof script !== 'string' || script === '') return undefined
+    const entry = join(pkg, script)
+    return (await stat(entry)).isFile() ? entry : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The argv that starts `command`. `dsh` is `[process.execPath, dshEntry(root)]` when the checkout has it: its shim
+ * would set a `NODE_PATH` naming the checkout (`withoutNodePath`), and run a `node_modules/.bin/node` in place of node
+ * when there is one. Any other bare name, and `dsh` when the checkout has none, is `[resolveCommand(root, command)]`.
+ */
+export async function invocation(root: string, command: string): Promise<string[]> {
+  if (command === 'dsh') {
+    const entry = await dshEntry(root)
+    if (entry !== undefined) return [process.execPath, entry]
+  }
+  return [await resolveCommand(root, command)]
 }
 
 /** Make `<root>/.dev` and `dsh/`, `config/`, `state/`, `data/`, `cache/` under it, mode 0700 (chmod, since the umask only narrows). */
@@ -179,7 +229,8 @@ const ignore = (): void => {}
  * and `SIGHUP` goes on as a `SIGTERM` (see `FORWARDED`). `SIGINT` does not go on (the terminal has already delivered it
  * to the command): the launcher outlives it, waits, and returns the command's code. The command stays in the
  * launcher's process group, which interactive dsh commands need for the terminal's job control. It runs in the current
- * directory with inherited stdio. A bare command is the checkout's own when it has one (`resolveCommand`).
+ * directory with inherited stdio. A bare command is the checkout's own when it has one, and `dsh` is started as its
+ * script by this node (`invocation`).
  */
 export async function main(argv: string[], options: { root?: string, env?: NodeJS.ProcessEnv } = {}): Promise<number> {
   const root = options.root ?? ROOT
@@ -202,9 +253,9 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
       return 1
     }
   }
-  const executable = await resolveCommand(root, command)
+  const [executable, ...prefix] = await invocation(root, command)
   return await new Promise<number>(settle => {
-    const child = spawn(executable, args, { stdio: 'inherit', env: environmentFor(mode, root, env) })
+    const child = spawn(executable!, [...prefix, ...args], { stdio: 'inherit', env: environmentFor(mode, root, env) })
     const forward = (signal: NodeJS.Signals): void => {
       child.kill(forwardedAs(signal))
     }

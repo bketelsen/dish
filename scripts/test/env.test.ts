@@ -79,7 +79,7 @@ test('resolveMode: anything else throws a UsageError, matched exactly', () => {
   }
 })
 
-test('devEnvironment replaces the three dish names, takes the checkout out of PATH, and changes nothing else', () => {
+test('devEnvironment replaces the three dish names, takes the checkout out of PATH, and changes nothing else (NODE_PATH: node-path.test.ts)', () => {
   const input: NodeJS.ProcessEnv = {
     PATH: `/r/node_modules/.bin:${BASE_PATH}`,
     HOME: '/home/someone',
@@ -118,10 +118,11 @@ test('devEnvironment gives PATH the system directories, never an empty entry, wh
   assert.equal(devEnvironment('/r', { PATH: '/r/node_modules/.bin' }).PATH, SYSTEM_PATH)
 })
 
-test('environmentFor: dev is devEnvironment; prod changes only PATH, which it takes the checkout out of', () => {
+test('environmentFor: dev is devEnvironment; prod changes only PATH, which it takes the checkout out of, and drops NODE_PATH', () => {
   const input: NodeJS.ProcessEnv = { PATH: `/r/node_modules/.bin:${BASE_PATH}`, HOME: '/h', DSH_HOME: '/real', XDG_DATA_HOME: '/data', DISH_ENV: 'prod' }
   assert.deepEqual(environmentFor('dev', '/r', input), devEnvironment('/r', input))
   assert.deepEqual(environmentFor('prod', '/r', input), { ...input, PATH: BASE_PATH })
+  assert.deepEqual(environmentFor('prod', '/r', { ...input, NODE_PATH: '/r/node_modules/.pnpm/node_modules' }), { ...input, PATH: BASE_PATH })
 })
 
 test('ensureDevDirectories makes .dev and its five directories with mode 0700, even under a permissive umask', async () => {
