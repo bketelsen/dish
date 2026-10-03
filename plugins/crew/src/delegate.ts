@@ -50,8 +50,8 @@
  *   `lookup`, inside the session's lock, as the reviewer rule does. The refusal says where the gate stands and how to go
  *   on: wait for the notice, send a fix round, or give `gateOverride` with a ruling. A ruling (folded onto one line; one
  *   with nothing past a leading `Ruling:`, or the placeholder itself, is refused) is recorded on the reviewer
- *   (`ChildRecord.gateOverride`) and told to it in a block after its task (`gateOverrideBrief`). A re-review keeps the
- *   reviewer's ruling while the reviewed child hasn't run since the reviewer was created. When nothing is refused (the
+ *   (`ChildRecord.gateOverride`, with its time) and told to it in a block after its task (`gateOverrideBrief`). A re-review
+ *   keeps the reviewer's ruling while the reviewed child hasn't run since the ruling was given. When nothing is refused (the
  *   gate passed, the child is unbound, `reviews: "main"`, or dish-gates isn't running), `gateOverride` is ignored and not
  *   recorded.
  *
@@ -438,8 +438,9 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
    * `undefined` when there is nothing to override (see `gateStanding`): a `gateOverride` given is then ignored. Otherwise
    * the ruling, and the block the reviewer gets.
    *
-   * A re-review with no `gateOverride` keeps the reviewer's ruling when the reviewed child hasn't run since the reviewer
-   * was created: its latest run ended before then, and none is in progress or running. The ruling was given on exactly the
+   * A re-review with no `gateOverride` keeps the reviewer's ruling when the reviewed child hasn't run since the ruling was
+   * given (`gateOverrideAt`, at the reviewer's start or on a follow-up; `startedAt` for a ruling recorded before its time
+   * was kept): its latest run ended before then, and none is in progress or running. The ruling was given on exactly the
    * standing it has now; any fix round, crash or resume of that child ends it.
    * @param followUp - a re-review's lead-in, and the reviewer it goes to.
    * @throws a refusal that says where the gate stands and how to go on, when there is no ruling or one with none in it.
@@ -457,7 +458,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       const reviewer = followUp?.reviewer
       const lastEnded = child.runs.at(-1)?.endedAt
       if (reviewer?.gateOverride !== undefined && standing !== STILL_RUNNING && child.last !== 'running'
-        && lastEnded !== undefined && lastEnded < reviewer.startedAt) return block(reviewer.gateOverride)
+        && lastEnded !== undefined && lastEnded < (reviewer.gateOverrideAt ?? reviewer.startedAt)) return block(reviewer.gateOverride)
       throw new Error(refused)
     }
     if (!hasRuling(call.gateOverride)) throw new Error(`gateOverride needs the ruling itself: ${RULING_BODY}. ${refused}`)

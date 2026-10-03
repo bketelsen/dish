@@ -642,6 +642,7 @@ const BAD_FILES: Array<[string, string | ((good: any) => unknown)]> = [
   ['a gate on a run that is malformed', (good) => { good.children[0].runs[0].gates = [{ ...gate(), round: 0 }]; return good }],
   ['a gateOverride that is not a string', (good) => { good.children[0].gateOverride = 5; return good }],
   ['a gateOverride that is null', (good) => { good.children[0].gateOverride = null; return good }],
+  ['a gateOverrideAt that is not finite', (good) => { good.children[0].gateOverrideAt = 'today'; return good }],
 ]
 
 for (const [what, make] of BAD_FILES) {
@@ -1186,6 +1187,25 @@ test('a children.json written before gates existed still parses: no gates, no ga
   assert.equal(latestGate(coder!), undefined)
 })
 
+test('a ruling recorded before its time was kept still parses, with no gateOverrideAt; one with it keeps it', async () => {
+  const { records, directory, corrupt } = await fixture()
+  const dir = sessionDir(directory, 's1')
+  await mkdir(dir, { recursive: true })
+  const reviewer = { role: 'reviewer', title: 'review', model: 'gpt-5.6-sol', family: 'openai', reviews: 'c0', startedAt: STARTED, followUps: 1, runs: [], last: 'running' }
+  await writeFile(join(dir, 'children.json'), JSON.stringify({
+    sessionId: 's1',
+    children: [
+      { id: 'r1', n: 1, ...reviewer, gateOverride: 'Ruling: a — b — c' },
+      { id: 'r2', n: 2, ...reviewer, gateOverride: 'Ruling: d — e — f', gateOverrideAt: STARTED + 5000 },
+    ],
+  }))
+  const [old, stamped] = await records.children('s1')
+  assert.deepEqual(corrupt, [])
+  assert.equal(old!.gateOverride, 'Ruling: a — b — c')
+  assert.ok(!('gateOverrideAt' in old!))
+  assert.equal(stamped!.gateOverrideAt, STARTED + 5000)
+})
+
 test('a gate\'s unknown fields are dropped when the record is read, on the child and on a run', async () => {
   const { records, directory, corrupt } = await fixture()
   await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
@@ -1225,10 +1245,14 @@ test('addChild records a gateOverride when it is given, and none when it is not'
   const ruling = 'Ruling: review it anyway — the failing test is a known flake — a real bug slips through'
   const reviewer = await records.addChild('s1', newChild('r1', { role: 'reviewer', reviews: 'c1', gateOverride: ruling }))
   assert.equal(reviewer.gateOverride, ruling)
+  // The ruling's time is the child's: it was given when the reviewer was recorded.
+  assert.equal(reviewer.gateOverrideAt, STARTED)
   const plain = await records.addChild('s1', newChild('r2', { role: 'reviewer', reviews: 'c1' }))
   assert.ok(!('gateOverride' in plain))
+  assert.ok(!('gateOverrideAt' in plain))
   const { records: restarted } = reopen(directory)
   assert.equal((await restarted.lookup('r1'))!.record.gateOverride, ruling)
+  assert.equal((await restarted.lookup('r1'))!.record.gateOverrideAt, STARTED)
   assert.ok(!('gateOverride' in (await restarted.lookup('r2'))!.record))
   for (const gateOverride of [5, null, ['Ruling: x']]) {
     await assert.rejects(records.addChild('s1', { ...newChild('r3'), gateOverride } as unknown as NewChild), /gateOverride must be a string/, String(gateOverride))
@@ -1240,16 +1264,24 @@ test('addFollowUp with a gateOverride records the ruling, a later one replaces i
   const { records, directory } = await fixture()
   await records.addChild('s1', newChild('r1', { role: 'reviewer', reviews: 'c1' }))
   await records.endRun('r1', { stopReason: 'completed', closing: 'LGTM' })
+  const before1 = Date.now()
   await records.addFollowUp('r1', { gateOverride: 'Ruling: first — why — cost' })
   let record = (await records.lookup('r1'))!.record
   assert.equal(record.gateOverride, 'Ruling: first — why — cost')
+  // Stamped when the follow-up recorded it.
+  assert.ok(record.gateOverrideAt! >= before1 && record.gateOverrideAt! <= Date.now(), String(record.gateOverrideAt))
   assert.equal(record.followUps, 1)
   assert.equal(record.last, 'running')
+  await new Promise(resolve => setTimeout(resolve, 5))
+  const before2 = Date.now()
   await records.addFollowUp('r1', { gateOverride: 'Ruling: second — why — cost' })
+  const second = (await records.lookup('r1'))!.record.gateOverrideAt!
+  assert.ok(second >= before2 && second > record.gateOverrideAt!, String(second))
   await records.addFollowUp('r1')
   await records.addFollowUp('r1', {})
   record = (await records.lookup('r1'))!.record
   assert.equal(record.gateOverride, 'Ruling: second — why — cost')
+  assert.equal(record.gateOverrideAt, second, 'a follow-up without a ruling keeps the time of the one it keeps')
   assert.equal(record.followUps, 4)
   // Not a string: refused before anything is written.
   const file = join(sessionDir(directory, 's1'), 'children.json')

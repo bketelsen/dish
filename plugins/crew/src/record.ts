@@ -46,7 +46,8 @@
  * `agent/turn-stopping`, which dsh-agent-loop awaits (`dispatch.serial`) before the turn can close; the run's
  * `subagent/end`, whose listener calls `endRun`, comes only after the turn has closed. So a run's last result is written,
  * through the session's queue, before `endRun` for that run is even called, and a result recorded after a run ended is the
- * next run's. A reviewer's ruling to review work whose gate hadn't passed is kept on the reviewer as `gateOverride`.
+ * next run's. A reviewer's ruling to review work whose gate hadn't passed is kept on the reviewer as `gateOverride`, with
+ * when it was given as `gateOverrideAt`.
  *
  * `prune` removes sessions nothing has written to for a while, with their pointers; see there for the rules.
  *
@@ -131,6 +132,12 @@ export interface ChildRecord {
    * follow-up's ruling replaces it.
    */
   gateOverride?: string
+  /**
+   * When `gateOverride` was recorded, in ms since the epoch: the child's `startedAt` for a ruling given at its start, the
+   * follow-up's time for one given on a follow-up. Absent for a ruling recorded before this was kept (`startedAt` stands
+   * in for it then), and when there is no ruling.
+   */
+  gateOverrideAt?: number
   /** When the child was recorded, in ms since the epoch. */
   startedAt: number
   /** How many follow-ups it has been sent. */
@@ -346,11 +353,12 @@ function parseRun(value: unknown): RunRecord | undefined {
 /** The child in `value`, or `undefined` if it isn't shaped like one. Other fields are dropped. */
 function parseChild(value: unknown): ChildRecord | undefined {
   if (!isObject(value)) return undefined
-  const { id, n, role, title, model, family, reviews, worktree, gateOverride, startedAt, followUps, runs, gates, last } = value
+  const { id, n, role, title, model, family, reviews, worktree, gateOverride, gateOverrideAt, startedAt, followUps, runs, gates, last } = value
   if (!isText(id) || id === '' || !isNumber(n) || !isText(role) || !isText(title) || !isText(model) || !isText(family)) return undefined
   if (reviews !== undefined && !isText(reviews)) return undefined
   if (worktree !== undefined && !isText(worktree)) return undefined
   if (gateOverride !== undefined && !isText(gateOverride)) return undefined
+  if (gateOverrideAt !== undefined && !isNumber(gateOverrideAt)) return undefined
   if (!isNumber(startedAt) || !isNumber(followUps) || !Array.isArray(runs)) return undefined
   if (!isText(last) || !['running', 'finished', 'failed', 'stopped'].includes(last)) return undefined
   const parsed: RunRecord[] = []
@@ -363,7 +371,7 @@ function parseChild(value: unknown): ChildRecord | undefined {
   if (gates !== undefined && parsedGates === undefined) return undefined
   return {
     id, n, role, title, model, family, ...reviews === undefined ? {} : { reviews }, ...worktree === undefined ? {} : { worktree },
-    ...gateOverride === undefined ? {} : { gateOverride },
+    ...gateOverride === undefined ? {} : { gateOverride }, ...gateOverrideAt === undefined ? {} : { gateOverrideAt },
     startedAt, followUps, runs: parsed, ...parsedGates === undefined ? {} : { gates: parsedGates }, last: last as ChildStatus,
   }
 }
@@ -581,6 +589,7 @@ export class CrewRecords {
       const loaded = (await this.#load(hash, sessionId)) ?? { sessionId, children: [] }
       const existing = loaded.children.find(candidate => candidate.id === record.id)
       if (existing !== undefined) return structuredClone(existing)
+      const startedAt = record.startedAt ?? Date.now()
       const child: ChildRecord = {
         id: record.id,
         n: loaded.children.length + 1,
@@ -590,8 +599,8 @@ export class CrewRecords {
         family: record.family,
         ...record.reviews === undefined ? {} : { reviews: record.reviews },
         ...record.worktree === undefined ? {} : { worktree: record.worktree },
-        ...record.gateOverride === undefined ? {} : { gateOverride: record.gateOverride },
-        startedAt: record.startedAt ?? Date.now(),
+        ...record.gateOverride === undefined ? {} : { gateOverride: record.gateOverride, gateOverrideAt: startedAt },
+        startedAt,
         followUps: 0,
         runs: [],
         last: 'running',
@@ -606,8 +615,8 @@ export class CrewRecords {
 
   /**
    * Count a follow-up sent to `childId`, which is running again until its next run ends, and, with `gateOverride`, record
-   * the main agent's ruling on the child (a reviewer), replacing any it had. Without one, a ruling it had stays. A child
-   * that isn't recorded is ignored.
+   * the main agent's ruling on the child (a reviewer), replacing any it had, with now as its `gateOverrideAt`. Without one,
+   * a ruling it had stays, with its time. A child that isn't recorded is ignored.
    * @throws TypeError if `gateOverride` is given and isn't a string. Nothing is written.
    */
   async addFollowUp(childId: string, extra?: { gateOverride?: string }): Promise<void> {
@@ -616,7 +625,10 @@ export class CrewRecords {
     await this.#update(childId, async (child) => {
       child.followUps += 1
       child.last = 'running'
-      if (gateOverride !== undefined) child.gateOverride = gateOverride
+      if (gateOverride !== undefined) {
+        child.gateOverride = gateOverride
+        child.gateOverrideAt = Date.now()
+      }
       return true
     })
   }

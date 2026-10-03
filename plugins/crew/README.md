@@ -61,7 +61,7 @@ While [`dish-gates`](../gates/) runs, a bound coder's work is gated each time it
   The refusal says where the gate stands and what to do: "coder «add login» (child <id>)'s gate hasn't passed (skipped: the coder reported BLOCKED / NEEDS CONTEXT). Send it a fix round with `to: "<id>"`, or start the review anyway with `gateOverride: "Ruling: what — why — cost if wrong"`."
 - **`gateOverride`,** a `delegate` parameter, is the main agent's ruling to review work whose gate hasn't passed, on one line (line breaks are folded). It is recorded on the reviewer (`gateOverride` in `children.json`), and the reviewer gets a block after its task: "The harness's gate for the work you review (<role> «<title>», child <id>) hasn't passed: <where it stands>. The main agent started this review anyway, with this ruling: <ruling>". A follow-up with a ruling replaces the recorded one, and its text gets the same block.
   - An empty `gateOverride` is none. `Ruling:` alone, or the placeholder `Ruling: what — why — cost if wrong` copied back, is refused: "gateOverride needs the ruling itself: what — why — cost if wrong".
-  - A re-review without one keeps the reviewer's ruling while the reviewed coder hasn't run since the reviewer started: the ruling was given on the standing it still has.
+  - A re-review without one keeps the reviewer's ruling while the reviewed coder hasn't run since the ruling was given: the ruling was given on the standing it still has. Its time is `gateOverrideAt` in `children.json`: the reviewer's start, or the follow-up that gave it. A ruling recorded before that field existed counts from the reviewer's start.
   - When nothing is refused (the gate passed, the coder isn't bound, `reviews: "main"`, or dish-gates isn't running), `gateOverride` is ignored and not recorded.
 
 ## crew.yaml
@@ -111,7 +111,7 @@ A role also needs a prompt: `prompts/crew/<role>.md`, or a shipped default.
 ## What crew records
 
 In `$XDG_DATA_HOME/dish/crew/`:
-- `sessions/<hash of the session>/children.json` holds each child's role, model, family, what it reviews, the worktree it is bound to, its follow-ups and its runs, and, with [`dish-gates`](../gates/), each run's gate results and a reviewer's `gateOverride` ([Gates](#gates)).
+- `sessions/<hash of the session>/children.json` holds each child's role, model, family, what it reviews, the worktree it is bound to, its follow-ups and its runs, and, with [`dish-gates`](../gates/), each run's gate results and a reviewer's `gateOverride` with its `gateOverrideAt` ([Gates](#gates)).
 - `<n>-<role>-<run>.md` in the same folder holds each run's closing message, the child's report.
 - `by-child/` holds pointers, so a child resumed after a restart is filed under the right session.
 

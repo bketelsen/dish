@@ -161,7 +161,7 @@ interface GateResult {
   - It goes through crew's existing queue, atomic and durable like the rest of the record.
   - dish-gates awaits it inside `agent/turn-stopping`, before the turn can close. So it lands before that run's `subagent/end` files the run.
 - **Rounds** count failures within one turn of the child. A steer continues the turn. A follow-up (`delegate` with `to`), or any message to a finished child, starts a new turn, so the coder gets three new rounds: that's the main agent's fix round.
-- **A reviewer's ruling** is kept on its record as `gateOverride`.
+- **A reviewer's ruling** is kept on its record as `gateOverride`, with when it was given as `gateOverrideAt`.
 
 ## Reviews (crew)
 
@@ -280,7 +280,7 @@ What the build decided within this spec, or added to it, beyond the plan's corre
 - **`latestGate`** gives no result while a run is in progress and has none yet, never the previous run's.
 - **The finish notice** says "Gate not run." for a bound coder's run with no result only while dish-gates runs. Without it no gate was going to run, so the line is left out.
 - **The review check's refusal** names the fix round's target (`to: "<id>"`), and for a coder still running says to wait for its finish notice. "No gate result" gives the likeliest cause as an example: "no gate result: it didn't run (for example, the coder ran before dish-gates was on)". Work done before dish-gates was installed needs a ruling to be reviewed.
-- **Rulings.** The placeholder copied back (`Ruling: what — why — cost if wrong`, with or without `Ruling:`) is no ruling, and is refused as `Ruling:` alone is. A re-review without `gateOverride` keeps the reviewer's ruling while the reviewed coder hasn't run since the reviewer started (its latest run ended before then, and it isn't running): the ruling was given on the standing it still has. A fix round, a crash or a resume of the coder ends it.
+- **Rulings.** The placeholder copied back (`Ruling: what — why — cost if wrong`, with or without `Ruling:`) is no ruling, and is refused as `Ruling:` alone is. A re-review without `gateOverride` keeps the reviewer's ruling while the reviewed coder hasn't run since the ruling was given (its latest run ended before then, and it isn't running): the ruling was given on the standing it still has. A fix round, a crash or a resume of the coder ends it. The ruling's time is kept as `gateOverrideAt`: the reviewer's start for a ruling given then, the follow-up's time for one given on a re-review (found in the final review: comparing with the reviewer's start lost a ruling given on a re-review at the next one). A ruling recorded before `gateOverrideAt` was kept uses the reviewer's start.
 
 **End to end (2026-10-03).** In a scratch `dsh web` (`env -i`, every directory scratch), installed by `deploy/install.sh`, on the dish preset with crew's `delegate`, and a scripted model on `127.0.0.1`. The project `bketelsen/gates-e2e` (gate `test -f ok.txt`) had a clone and two worktrees made by hand; its onboarding failed at the App, as expected, and `resolve` took the worktrees.
 - A coder bound to `e2e` finished without the file. Its session got "The gate failed (round 1 of 3): `test -f ok.txt` exited 1 after 31 ms." with the log's path; it wrote `ok.txt` and finished again.

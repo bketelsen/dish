@@ -2134,6 +2134,41 @@ test('a re-review (a follow-up to a reviewer, with to) is checked the same way: 
   assert.equal((await w.records.lookup(reviewer.child))!.record.gateOverride, ruling)
 })
 
+test('a ruling given on a re-review carries over to the next re-review, until the coder runs again', async () => {
+  const w = await world({ dishGates: true })
+  const pause = () => new Promise(resolve => setTimeout(resolve, 10))
+  await boundCoder(w, 'c1', [gateResult()])
+  // t0: the reviewer is made, on a coder whose gate passed: no ruling.
+  await pause()
+  const reviewer = await w.delegate({ ...REVIEW, reviews: 'c1' })
+  await finish(w, reviewer.child)
+  // t1: the coder's fix round fails its gate in every round.
+  await pause()
+  await w.records.addFollowUp('c1')
+  for (const result of FAILED_3) await w.records.addGate('c1', { ...result, turn: 2 })
+  await w.records.endRun('c1', { stopReason: 'completed', closing: 'done' })
+  const standing = `failed, round 3 of 3; log ${LOG_3}`
+  const again = { ...REVIEW, task: 'Review the fix.', to: reviewer.child }
+  // t2: a re-review with a ruling.
+  await pause()
+  const ruling = 'Ruling: re-review anyway — the failing test is unrelated — a missed regression'
+  await w.delegate({ ...again, gateOverride: ruling })
+  await finish(w, reviewer.child)
+  // t3: a second re-review with no new ruling: the coder hasn't run since the ruling, so it stands.
+  await pause()
+  await w.delegate({ ...again, task: 'Once more.' })
+  assert.equal(w.sends.length, 2)
+  assert.deepEqual(w.sends[1]!.content, [{ type: 'text', text: 'Once more.' }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }])
+  await finish(w, reviewer.child)
+  // The coder runs again, and fails again: the ruling was on the work before, so it no longer stands.
+  await pause()
+  await w.records.addFollowUp('c1')
+  await w.records.addGate('c1', { ...FAILED_3[2]!, turn: 3 })
+  await w.records.endRun('c1', { stopReason: 'completed', closing: 'done' })
+  assert.match(await refusal(w.delegate({ ...again, task: 'And again.' })), /gate hasn't passed \(failed, round 3 of 3/)
+  assert.equal(w.sends.length, 2)
+})
+
 test('a re-review of the main agent\'s own work, or of an unbound coder, is not checked', async () => {
   const w = await world({ dishGates: true })
   const mine = await w.delegate({ ...REVIEW, reviews: 'main' })
