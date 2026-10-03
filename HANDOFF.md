@@ -33,6 +33,10 @@ Everything below is merged and running on the VM.
 | The account's mise config and toolchains | fleet #40 and #41 | Node 24.21.0, pnpm 11.25.0, Go 1.27.1, Python 3.14.8. Configs under `~/work` are trusted. |
 | The private-key screen fix | #15 | A fake `BEGIN … PRIVATE KEY` header no longer hides a page from the injection screen. |
 | 6c `gates` | #16 | See Next, item 1. |
+| Friction fixes from the clippy session | #17 | One `/tmp` for every agent and tool, which lasts (dsh's own temp files moved to `~/.cache/dish/tmp`, the unit's `TMPDIR`); mise's shims at the end of a sandboxed command's `PATH`; the judge counts `/tmp` with the workspace; `read_image` for the coder, reviewer and writer. Checked on the VM after the deploy. |
+| `file` on the VM | fleet #42 | Guest play applied 2026-10-03 (`changed=1`, rerun `changed=0`). |
+
+**The VM's `judge.yaml`** has `reversible: 0.80` and `servesTask: 0.40` (set in the web UI on 2026-10-03; the shipped default is 0.90/0.50). The [judge spec](docs/specs/judge.md) has the replay behind them.
 
 **Shelved:** mise approvals (the `dish-mise` wrapper, the judge's trusted rule and its checkbox). The work sits on the local branches `mise-approvals`, `mise-t1`, `mise-t2` and `mise-t3` in `~/projects/dish`, and was never pushed. sandbox-home replaced it: plain `mise install` works in the sandbox. Delete those branches when you're sure.
 
@@ -89,13 +93,7 @@ Sessions are `session.v4.jsonl.zstd` under the workspace's directory, and a crew
    - done: `bketelsen/clippy`'s gate is `go vet ./... && go test ./...` with `5m`;
    - seen in a real session (clippy README, 2026-10-03, 10:48–11:05 UTC): a coder that reported BLOCKED had its gate skipped, and the commit run's gate passed in 0.3 s (Go's test cache was warm). The coder also ran `go test` itself, because the main agent's brief told it to;
    - still to see live: a failing gate fixed in round 2, and a review that needs a ruling.
-2. **Friction fixes from that clippy session** (branch `friction`). In it, the judge stopped 24 of 66 commands, 15 of them for writing to `/tmp`, which dsh also emptied after every call. The branch:
-   - gives sandboxed commands the VM's own `/tmp`, the one dsh's file tools and `workdir` see, by moving dsh's own temp files to `~/.cache/dish/tmp` (the unit's `TMPDIR`); and puts mise's shims at the end of their `PATH` (`deploy/dish-sandbox`);
-   - has the judge count `/tmp` with the workspace, and word a refusal as what fell short;
-   - lets `delegate` follow-ups go without a `title`;
-   - gives the coder, reviewer and writer `read_image`, and moves an unedited `crew.yaml` to the new default at start.
-
-   After it deploys, check the config store's History: `crew.yaml` should show "updated to the new defaults" (an edited `crew.yaml` keeps its text, and gets no `read_image`). The judge's `reversible: 0.80` and `servesTask: 0.40` are the user's `judge.yaml` on the VM (Settings → Judge), not the shipped default; the judge spec has the replay behind them.
+2. **Watch the next sessions after #17.** Replayed against Jev, the clippy run's 24 stops and asks come to about 4 with the new `/tmp` wording and the VM's thresholds. Check that it holds in practice. Also check whether agents keep scratch files in `/tmp` (with `mktemp -d -p /tmp`) rather than `.worktrees/`, and whether the main agent hands image checks to a child.
 3. **6b's last check:** the squash-merge sweep check in the [plan's rollout](docs/plans/2026-10-02-projects.md#the-rollout-for-you), step 8.
 4. **The prod App:** the user is making it (above). Then switch keys on Settings → GitHub App, and check that an agent can push a branch.
 5. **`README.md:19`** says Settings → GitHub App takes dev's own App, which waits on the prod App decision.
@@ -118,6 +116,7 @@ Sessions are `session.v4.jsonl.zstd` under the workspace's directory, and a crew
 
 - **The sandbox guards against accidents, not a determined agent.** The D-Bus session bus and the systemd user manager are reachable from inside it, which is left open on purpose. Reads were never confined: an agent's shell can read `~/.dsh/.credentials.yaml` and `~/.ssh`.
 - **The GitHub App is read-only, so agents never push,** until the prod App (above). A `git push` from an agent is refused with 403 (decision 2A).
+- **`/tmp` on the VM is shared and RAM-backed** (since #17). Every agent and tool sees the machine's `/tmp`, a 3.9 GB tmpfs aged out after 10 days, so an agent that fills it costs memory. Nothing that runs as `dish` outside the sandbox may keep files there that it later reads or runs: dsh uses `~/.cache/dish/tmp`, `update.sh` gives `install.sh` the same, and `install.sh` should be run on the VM only through `dish-update` (`deploy/README.md`, The sandbox).
 - **The writable home's residual risks:** sandboxed code can leave things in the home directory (caches, `~/go/bin`, mise installs) that an approved escalation later runs. The protected list covers what runs without anyone acting.
 - **The judge's read-only rule:** a command that reads and sends in one step depends on the judge reading it as `irreversible`.
 - **The judge's ask counts:** read-only commands no longer ask. The judge still asks about writes that it scores as not serving the task, such as tests an agent runs on its own initiative.
