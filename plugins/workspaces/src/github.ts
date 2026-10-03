@@ -132,7 +132,11 @@ export interface PullDetails {
   base: { ref: string }
 }
 
-/** A page of GitHub's items, unparsed (readPull reads each field with a type check), and whether it was full. */
+/**
+ * GitHub's items, unparsed (readPull reads each field with a type check), and `full`: whether GitHub has items this list
+ * doesn't hold. For the reviews and the comments (the newest 100), those are older ones; for the checks (the first page),
+ * a full page.
+ */
 export interface RawList {
   items: unknown[]
   full: boolean
@@ -524,19 +528,19 @@ export class GitHubApp {
     }
   }
 
-  /** GET …/pulls/{number}/reviews?per_page=100 (the first page). */
+  /** GET …/pulls/{number}/reviews: the newest 100 (`#newest`). */
   async pullReviews(owner: string, repo: string, number: number, token: string): Promise<RawList> {
-    return this.#list(`${repoPath(owner, repo)}/pulls/${pullNumber(number)}/reviews`, token)
+    return this.#newest(`${repoPath(owner, repo)}/pulls/${pullNumber(number)}/reviews`, token)
   }
 
-  /** GET …/pulls/{number}/comments?per_page=100 (the first page). */
+  /** GET …/pulls/{number}/comments: the newest 100 (`#newest`). */
   async pullReviewComments(owner: string, repo: string, number: number, token: string): Promise<RawList> {
-    return this.#list(`${repoPath(owner, repo)}/pulls/${pullNumber(number)}/comments`, token)
+    return this.#newest(`${repoPath(owner, repo)}/pulls/${pullNumber(number)}/comments`, token)
   }
 
-  /** GET /repos/{o}/{r}/issues/{number}/comments?per_page=100 (the first page). */
+  /** GET /repos/{o}/{r}/issues/{number}/comments: the newest 100 (`#newest`). */
   async issueComments(owner: string, repo: string, number: number, token: string): Promise<RawList> {
-    return this.#list(`${repoPath(owner, repo)}/issues/${pullNumber(number)}/comments`, token)
+    return this.#newest(`${repoPath(owner, repo)}/issues/${pullNumber(number)}/comments`, token)
   }
 
   /** GET /repos/{o}/{r}/commits/{sha}/check-runs?per_page=100: its `check_runs`. */
@@ -547,6 +551,38 @@ export class GitHubApp {
   /** GET /repos/{o}/{r}/commits/{sha}/status?per_page=100 (the combined status): its `statuses`. */
   async combinedStatus(owner: string, repo: string, sha: string, token: string): Promise<RawList> {
     return this.#list(`${repoPath(owner, repo)}/commits/${commitId(sha)}/status`, token, 'statuses')
+  }
+
+  /**
+   * The newest 100 items of a list GitHub gives oldest first, a page at a time, in GitHub's order: the first page (which
+   * says how many pages there are), then, when its `Link` header names a last page past it, that page, and the page before
+   * it when the last is short. Only the page number is taken from the header: each request is `path` with `page`, never a
+   * URL GitHub gave. `full` is true when older items weren't read. A `Link` with no last page it can read leaves the first
+   * page, and `full`.
+   */
+  async #newest(path: string, token: string): Promise<RawList> {
+    const auth: Auth = { kind: 'token', token: checkedToken(token) }
+    const call = `GET ${path}`
+    const page = async (number?: number): Promise<{ items: unknown[], headers: Headers }> => {
+      const { json, headers } = await this.#request('GET', `${path}?per_page=${PER_PAGE}${number === undefined ? '' : `&page=${number}`}`, auth, call)
+      if (!Array.isArray(json)) throw malformed(call)
+      return { items: json, headers }
+    }
+    const first = await page()
+    const links = linkRelations(first.headers.get('link'))
+    const last = pageNumber(links.get('last'))
+    if (last === undefined) {
+      // No other page; or one GitHub names only as `next`, which can't be the newest.
+      const more = links.size > 0 || first.items.length > PER_PAGE
+      return { items: first.items.slice(-PER_PAGE), full: more }
+    }
+    if (last <= 1) return { items: first.items.slice(-PER_PAGE), full: first.items.length > PER_PAGE }
+    let items = (await page(last)).items
+    if (items.length < PER_PAGE) {
+      const before = last === 2 ? first.items : (await page(last - 1)).items
+      items = [...before, ...items]
+    }
+    return { items: items.slice(-PER_PAGE), full: true }
   }
 
   /** The first page (100) of `path` with an installation token: the answer itself, or its `field`, must be a list. */
@@ -621,6 +657,31 @@ export class GitHubApp {
     const detail = message === '' ? '' : `: ${message}`
     throw new GitHubError(kindOf(status, response.headers), `${call} answered HTTP ${status}${detail}`, status)
   }
+}
+
+/** GitHub's `Link` header as relation → URL (`next`, `last`, `prev`, `first`); empty for none. Nothing in it is fetched. */
+function linkRelations(header: string | null): Map<string, string> {
+  const relations = new Map<string, string>()
+  if (header === null) return relations
+  for (const part of header.slice(0, 8 * 1024).split(',')) {
+    const found = /^\s*<([^>]*)>\s*;\s*rel="([^"]*)"\s*$/.exec(part)
+    if (found === null) continue
+    for (const rel of found[2]!.split(/\s+/)) if (rel !== '') relations.set(rel, found[1]!)
+  }
+  return relations
+}
+
+/** The `page` of a `Link` URL, a whole number from 1; undefined when there is none, or it isn't one. */
+function pageNumber(url: string | undefined): number | undefined {
+  if (url === undefined) return undefined
+  let page: string | null
+  try {
+    page = new URL(url, 'https://api.github.com').searchParams.get('page')
+  } catch {
+    return undefined
+  }
+  if (page === null || !/^[1-9]\d{0,6}$/.test(page)) return undefined
+  return Number(page)
 }
 
 /** The kind of a failed answer. */

@@ -221,6 +221,9 @@ test('end to end: a project in projects.yaml is onboarded; a restart prepares it
     await commit('dirty-one', made.dirty.path)
     const merged = made.merged
     await writeFile(join(made.dirty.path, 'scratch.txt'), 'not committed\n')
+    // isClean's option reaches the service through dishWorkspaces.
+    assert.deepEqual(await run.service()!.isClean('acme/widget/dirty-one', { untracked: 'ignore' }), { clean: true, untracked: ['scratch.txt'] })
+    assert.equal((await run.service()!.isClean('acme/widget/dirty-one')).clean, false)
     const swept = await run.service()!.sweep()
     assert.deepEqual(swept.removed, [{ project: 'acme/widget', slug: 'merged-one', by: 'pull-request' }])
     assert.deepEqual(swept.kept.map(item => [item.slug, item.reason]).sort(), [['dirty-one', 'dirty'], ['feature', 'not-merged']])

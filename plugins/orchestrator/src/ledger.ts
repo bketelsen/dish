@@ -1,11 +1,11 @@
 /**
  * A run's ledger: one JSON entry a line, in the file `ledgerFile` names (paths.ts), written the way dish-judge writes its log
- * (`JudgeLog.write`, judge log.ts:441–487) for one file.
+ * (`JudgeLog.write`) for one file.
  *
  * - **Append-only.** This module opens a ledger only to append to it or to read it. It never takes a file away, moves
  *   one, shortens one or writes one over, and nothing here ages a ledger out: every ledger is kept for good.
  * - **Checked, masked, fitted.** Every entry passes `entryProblem` (a known kind, by its own writer), then every string in
- *   it, at any depth, goes through `maskSecrets` (keys are left alone), then its line is fitted to `MAX_LINE_BYTES` (see
+ *   it, at any depth, keys too, goes through `maskSecrets` (text's `masked`), then its line is fitted to `MAX_LINE_BYTES` (see
  *   `fitEntry`). Masking comes before any cut, so a cut can't leave the start of a secret that no pattern would now match.
  *   A call whose entries don't all pass writes none of them.
  * - **Whole lines, in order.** Each file has one promise queue; the lines of one call go in one `appendFile`, opened
@@ -25,7 +25,7 @@ import { maskSecrets } from 'dish-kit'
 import { BASE_FIELDS, entryProblem, lineProblem } from './entries.ts'
 import type { LedgerEntry } from './entries.ts'
 import { ledgerFile } from './paths.ts'
-import { headOf } from './text.ts'
+import { errorCode, headOf, masked } from './text.ts'
 
 /** The most a line takes in its file, its newline included. */
 export const MAX_LINE_BYTES = 16 * 1024
@@ -61,10 +61,6 @@ const CUT_MARK = '…'
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0
 const APPEND_FLAGS = constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | NO_FOLLOW
 
-function errorCode(error: unknown): unknown {
-  return (error as { code?: unknown } | null)?.code
-}
-
 function isJsonObject(value: Json): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -72,18 +68,6 @@ function isJsonObject(value: Json): value is JsonObject {
 /** How many bytes `value` takes as JSON. */
 function jsonBytes(value: Json): number {
   return Buffer.byteLength(JSON.stringify(value), 'utf8')
-}
-
-/** `value` with every string in it masked, at any depth. Keys are left alone. */
-function masked(value: Json): Json {
-  if (typeof value === 'string') return maskSecrets(value)
-  if (Array.isArray(value)) return value.map(masked)
-  if (isJsonObject(value)) {
-    const result: JsonObject = {}
-    for (const [key, item] of Object.entries(value)) result[key] = masked(item)
-    return result
-  }
-  return value
 }
 
 /** A binary heap: `before(a, b)` is true when `a` comes out first. */
@@ -289,7 +273,7 @@ interface FoundLine {
 
 /**
  * The non-empty lines of `file` that start before byte `end` (the end of the file if there's none), last first (judge's
- * `linesBackward`, log.ts:325–373, copied). Reads the file backward in `READ_CHUNK`s, so it holds a chunk and the line
+ * `linesBackward`, copied). Reads the file backward in `READ_CHUNK`s, so it holds a chunk and the line
  * being put together, and stops reading when its caller stops asking. A file that isn't there, or is a link, has none.
  */
 async function* linesBackward(file: string, end: number | undefined): AsyncGenerator<FoundLine> {

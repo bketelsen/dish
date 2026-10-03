@@ -7,7 +7,7 @@ import {
   appJwt, botIdentity, GITHUB_API, GITHUB_WEB, GitHubApp, GitHubError, PULL_PERMISSIONS, PUSH_PERMISSIONS,
 } from '../src/github.ts'
 import type { AppCredentials, GitHubErrorKind, WritePermissions } from '../src/github.ts'
-import { WRITE_APP_PERMISSIONS, startFakeGitHub, testKeys } from './fake-github-api.ts'
+import { LINK_ORIGIN, WRITE_APP_PERMISSIONS, startFakeGitHub, testKeys } from './fake-github-api.ts'
 
 const keys = testKeys()
 const APP_ID = 4242
@@ -655,9 +655,10 @@ describe('pull requests', () => {
     fake.checks('acme/widget', sha, { checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'success' }], statuses: [{ context: 'lint', state: 'pending' }] })
     assert.deepEqual(await app.pullReviews('acme', 'widget', 1, token), { items: [review], full: false })
     assert.equal(fake.requests.at(-1)!.path, '/repos/acme/widget/pulls/1/reviews?per_page=100')
+    // 100 on one page: GitHub sends no Link, so there is nothing older.
     const comments = await app.pullReviewComments('acme', 'widget', 1, token)
     assert.equal(comments.items.length, 100)
-    assert.equal(comments.full, true)
+    assert.equal(comments.full, false)
     assert.equal(fake.requests.at(-1)!.path, '/repos/acme/widget/pulls/1/comments?per_page=100')
     assert.deepEqual(await app.issueComments('acme', 'widget', 1, token), { items: [{ id: 7, user: { login: 'bob' }, body: 'Hm' }], full: false })
     assert.equal(fake.requests.at(-1)!.path, '/repos/acme/widget/issues/1/comments?per_page=100')
@@ -679,5 +680,51 @@ describe('pull requests', () => {
     fake.failNext('/repos/acme/widget/pulls/1', 200, { number: 1 })
     await rejectsWith(app.pullDetails('acme', 'widget', 1, token), 'other')
     await assert.rejects(app.checkRuns('acme', 'widget', '../x', token))
+  })
+
+  it('pullReviews, pullReviewComments and issueComments read the newest 100: the last page GitHub\'s Link names, and the one before it when the last is short; full says older ones weren\'t read', async () => {
+    const { fake, app } = await writeSetup()
+    const write = (await app.createWriteToken(77, 'widget', PULL_PERMISSIONS)).token
+    await app.createPull('acme', 'widget', { title: 'Fix', head: 'dish/fix-1', base: 'main', body: '' }, write)
+    const token = (await app.createToken(77, ['widget'], { metadata: 'read', pull_requests: 'read', checks: 'read', statuses: 'read' })).token
+    const numbered = (count: number) => Array.from({ length: count }, (_, id) => ({ id, user: { login: 'ann' }, state: 'COMMENTED', path: 'a.ts', body: `c${id}` }))
+    const ids = (from: number, to: number): number[] => Array.from({ length: to - from }, (_, index) => from + index)
+    fake.feedback('acme/widget', 1, { issueComments: numbered(130), reviews: numbered(250), reviewComments: numbered(200) })
+    const paths = async (read: () => Promise<{ items: unknown[], full: boolean }>): Promise<{ ids: number[], full: boolean, paths: string[] }> => {
+      const seen = fake.requests.length
+      const list = await read()
+      const asked = fake.requests.slice(seen)
+      assert.ok(asked.every(request => request.auth === 'token' && request.status === 200), JSON.stringify(asked))
+      return { ids: list.items.map(item => (item as { id: number }).id), full: list.full, paths: asked.map(request => request.path) }
+    }
+
+    // 130: page 1, then page 2 (the last, 30): the newest 100, oldest first.
+    assert.deepEqual(await paths(() => app.issueComments('acme', 'widget', 1, token)), {
+      ids: ids(30, 130), full: true, paths: ['/repos/acme/widget/issues/1/comments?per_page=100', '/repos/acme/widget/issues/1/comments?per_page=100&page=2'],
+    })
+    // 250: page 1, page 3 (the last, 50), then page 2.
+    assert.deepEqual(await paths(() => app.pullReviews('acme', 'widget', 1, token)), {
+      ids: ids(150, 250), full: true,
+      paths: ['/repos/acme/widget/pulls/1/reviews?per_page=100', '/repos/acme/widget/pulls/1/reviews?per_page=100&page=3', '/repos/acme/widget/pulls/1/reviews?per_page=100&page=2'],
+    })
+    // 200: page 1, then page 2, full: nothing before it is needed.
+    assert.deepEqual(await paths(() => app.pullReviewComments('acme', 'widget', 1, token)), {
+      ids: ids(100, 200), full: true, paths: ['/repos/acme/widget/pulls/1/comments?per_page=100', '/repos/acme/widget/pulls/1/comments?per_page=100&page=2'],
+    })
+
+    // A Link with no last page, or one whose page isn't a page number: the first page, and full. The Link's URL is never asked.
+    const first = numbered(100)
+    fake.failNext('/repos/acme/widget/issues/1/comments', 200, first, { link: `<${LINK_ORIGIN}/x?page=2>; rel="next"` })
+    assert.deepEqual(await paths(() => app.issueComments('acme', 'widget', 1, token)), { ids: ids(0, 100), full: true, paths: ['/repos/acme/widget/issues/1/comments?per_page=100'] })
+    for (const link of [`<${LINK_ORIGIN}/x?page=0>; rel="last"`, `<${LINK_ORIGIN}/x?page=two>; rel="last"`, '<not a url>; rel="last"']) {
+      fake.failNext('/repos/acme/widget/issues/1/comments', 200, first, { link })
+      assert.deepEqual(await paths(() => app.issueComments('acme', 'widget', 1, token)), { ids: ids(0, 100), full: true, paths: ['/repos/acme/widget/issues/1/comments?per_page=100'] }, link)
+    }
+    // A last page that is the first: one page, all read.
+    fake.failNext('/repos/acme/widget/issues/1/comments', 200, first, { link: `<${LINK_ORIGIN}/x?per_page=100&page=1>; rel="last"` })
+    assert.deepEqual(await paths(() => app.issueComments('acme', 'widget', 1, token)), { ids: ids(0, 100), full: false, paths: ['/repos/acme/widget/issues/1/comments?per_page=100'] })
+    // A last page that fails fails the read.
+    fake.failNext('/repos/acme/widget/issues/1/comments?per_page=100&page=2', 502)
+    await rejectsWith(app.issueComments('acme', 'widget', 1, token), 'other')
   })
 })

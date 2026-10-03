@@ -176,7 +176,9 @@ function Verdict({ verdict, now }: { verdict: VerdictView, now: number }) {
   const { blocking, should_fix: shouldFix, nit } = verdict.findings
   return (
     <p className="dish-runs-text">
-      {verdict.final ? 'final review' : 'review'}: {verdictLabel(verdict.verdict)} of <code className="dish-runs-code" title={verdict.head}>{shortSha(verdict.head)}</code> by <code className="dish-runs-code">{verdict.child}</code>
+      {verdict.final ? 'final review' : 'review'}: {verdictLabel(verdict.verdict)}{verdict.head === undefined
+        ? ', no head given,'
+        : <> of <code className="dish-runs-code" title={verdict.head}>{shortSha(verdict.head)}</code></>} by <code className="dish-runs-code">{verdict.child}</code>
       ; findings: {blocking} blocking, {shouldFix} should fix, {count(nit, 'nit')}
       <span className="dish-runs-muted" title={fullTime(verdict.at)}> ({relativeTime(verdict.at, now)})</span>
     </p>

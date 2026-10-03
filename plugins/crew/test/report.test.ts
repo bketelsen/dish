@@ -97,7 +97,7 @@ const REVIEWER = {
 }
 
 const BLOCKED_ON = 'blockedOn is required when status is blocked or needs_context: say what you\'re blocked on, or what you need'
-const HEAD_FORM = 'head must be the full sha of the commit you reviewed (40 hex digits): run `git rev-parse HEAD` in the worktree you reviewed'
+const HEAD_FORM = 'head must be the full sha of the commit you reviewed (40 hex digits): run `git rev-parse HEAD` in the worktree you reviewed, or leave head out when the work isn\'t in a git repository'
 
 /** Every node of a JSON schema, depth first. */
 function nodes(schema: unknown, out: Array<Record<string, unknown>> = []): Array<Record<string, unknown>> {
@@ -129,7 +129,9 @@ test('the schemas: dsh-tools compiles both parameter sets, every nested object i
   assert.deepEqual(items(coder, 'notFixed').required, ['finding', 'why'])
   assert.deepEqual(items(coder, 'commits'), { type: 'string' })
   assert.deepEqual(items(coder, 'concerns'), { type: 'string' })
-  assert.deepEqual(reviewer.required, ['verdict', 'head', 'summary', 'findings'])
+  assert.deepEqual(reviewer.required, ['verdict', 'summary', 'findings'])
+  assert.equal(reviewer.properties.head.type, 'string')
+  assert.equal(REVIEWER_PARAMETERS.head.description, 'The full sha of the commit you reviewed (`git rev-parse HEAD`), when the work is in a git repository.')
   assert.deepEqual(items(reviewer, 'findings').required, ['severity', 'file', 'summary', 'fix'])
   assert.deepEqual(items(reviewer, 'findings').properties.severity.enum, ['blocking', 'should_fix', 'nit'])
   assert.equal(items(reviewer, 'findings').properties.line.type, 'integer')
@@ -235,6 +237,16 @@ test('the body\'s checks: blockedOn when not done, a blank summary, a head that 
   // A full sha, uppercased and with spaces around it, is stored trimmed and lowercased.
   const upper = await reviewer.call({ ...REVIEWER, head: `  ${SHA.toUpperCase()}\n` })
   assert.equal((upper.value as { head: string }).head, SHA)
+  // No head (a review of work outside git), or a blank one: the report is recorded without it.
+  const { head: _head, ...headless } = REVIEWER
+  for (const args of [headless, { ...REVIEWER, head: '  ' }]) {
+    const none = await reviewer.call(args)
+    assert.equal(none.error, undefined, JSON.stringify(args))
+    assert.equal(none.concluded, 1)
+    assert.equal('head' in (none.value as object), false)
+    assert.equal(reviewer.tool.output.render({}, none.value as never).map(block => (block as { text?: string }).text).join(''), 'Report recorded: changes_requested.')
+  }
+  assert.equal(reviewer.tool.output.render({}, upper.value as never).map(block => (block as { text?: string }).text).join(''), `Report recorded: changes_requested at ${SHA.slice(0, 12)}.`)
   // blocked with blockedOn is a report.
   const blocked = await coder.call({ status: 'blocked', summary: 'Stuck.', blockedOn: 'Which database?' })
   assert.deepEqual(blocked.value, { role: 'coder', turn: 0, at: NOW, status: 'blocked', summary: 'Stuck.', blockedOn: 'Which database?' })
@@ -458,7 +470,7 @@ test('the steer: at most two a turn, the last says what happens without it, and 
 
 test('the steer\'s texts, word for word', () => {
   assert.equal(reportSteerText('coder', 1, 2), 'Finish by calling `report`: `status` (`done` when the work is complete and committed; `blocked` or `needs_context`, with `blockedOn`, when you can\'t go on), a `summary` of what changed, for a person, and `commits`, `rulings`, `concerns` and `notFixed` where they apply. The main agent reads your report, not your last message, and your turn ends when you call it.')
-  assert.equal(reportSteerText('reviewer', 1, 2), 'Finish by calling `report`: your `verdict` (`approved` or `changes_requested`), `head` (the full sha of the commit you reviewed), a `summary`, and `findings`, each with its severity, file, line, summary and fix (an empty list for a clean review), with the `checks` you ran and, in a re-review, `addressed`. The main agent reads your report, not your last message, and your turn ends when you call it.')
+  assert.equal(reportSteerText('reviewer', 1, 2), 'Finish by calling `report`: your `verdict` (`approved` or `changes_requested`), `head` (the full sha of the commit you reviewed, when the work is in a git repository), a `summary`, and `findings`, each with its severity, file, line, summary and fix (an empty list for a clean review), with the `checks` you ran and, in a re-review, `addressed`. The main agent reads your report, not your last message, and your turn ends when you call it.')
   assert.equal(reportSteerText('coder', 1, 1), `${reportSteerText('coder', 1, 2)} If you end your turn without it, the main agent gets your work without a report.`)
   assert.equal(reportSteerSummary(2, 2), 'Asked to finish with report (2 of 2)')
   assert.ok(reportSteerSummary(999_999, 999_999).length <= 120)

@@ -179,7 +179,8 @@ test('open: the worktree made with the chat\'s cwd and the call\'s signal; the r
   assert.deepEqual(answer.text.split('\n'), [
     `Opened run \`${ID}\` (${PROJECT}): ${GOAL} for SSO`,
     `Its worktree is ${path}, on branch dish/fix-login, cut from origin/main (${shortSha(BASE)}).`,
-    `This chat drives it. Worktrees you make in ${PROJECT} while you drive it are its tasks; bind a coder to the run's own worktree with delegate's \`worktree\`: ${PROJECT}/fix-login. \`open_pr\` ends the run.`,
+    `This chat drives it. Worktrees you make in ${PROJECT} while you drive it are its tasks. Bind coders to it (delegate's \`worktree\`: ${PROJECT}/fix-login), `
+      + 'or to task worktrees made with `worktree` (base `dish/fix-login`). `open_pr` ends the run.',
     'The project has no setup.',
   ])
   assert.equal((await w.runs.driving(SESSION))?.id, ID)

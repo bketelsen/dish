@@ -140,7 +140,7 @@ test('pr_feedback: the text, part by part', async () => {
   assert.equal(value.text, [
     leadLine(7, PR.url),
     'State: open, draft; mergeable: no (conflicts) (dirty). Head bbbbbbb on dish/fix-login, base main.',
-    'Reviews (4; more on GitHub):',
+    'Reviews (4; older ones on GitHub):',
     '- alice: changes requested at bbbbbbb',
     '  > Please handle the empty `next` parameter.',
     '- bob: approved',
@@ -176,12 +176,12 @@ test('pr_feedback: each state and mergeable form', () => {
   assert.equal(state({ draft: true, mergeable: false, mergeableState: 'dirty' }), 'State: open, draft; mergeable: no (conflicts) (dirty). Head bbbbbbb on dish/fix-login, base main.')
 })
 
-test('pr_feedback: empty parts, and "more on GitHub" for each full page', () => {
+test('pr_feedback: empty parts, "older ones on GitHub" for the reviews and comments (readPull gives the newest), and "more on GitHub" for the checks', () => {
   const text = feedbackText(pullFeedback(PROJECT, 7, { more: { reviews: true, reviewComments: true, issueComments: true, checks: true } }))
   assert.deepEqual(text.split('\n').slice(2), [
-    'Reviews (0; more on GitHub): none.',
-    'Review comments (0; more on GitHub): none.',
-    'Comments (0; more on GitHub): none.',
+    'Reviews (0; older ones on GitHub): none.',
+    'Review comments (0; older ones on GitHub): none.',
+    'Comments (0; older ones on GitHub): none.',
     'Checks on bbbbbbb (0; more on GitHub): none.',
   ])
 })

@@ -244,6 +244,57 @@ test('open_pr: a worktree that isn\'t clean (with why), and isClean rejecting', 
   assert.deepEqual(await written(w, run), [])
 })
 
+/** open_pr's line for untracked files, naming `names`. */
+function untrackedLine(names: string): string {
+  return `Untracked, not in the pull request: ${names}. If the project's gate writes them, have a coder add them to \`.gitignore\`; `
+    + 'if one should be in the pull request, have a coder commit it and call `open_pr` again.'
+}
+
+test('open_pr: a gate that leaves untracked files (a `go build` binary) doesn\'t loop: the PR opens, and the answer names them', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  // What git would say: the worktree is clean but for what the gate wrote, which `untracked: 'ignore'` names.
+  let built = false
+  w.workspaces.impl.isClean = async (_path, options) => {
+    if (options?.untracked !== 'ignore') return built ? { clean: false, why: '?? clippy' } : { clean: true }
+    return built ? { clean: true, untracked: ['clippy'] } : { clean: true }
+  }
+  const runAt = w.gates.impl.runAt
+  w.gates.impl.runAt = async (...args) => {
+    built = true
+    return runAt(...args)
+  }
+  const value = await call(tool)
+  assert.deepEqual(w.workspaces.calls.isClean, [[run.worktree, { untracked: 'ignore' }], [run.worktree, { untracked: 'ignore' }]])
+  assert.equal(w.workspaces.calls.pushBranch.length, 1)
+  assert.equal(value.number, 1)
+  const lines = value.text.split('\n')
+  assert.equal(lines.at(-1), untrackedLine('clippy'))
+  assert.equal(lines.filter(text => text.startsWith('Untracked')).length, 1)
+  assert.deepEqual(await written(w, run), ['pr.checked', 'pr.opened', 'run.closed'])
+})
+
+test('open_pr: untracked files before the gate are named in a refusal too; none, no line', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  w.workspaces.impl.isClean = async () => ({ clean: true, untracked: ['coverage.out', 'reports/', 'and 3 more'] })
+  w.gates.impl.runAt = async () => gate({})
+  const message = await refused(call(tool), '- the gate failed with exit 1')
+  assert.equal(message.split('\n').at(-1), untrackedLine('coverage.out, reports/, and 3 more'))
+  nothingWritten(w)
+  // A tracked change after the gate still refuses as before, naming the untracked files the first check saw.
+  let cleans = 0
+  w.workspaces.impl.isClean = async () => (cleans++ === 0 ? { clean: true, untracked: ['clippy'] } : { clean: false, why: 'src/a.ts changed' })
+  w.gates.impl.runAt = async () => gate({ outcome: 'passed', exitCode: 0 })
+  const changed = await refused(call(tool), 'the run\'s worktree changed while the gate ran (new uncommitted changes: src/a.ts changed): call open_pr again. Nothing was pushed.')
+  assert.equal(changed.split('\n').at(-1), untrackedLine('clippy'))
+  nothingWritten(w)
+  // Nothing untracked: no line, either way.
+  w.workspaces.impl.isClean = async () => ({ clean: true })
+  const plain = await call(tool)
+  assert.ok(!plain.text.includes('Untracked'), plain.text)
+})
+
 test('open_pr: a head that can\'t be read, undefined or a rejection', async () => {
   const { w, run, tool } = await setup()
   await verdict(w, run)
@@ -339,6 +390,23 @@ test('open_pr: no final review, one that requested changes, a stale approval, an
   assert.deepEqual((checked[3]!.final as { child: string }).child, 'rev-3')
 })
 
+test('open_pr: a latest final review that gave no head refuses it, saying so; a reviewRuling opens past it', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run, { child: 'rev-1' })
+  // A newer final review without a head (its reviewer reported none): the approval of this head before it no longer counts.
+  await w.runs.harness(run, {
+    kind: 'review.verdict', session: SESSION, child: 'rev-2', task: run.slug, verdict: 'approved', final: true, findings: { blocking: 0, should_fix: 0, nit: 0 },
+  })
+  await refused(call(tool), '- no final review approved bbbbbbb: the latest final review (child rev-2) gave no head: the reviewer must report the full sha of the head it approved. '
+    + 'Delegate a fresh reviewer with `final: true`')
+  nothingWritten(w)
+  const [checked] = await entriesOf(w, run, 'pr.checked')
+  assert.equal(checked!.reviewOk, false)
+  assert.deepEqual(checked!.final, { child: 'rev-2', verdict: 'approved', at: (await entriesOf(w, run, 'review.verdict'))[1]!.at })
+  const value = await call(tool, { reviewRuling: RULING })
+  assert.match(value.text, /without an approved final review of it, on your ruling/)
+})
+
 test('open_pr: both checks failing give both lines, the gate\'s first', async () => {
   const { w, run, tool } = await setup()
   w.gates.impl.runAt = async () => gate({})
@@ -397,7 +465,8 @@ test('open_pr: all passing pushes the head, opens the pull request, and closes t
   assert.equal(value.text, [
     `Opened PR #1 for run \`${run.id}\`: ${url}`,
     'Pushed dish/fix-login at bbbbbbb: the gate passed on it; the final review approved it.',
-    `Run \`${run.id}\` is closed. Humans merge; dish removes the run's worktrees once the PR is merged. Review feedback: \`run\` \`resume\` reopens it.`,
+    `Run \`${run.id}\` is closed. Humans merge; dish removes the run's own worktree once the PR is merged, and task worktrees are removed with \`worktree\` \`remove\`. `
+      + 'Review feedback: `run` `resume` reopens it.',
   ].join('\n'))
 
   assert.deepEqual(await written(w, run), ['pr.checked', 'pr.opened', 'run.closed'])
@@ -418,7 +487,7 @@ test('open_pr: all passing pushes the head, opens the pull request, and closes t
   await assert.rejects(call(tool), (error: Error) => error.message === NO_RUN)
 })
 
-test('open_pr: a final reviewer\'s re-review with `to` counts; so does an approval of a 7-character prefix', async () => {
+test('open_pr: a final reviewer\'s re-review with `to` counts; an approval of a 7-character prefix doesn\'t (full shas only)', async () => {
   const { w, run, tool } = await setup()
   await verdict(w, run, { child: 'rev-1', head: SHA_A })
   await verdict(w, run, { child: 'rev-1', head: HEAD })
@@ -426,6 +495,10 @@ test('open_pr: a final reviewer\'s re-review with `to` counts; so does an approv
 
   const other = await setup()
   await verdict(other.w, other.run, { head: HEAD.slice(0, 7) })
+  await refused(call(other.tool), '- no final review approved bbbbbbb: the latest final review (child rev-1) approved bbbbbbb, not this head.')
+  nothingWritten(other.w)
+  // Its uppercase full sha does count.
+  await verdict(other.w, other.run, { head: HEAD.toUpperCase() })
   assert.equal((await call(other.tool)).number, 1)
 })
 

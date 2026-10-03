@@ -152,11 +152,25 @@ export interface PullFeedback {
    * Checks or Commit statuses read, or GitHub failed ("could not read the checks: …", masked and cut).
    */
   checksUnavailable?: string
-  /** Which lists filled a page of 100 (GitHub may have more). */
+  /**
+   * Which lists GitHub has more of: the reviews and the comments are each the newest 100 (GitHub's last pages), so for them
+   * older ones weren't read; the checks are the first 100, so for them a page was full.
+   */
   more: { reviews: boolean, reviewComments: boolean, issueComments: boolean, checks: boolean }
 }
 
 export type { BranchComparison }
+
+/** How many untracked paths `isClean` names, with `{ untracked: 'ignore' }`, before `and <n> more`. */
+export const UNTRACKED_NAMED = 20
+
+/** `isClean`'s options: `untracked: 'ignore'` lets a worktree with only untracked files be clean (and names them). */
+export interface CleanOptions {
+  untracked?: 'ignore'
+}
+
+/** What `isClean` gives. `untracked` only with `{ untracked: 'ignore' }`, and only when there are untracked files. */
+export type Cleanliness = { clean: true, untracked?: string[] } | { clean: false, why: string }
 
 export interface DishWorkspaces {
   /** Onboarding's steps 1 to 5 (onboard.ts), under the project's lock. */
@@ -196,8 +210,13 @@ export interface DishWorkspaces {
   /**
    * Whether the worktree has nothing a commit would lose, on its own branch: nothing uncommitted or untracked, `dish/<slug>`
    * checked out, no nested worktree or repository. Rejects when resolve gives none, or git can't say. No lock.
+   *
+   * With `{ untracked: 'ignore' }` (open_pr's, since a gate may leave output git doesn't ignore), untracked files don't
+   * count: a worktree whose only change is untracked files is `{ clean: true, untracked }`, their paths relative, masked,
+   * at most `UNTRACKED_NAMED` and then `and <n> more`. A tracked change, staged or not, another branch, and a nested
+   * worktree or repository (one in an untracked folder too) are still `{ clean: false, why }`.
    */
-  isClean(pathOrRef: string): Promise<{ clean: true } | { clean: false, why: string }>
+  isClean(pathOrRef: string, options?: CleanOptions): Promise<Cleanliness>
   /**
    * Push dish/<slug> of a worktree dish made, at `head` only, to the project's HTTPS URL, with a write token minted for
    * this call, from an isolated repository, never forced. Under the project's lock. Rejects with GitHub's reason, masked.
@@ -214,7 +233,10 @@ export interface DishWorkspaces {
    * the project's lock. Read-only on the worktree.
    */
   compareBranch(project: string, slug: string): Promise<BranchComparison>
-  /** Pull request `number`'s feedback, read with the in-memory API token. Untrusted: masked and capped here. No lock. */
+  /**
+   * Pull request `number`'s feedback, read with the in-memory API token: its newest 100 reviews, review comments and
+   * comments (GitHub's last pages), and the first 100 checks of each source. Untrusted: masked and capped here. No lock.
+   */
   readPull(project: string, number: number): Promise<PullFeedback>
 }
 
@@ -867,11 +889,16 @@ class Service implements WorkspacesService {
     return this.#worktrees.head(worktree.clone, worktree.path)
   }
 
-  async isClean(pathOrRef: string): Promise<{ clean: true } | { clean: false, why: string }> {
+  async isClean(pathOrRef: string, options?: CleanOptions): Promise<Cleanliness> {
     const worktree = await this.resolve(pathOrRef)
     if (worktree === undefined) throw new Error(`no worktree ${shown(String(pathOrRef), 200)} that dish made`)
-    const why = await this.#worktrees.dirty(worktree.clone, worktree.path, worktree.branch)
-    return why === undefined ? { clean: true } : { clean: false, why }
+    const untracked = options?.untracked === 'ignore' ? [] as string[] : undefined
+    const why = await this.#worktrees.dirty(worktree.clone, worktree.path, worktree.branch, untracked === undefined ? undefined : { untracked })
+    if (why !== undefined) return { clean: false, why }
+    if (untracked === undefined || untracked.length === 0) return { clean: true }
+    const named = untracked.slice(0, UNTRACKED_NAMED).map(path => shown(path, 200))
+    if (untracked.length > UNTRACKED_NAMED) named.push(`and ${untracked.length - UNTRACKED_NAMED} more`)
+    return { clean: true, untracked: named }
   }
 
   async pushBranch(name: string, slug: string, options: { head: string, signal?: AbortSignal }): Promise<{ head: string }> {

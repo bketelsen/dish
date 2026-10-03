@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { appendFileSync } from 'node:fs'
-import { chmod, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { projectStateDir, tokensDir } from '../src/paths.ts'
@@ -180,6 +180,89 @@ test('isClean: clean; a modified or untracked file is not, with why; another bra
     await run.git(['switch', '-q', 'dish/fix-1'], path)
     assert.deepEqual(await run.service.isClean('acme/widget/fix-1'), { clean: true })
     await assert.rejects(run.service.isClean('acme/widget/nothing'), /^Error: no worktree acme\/widget\/nothing that dish made$/)
+  } finally {
+    await teardown(run)
+  }
+})
+
+test("isClean with untracked: 'ignore': untracked files (a gate's output) are clean and named; a tracked change, a staged file, another branch, a nested repository or worktree are not", async () => {
+  const run = await setup()
+  const path = run.worktree.path
+  const ignore = { untracked: 'ignore' } as const
+  try {
+    assert.deepEqual(await run.service.isClean('acme/widget/fix-1', ignore), { clean: true })
+    // What a gate leaves: a binary (`go build`), a coverage file, a folder of reports. git lists the folder once.
+    await writeFile(join(path, 'clippy'), 'binary\n')
+    await writeFile(join(path, 'coverage.out'), 'mode: set\n')
+    await mkdir(join(path, 'reports', 'junit'), { recursive: true })
+    await writeFile(join(path, 'reports', 'junit', 'a.xml'), '<x/>\n')
+    assert.deepEqual(await run.service.isClean('acme/widget/fix-1', ignore), { clean: true, untracked: ['clippy', 'coverage.out', 'reports/'] })
+    assert.deepEqual(await run.service.isClean(path, ignore), { clean: true, untracked: ['clippy', 'coverage.out', 'reports/'] })
+    // Without the option, as before.
+    const strict = await run.service.isClean('acme/widget/fix-1')
+    assert.equal(strict.clean, false)
+    assert.match((strict as { why: string }).why, /clippy/)
+
+    // A tracked change still isn't clean, untracked files or not; nor is a staged new file.
+    await writeFile(join(path, 'README.md'), 'changed\n')
+    const modified = await run.service.isClean(path, ignore)
+    assert.equal(modified.clean, false)
+    assert.match((modified as { why: string }).why, /README\.md/)
+    await run.git(['checkout', '--', 'README.md'], path)
+    await run.git(['add', 'coverage.out'], path)
+    const staged = await run.service.isClean(path, ignore)
+    assert.equal(staged.clean, false)
+    assert.match((staged as { why: string }).why, /coverage\.out/)
+    await run.git(['rm', '-q', '--cached', 'coverage.out'], path)
+    // A rename staged in the index (its source path follows it in git's output) is a tracked change too.
+    await run.git(['mv', 'README.md', 'READ.md'], path)
+    const renamed = await run.service.isClean(path, ignore)
+    assert.equal(renamed.clean, false)
+    assert.match((renamed as { why: string }).why, /READ\.md/)
+    await run.git(['mv', 'READ.md', 'README.md'], path)
+    assert.deepEqual(await run.service.isClean(path, ignore), { clean: true, untracked: ['clippy', 'coverage.out', 'reports/'] })
+
+    // Another branch checked out.
+    await run.git(['switch', '-q', '-c', 'other'], path)
+    assert.deepEqual(await run.service.isClean(path, ignore), { clean: false, why: 'other, not dish/fix-1, is checked out' })
+    await run.git(['switch', '-q', 'dish/fix-1'], path)
+
+    // A nested repository: at the top of an untracked folder, and deeper inside one (git lists only the folder).
+    await run.git(['init', '-q', join(path, 'vendor')])
+    assert.deepEqual(await run.service.isClean(path, ignore), { clean: false, why: 'it has a nested repository (vendor/)' })
+    await rm(join(path, 'vendor'), { recursive: true })
+    await run.git(['init', '-q', join(path, 'reports', 'deep', 'lib')])
+    assert.deepEqual(await run.service.isClean(path, ignore), { clean: false, why: 'it has a nested repository (reports/deep/lib/)' })
+    await rm(join(path, 'reports', 'deep'), { recursive: true })
+    // Another worktree inside it.
+    const inner = join(path, '.worktrees', 'inner')
+    await run.git(['worktree', 'add', '-q', '-b', 'inner', inner])
+    const nested = await run.service.isClean(path, ignore)
+    assert.equal(nested.clean, false)
+    assert.match((nested as { why: string }).why, /another worktree/)
+    await run.git(['worktree', 'remove', '--force', inner])
+    assert.deepEqual(await run.service.isClean(path, ignore), { clean: true, untracked: ['clippy', 'coverage.out', 'reports/'] })
+    await assert.rejects(run.service.isClean('acme/widget/nothing', ignore), /^Error: no worktree acme\/widget\/nothing that dish made$/)
+  } finally {
+    await teardown(run)
+  }
+})
+
+test("isClean with untracked: 'ignore': the names are masked, without control characters, and at most 20, then how many more", async () => {
+  const run = await setup()
+  const path = run.worktree.path
+  try {
+    await writeFile(join(path, `out-${LEAK}.log`), 'x\n')
+    await writeFile(join(path, 'line\nbreak.txt'), 'x\n')
+    for (let n = 10; n < 40; n += 1) await writeFile(join(path, `z${n}.tmp`), 'x\n')
+    const clean = await run.service.isClean(path, { untracked: 'ignore' })
+    assert.equal(clean.clean, true)
+    const names = (clean as { untracked: string[] }).untracked
+    assert.equal(names.length, 21)
+    assert.equal(names[0], 'line break.txt')
+    assert.ok(names[1]!.startsWith('out-') && !names[1]!.includes(LEAK), names[1])
+    assert.deepEqual(names.slice(2, 20), Array.from({ length: 18 }, (_, n) => `z${n + 10}.tmp`))
+    assert.equal(names[20], 'and 12 more')
   } finally {
     await teardown(run)
   }
@@ -949,6 +1032,34 @@ test('readPull: with 100 review comments, more.reviewComments is true', async ()
     const feedback = await run.service.readPull('acme/widget', 1)
     assert.equal(feedback.reviewComments.length, 100)
     assert.deepEqual(feedback.more, { reviews: false, reviewComments: true, issueComments: false, checks: false })
+  } finally {
+    await teardown(run)
+  }
+})
+
+test('readPull on a busy pull request: the newest 100 of each list, the comment just left among them, and more saying older ones weren\'t read', async () => {
+  const run = await setup()
+  try {
+    await run.service.openPull('acme/widget', { head: 'dish/fix-1', title: 'Fix', body: '' })
+    Object.assign(run.world.github.pullRequests[0]!, { headSha: HEAD_SHA })
+    const at = (index: number): string => new Date(Date.UTC(2026, 9, 1) + index * 60_000).toISOString()
+    run.world.github.feedback('acme/widget', 1, {
+      issueComments: Array.from({ length: 130 }, (_, index) => ({ user: { login: 'ann' }, body: `comment ${index}`, created_at: at(index) })),
+      reviews: Array.from({ length: 130 }, (_, index) => ({ user: { login: 'bob' }, state: 'COMMENTED', body: `review ${index}`, submitted_at: at(index) })),
+      reviewComments: Array.from({ length: 130 }, (_, index) => ({ path: 'a.ts', line: index + 1, user: { login: 'cy' }, body: `note ${index}`, created_at: at(index) })),
+    })
+    // The comment just left, the newest, holds a token: masked as before.
+    run.world.github.feedback('acme/widget', 1, { issueComments: [{ user: { login: 'dee' }, body: `Please fix ${LEAK}\x00 now`, created_at: at(130) }] })
+    const feedback = await run.service.readPull('acme/widget', 1)
+    assert.equal(feedback.issueComments.length, 100)
+    assert.equal(feedback.issueComments[0]!.body, 'comment 31')
+    assert.equal(feedback.issueComments.at(-1)!.author, 'dee')
+    assert.ok(feedback.issueComments.at(-1)!.body.startsWith('Please fix ') && !feedback.issueComments.at(-1)!.body.includes(LEAK), feedback.issueComments.at(-1)!.body)
+    assert.ok(!feedback.issueComments.at(-1)!.body.includes('\x00'))
+    assert.deepEqual([feedback.reviews.length, feedback.reviews[0]!.body, feedback.reviews.at(-1)!.body], [100, 'review 30', 'review 129'])
+    assert.deepEqual([feedback.reviewComments.length, feedback.reviewComments[0]!.body, feedback.reviewComments.at(-1)!.body], [100, 'note 30', 'note 129'])
+    assert.deepEqual(feedback.more, { reviews: true, reviewComments: true, issueComments: true, checks: false })
+    assert.ok(run.world.github.requests.every(request => !request.path.includes('/repositories/')), 'only the page number of a Link is used')
   } finally {
     await teardown(run)
   }

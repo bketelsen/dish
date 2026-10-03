@@ -1,5 +1,5 @@
 /**
- * One lock per key: dish-workspaces' `KeyedLock` (workspaces locks.ts:8–37), copied (orchestrator imports no runtime code
+ * One lock per key: dish-workspaces' `KeyedLock`, copied (orchestrator imports no runtime code
  * from another dish plugin). orchestrator keeps two: one keyed by a session's id, one by a run's ref. A session's lock is
  * always taken before a run's, never the other way round, and neither is ever taken by a `dishRuns` hook that another
  * plugin calls under a lock of its own.

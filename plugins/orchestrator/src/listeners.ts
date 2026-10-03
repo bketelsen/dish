@@ -25,6 +25,7 @@ import type { ChildEnded, ChildStarted, GateResultEntry, LedgerCoderReport, Ledg
 import { describe } from './runs.ts'
 import type { ChildTags, Runs } from './runs.ts'
 import type { Run } from './store.ts'
+import { isObject, isText } from './text.ts'
 
 /** `dish-crew/delegated`'s payload (Task 1). */
 export interface Delegated {
@@ -45,8 +46,8 @@ export interface GateFinished {
   result: GateResult
 }
 
-// What the ledger keeps must be what crew and dish-gates give: these fail to compile if either side drifts (judge's
-// Same/Check, remote.ts:57–72).
+// What the ledger keeps must be what crew and dish-gates give: these fail to compile if either side drifts (dish-judge's
+// `Same` and `Check`, in its remote module).
 type Same<A, B> = [A] extends [B] ? [B] extends [A] ? SameKeys<A, B> : false : false
 /** Mutual assignability lets a field that is optional on one side only through: the keys of two objects must be the same too. */
 type SameKeys<A, B> = [A] extends [object] ? [B] extends [object] ? ([keyof A] extends [keyof B] ? [keyof B] extends [keyof A] ? true : false : false) : true : true
@@ -62,14 +63,6 @@ export type EventsMatchProducers = [
   Check<Same<Settled, CrewSettled>>,
   Check<Same<GateFinished, GateResultEvent>>,
 ]
-
-function isText(value: unknown): value is string {
-  return typeof value === 'string' && value !== ''
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
 
 /** The child's task, when it has one. */
 function taskOf(child: ChildRecord): string | undefined {
@@ -107,7 +100,7 @@ export function endedEntries(run: Run, e: Settled, head: string | null, at: numb
   }
   return [ended, {
     at, run: run.id, kind: 'review.verdict', by: 'harness', session: e.sessionId, child: child.id, ...task === undefined ? {} : { task },
-    verdict: report.verdict, head: report.head, final: child.final === true, findings,
+    verdict: report.verdict, ...report.head === undefined ? {} : { head: report.head }, final: child.final === true, findings,
   }]
 }
 

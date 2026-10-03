@@ -2610,7 +2610,7 @@ const UNPLACED = '`final` had no effect: dish couldn\'t place this reviewer in a
 /** The ladder's refusal of more coder work on task `task` at `round`, as the plan words it. */
 function ladderRefusal(round: number, task = 'fix-1'): string {
   return `round ${round} of task \`${task}\`: the escalation ladder ends at round 4, so delegate won't send more coder work on this task without your ruling. `
-    + 'Rule with `ruling: "Ruling: what — why — cost if wrong"` (it is recorded), or stop the run with `run` (action `abandon`, and a reason).'
+    + 'Rule with `ruling: "Ruling: what — why — cost if wrong"` (it is recorded), or stop and tell the user (`run` action `abandon`, with a reason, only if they drop the change).'
 }
 
 /** A world with dish-orchestrator's stub and worktree fix-1, which `place` puts in run RUN as task fix-1 at `round.current`. */

@@ -148,7 +148,7 @@ function item(lines: string[], outdated?: boolean): Item {
 /** A section: its heading (from what it has), its items in GitHub's order (oldest first), and how many the cap took out. */
 interface Section {
   heading: (count: string) => string
-  /** How many GitHub gave, and whether a page was full. */
+  /** How many GitHub gave, and whether it has older ones (readPull reads the newest 100). */
   total: number
   more: boolean
   items: Item[]
@@ -156,7 +156,7 @@ interface Section {
 }
 
 function headingOf(section: Section): string {
-  const count = `${section.total}${section.more ? '; more on GitHub' : ''}`
+  const count = `${section.total}${section.more ? '; older ones on GitHub' : ''}`
   return section.total === 0 ? `${section.heading(count)}: none.` : `${section.heading(count)}:`
 }
 
