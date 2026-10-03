@@ -7,6 +7,7 @@
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./control": "./src/control.ts",
     "./delegate": "./src/delegate.ts"
   },
   "files": [

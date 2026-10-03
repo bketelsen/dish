@@ -89,7 +89,7 @@ import { createHash } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
-import { isTopLevelAgent, leftOut, maskSecrets } from 'dish-kit'
+import { isTopLevelAgent, leftOut, maskSecrets, RETURN_NOTE_LEAD } from 'dish-kit'
 import type { Decision, Judge, JudgeAgent, JudgeResult, JsonValue, Question } from './client.ts'
 import { ASK_JUDGE_TOOL } from './ask.ts'
 import { DEFAULT_SETTINGS } from './settings.ts'
@@ -574,9 +574,31 @@ function topLevelTask(events: Iterable<unknown>): string {
 }
 
 /**
- * A child's task: its brief, and the latest instruction after it, each clipped. The brief is the first text block with
- * something in it of its first prompt (`source.kind === 'user'`): crew's closing note and dsh's return note are the blocks
- * after it. An instruction is a later prompt a person typed into the child (`source.kind === 'user'` with a string `rpcId`,
+ * How crew's closing note began before it gave the parent's id (until 2026-10-03), in a session started then: it came before
+ * dsh's return note, and is no more the task than that is.
+ */
+const OLD_CLOSING_NOTE_LEAD = 'Your closing message is your report'
+
+/**
+ * A child's brief, from the text blocks of its first prompt: those before the first note about how to report, joined. That
+ * note begins as dsh's return guidance does (`RETURN_NOTE_LEAD`), and so does crew's closing note, which takes its place on
+ * the dish preset; an older crew note begins otherwise (`OLD_CLOSING_NOTE_LEAD`). So a bound coder's worktree block, and a
+ * reviewer's ruling block, are part of the brief: where to work, and the gate dish runs there, are its task too.
+ * `undefined` when nothing is left.
+ */
+function briefOf(texts: readonly string[]): string | undefined {
+  const parts: string[] = []
+  for (const text of texts) {
+    const trimmed = text.trim()
+    if (trimmed.startsWith(RETURN_NOTE_LEAD) || trimmed.startsWith(OLD_CLOSING_NOTE_LEAD)) break
+    if (trimmed !== '') parts.push(trimmed)
+  }
+  return parts.length === 0 ? undefined : parts.join(SEPARATOR)
+}
+
+/**
+ * A child's task: its brief, and the latest instruction after it, each clipped. The brief is the text of its first prompt
+ * (`source.kind === 'user'`) up to the note about how to report (`briefOf`): its task, and a bound coder's worktree block. An instruction is a later prompt a person typed into the child (`source.kind === 'user'` with a string `rpcId`,
  * which dsh's `subagent.prompt` gives it, and dsh's auto-review reads as a human instruction), or a message from its parent
  * (`agent-message` whose `senderSessionId` is `parent`), without dsh's leading block. With no `parent`, no `agent-message`
  * counts; nothing else ever does.
@@ -589,7 +611,7 @@ function childTask(events: Iterable<unknown>, parent: string | undefined): strin
     if (message === undefined) continue
     const { source, texts } = message
     if (brief === undefined) {
-      if (source.kind === 'user') brief = texts.map(text => text.trim()).find(text => text !== '')
+      if (source.kind === 'user') brief = briefOf(texts)
       continue
     }
     if (source.kind === 'user' && typeof source.rpcId === 'string') {
@@ -783,15 +805,18 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     const shell = SHELLS.has(exec.name)
     const args = exec.arguments
     const command = commandOf(exec.name, args)
-    const escalation = shell ? escalationOf(args) : undefined
-    // The escalation dsh's tool will ask for: none for the mode the session already has.
-    const named = shell ? escalationAskedOf(args) : undefined
+    const permissions = shell && isRecord(args) ? given(args.sandbox_permissions) : undefined
     let mode: string | undefined
     try {
-      if (named !== undefined) mode = deps.sandboxMode?.(agent)
+      if (permissions !== undefined) mode = deps.sandboxMode?.(agent)
     } catch {
-      // Not known: the escalation is taken to be asked for.
+      // Not known: the escalation is taken to be asked for, and shown.
     }
+    // `sandbox_permissions` naming the mode the session already has is no escalation: dsh's tool runs the command as it is
+    // (`dsh-tool-bash`), so the judge isn't shown one, and is asked the plain question. A GPT reviewer sent it on 9 calls.
+    const escalation = shell && permissions !== mode ? escalationOf(args) : undefined
+    // The escalation dsh's tool will ask for: none for the mode the session already has.
+    const named = shell ? escalationAskedOf(args) : undefined
     const asked = named !== undefined && named.mode !== mode ? named : undefined
     const escalationReason = asked === undefined ? undefined : escalationReasonOf(asked)
     const sessionCwd = given(agent.session?.header?.cwd)

@@ -8,7 +8,7 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import { ToolRuntime, assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ContinuableStartSpec } from '@deepseek-ai/dsh-subagent'
-import { maskSecrets } from 'dish-kit'
+import { maskSecrets, RETURN_NOTE_LEAD } from 'dish-kit'
 import * as promptsPlugin from 'dish-prompts'
 import * as row from '../src/delegate.ts'
 import { CrewRecords, isRunning } from '../src/record.ts'
@@ -57,6 +57,8 @@ interface Options {
   globalTools?: string[]
   /** Standard tools the preset leaves out. */
   withoutTools?: string[]
+  /** The preset's `send_message` is dsh's own, marked one (a preset that still loads `tool-subagent-control`). */
+  dshSendMessage?: boolean
   /** Whether dish-workspaces' service is there (a stub that resolves what `makeWorktree` made). */
   workspaces?: boolean
   /** Whether dish-gates' service is there (a stub whose `gateFor` gives what `World.gates` has for a project). */
@@ -155,7 +157,13 @@ async function world(options: Options = {}): Promise<World> {
   const presetKey = {}
   const preset = createScope(owner, presetKey)
   disposables.push(preset)
-  for (const name of PRESET_TOOLS) if (!options.withoutTools?.includes(name)) preset.ctx.tools.register(stubTool(name))
+  for (const name of PRESET_TOOLS) {
+    if (options.withoutTools?.includes(name)) continue
+    const tool = stubTool(name)
+    // dsh's mark, as `markAdjacentAgentSendMessageTool` sets it on its own send_message.
+    if (name === 'send_message' && options.dshSendMessage === true) Object.assign(tool, { [Symbol.for('dsh.subagent.adjacentAgentSendMessageTool')]: true })
+    preset.ctx.tools.register(tool)
+  }
 
   const settings = { current: options.settings ?? DEFAULT_SETTINGS }
   const mainModel = { current: 'claude-opus-5.5' as string | undefined }
@@ -540,11 +548,25 @@ test('a start gives startContinuable everything, and records the child before it
   assert.deepEqual({ ...recorded, startedAt: 0 }, { id: String(spec.childId), n: 1, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', startedAt: 0, followUps: 0, runs: [], last: 'running' })
 })
 
-// dsh appends its own note to the prompt of a child that has `send_message`: "send your result to that agent with send_message".
-// The note below goes before it, in a block of its own, and only when the child has the tool, as dsh's does.
-const CLOSING_NOTE = 'Your closing message is your report: when you finish, the main agent receives it in full, automatically. '
-  + 'So don\'t send your result with send_message, not even a summary or part of it, even though the note after this one says to. '
-  + 'Use send_message only for a short question you\'re blocked on while you work.'
+// The note a child that has `send_message` gets after its task: its parent's id, and that its closing message is its report. It
+// begins as dsh's own return note does, where dish-judge ends the brief. With dsh's marked send_message (a preset that still
+// loads dsh's row), dsh appends its note after this one, and this one says so.
+const closing = (marked: boolean): string => `Your parent agent id is "${SESSION}". `
+  + 'Your closing message is your report: when you finish, the main agent receives it in full, automatically. '
+  + `So don't send your result with send_message, not even a summary or part of it${marked ? ', even though the note after this one says to' : ''}. `
+  + `Use send_message({ agent_id: "${SESSION}", message: "…" }) only for a short question you're blocked on while you work.`
+const CLOSING_NOTE = closing(false)
+
+test('the closing note gives the parent\'s id, begins as dsh\'s note does, and names dsh\'s note only when dsh will add one', async () => {
+  const w = await world()
+  await w.delegate(CODER)
+  const note = w.starts[0]!.request.prompt.at(-1)!
+  assert.ok(note.type === 'text' && note.text.startsWith(RETURN_NOTE_LEAD), 'dish-judge ends the brief at it')
+  assert.deepEqual(note, { type: 'text', text: closing(false) + BLOCK_END })
+  const marked = await world({ dshSendMessage: true })
+  await marked.delegate(CODER)
+  assert.deepEqual(marked.starts[0]!.request.prompt.at(-1), { type: 'text', text: closing(true) + BLOCK_END })
+})
 
 test('a child that has send_message is told, after its task, that its closing message is its report; one that has not, is not', async () => {
   const w = await world()

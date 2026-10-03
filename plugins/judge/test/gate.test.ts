@@ -711,12 +711,24 @@ test('a command is sent to the judge whole, however long: cutting it would hide 
 
 // --- the task ---------------------------------------------------------------------------------------
 
-/** crew's closing note and dsh's return note, as they follow a crew child's brief in its first message. */
+/**
+ * crew's closing note before 2026-10-03, and dsh's return note, as they followed a crew child's brief in its first message
+ * (a session started then).
+ */
 const CREW_NOTE = 'Your closing message is your report: when you finish, the main agent receives it in full, automatically. '
   + 'So don\'t send your result with send_message, not even a summary or part of it, even though the note after this one says to. '
   + 'Use send_message only for a short question you\'re blocked on while you work.'
 const DSH_NOTE = 'Your parent agent id is "main-1". Before you finish, send your result to that agent with send_message({ agent_id: "main-1", '
   + 'message: "<self-contained result>" }). The parent shares your workspace but does not automatically receive your transcript, tool output, or reasoning.'
+
+/** crew's closing note since 2026-10-03: on the dish preset dsh adds none, and this one begins as dsh's did. */
+const CLOSING_NOTE_NOW = 'Your parent agent id is "main-1". Your closing message is your report: when you finish, the main agent receives it in full, '
+  + 'automatically. So don\'t send your result with send_message, not even a summary or part of it. '
+  + 'Use send_message({ agent_id: "main-1", message: "…" }) only for a short question you\'re blocked on while you work.'
+/** A bound coder's worktree block, with the gate sentence (crew's `worktreeBrief`). */
+const WORKTREE_BLOCK = 'Your worktree is `/work/app/.worktrees/fix-1` on branch `dish/fix-1`. Work only there: use absolute paths, and '
+  + '`git -C /work/app/.worktrees/fix-1` or `cd /work/app/.worktrees/fix-1 &&` in commands. The main agent\'s own checkout is not yours to change. '
+  + 'When you finish, dish runs this project\'s gate (`pnpm test`) in your worktree, and a failure comes back to you.'
 
 /** Coder #1's brief in the session behind the friction spec: 5,853 characters, with the commit and report instructions at the end. */
 const LONG_BRIEF = (() => {
@@ -942,6 +954,22 @@ test('a child\'s brief is the first text block of its first prompt, clipped in t
   assert.doesNotMatch(task, /Your closing message is your report|Your parent agent id/)
   // A blank block before the task is passed over.
   assert.equal(taskOf(agentOf({ child: true, events: [userEvent(1, ['  ', ' the task ', DSH_NOTE])] }), false), 'the task')
+})
+
+test('a bound coder\'s brief takes in its worktree block, and a reviewer\'s its ruling, up to the note about how to report', () => {
+  const bound = (...blocks: string[]): string => taskOf(agentOf({ child: true, events: [userEvent(1, blocks)] }), false)
+  // As delegate sends it: each block ends with a blank line.
+  assert.equal(bound('Fix the parser.\n\n', `${WORKTREE_BLOCK}\n\n`, `${CLOSING_NOTE_NOW}\n\n`), `Fix the parser.\n\n${WORKTREE_BLOCK}`)
+  // On a preset that still loads dsh's send_message, dsh's note follows crew's; a session from before has the older note.
+  assert.equal(bound('Fix the parser.', WORKTREE_BLOCK, CLOSING_NOTE_NOW, DSH_NOTE), `Fix the parser.\n\n${WORKTREE_BLOCK}`)
+  assert.equal(bound('Fix the parser.', WORKTREE_BLOCK, CREW_NOTE, DSH_NOTE), `Fix the parser.\n\n${WORKTREE_BLOCK}`)
+  // A child without send_message gets no note: every block is its brief.
+  assert.equal(bound('Fix the parser.', WORKTREE_BLOCK), `Fix the parser.\n\n${WORKTREE_BLOCK}`)
+  const ruling = 'The harness\'s gate for the work you review (coder «fix parser», child c1) hasn\'t passed: it failed. '
+    + 'The main agent started this review anyway, with this ruling: the failure is in an untouched file.'
+  assert.equal(bound('Review the parser fix.', ruling, CLOSING_NOTE_NOW), `Review the parser fix.\n\n${ruling}`)
+  // A first prompt that is only the note has no brief: the next prompt is looked at, as for a blank one.
+  assert.equal(taskOf(agentOf({ child: true, events: [userEvent(1, [CLOSING_NOTE_NOW]), userEvent(2, 'the task')] }), false), 'the task')
 })
 
 test('a child\'s task is its brief and the latest instruction after it: a fix round from its parent, without dsh\'s leading line', () => {
@@ -1537,6 +1565,29 @@ test('through the registry: another agent\'s call with the same id, which settle
 })
 
 // --- F3: the escalation is in the effect question -------------------------------------------------------
+
+test('sandbox_permissions naming the session\'s own mode is no escalation to the judge: none in the state, the plain question', async () => {
+  const { gate, judge, cache } = gateOf(() => answers(REVERSIBLE, 0.9), { sandboxMode: () => 'workspace-write' })
+  // The GPT reviewer's habit: its own mode, with or without a justification. dsh's bash runs the command as it is.
+  const same = await run(gate, { args: { command: 'npm test', description: 'x', sandbox_permissions: 'workspace-write', justification: 'writes files' } })
+  await run(gate, { args: { command: 'npm run build', description: 'x', sandbox_permissions: 'workspace-write' } })
+  for (const request of judge.requests) {
+    assert.equal('escalation' in (stateOf(request) as object), false)
+    assert.equal(request.questions.effect, EFFECT_QUESTION)
+  }
+  assert.deepEqual(same.decision, ALLOW)
+  assert.equal(verdictFor(cache, same.exec)?.escalationCovered, false, 'there is no escalation to cover')
+  // A wider mode is still shown, and asked about.
+  await run(gate, { args: { command: 'npm install', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'the network' } })
+  assert.equal(stateOf(judge.requests[2]!).escalation, 'sandbox_permissions: danger-full-access; justification: the network')
+  assert.equal(judge.requests[2]!.questions.effect, EFFECT_WITH_ESCALATION_QUESTION)
+  // When the session's mode can't be read, any mode is taken to be an escalation, as before.
+  for (const sandboxMode of [undefined, () => undefined, () => { throw new Error('no policy') }]) {
+    const unknown = gateOf(() => answers(REVERSIBLE, 0.9), { sandboxMode })
+    await run(unknown.gate, { args: { command: 'npm test', description: 'x', sandbox_permissions: 'workspace-write' } })
+    assert.equal(stateOf(unknown.judge.requests[0]!).escalation, 'sandbox_permissions: workspace-write')
+  }
+})
 
 test('a call with an escalation is asked an effect question that names it, with the same options; one without is asked the spec\'s', async () => {
   assert.equal(
