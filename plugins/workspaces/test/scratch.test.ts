@@ -328,7 +328,8 @@ test('a record that cannot be written is "failed"; the registration is kept and 
     try {
       assert.equal(await s.run(registry), 'failed')
       assert.equal(s.warnings.length, 1)
-      assert.match(s.warnings[0]!, /\.tmp/, 'the error names the temporary file, whose name is random')
+      // The error names the temporary file, whose name is random; under a long TMPDIR the cut may come before it.
+      assert.match(s.warnings[0]!, /could not set up the scratch workspace: EACCES/)
       assert.equal(registry.list().length, 1, 'registered, but not recorded')
       assert.equal(await exists(s.record), false)
     } finally {
@@ -355,6 +356,18 @@ test('a record write that fails the same way every time is logged once, whatever
       await chmod(directory, 0o700)
     }
   })
+})
+
+test('a failure whose message is cut inside the temporary file\'s name is still one line', async () => {
+  // Wherever the 200-character cut falls (a long TMPDIR moves it), the random part of the name doesn't make it a new error.
+  for (const pad of [170, 185, 190, 196]) {
+    const s = await setup()
+    const logged = new Set<string>()
+    let attempt = 0
+    const registry = failingRegistry(() => new Error(`EACCES: open '/${'d'.repeat(pad)}/.scratch.${(++attempt).toString(16)}${'b'.repeat(11)}.tmp'`))
+    for (let run = 0; run < 3; run++) assert.equal(await s.run(registry, logged), 'failed')
+    assert.equal(s.warnings.length, 1, `cut at ${pad}: ${s.warnings.join('\n')}`)
+  }
 })
 
 test('a record whose state is unreadable (its directory is a file) is "failed" before anything is registered', async () => {

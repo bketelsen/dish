@@ -283,7 +283,10 @@ test("include.path is refused by name, and the included file isn't read (--no-in
 
   const conditional = await dishClone()
   await appendFile(join(conditional.clone, '.git', 'config'), `[includeIf "gitdir:${conditional.clone}/"]\n\tpath = ${included}\n`)
-  assert.match(problemOf(await checkClone(conditional.clone, EXPECT)), /includeif\.gitdir:.*\.path/)
+  // The key is named: in full, or its first 200 characters when the clone's path is long (a long TMPDIR).
+  const problem = problemOf(await checkClone(conditional.clone, EXPECT))
+  const named = /^\.git\/config sets (includeif\.gitdir:.*), which dish doesn't allow$/.exec(problem)?.[1]
+  assert.ok(named !== undefined && `includeif.gitdir:${conditional.clone}/.path`.startsWith(named), problem)
 })
 
 test(".git must be a directory: a worktree's or a submodule's .git file, a symbolic link, or none, is refused", async () => {

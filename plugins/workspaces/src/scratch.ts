@@ -46,9 +46,11 @@ const TEMP_SUFFIX = /\.[0-9a-f]{12}\.tmp\b/g
 
 function logOnce(options: ScratchOptions, error: unknown): void {
   const text = error instanceof Error ? error.message : String(error)
-  const message = Array.from(maskSecrets(text.replace(/[\x00-\x1f\x7f]+/g, ' '))).slice(0, MAX_LOGGED_CHARS).join('')
-  // The same failure is the same line, whatever the temporary file was called this time.
-  const key = `${options.record}\n${message.replace(TEMP_SUFFIX, '')}`
+  const masked = maskSecrets(text.replace(/[\x00-\x1f\x7f]+/g, ' '))
+  const message = Array.from(masked).slice(0, MAX_LOGGED_CHARS).join('')
+  // The same failure is the same line, whatever the temporary file was called this time: its name is taken out before
+  // the cut, which may fall inside it (a long TMPDIR moves the cut).
+  const key = `${options.record}\n${Array.from(masked.replace(TEMP_SUFFIX, '')).slice(0, MAX_LOGGED_CHARS).join('')}`
   if (options.logged?.has(key)) return
   options.logged?.add(key)
   options.logger.warn('could not set up the scratch workspace: %s', message)

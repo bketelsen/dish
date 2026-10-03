@@ -489,7 +489,12 @@ test('remove: a worktree holding another worktree is refused, with and without f
   await f.git(['worktree', 'add', '-q', '-b', 'mine', inner])
   await writeFile(join(inner, 'work.txt'), 'uncommitted\n')
   await assert.rejects(remove(f, 'outer'), /another worktree/)
-  await assert.rejects(remove(f, 'outer', true), /another worktree .*remove it first \(`git worktree remove [^`]*\/\.worktrees\/inner`\), then try again/)
+  await assert.rejects(remove(f, 'outer', true), (error: Error) => {
+    // The command names the inner worktree: in full, or cut with "…" when the path is long (a long TMPDIR).
+    const named = /another worktree .*remove it first \(`git worktree remove ([^`]*)`\), then try again$/.exec(error.message)?.[1]
+    assert.ok(named !== undefined && (named === inner || (named.endsWith('…') && inner.startsWith(named.slice(0, -1)))), error.message)
+    return true
+  })
   assert.equal(await readFile(join(inner, 'work.txt'), 'utf8'), 'uncommitted\n')
   assert.ok(await hasBranch(f, 'dish/outer'))
   const [info] = (await f.call(() => f.worktrees().list(f.project))).filter(item => item.slug === 'outer')
