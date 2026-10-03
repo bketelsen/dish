@@ -311,7 +311,7 @@ const FINAL_NO_RUNS = '`final` had no effect: dish keeps no runs here (dish-orch
 /** The ladder's refusal of more coder work on `task` at `round` (from `LADDER_RULING_ROUND`). */
 function ladderRefusal(task: string, round: number): string {
   return `round ${round} of task \`${task}\`: the escalation ladder ends at round 4, so delegate won't send more coder work on this task without your ruling. `
-    + `Rule with \`ruling: "${RULING_FORM}"\` (it is recorded), or stop the run with \`run\` (action \`abandon\`, and a reason).`
+    + `Rule with \`ruling: "${RULING_FORM}"\` (it is recorded), or stop and tell the user (\`run\` action \`abandon\`, with a reason, only if they drop the change).`
 }
 
 /** `text` on one line: runs of whitespace, line breaks among them, folded into one space. */
