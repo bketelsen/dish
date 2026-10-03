@@ -13,6 +13,13 @@
  * leaves out (an MCP result's `structuredContent`, the HTML of a page, a key that is a sentence). A result with no text isn't sent
  * anywhere. If it is images or files, it is marked "Not screened: the judge reads text only"; if it is empty, it is left alone.
  *
+ * **A private key is cut out of what the judge reads** (dish-kit's `privateKeyCuts`), and the rest is screened: its header, its
+ * base64 lines, its last line and its END line become `[a private key, left out]`, and nothing written around it is cut, so a
+ * fake header (and END line) around a page's instructions can't keep them from the judge. The client refuses a request that
+ * holds a private key's mask, which would take in what is written around the key, so without the cut such a result was not
+ * screened at all. Only what is sent is cut: chunks are spans of the text as it is, and the result the agent gets is unchanged.
+ * The line's subject says how many keys were left out.
+ *
  * **Chunks and calls.** Text longer than `chunkChars` is chunks (each overlapping the one before by `OVERLAP_CHARS`, and ending at
  * a line break near its end when there is one). Each chunk is a noul of its own, `injected_<i>`, asking the spec's question
  * about its own field of the state, `content_<i>` (`content` when the whole result is one chunk). Chunks are packed into calls
@@ -36,8 +43,9 @@
  *   it when not; a line of the screen's own then says what became of the content (see `reportKept`);
  * - at or above `warn`: the warning is prepended as a first text block;
  * - a chunk that couldn't be checked (Jev unavailable, or too big however it was split): "Not screened" if none could be,
- *   "Partly screened" if some could. A call that holds what looks like a private key is not sent (the client refuses it, with
- *   `opaque`, and a split would not help): its banner says that, in the same two forms, and not that the judge was unavailable;
+ *   "Partly screened" if some could. A call that the client still refuses as holding what looks like a private key, after the
+ *   cut (`opaque`: its own mask found what it could only hide whole, or the cut failed), is not sent, and a split would not help:
+ *   its banner says that, in the same two forms, and not that the judge was unavailable;
  * - otherwise the result comes back as the very decision the chain made.
  *
  * **The log.** The client writes one line for every call, and the screen's `decide` hook puts that call's own decision on it:
@@ -55,7 +63,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, ContextFormed, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { PostToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
-import { isTopLevelAgent } from 'dish-kit'
+import { isTopLevelAgent, leftOut, privateKeyCuts } from 'dish-kit'
+import type { KeyCut, KeyCuts } from 'dish-kit'
 import type { Decision, Judge, JudgeResult, Question } from './client.ts'
 import type { JudgeLogLine } from './log.ts'
 import { DEFAULT_SETTINGS } from './settings.ts'
@@ -188,7 +197,8 @@ export function notScreenedBanner(): string {
 /**
  * What goes in front of a result that was not sent to the judge, wholly (`partly` false) or in part, because it holds what looks
  * like a private key: the client refuses such a request (its `opaque` flag), since the mask for the key would take in what is
- * written around it. The judge was not unavailable, so the banner does not say it was.
+ * written around it. The screen cuts keys out before it asks, so this is for what the client still refuses after the cut. The
+ * judge was not unavailable, so the banner does not say it was.
  */
 export function privateKeyBanner(partly: boolean): string {
   return partly
@@ -327,20 +337,57 @@ function head(text: string, length: number): string {
 interface Piece {
   /** `0`, `1`, … for a chunk, and `<chunk>_0`, `<chunk>_1`, … for what a split made of it. Part of the question's id and its field. */
   label: string
+  /** Where it is in the text that is screened. */
   start: number
   end: number
+  /** What the judge reads of it: its text, with any private key in it cut out (`sentOf`). */
   text: string
   /** Its size as JSON, in bytes. */
   bytes: number
 }
 
-function pieceOf(label: string, text: string, start: number, end: number): Piece {
-  const slice = text.slice(start, end)
-  return { label, start, end, text: slice, bytes: Buffer.byteLength(JSON.stringify(slice)) - 2 }
+/**
+ * The text that is screened, and what is cut out of it before the judge reads it: its private keys (`privateKeyCuts`), each
+ * span in order. Chunks, and the halves of a split, are spans of `text`, so that what they came to maps back to the result; the
+ * cuts are made in what each one sends.
+ */
+interface Source {
+  text: string
+  cuts: readonly KeyCut[]
+}
+
+/**
+ * What the judge reads of `source.text` from `start` to `end`: the text, with each cut that falls in it, wholly or in part,
+ * replaced by `leftOut` of its kind (`[a private key, left out]`). A key that a chunk's edge goes through is cut in both chunks.
+ */
+function sentOf(source: Source, start: number, end: number): string {
+  const { text, cuts } = source
+  // The first cut that ends after `start`.
+  let low = 0
+  let high = cuts.length
+  while (low < high) {
+    const middle = (low + high) >>> 1
+    if (cuts[middle]!.end <= start) low = middle + 1
+    else high = middle
+  }
+  let out = ''
+  let cursor = start
+  for (let index = low; index < cuts.length && cuts[index]!.start < end; index++) {
+    const cut = cuts[index]!
+    out += text.slice(cursor, Math.max(cut.start, start)) + leftOut(cut.kind)
+    cursor = Math.min(cut.end, end)
+  }
+  return out + text.slice(cursor, end)
+}
+
+function pieceOf(label: string, source: Source, start: number, end: number): Piece {
+  const sent = sentOf(source, start, end)
+  return { label, start, end, text: sent, bytes: Buffer.byteLength(JSON.stringify(sent)) - 2 }
 }
 
 /** `piece` in two, at a line break near the middle if there is one, or `undefined` if it is too short to be. */
-function splitPiece(piece: Piece, whole: string): [Piece, Piece] | undefined {
+function splitPiece(piece: Piece, source: Source): [Piece, Piece] | undefined {
+  const whole = source.text
   const length = piece.end - piece.start
   if (length < 2) return undefined
   const middle = piece.start + Math.floor(length / 2)
@@ -349,14 +396,14 @@ function splitPiece(piece: Piece, whole: string): [Piece, Piece] | undefined {
   if (newline >= piece.start + Math.floor(length * 0.4)) cut = newline + 1
   else if (isHighSurrogate(whole.charCodeAt(cut - 1))) cut -= 1
   if (cut <= piece.start || cut >= piece.end) return undefined
-  return [pieceOf(`${piece.label}_0`, whole, piece.start, cut), pieceOf(`${piece.label}_1`, whole, cut, piece.end)]
+  return [pieceOf(`${piece.label}_0`, source, piece.start, cut), pieceOf(`${piece.label}_1`, source, cut, piece.end)]
 }
 
 /** `piece`, or the pieces it is split into until each is at most `room` bytes of JSON. */
-function fit(piece: Piece, whole: string, room: number): Piece[] {
+function fit(piece: Piece, source: Source, room: number): Piece[] {
   if (piece.bytes <= room) return [piece]
-  const halves = splitPiece(piece, whole)
-  return halves === undefined ? [piece] : halves.flatMap(half => fit(half, whole, room))
+  const halves = splitPiece(piece, source)
+  return halves === undefined ? [piece] : halves.flatMap(half => fit(half, source, room))
 }
 
 /** What one field of a piece costs in a state, besides its text, in bytes. */
@@ -489,6 +536,8 @@ export interface ResultScreenDeps {
   warn?(message: string): void
   /** The budget of calls and characters that every screen of this listener shares. For a test to make it small; the default is the one above. */
   limits?: RateLimits
+  /** What to cut out of a text before the judge reads it. For a test of what a failure of it does; the default is dish-kit's `privateKeyCuts`. */
+  cutKeys?(text: string): KeyCuts
 }
 
 function describe(error: unknown): string {
@@ -561,11 +610,21 @@ interface Screening {
 async function screen({ deps, exec, settings, content, original, budget }: Screening): Promise<Verdict> {
   const { withhold: withholdAt, warn: warnAt, chunkChars } = settings.screening
   const tool = exec.name
-  const subject = `${tool} (${original.length} chars)`
   const text = head(content, MAX_SCREENED_CHARS)
+  const source: Source = { text, cuts: [] }
+  let keys = 0
+  try {
+    const found = (deps.cutKeys ?? privateKeyCuts)(text)
+    source.cuts = found.spans
+    keys = found.keys
+  } catch (error) {
+    // Nothing is cut: the client finds the key, and refuses the call as it did before the cut, with the banner that says why.
+    deps.warn?.(`could not cut the private keys out of a result of ${tool}: ${describe(error)}`)
+  }
+  const subject = `${tool} (${original.length} chars${keys === 0 ? '' : `, ${keys === 1 ? 'a private key' : `${keys} private keys`} left out`})`
   const base = Buffer.byteLength(JSON.stringify({ tool })) + 1
   const room = Math.max(MIN_ROOM_BYTES, CALL_STATE_BYTES - base - 64)
-  const pieces = chunkSpans(text, chunkChars).flatMap((span, index) => fit(pieceOf(String(index), text, span.start, span.end), text, room))
+  const pieces = chunkSpans(text, chunkChars).flatMap((span, index) => fit(pieceOf(String(index), source, span.start, span.end), source, room))
   const solo = pieces.length === 1 && pieces[0]!.label === '0'
   const fieldOf = (piece: Piece): string => solo ? 'content' : `content_${piece.label}`
 
@@ -613,7 +672,7 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
     // A call that is one chunk is the chunk in halves.
     const halves: Array<readonly Piece[]> = group.length > 1
       ? [group.slice(0, Math.ceil(group.length / 2)), group.slice(Math.ceil(group.length / 2))]
-      : (splitPiece(group[0]!, text) ?? []).map(half => [half])
+      : (splitPiece(group[0]!, source) ?? []).map(half => [half])
     if (halves.length === 0 || used + halves.length > MAX_CALLS) return undefined
     used += halves.length
     const granted = await Promise.all(halves.map(half => admit(half)))
@@ -692,7 +751,8 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
         return answer?.type === 'noul' && Number.isFinite(answer.noul) ? { start: piece.start, end: piece.end, p: answer.noul } : { start: piece.start, end: piece.end }
       })
     }
-    // A private key in it: not sent, and no use in a split, which would not make the judge see what the mask took in.
+    // What the client still takes for a private key after the cut: not sent, and no use in a split, which would not make the
+    // judge see what the mask took in.
     if (result.reason === 'invalid' && result.opaque === true) return group.map((piece): Leaf => ({ start: piece.start, end: piece.end, opaque: true }))
     if (tooBig(result)) {
       // Too big: in two calls, asked at once.
