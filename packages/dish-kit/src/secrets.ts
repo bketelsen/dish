@@ -392,9 +392,9 @@ export const KEY_LINE_MIN = 40
 export const KEY_DATA_MIN = 8
 
 /**
- * How far after a header its key is looked for: an END line, or, with none, the lines of a key that was cut off. More than the
- * mask's 8 KB, so that a big key (RSA 8192, PGP with subkeys) written with a prefix on each line (a file name, a line number)
- * is in reach whole.
+ * How far after a header the cut reads words: the rules that cut a run shorter than `KEY_LINE_MIN` (one that looks like data, a
+ * fold) apply this far and no further, so that one fake header can't take words from a whole page. Lines of a key are cut at any
+ * distance: to the END line, or, with none, for as long as rows have one (see `cutRegion`).
  */
 export const KEY_REACH_CHARS = 16 * 1024
 
@@ -436,6 +436,13 @@ const CHECKSUM = /^=[A-Za-z0-9+\/]{4}$/
 const ENTITY_UNIT = /&(?:#0{0,4}(?:43|47|61)|#[xX]0{0,4}(?:2[bBfF]|3[dD])|plus|sol|equals);/y
 const PERCENT_UNIT = /%(?:2[bBfF]|3[dD])/y
 const ESCAPED_UNIT = /^00(?:2[bBfF]|3[dD])$/
+/**
+ * What a page may put inside a word that shows as nothing: zero-width spaces and joiners, the word joiner, a byte-order mark, a
+ * soft hyphen, and a `<wbr>`. A run of base64 reads on through them: one every few characters would otherwise split a key's lines
+ * into runs too short to cut.
+ */
+const INVISIBLE = /[\u200b-\u200d\u2060\ufeff\u00ad]/
+const WORD_BREAK_TAG = /<wbr\s{0,8}\/?>/iy
 /** A line break written as an entity or a URL escape: `&#xD;`, `&#10;`, `%0A`. */
 const ENTITY_BREAK = /&#(?:[xX]0{0,4}[aAdD]|0{0,4}1[03]);/y
 const PERCENT_BREAK = /%0[aAdD]/y
@@ -443,6 +450,11 @@ const PERCENT_BREAK = /%0[aAdD]/y
 const ENTITY = /&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/y
 /** The start of an HTML tag, to its name, which is not read for base64. Its attributes are. */
 const TAG_NAME = /<\/?([A-Za-z][A-Za-z0-9]{0,15})/y
+/**
+ * How many rows down the row after a header or a key's lines may be: the next row that has runs, past blank rows. Markup makes
+ * two of them between two rows of a table (`</tr>`, a line break, `<tr>`); a row further down is not the row after.
+ */
+const NEXT_ROW_REACH = 4
 /** Tags that start a new line on a page: what a row of a key in markup ends at. */
 const BLOCK_TAGS = new Set(['br', 'p', 'div', 'li', 'tr', 'pre', 'table', 'tbody', 'thead', 'tfoot', 'ul', 'ol', 'dd', 'dt', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'section', 'article'])
 /** Tags with no attributes, which may stand between two cut parts and be cut with them. */
@@ -530,6 +542,13 @@ function breakEnd(text: string, index: number): number | undefined {
   return undefined
 }
 
+/** Where something that shows as nothing (`INVISIBLE`, a `<wbr>`) at `index` ends, or `undefined`. */
+function invisibleEnd(text: string, index: number): number | undefined {
+  const char = text.charAt(index)
+  if (char === '<') return stickyEnd(WORD_BREAK_TAG, text, index)
+  return char !== '' && INVISIBLE.test(char) ? index + 1 : undefined
+}
+
 /** Past what is at `index` that is neither base64 nor a line break: a run of backslashes (and a `\t`), an entity, a tag's name, or one character. */
 function skipEnd(text: string, index: number): number {
   const char = text.charAt(index)
@@ -559,15 +578,27 @@ function unitChar(text: string, start: number, end: number): string {
   return /2b|43;|plus/.test(escape) ? '+' : /3d|61;|equals/.test(escape) ? '=' : '/'
 }
 
-/** The runs of base64 in `text` from `from` to `to`, in order, each with its row (how many line breaks come before it), and how many rows there are. */
-function scanRuns(text: string, from: number, to: number): { runs: Run[], rows: number } {
+/**
+ * The runs of base64 in `text` from `from` to `to`, in order, each with its row (how many line breaks come before it), how many
+ * rows there are, and where the scan ended. Past `softEnd` it goes on only while rows have a run of `KEY_LINE_MIN` or more: it
+ * stops after the first row that has runs and none that long.
+ */
+function scanRuns(text: string, from: number, to: number, softEnd = Infinity): { runs: Run[], rows: number, end: number } {
   const runs: Run[] = []
   let row = 0
+  let rowStart = 0
   let run: Run | undefined
   let lower = false
   let capitalLater = false
   let at = from
   while (at < to) {
+    if (run !== undefined) {
+      const invisible = invisibleEnd(text, at)
+      if (invisible !== undefined && invisible <= to) {
+        at = invisible
+        continue
+      }
+    }
     const unit = unitEnd(text, at)
     if (unit !== undefined && unit <= to) {
       const char = unitChar(text, at, unit)
@@ -589,13 +620,15 @@ function scanRuns(text: string, from: number, to: number): { runs: Run[], rows: 
     run = undefined
     const lineBreak = breakEnd(text, at)
     if (lineBreak !== undefined) {
+      if (at >= softEnd && runs.length > rowStart && !runs.slice(rowStart).some(one => one.units >= KEY_LINE_MIN)) break
       row++
+      rowStart = runs.length
       at = lineBreak
     } else {
       at = skipEnd(text, at)
     }
   }
-  return { runs, rows: row }
+  return { runs, rows: row, end: Math.min(at, to) }
 }
 
 /**
@@ -686,6 +719,11 @@ function runAt(text: string, index: number): { start: number, end: number, units
   let units = 0
   while (end < text.length) {
     if (isIn(BASE64, text, end) && tokenStarts(text, end)) break
+    const invisible = units > 0 ? invisibleEnd(text, end) : undefined
+    if (invisible !== undefined && unitEnd(text, invisible) !== undefined) {
+      end = invisible
+      continue
+    }
     const unit = unitEnd(text, end)
     if (unit === undefined) break
     end = unit
@@ -815,61 +853,102 @@ function walkKey(text: string, header: Line, cuts: KeyCut[]): void {
   close()
 }
 
+/** A cut, and whether it is of a word (`word`): a short run that a rule cuts because a key's line could be there. */
+interface Cut extends KeyCut {
+  word?: true
+}
+
 /**
- * Cut, into `cuts`, what a key is made of between its header (`from`) and its END line, or, with no END line in reach, the next
- * header or `KEY_REACH_CHARS` (`to`), however the key is written: with a prefix on each line (`rg` and `grep -n`'s file and line
- * number, a numbered file view, a log line's time, a table cell), escaped (`\/`, `+`, `&#43;`), or cut off. Rows are what
- * line breaks make (in the text, written out, as entities, or as tags that start a line on a page).
+ * Cut, into `cuts`, what a key is made of after its header (`from`), however it is written: with a prefix on each line (`rg` and
+ * `grep -n`'s file and line number, a numbered file view, a log line's time, a table cell), escaped (`\/`, `+`, `&#43;`), with
+ * invisible characters in it, or cut off. Rows are what line breaks make (in the text, written out, as entities, or as tags that
+ * start a line on a page). The key's reach is its END line, if one comes before the next header (`endLine`), at any distance;
+ * or else the next header (`hardEnd`). Within `KEY_REACH_CHARS` of the header (`softEnd`) the rules for words apply too; past it,
+ * with no END line, the cut goes on for as long as rows have a line of a key.
  *
  * - every run of `KEY_LINE_MIN` or more base64 characters (an escaped one counted as one): a line of a key;
- * - every run of `KEY_DATA_MIN` or more that looks like data, not a word (a digit, a `+` or `=`, a capital inside it): what is
- *   left of a line that something else split;
- * - after the header, and after each block of rows that have a long run, the first and the last runs of the next row that has
- *   any (past armor header lines): the key's last line, or its only one, which is shorter, whatever stands before or after it
- *   on its row (a line number, a file name, `… [truncated]`); on the header's own row, the first run after it;
- * - with an END line: the last run on the END line's row before it, and the last run of the row before that has any: the key's
- *   last line, whatever its row's prefix is; and the END line.
+ * - within `softEnd`, every run of `KEY_DATA_MIN` or more that looks like data, not a word (a digit, a `+` or `=`, a capital inside
+ *   it): what is left of a line that something else split; and rows that are each one run, three or more of one length of
+ *   `KEY_DATA_MIN` or more and none longer: a key folded narrower than a line;
+ * - the first and last runs of the row right after the header (past armor header lines that follow it directly; on the header's
+ *   own row, the first run after it), and of the row right after the last row that has a long run: a key's only line, or its last,
+ *   which is shorter, whatever stands before or after it on its row (a line number, a file name, `… [truncated]`). The next row
+ *   is the next that has runs, within `NEXT_ROW_REACH` rows;
+ * - with an END line: the last run on its row before it, the last run of the row before that, and the END line;
+ * - on the row after the last long row and the two by the END line, at any distance, the runs that look like data too: a key's
+ *   last line may stand in the middle of its row (`echo <line> >> key.pem`).
  *
- * Words are not cut but in those places: the first and last word of the row after a header or a key's lines, the last word
- * before an END line, and words of eight letters or more that look like data.
+ * What the rules for words cut is a word each (`word`): such cuts are not joined to others across a gap, so the judge sees a
+ * marker for each word that a fake header hides. Returns where it read to.
  */
-function cutRegion(text: string, from: number, to: number, endLine: Line | undefined, cuts: KeyCut[]): void {
-  const { runs, rows } = scanRuns(text, from, endLine?.start ?? to)
-  const cut = (run: Run): void => {
-    cuts.push({ start: run.start, end: run.end, kind: PRIVATE_KEY_KIND })
+function cutRegion(text: string, from: number, softEnd: number, hardEnd: number, endLine: Line | undefined, cuts: Cut[]): number {
+  const { runs, rows, end } = scanRuns(text, from, endLine?.start ?? hardEnd, endLine === undefined ? softEnd : Infinity)
+  const cut = (run: Run, word: boolean): void => {
+    cuts.push(word ? { start: run.start, end: run.end, kind: PRIVATE_KEY_KIND, word: true } : { start: run.start, end: run.end, kind: PRIVATE_KEY_KIND })
   }
-  const rowsOf: Array<{ first: Run, last: Run, long: boolean }> = []
-  for (const run of runs) {
+  const rowsOf: Array<{ first: Run, last: Run, long: boolean, count: number, from: number }> = []
+  for (const [at, run] of runs.entries()) {
     const long = run.units >= KEY_LINE_MIN
-    if (long || (run.data && run.units >= KEY_DATA_MIN)) cut(run)
+    if (long) cut(run, false)
+    else if (run.start < softEnd && run.data && run.units >= KEY_DATA_MIN) cut(run, true)
     const current = rowsOf.at(-1)
     if (current !== undefined && current.first.row === run.row) {
       current.last = run
       current.long ||= long
+      current.count++
     } else {
-      rowsOf.push({ first: run, last: run, long })
+      rowsOf.push({ first: run, last: run, long, count: 1, from: at })
     }
   }
-  // The header counts as such a row: the row after it is a key's only line when it is short (an Ed25519 key's is 64 characters,
-  // and cut off it is less), so its first and last runs are cut too, or, on the header's own row, the first run after it. Armor
-  // header lines right after the header are passed over: they hold nothing of a key, and the walk keeps them.
-  let previousLong = true
-  let afterHeader = true
-  for (const row of rowsOf) {
-    if (afterHeader && !row.long && armorAt(text, row.first.start) !== undefined) continue
-    if (previousLong && !row.long) {
-      cut(row.first)
-      if (!afterHeader || row.first.row > 0) cut(row.last)
-    }
-    previousLong = row.long
-    afterHeader = false
+  /** Where a key's last line may be, at any distance: a row's first and last runs, and the runs on it that look like data. */
+  const cutLastLine = (row: { first: Run, last: Run, count: number, from: number }, first = true): void => {
+    if (first) cut(row.first, true)
+    cut(row.last, true)
+    for (let at = row.from; at < row.from + row.count; at++) if (runs[at]!.data && runs[at]!.units >= KEY_DATA_MIN) cut(runs[at]!, true)
   }
-  if (endLine === undefined) return
+  // The header counts as a long row: the row right after it is a key's only line when it is short (an Ed25519 key's is 64
+  // characters, and cut off it is less). Armor header lines that follow the header directly are passed over: they hold nothing of
+  // a key, and the walk keeps them. A row further down is not the row after the header.
+  let index = 0
+  let adjacent = 0
+  while (index < rowsOf.length && !rowsOf[index]!.long && rowsOf[index]!.first.row === adjacent + 1 && armorAt(text, rowsOf[index]!.first.start) !== undefined) {
+    adjacent = rowsOf[index]!.first.row
+    index++
+  }
+  const afterHeader = rowsOf[index]
+  if (afterHeader !== undefined && !afterHeader.long && afterHeader.first.start < softEnd && afterHeader.first.row <= adjacent + NEXT_ROW_REACH) {
+    cut(afterHeader.first, true)
+    if (afterHeader.first.row > 0) cut(afterHeader.last, true)
+  }
+  // The row right after the last long one: a key's last line. Only after the last: a page that puts a line of base64 before each
+  // row of its words doesn't have each row's first and last words cut.
+  let lastLong = -1
+  for (const [at, row] of rowsOf.entries()) if (row.long) lastLong = at
+  const afterLines = rowsOf[lastLong + 1]
+  if (lastLong >= 0 && afterLines !== undefined && afterLines.first.row <= rowsOf[lastLong]!.last.row + NEXT_ROW_REACH) cutLastLine(afterLines)
+  // A key folded narrower than a line: rows that are each one run, three of them or more of one length, and none longer.
+  for (let at = 0; at < rowsOf.length;) {
+    let stop = at
+    while (stop < rowsOf.length && rowsOf[stop]!.count === 1 && !rowsOf[stop]!.long && rowsOf[stop]!.first.start < softEnd) stop++
+    if (stop - at >= 3) {
+      const lengths = new Map<number, number>()
+      let longest = 0
+      for (let k = at; k < stop; k++) {
+        const units = rowsOf[k]!.first.units
+        lengths.set(units, (lengths.get(units) ?? 0) + 1)
+        longest = Math.max(longest, units)
+      }
+      if (longest >= KEY_DATA_MIN && (lengths.get(longest) ?? 0) >= 3) for (let k = at; k < stop; k++) cut(rowsOf[k]!.first, true)
+    }
+    at = Math.max(stop, at + 1)
+  }
+  if (endLine === undefined) return end
   // The last run on the END line's row (a prefix, or the last line of a key written on one line), then the last of the row before.
-  let index = rowsOf.length - 1
-  if (index >= 0 && rowsOf[index]!.first.row === rows) cut(rowsOf[index--]!.last)
-  if (index >= 0) cut(rowsOf[index]!.last)
+  let last = rowsOf.length - 1
+  if (last >= 0 && rowsOf[last]!.first.row === rows) cutLastLine(rowsOf[last--]!, false)
+  if (last >= 0) cutLastLine(rowsOf[last]!, false)
   cutLine(text, endLine.start, endLine.end, cuts)
+  return endLine.end
 }
 
 /**
@@ -964,26 +1043,30 @@ function isGap(text: string, from: number, to: number): boolean {
 }
 
 /**
- * The private keys in `text`, as what to cut out of it so that a reader (the judge) can be sent the rest: none of a key, and
- * nothing written around it but a few words where a key's last line would be. The text is not changed; `withoutPrivateKeys` puts
- * `leftOut` in each place.
+ * The private keys in `text`, as what to cut out of it so that a reader (the judge) can be sent the rest: none of a key, and of
+ * what is written around it only what a key could be. The text is not changed; `withoutPrivateKeys` puts `leftOut` in each place.
+ * Where the cut can't tell, it cuts: a few words near a header cost the judge little, and a key's line sent costs the user its key.
  *
  * - **What is a key.** Each private key header (the patterns', at every place one starts, also in the dashes that end another).
  *   The header is cut (`cutLine`), but for words in it that don't say what kind of key it is.
- * - **What is cut after it** goes as far as its END line, if one is in reach (the first after the header, within
- *   `KEY_REACH_CHARS` and before any other header), or else the next header or `KEY_REACH_CHARS`. In that reach (`cutRegion`):
- *   every run of `KEY_LINE_MIN` or more base64 characters, an escaped one counted as one, and every run of `KEY_DATA_MIN` or
- *   more that looks like data; the first and last runs of the row after the header and after a block of rows that have a long
- *   run (the key's last line, whatever prefix its row has); the last runs before the END line; and the END line. And what
- *   follows the header for as long as it reads as a key's body (`walkKey`), however long. Where it can't tell, it cuts: a few
- *   words near a header cost the judge little, and a key's line sent costs the user its key.
+ * - **What is cut after it** (`cutRegion`): every run of `KEY_LINE_MIN` or more base64 characters (an escaped one counted as one,
+ *   an invisible one not counted), to the END line if one comes before the next header, at any distance, or else for as long as
+ *   rows have such a run; within `KEY_REACH_CHARS`, runs of `KEY_DATA_MIN` or more that look like data, and a fold; the row
+ *   where a key's only or last line would be (after the header, and after the last row with a long run); the runs by the END
+ *   line; and the END line. And what follows the header for as long as it reads as a key's body (`walkKey`), however long.
  * - **Tokens** that the mask would take with a key, or that are in its reach (`cutTokens`), are cut whole, so that no cut leaves
  *   part of one.
- * - **What is never cut:** a sentence. What is cut has no space in it: a run of base64, or whitespace, punctuation and line
- *   breaks between two cut parts (`isGap`). A fake header above a page, or a fake header and END line around it, can't take the
- *   page out of what the judge reads. What one can take is runs of base64 with no space in them (instructions written as one long
- *   word, as a token-shaped word can be, and words of eight or more with a digit or a capital inside), the first and last words
- *   of the row after a header or a long run, and the last before an END line: a few words for each fake header.
+ * - **What one fake header can take from the judge:**
+ *   - runs of base64 of `KEY_LINE_MIN` or more with no space in them: instructions written as one long word (CamelCase, joined by
+ *     `+` or `/`, or by invisible characters), as a token-shaped word can be;
+ *   - within `KEY_REACH_CHARS`, words of `KEY_DATA_MIN` or more that look like data (a digit, a `+` or `=`, a capital inside),
+ *     and rows of one word each, three or more of one length;
+ *   - the first and last words of the row after it, of the row after the last line of base64, and, with an END line, the last
+ *     words of its row and the row before, with the words on those rows that look like data.
+ *
+ *   That is a few words at each edge of a key. A sentence written in words is read but for those, and each word taken is a
+ *   marker of its own (a word's cut is not joined to others across a gap), so the judge sees that something was taken, and
+ *   where. A page with a fake header for each word can hide each of those words, and shows the judge a marker for each.
  *
  * Linear in the length of the text.
  */
@@ -991,35 +1074,38 @@ export function privateKeyCuts(text: string): KeyCuts {
   if (!text.includes('-----BEGIN ')) return { keys: 0, spans: [] }
   const headers = everyMatch(text, KEY_HEADER)
   const endLines = text.includes('-----END ') ? everyMatch(text, KEY_END) : []
-  const cuts: KeyCut[] = []
+  const cuts: Cut[] = []
   /** Which key each cut is for: two cuts with only a gap between them are one if they are for the same key. */
   const owners: number[] = []
   for (const [index, header] of headers.entries()) {
     const first = cuts.length
     cutLine(text, header.start, header.end, cuts)
     walkKey(text, header, cuts)
-    const limit = Math.min(headers[index + 1]?.start ?? text.length, header.end + KEY_REACH_CHARS, text.length)
+    const hardEnd = Math.min(headers[index + 1]?.start ?? text.length, text.length)
     const next = firstFrom(endLines, header.end)
-    const endLine = next !== undefined && next.start < limit ? next : undefined
-    if (limit > header.end) cutRegion(text, header.end, limit, endLine, cuts)
+    const endLine = next !== undefined && next.start < hardEnd ? next : undefined
+    const softEnd = Math.min(header.end + KEY_REACH_CHARS, endLine?.start ?? hardEnd)
+    const read = hardEnd > header.end ? cutRegion(text, header.end, softEnd, hardEnd, endLine, cuts) : header.end
     KEY_REACH.lastIndex = header.start
     const taken = KEY_REACH.exec(text)
-    const reach = Math.max(taken === null ? header.end : header.start + taken[0].length, endLine?.end ?? limit)
-    cutTokens(text, header.start, reach, cuts)
+    cutTokens(text, header.start, Math.max(taken === null ? header.end : header.start + taken[0].length, read), cuts)
     for (let at = first; at < cuts.length; at++) owners[at] = index
   }
   const order = cuts.map((_cut, at) => at).sort((a, b) => cuts[a]!.start - cuts[b]!.start || cuts[b]!.end - cuts[a]!.end)
   const spans: KeyCut[] = []
   let owner = -1
+  let word = false
   for (const at of order) {
     const cut = cuts[at]!
     const previous = spans.at(-1)
-    // Overlapping or touching cuts are one. So are a key's cuts with a gap between them, but not two keys': a page of fake keys
-    // shows the judge each of them.
-    if (previous !== undefined && (cut.start <= previous.end || (owners[at] === owner && isGap(text, previous.end, cut.start)))) {
+    // Overlapping or touching cuts are one. So are a key's cuts with a gap between them, but not two keys', and not a word's: a
+    // page of fake keys shows the judge each of them, and each word a fake header hides is a marker of its own.
+    if (previous !== undefined && (cut.start <= previous.end || (owners[at] === owner && !word && cut.word !== true && isGap(text, previous.end, cut.start)))) {
       previous.end = Math.max(previous.end, cut.end)
+      word &&= cut.word === true
     } else {
-      spans.push({ ...cut })
+      spans.push({ start: cut.start, end: cut.end, kind: cut.kind })
+      word = cut.word === true
     }
     owner = owners[at]!
   }
