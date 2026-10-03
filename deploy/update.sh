@@ -43,7 +43,7 @@
 #      The dry run stops here. Everything above changes nothing but the fetched refs (and makes the lock file), so every
 #      refusal comes before the first change, and a dry run that passes means --apply can start;
 #   7. move the checkout: a fast-forward of main, or a detached checkout of the ref;
-#   8. run install.sh, whose last line says whether it changed the profile;
+#   8. run install.sh, with DISH_SANDBOX_HOME=on, whose last line says whether it changed the profile;
 #   9. install the unit when it differs, daemon-reload when the unit file or the unit the service last started with
 #      differs from the checkout's, or the user manager says it needs one; make ~/work; enable the unit;
 #  10. restart when the service isn't active, install.sh changed the profile, or the stamp is missing or differs;
@@ -561,13 +561,14 @@ move_the_checkout() {
   if [ "$head" != "$target" ]; then fail "HEAD is $head, not the target"; fi
 }
 
-# install.sh, with the unit's environment and install.env's inputs. Its output, both streams, passes through on stdout,
-# less the lines that mention a token; its last line says whether it changed the profile.
+# install.sh, with the unit's environment, install.env's inputs and DISH_SANDBOX_HOME=on: on the VM, agents' sandboxed
+# commands can write the home directory less a protected list (deploy/dish-sandbox). Its output, both streams, passes
+# through on stdout, less the lines that mention a token; its last line says whether it changed the profile.
 run_install() {
   begin 'running deploy/install.sh'
   local line last='' hidden=0
   env -u DISH_UPDATE_CLEAN -u DISH_UPDATE_WAIT "PATH=$target_path" \
-    "DISH_REMOTE=$remote" "DISH_USER_NAME=$user_name" "DISH_USER_EMAIL=$user_email" \
+    "DISH_REMOTE=$remote" "DISH_USER_NAME=$user_name" "DISH_USER_EMAIL=$user_email" DISH_SANDBOX_HOME=on \
     "$checkout/deploy/install.sh" </dev/null 9>&- 2>&1 |
     while IFS= read -r line || [ -n "$line" ]; do
       last=$line

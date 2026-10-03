@@ -10,7 +10,8 @@
  * - it never half-updates: every refusal comes before the first change, and the stamp is written only after dsh answers;
  * - it restarts exactly when the service is stale, stopped, or install.sh changed the profile, and reloads the user
  *   manager whenever it may hold another definition of the unit;
- * - install.sh gets the unit's environment and install.env's three inputs, and nothing of the caller's;
+ * - install.sh gets the unit's environment, install.env's three inputs and DISH_SANDBOX_HOME=on, and nothing of the
+ *   caller's;
  * - it never runs as root;
  * - it prints no line that mentions a token.
  */
@@ -41,8 +42,13 @@ const OWN_ENV: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: OWN_HOME }
 
 const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex')
 
-/** The names install.sh may see: the clean environment, its three inputs, and what bash adds to any environment. */
-const INSTALL_NAMES = ['DISH_REMOTE', 'DISH_USER_EMAIL', 'DISH_USER_NAME', 'HOME', 'LANG', 'LOGNAME', 'PATH', 'TMPDIR', 'USER', 'XDG_RUNTIME_DIR']
+/**
+ * The names install.sh may see: the clean environment, its three inputs, DISH_SANDBOX_HOME, and what bash adds to any
+ * environment.
+ */
+const INSTALL_NAMES = ['DISH_REMOTE', 'DISH_SANDBOX_HOME', 'DISH_USER_EMAIL', 'DISH_USER_NAME', 'HOME', 'LANG', 'LOGNAME', 'PATH', 'TMPDIR', 'USER', 'XDG_RUNTIME_DIR']
+/** The DISH_* values install.sh gets: install.env's, and the VM's writable home in the sandbox (deploy/dish-sandbox). */
+const INSTALL_VALUES = { ...INPUTS, DISH_SANDBOX_HOME: 'on' }
 const BASH_NAMES = ['OLDPWD', 'PWD', 'SHLVL', '_']
 
 const CHANGING_VERBS = ['restart', 'enable', 'daemon-reload']
@@ -188,7 +194,7 @@ test('--apply to a new upstream commit installs, starts, waits and stamps', asyn
 
   const installs = host.installs()
   assert.equal(installs.length, 1)
-  assert.deepEqual(installs[0].env, INPUTS)
+  assert.deepEqual(installs[0].env, INSTALL_VALUES)
 
   const unit = await readFile(join(host.checkout, 'deploy', 'dish-web.service'), 'utf8')
   assert.equal(host.installedUnit(), unit)
@@ -811,7 +817,16 @@ test('as the account, it runs itself again with a clean environment, and install
   const [install] = host.installs()
   for (const name of LEAKED) assert.ok(!install.names.includes(name), `install.sh does not see ${name}`)
   assert.deepEqual(install.names.filter((name) => !BASH_NAMES.includes(name)), INSTALL_NAMES)
-  assert.deepEqual(install.env, INPUTS)
+  assert.deepEqual(install.env, INSTALL_VALUES)
+})
+
+test('install.sh always gets DISH_SANDBOX_HOME=on, whatever the caller set', async () => {
+  for (const value of ['off', '']) {
+    const { host } = await hostWithUpdate()
+    const result = await host.run('update.sh', ['--apply'], { env: { DISH_SANDBOX_HOME: value } })
+    assertOk(result)
+    assert.equal(host.installs()[0]?.env.DISH_SANDBOX_HOME, 'on', JSON.stringify(value))
+  }
 })
 
 test('as the account with only what the dish-update wrapper passes, the same', async () => {

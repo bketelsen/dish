@@ -10,12 +10,16 @@
 #   DISH_USER_NAME   the store's commit author name. Required.
 #   DISH_USER_EMAIL  the store's commit author email. Required.
 #   DISH_PROFILE     the dsh profile to install into. Default `web`.
+#   DISH_SANDBOX_HOME  `on` runs every sandboxed agent command through deploy/dish-sandbox, which lets it write the home
+#                    directory less a protected list: the profile's `sandbox` row gets it as its runnerCommand. `off`,
+#                    empty or unset takes that away again. update.sh (the VM) sets it to `on`; dev leaves it off unless
+#                    you set it (docs/specs/sandbox-home.md).
 # The profile lives under $DSH_HOME (default ~/.dsh). Nothing here is secret, and nothing here is printed that is.
 #
 # Steps, in order. A failure stops the script and names the step on stderr:
 #   1. pnpm install --frozen-lockfile, then pnpm build
 #   2. create the profile when it is missing
-#   3. write dish's rows into the profile's cordis.patch.yml (deploy/profile.ts)
+#   3. write dish's rows into the profile's cordis.patch.yml (deploy/profile.ts), the sandbox row included
 #   4. link the bundles that are not linked yet
 #
 # The rows go in before the bundles on purpose. The dish-config row patches a row that the config bundle inserts, so
@@ -69,6 +73,14 @@ trap 'exit 143' TERM HUP
 : "${DISH_USER_NAME:?DISH_USER_NAME must be set: the commit author name for the config store}"
 : "${DISH_USER_EMAIL:?DISH_USER_EMAIL must be set: the commit author email for the config store}"
 profile=${DISH_PROFILE:-web}
+case ${DISH_SANDBOX_HOME-} in
+  on) sandbox_home=on ;;
+  off | '') sandbox_home=off ;;
+  *)
+    echo "install: DISH_SANDBOX_HOME must be on or off (unset means off), not \"$DISH_SANDBOX_HOME\"" >&2
+    exit 1
+    ;;
+esac
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd -- "$root"
@@ -140,8 +152,10 @@ if [ -n "$DISH_REMOTE" ]; then
   remote_args=("--remote=$DISH_REMOTE")
   remote_shown=$DISH_REMOTE
 fi
+sandbox_args=(--no-sandbox-runner)
+if [ "$sandbox_home" = on ]; then sandbox_args=("--sandbox-runner=$root/deploy/dish-sandbox"); fi
 # The --opt=value form, so that a value that starts with a dash is not read as another option.
-rows=$(node deploy/profile.ts --patch "$patch" "${remote_args[@]}" "--user-name=$DISH_USER_NAME" "--user-email=$DISH_USER_EMAIL")
+rows=$(node deploy/profile.ts --patch "$patch" "${remote_args[@]}" "--user-name=$DISH_USER_NAME" "--user-email=$DISH_USER_EMAIL" "${sandbox_args[@]}")
 if [ "$rows" != unchanged ]; then changed=1; fi
 
 added=()
@@ -162,6 +176,7 @@ done
 step='printing the summary'
 echo "install: profile $profile at $profile_dir: $profile_made"
 echo "install: dish rows ($remote_shown): $rows"
+echo "install: sandbox home: $sandbox_home"
 echo "install: bundles added: ${added[*]:-none}; already linked: ${linked[*]:-none}"
 if [ "$changed" -eq 0 ]; then
   echo 'install: no changes to the profile'
