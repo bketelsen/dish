@@ -255,6 +255,43 @@ test('VerdictCache: writing a call id again makes it the newest, so it is evicte
   assert.equal(cache.size, 3)
 })
 
+test('VerdictCache: replace writes only over the very entry that was read, and keeps what it is given', () => {
+  let now = 0
+  const cache = new VerdictCache({ now: () => now })
+  const ASKED = { verdict: 'ask', escalationCovered: false, tool: 'bash', escalationReason: 'escalate sandbox to danger-full-access: x', askReason: 'ask x' } as const
+  cache.set('o', 'c', ASKED)
+  const read = cache.get('o', 'c')!
+  assert.equal(read.askReason, 'ask x')
+  assert.equal(read.coveredByYou, undefined, 'nothing is covered by you until you say yes')
+  now = 50
+  assert.equal(cache.replace('o', 'c', read, { ...read, coveredByYou: true }), true)
+  const covered = cache.get('o', 'c')!
+  assert.deepEqual({ ...covered }, { ...ASKED, coveredByYou: true, at: 50 }, 'as set writes it: fresh, and `at` is not taken from the input')
+  // What was read is not there any more: the same object is needed.
+  assert.equal(cache.replace('o', 'c', read, { ...read, coveredByYou: true }), false)
+  // Written false, the cover is not kept at all.
+  assert.equal(cache.replace('o', 'c', covered, { ...covered, coveredByYou: false }), true)
+  assert.ok(!('coveredByYou' in cache.get('o', 'c')!))
+  // Another agent's entry under the same call id, a deleted entry, and one written again since are not replaced.
+  const mine = cache.get('o', 'c')!
+  cache.set('p', 'c', ASKED)
+  assert.equal(cache.replace('p', 'c', mine, { ...mine, coveredByYou: true }), false)
+  assert.equal(cache.get('p', 'c')?.coveredByYou, undefined)
+  cache.set('o', 'c', ASKED)
+  assert.equal(cache.replace('o', 'c', mine, { ...mine, coveredByYou: true }), false)
+  assert.equal(cache.get('o', 'c')?.coveredByYou, undefined)
+  const again = cache.get('o', 'c')!
+  cache.delete('o', 'c')
+  assert.equal(cache.replace('o', 'c', again, { ...again, coveredByYou: true }), false)
+  assert.equal(cache.get('o', 'c'), undefined, 'a deleted entry is not written back')
+  // One that has expired since it was read, and is still there, is the same entry: its call has not settled.
+  cache.set('o', 'late', ASKED)
+  const waited = cache.get('o', 'late')!
+  now += VERDICT_TTL_MS + 1
+  assert.equal(cache.replace('o', 'late', waited, { ...waited, coveredByYou: true }), true)
+  assert.equal(cache.get('o', 'late')?.coveredByYou, true, 'written fresh, so it has not expired')
+})
+
 // --- which calls are gated ----------------------------------------------------------------------------
 
 test('isGated: a plain entry matches exactly, an entry ending in * is a prefix, and ask_judge and run_code never match', () => {
@@ -1308,6 +1345,138 @@ test('an ask or a deny keeps the tool, and covers no escalation, whatever the ca
   const final = await allowing.gate(exec, () => Promise.resolve({ kind: 'ask', reason: 'a hook asks' } as PreToolDecision))
   assert.equal(final.kind, 'ask')
   assert.deepEqual([verdictFor(allowing.cache, exec)?.verdict, verdictFor(allowing.cache, exec)?.escalationCovered, verdictFor(allowing.cache, exec)?.tool], ['ask', false, 'bash'])
+})
+
+// --- the gate's own ask shows you the escalation, so that your yes can cover it ----------------------------
+
+/** The sentence the gate's ask gets for a call that will ask to escalate. */
+const ALSO = (mode: string, justification: string) => ` The command also asks for ${mode} permissions: "${justification}". Allowing it allows that too.`
+const READING = 'The judge reads this as irreversible (p 0.87), and as serving the task (p 0.90).'
+const UNAVAILABLE = 'The command needs your approval because the judge is unavailable.'
+
+test('the gate\'s own ask shows you the escalation the call will ask for, whole and as the model gave it, and the entry keeps that ask\'s reason', async () => {
+  const escalating = { command: 'npm install', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'Needs the network to reach the registry' }
+  for (const [name, script, before] of [
+    ['the judge\'s reading', () => answers(IRREVERSIBLE, 0.9), READING],
+    ['an unavailable judge', () => DOWN, UNAVAILABLE],
+    ['a command the judge could not read', () => OPAQUE, OPAQUE_ASK],
+  ] as const) {
+    const { gate, cache } = gateOf(script)
+    const asked = await run(gate, { callId: 'shown', args: escalating })
+    const reason = `${before}${ALSO('danger-full-access', 'Needs the network to reach the registry')}`
+    assert.deepEqual(asked.decision, { kind: 'ask', reason, displayReason: { en: reason } }, name)
+    const entry = verdictFor(cache, asked.exec)
+    assert.deepEqual([entry?.verdict, entry?.askReason, entry?.escalationReason, entry?.coveredByYou], ['ask', reason, 'escalate sandbox to danger-full-access: Needs the network to reach the registry', undefined], name)
+  }
+
+  // Whole, where the judge reads it cut; and as the model gave it, spaces and all, as dsh's own request would show it.
+  const { gate, cache } = gateOf(() => answers(IRREVERSIBLE, 0.9))
+  const long = 'j'.repeat(3000)
+  const lengthy = await run(gate, { args: { command: 'ls', description: 'x', sandbox_permissions: 'workspace-write', justification: long } })
+  assert.equal(lengthy.decision.kind === 'ask' && lengthy.decision.reason, `${READING}${ALSO('workspace-write', long)}`)
+  const padded = await run(gate, { args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access', justification: '  needs the network \n' } })
+  assert.equal(padded.decision.kind === 'ask' && padded.decision.reason, `${READING}${ALSO('danger-full-access', '  needs the network \n')}`)
+  assert.equal(verdictFor(cache, padded.exec)?.askReason, `${READING}${ALSO('danger-full-access', '  needs the network \n')}`)
+  const powershell = await run(gate, { name: 'pwsh', args: { command: 'Remove-Item x', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'outside the workspace' } })
+  assert.equal(powershell.decision.kind === 'ask' && powershell.decision.reason, `${READING}${ALSO('danger-full-access', 'outside the workspace')}`)
+
+  // A call that comes through again as it was is asked the same, the escalation in it.
+  const first = await run(gate, { callId: 'twice', args: { command: 'git push', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'pushes' } })
+  const second = await run(gate, { callId: 'twice', args: { command: 'git push', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'pushes' } })
+  assert.deepEqual(second.decision, first.decision)
+  assert.equal(verdictFor(cache, second.exec)?.askReason, `${READING}${ALSO('danger-full-access', 'pushes')}`)
+})
+
+test('an escalation dsh will not ask for is not shown: the session\'s own mode, or a blank justification', async () => {
+  const modes: unknown[] = []
+  const { gate, cache } = gateOf(() => answers(IRREVERSIBLE, 0.9), { sandboxMode: (agent) => { modes.push(agent.id); return 'workspace-write' } })
+  // The mode the session already has: dsh's bash runs it with no request (approveEscalation returns at once).
+  const same = await run(gate, { args: { command: 'npm test', description: 'x', sandbox_permissions: 'workspace-write', justification: 'writes files' } })
+  assert.deepEqual(same.decision, { kind: 'ask', reason: READING, displayReason: { en: READING } })
+  assert.deepEqual([verdictFor(cache, same.exec)?.askReason, verdictFor(cache, same.exec)?.escalationReason], [undefined, undefined])
+  assert.deepEqual(modes, ['main-1'], 'the mode is the sandbox policy\'s for the agent')
+  // A blank justification: dsh's bash refuses the call before it asks.
+  for (const justification of ['', '   ', '\n']) {
+    const blank = await run(gate, { args: { command: 'npm install', description: 'x', sandbox_permissions: 'danger-full-access', justification } })
+    assert.deepEqual(blank.decision, { kind: 'ask', reason: READING, displayReason: { en: READING } }, JSON.stringify(justification))
+    assert.deepEqual([verdictFor(cache, blank.exec)?.askReason, verdictFor(cache, blank.exec)?.escalationReason], [undefined, undefined])
+  }
+  // A wider mode is shown, and so is any mode when the session's can't be read.
+  const wider = await run(gate, { args: { command: 'npm install', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'the network' } })
+  assert.equal(wider.decision.kind === 'ask' && wider.decision.reason, `${READING}${ALSO('danger-full-access', 'the network')}`)
+  for (const sandboxMode of [undefined, () => undefined, () => { throw new Error('no policy') }]) {
+    const unknown = gateOf(() => answers(IRREVERSIBLE, 0.9), { sandboxMode })
+    const shown = await run(unknown.gate, { args: { command: 'npm test', description: 'x', sandbox_permissions: 'workspace-write', justification: 'writes files' } })
+    assert.equal(shown.decision.kind === 'ask' && shown.decision.reason, `${READING}${ALSO('workspace-write', 'writes files')}`)
+  }
+})
+
+test('a call id gated again is judged again when the escalation dsh will ask for has changed, so the ask shows the one it will ask for', async () => {
+  let mode = 'read-only'
+  const { gate, judge, cache } = gateOf(() => answers(IRREVERSIBLE, 0.9), { sandboxMode: () => mode })
+  const args = { command: 'npm test', description: 'x', sandbox_permissions: 'workspace-write', justification: 'writes files' }
+  const first = await run(gate, { callId: 'again', args })
+  assert.equal(first.decision.kind === 'ask' && first.decision.reason, `${READING}${ALSO('workspace-write', 'writes files')}`)
+  // The session is at workspace-write now: dsh won't ask, so the ask doesn't show it.
+  mode = 'workspace-write'
+  const second = await run(gate, { callId: 'again', args })
+  assert.equal(second.decision.kind === 'ask' && second.decision.reason, READING)
+  assert.equal(verdictFor(cache, second.exec)?.askReason, undefined)
+  assert.equal(judge.requests.length, 2)
+  // Two justifications the judge reads alike (cut to 1,000 characters) are still two escalations.
+  const head = 'j'.repeat(1000)
+  const one = await run(gate, { callId: 'long', args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access', justification: `${head}one` } })
+  const other = await run(gate, { callId: 'long', args: { command: 'ls', description: 'x', sandbox_permissions: 'danger-full-access', justification: `${head}two` } })
+  assert.equal(judge.requests.length, 4)
+  assert.equal(one.decision.kind === 'ask' && one.decision.reason, `${READING}${ALSO('danger-full-access', `${head}one`)}`)
+  assert.equal(other.decision.kind === 'ask' && other.decision.reason, `${READING}${ALSO('danger-full-access', `${head}two`)}`)
+  assert.equal(verdictFor(cache, other.exec)?.askReason, `${READING}${ALSO('danger-full-access', `${head}two`)}`)
+})
+
+test('through the registry: the session\'s mode is read from the sandbox policy service, as dsh\'s bash reads it', async () => {
+  const w = await world({ script: () => answers(IRREVERSIBLE, 0.9), workspaceRoot: '/canonical/app', approval: 'rejected' })
+  await w.call('bash', BASH('npm test', { sandbox_permissions: 'workspace-write', justification: 'writes files' }), undefined, 'same-mode')
+  await w.call('bash', BASH('npm install', { sandbox_permissions: 'danger-full-access', justification: 'the network' }), undefined, 'wider')
+  assert.deepEqual(w.approvals.map(request => request.reason), [READING, `${READING}${ALSO('danger-full-access', 'the network')}`])
+})
+
+test('an ask with no escalation to show, an allow, a deny, and a later listener\'s ask are as they were, and keep no ask reason', async () => {
+  const { gate, cache } = gateOf(() => answers(IRREVERSIBLE, 0.9))
+  // No escalation, or none that dsh's tool would ask for (no justification, or a blank mode).
+  for (const args of [
+    { command: 'git push', description: 'x' },
+    { command: 'git push', description: 'x', sandbox_permissions: 'danger-full-access' },
+    { command: 'git push', description: 'x', sandbox_permissions: '  ', justification: 'pushes' },
+    { command: 'git push', description: 'x', justification: 'pushes' },
+  ]) {
+    const asked = await run(gate, { args })
+    assert.deepEqual(asked.decision, { kind: 'ask', reason: READING, displayReason: { en: READING } }, JSON.stringify(args))
+    assert.equal(verdictFor(cache, asked.exec)?.askReason, undefined)
+  }
+  // Another gated tool is judged on its whole call, and dsh asks it no escalation.
+  const other = gateOf(() => answers(IRREVERSIBLE, 0.9), { settings: gatedSettings(['bash', 'mcp__*']) })
+  const mcp = await run(other.gate, { name: 'mcp__ssh__run', args: { command: 'ls', sandbox_permissions: 'danger-full-access', justification: 'x' } })
+  assert.equal(mcp.decision.kind === 'ask' && mcp.decision.reason, READING)
+  assert.equal(verdictFor(other.cache, mcp.exec)?.askReason, undefined)
+  // A child is refused, as it was; the gate never asks you about a child's call.
+  const escalating = { command: 'git push', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'pushes' }
+  const denied = await run(gate, { agent: agentOf({ child: true, cwd: '/w' }), args: escalating })
+  assert.equal(denied.decision.kind, 'deny')
+  assert.ok(denied.decision.kind === 'deny' && !denied.decision.reason.includes('also asks'))
+  assert.equal(verdictFor(cache, denied.exec)?.askReason, undefined)
+  // An allow keeps none, and neither does another listener's ask after it: that ask is not the gate's.
+  const allowing = gateOf(() => answers(READ_ONLY, 0.95))
+  const allowed = await run(allowing.gate, { args: escalating })
+  assert.deepEqual(allowed.decision, { kind: 'allow' })
+  assert.equal(verdictFor(allowing.cache, allowed.exec)?.askReason, undefined)
+  const hooked = await run(allowing.gate, { args: escalating }, { kind: 'ask', reason: 'a hook asks' })
+  assert.deepEqual(hooked.decision, { kind: 'ask', reason: 'a hook asks' })
+  assert.equal(verdictFor(allowing.cache, hooked.exec)?.askReason, undefined)
+  // A later deny over the gate's ask: nobody is asked, and the entry keeps no ask reason.
+  const over = await run(gate, { args: escalating }, { kind: 'deny', reason: 'policy says no' })
+  assert.deepEqual(over.decision, { kind: 'deny', reason: 'policy says no' })
+  assert.equal(verdictFor(cache, over.exec)?.verdict, 'deny')
+  assert.equal(verdictFor(cache, over.exec)?.askReason, undefined)
 })
 
 test('VerdictCache: the owner and the call id are both part of the key, whatever characters they have', () => {
