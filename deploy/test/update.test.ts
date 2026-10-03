@@ -820,6 +820,17 @@ test('as the account, it runs itself again with a clean environment, and install
   assert.deepEqual(install.env, INSTALL_VALUES)
 })
 
+test('install.sh\'s TMPDIR is dsh\'s own ~/.cache/dish/tmp, made 0700, not /tmp, which sandboxed commands write', async () => {
+  for (const wrapper of [false, true]) {
+    const { host } = await hostWithUpdate()
+    const result = await host.run('update.sh', ['--apply'], { wrapper })
+    assertOk(result)
+    const [install] = host.installs()
+    assert.equal(install?.tmpdir, `${host.home}/.cache/dish/tmp`, `wrapper: ${wrapper}`)
+    assert.equal(install?.tmpdirMode, 0o700, `wrapper: ${wrapper}`)
+  }
+})
+
 test('install.sh always gets DISH_SANDBOX_HOME=on, whatever the caller set', async () => {
   for (const value of ['off', '']) {
     const { host } = await hostWithUpdate()

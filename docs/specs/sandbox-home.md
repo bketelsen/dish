@@ -73,6 +73,15 @@ This is most of the friction from the qwen session, and it would hit every Go pr
    - `previous.json` is regenerated with the script.
 7. **The judge is unchanged.** Fewer commands need an escalation, so fewer reach it as one.
 
+### Later: the machine's `/tmp`, and mise's shims (2026-10-03)
+
+A clippy session showed the per-call `/tmp` costing more than the home did. Agents build to `/tmp/x` and run it a call later, and a main agent made `/tmp/review-scratch` for a reviewer, whose `workdir` there then failed with `spawn …/dish-sandbox ENOENT`: 15 of the session's 24 stopped commands wrote to `/tmp`. Three different models reached for `/tmp` despite the prompt's advice (scratch files in `.worktrees/`). And the split was not only between calls: dsh's file tools (`read`, `write`, `read_image`, all in-process) and a call's `workdir` were always on the host's `/tmp`, which no sandboxed command could see. So, in `workspace-write` mode:
+- **A command gets the machine's `/tmp`,** bound where dsh's profile had `--tmpfs /tmp` (so dsh's workspace bind still comes after it), with `TMPDIR=/tmp`. Every agent and tool then sees one `/tmp`, which lasts.
+- **Only when dsh's own temp files are elsewhere and protected.** dsh keeps spill files, launch requests and an interactive shell's rc file in its `TMPDIR`, some read or run outside the sandbox. The unit sets `TMPDIR=~/.cache/dish/tmp` (under the protected `~/.cache/dish`, made 0700 by `ExecStartPre`), and `dish-sandbox` shares `/tmp` only when dsh's `TMPDIR` is at or under a protected path in the home. Otherwise (dev, tests, the old unit), the command gets dsh's empty `/tmp`, as before. With `/tmp` writable, a protected path under `/tmp` gets its own read-only bind.
+- **A first version** bound a scratch directory, `/tmp/dish-sandbox-<uid>`, onto `/tmp` instead. The review found that only a sandboxed `bash` saw it (not `read_image`, `write` or a `workdir`), and that filling the tmpfs it shared with dsh's launch files would stop every command. Moving dsh's `TMPDIR` fixes both.
+- **mise's shims go at the end of `PATH`,** with bwrap's `--setenv`, for the sandboxed command only: a bare `go` works, as it already did in a gate (`withMiseShims`). The unit's `PATH` is unchanged, since dsh looks `bash` up there for escalated commands and the shims directory is writable.
+- **The judge counts `/tmp` with the workspace** ([judge spec](judge.md)), and the prompts tell agents to keep scratch files in `/tmp` on the VM.
+
 ## Known limits
 
 - **Sandboxed code can leave things in the home directory that run later outside the sandbox:** a binary in `~/.local/bin` or `~/go/bin`, a mise install, a poisoned cache.
@@ -85,7 +94,7 @@ This is most of the friction from the qwen session, and it would hit every Go pr
 - **A protected path that is a symbolic link,** or that sits under one, stops every sandboxed command with a `dish-sandbox:` message naming it: bwrap can't mount on a link, and a link in a writable directory could be replaced. Replace the link with what it points to. On the VM there is none.
 - **Reads were never confined.** An agent's shell can read `~/.dsh/.credentials.yaml` and `~/.ssh`. That is unchanged (`deploy/README.md`).
 - **dsh's file tools are still fenced.** `write` and `edit` use dsh's in-process fence (workspace and temp only), which this hook doesn't reach. To write a file in the home directory, an agent uses `bash`.
-- **Caches are shared across workspaces.** A command in one project can write a cache that a command in another project reads.
+- **Caches are shared across workspaces.** A command in one project can write a cache that a command in another project reads. So is `/tmp`, since 2026-10-03: two agents that pick the same name there see each other's files, as on any shared machine (the prompt says `mktemp -d`). It is RAM on the VM (a 3.9 GB tmpfs, aged out after 10 days), so an agent that fills it costs memory, though dsh, whose files are under `~/.cache/dish/tmp`, keeps working.
 - **Dev is off by default** (decision 5).
 
 ## Build

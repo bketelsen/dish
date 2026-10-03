@@ -108,8 +108,14 @@ test('the unit never goes through pnpm, env, the launcher or a node_modules/.bin
   }
 })
 
-test('Environment is exactly one entry, PATH', () => {
-  assert.deepEqual(service.Environment, ['PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin'])
+test('Environment is exactly two entries, PATH and TMPDIR, and TMPDIR is made before each start', () => {
+  assert.deepEqual(service.Environment, ['PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin', 'TMPDIR=%h/.cache/dish/tmp'])
+  // Under ~/.cache/dish, which dish-sandbox protects: only then does it give sandboxed commands the machine's /tmp.
+  assert.deepEqual(service.ExecStartPre, [
+    '/usr/bin/mkdir -p -m 0700 %h/.cache/dish %h/.cache/dish/tmp',
+    // dsh is stopped then: what has been untouched for 10 days goes, as systemd-tmpfiles ages /tmp. A failure doesn't stop the start.
+    '-/usr/bin/find %h/.cache/dish/tmp -mindepth 1 -maxdepth 1 -mtime +10 -exec rm -rf -- {} +',
+  ])
 })
 
 test('no line sets or mentions what dev, the install or the plugin manager use', () => {
@@ -144,6 +150,7 @@ test('the checks see settings written with spaces around "=", as systemd reads t
   assert.deepEqual(spacedSections.Service?.Environment, [
     'FOO=bar',
     'PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin',
+    'TMPDIR=%h/.cache/dish/tmp',
   ])
 })
 

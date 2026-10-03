@@ -467,9 +467,12 @@ test('real, with dish-sandbox as the runner: a bare `go` resolves through mise\'
     const r = ran(await realGate(world, 'command -v go && go version', { env }))
     assert.equal(r.exitCode, 0, r.output)
     assert.equal(r.output, `${shims}/go\ngo version stub (from mise's shims)\n`)
-    // Without the shims on PATH there is no go.
+    // dish-sandbox puts the shims on every sandboxed command's PATH as well (2026-10-03): go is found without the gate's
+    // addition, and with it the directory is on PATH once.
     const bare = ran(await realGate(world, 'go version', { env: { PATH: '/usr/local/bin:/usr/bin:/bin' } }))
-    assert.equal(bare.exitCode, 127, bare.output)
+    assert.equal(bare.exitCode, 0, bare.output)
+    const once = ran(await realGate(world, 'printf "%s" "$PATH"', { env }))
+    assert.equal(once.output, `/usr/local/bin:/usr/bin:/bin:${shims}`)
   })
 })
 

@@ -48,7 +48,7 @@ Status: implemented 2026-10-01 (branch `crew`). Implements roadmap step 4. Build
 
 ## `crew.yaml`
 
-A document in the config store, claimed by `dish-crew` with agent policy `write`, and seeded once. It's YAML because that's comfortable to read in diffs and History; it's parsed with `js-yaml`, which is already in dsh's dependency tree and is declared as a dependency.
+A document in the config store, claimed by `dish-crew` with agent policy `write`, and seeded once. Since 2026-10-03, a stored `crew.yaml` that is still an earlier shipped default (`defaults/previous.json`, from git history) moves to the current one at start, as the prompts do; an edited one stays. It's YAML because that's comfortable to read in diffs and History; it's parsed with `js-yaml`, which is already in dsh's dependency tree and is declared as a dependency.
 
 ```yaml
 provider: github-copilot
@@ -62,11 +62,11 @@ limits:
   perSession: 30          # delegations a session may start, ever
 roles:
   architect:  { tier: strong, family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
-  coder:      { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
-  reviewer:   { tier: mid,    reviews: true,                    tools: [read, glob, grep, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
+  coder:      { tier: mid,    family: anthropic, writes: true,  tools: [read, read_image, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
+  reviewer:   { tier: mid,    reviews: true,                    tools: [read, read_image, glob, grep, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
   researcher: { tier: mid,    family: anthropic,                tools: [read, glob, grep, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
   ops:        { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
-  writer:     { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
+  writer:     { tier: mid,    family: anthropic, writes: true,  tools: [read, read_image, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
 ```
 
 **With direct API keys, a family can have a provider of its own.** The shipped file sends both families through the top-level `provider`, because Copilot serves Claude and GPT alike. With direct keys, Claude comes through an `anthropic` provider and GPT through an `openai` one, so each family says so, next to its tiers. A family without a `provider` runs on the top-level one, which stays required. This is an alternative example, not the shipped file; the `limits` and `roles` are as above.

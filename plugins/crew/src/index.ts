@@ -23,8 +23,9 @@
  *   `send_message` longer than `messageLimit` characters and then closes `send_message` to that child until its run ends
  *   (`subagent/end` opens it), so that a child reports once, in its closing message, and the main agent gets one delivery.
  *   Registered with the approval guard, before anything is awaited;
- * - claims `crew.yaml` in the store and seeds it when `dishConfig` is there. `dishConfig` is optional, so there is no
- *   order to keep: with no store, every answer is the shipped default;
+ * - claims `crew.yaml` in the store and seeds it when `dishConfig` is there, moving an unedited earlier default to the
+ *   current one. `dishConfig` is optional, so there is no order to keep: with no store, every answer is the shipped
+ *   default;
  * - logs as `dish-crew`.
  *
  * @module dish-crew
@@ -40,7 +41,7 @@ import { approvalGuard } from './guard.ts'
 import { CrewRecords, closingOf, isRunning } from './record.ts'
 import type { EndedRun, LiveAgents } from './record.ts'
 import { DEFAULT_MESSAGE_LIMIT, reportGuard } from './report-guard.ts'
-import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from './settings.ts'
+import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, PREVIOUS_HASHES, parseSettings } from './settings.ts'
 import type { CrewSettings } from './settings.ts'
 
 export type { CrewSettings, FamilySettings, Limits, ParseResult, RoleSettings, Tier } from './settings.ts'
@@ -397,7 +398,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       return
     }
     try {
-      await store.seed({ 'crew.yaml': DEFAULT_TEXT }, name)
+      // An unedited earlier default moves to the current one (2026-10-03: `read_image` for coder, reviewer and writer).
+      await store.seed({ 'crew.yaml': DEFAULT_TEXT }, name, { replace: { 'crew.yaml': [...PREVIOUS_HASHES] } })
     } catch (error) {
       // Unless the store is going away, which closed it under the seed.
       if (present) warn('could not seed crew.yaml: %s', describe(error))

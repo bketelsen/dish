@@ -19,7 +19,9 @@
  * when that directory exists (`withMiseShims`). The VM's unit has a `PATH` with no `go` or `cargo` on it
  * (`/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin`), so a gate such as `go test ./...` would exit 127, while the coder's
  * tools are installed with mise. The shims come after the system's directories, so dish's own node still comes first. A
- * shim runs `mise`, which runs the tool: inside the gate's sandbox, as everything the gate starts does.
+ * shim runs `mise`, which runs the tool: inside the gate's sandbox, as everything the gate starts does. Since 2026-10-03
+ * `deploy/dish-sandbox` puts the same directory at the end of every sandboxed command's `PATH` on the VM, so this matters
+ * where it doesn't run (dev without `DISH_SANDBOX_HOME=on`); a directory on `PATH` already is not added twice.
  *
  * @module dish-gates/env
  */
