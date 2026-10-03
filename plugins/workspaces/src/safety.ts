@@ -10,7 +10,9 @@
  *
  * Reading runs nothing of the clone's: files are opened without following a link and without blocking on a FIFO, and
  * the config is listed by `git config --file <clone>/.git/config --no-includes --null --list` from `/`, with no system
- * or global config, through `git()`.
+ * or global config, through `git()`. Once the config passes, git is asked where the clone's repository is
+ * (`git -C <clone> rev-parse --absolute-git-dir`, no system or global config): it must be `<clone>/.git`, so a `.git`
+ * git doesn't take as a repository (its `HEAD` removed, say) is refused, whatever repository is around the clone.
  *
  * @module dish-workspaces/safety
  */
@@ -260,10 +262,37 @@ async function cloneProblem(clone: string, expect: CloneExpectations): Promise<s
   const worktrees = await worktreesProblem(dotGit)
   if (worktrees !== undefined) return worktrees
   const entries = await listConfig(join(dotGit, 'config'))
-  return typeof entries === 'string' ? entries : configProblem(entries, expect)
+  if (typeof entries === 'string') return entries
+  return configProblem(entries, expect) ?? await gitDirProblem(clone)
 }
 
-/** Check a clone before dish's git works in it. Reads files, and runs only `git config --file <clone>/.git/config --no-includes --null --list` (with SAFE_FLAGS, cwd '/'), which runs nothing of the clone's. */
+/** git's own word on where the clone's repository is, asked once its config has passed: it must be `<clone>/.git`, by its real path. */
+async function gitDirProblem(clone: string): Promise<string | undefined> {
+  let real: string
+  try {
+    real = await realpath(clone)
+  } catch {
+    return `${clone} can't be resolved`
+  }
+  let found: string
+  try {
+    found = (await gitOk(['-C', real, 'rev-parse', '--absolute-git-dir'], {
+      timeoutMs: CONFIG_READ_TIMEOUT_MS,
+      env: { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    })).replace(/\n$/, '')
+  } catch (error) {
+    if (error instanceof GitError) return `git doesn't take .git as a repository (${error.message})`
+    throw error
+  }
+  const expected = join(real, '.git')
+  return found === expected ? undefined : `git finds the repository at ${showName(found)}, not ${expected}`
+}
+
+/**
+ * Check a clone before dish's git works in it. Reads files, runs `git config --file <clone>/.git/config --no-includes
+ * --null --list` (with SAFE_FLAGS, cwd '/'), which runs nothing of the clone's, and once that config passes, `git -C
+ * <clone> rev-parse --absolute-git-dir` (SAFE_FLAGS, no system or global config), which must name `<clone>/.git`.
+ */
 export async function checkClone(clone: string, expect: CloneExpectations = {}): Promise<SafetyResult> {
   const problem = await cloneProblem(clone, expect)
   return problem === undefined ? { ok: true } : { ok: false, problem: maskSecrets(problem) }

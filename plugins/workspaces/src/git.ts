@@ -18,6 +18,9 @@
  *   scrub, which has dropped every inherited `GIT_*` name.
  * - `safe.bareRepository=explicit`, so a bare repository an agent planted where dish `-C`s is refused unless named
  *   with `--git-dir`. dish never `-C`s into a bare repository, so this changes nothing it does.
+ * - no repository above the directory git starts in: `GIT_CEILING_DIRECTORIES` is that directory's parent (by its real
+ *   path), so a clone whose `.git` git doesn't accept (its `HEAD` removed, say) is an error, never the repository
+ *   around it (the dish checkout, around a dev work root). `checkClone` asks git where `.git` is as well.
  * - the environment is `childEnvironment()`: no inherited `GIT_*` name (that could point git at another repository
  *   or config), nothing credential-shaped, no `DSH_*`, and `GIT_TERMINAL_PROMPT=0`.
  * - git runs detached: in its own session and process group, with no terminal to prompt on and stdin closed unless
@@ -31,6 +34,8 @@
 
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
+import { realpathSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 import { maskSecrets } from 'dish-kit'
 import { childEnvironment } from './env.ts'
 
@@ -147,10 +152,45 @@ export function submoduleProblem(args: readonly string[]): string | undefined {
 }
 
 /**
+ * Where git starts looking for a repository: `cwd` (else this process's directory), then each `-C` before the
+ * subcommand in turn, as git joins them (an empty one changes nothing).
+ */
+function startDirectory(args: readonly string[], cwd?: string): string {
+  let dir = resolve(cwd ?? process.cwd())
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!
+    if (VALUED_OPTIONS.has(arg)) {
+      const value = args[index + 1]
+      if (arg === '-C' && value !== undefined && value !== '') dir = resolve(dir, value)
+      index++
+      continue
+    }
+    if (!arg.startsWith('-')) break
+  }
+  return dir
+}
+
+/**
+ * `GIT_CEILING_DIRECTORIES` for a git that starts in `dir`: its parent, by its real path (git compares the ceiling
+ * with the directory it is in, which is real), so discovery never leaves `dir`. A `dir` that can't be resolved (it
+ * isn't there: git fails on it anyway) gets the parent as spelled.
+ */
+function ceilingFor(dir: string): string {
+  let real = dir
+  try {
+    real = realpathSync(dir)
+  } catch {
+    // git can't start there; nothing to walk up from.
+  }
+  return dirname(real)
+}
+
+/**
  * `git ...SAFE_FLAGS ...args`, detached (its own process group), stdin `input` or closed, env childEnvironment() plus
- * `options.env`. A timeout or an abort kills the group. Output capped at 4 MB each. Never throws for an exit code;
- * throws only when git can't be started, for a time limit that isn't a positive number of milliseconds, and, before
- * starting anything, for a `status` or `diff*` call that `submoduleProblem` refuses.
+ * `options.env`, then `GIT_CEILING_DIRECTORIES` (the parent of the directory git starts in) and `GIT_GRAFT_FILE`. A
+ * timeout or an abort kills the group. Output capped at 4 MB each. Never throws for an exit code; throws only when git
+ * can't be started, for a time limit that isn't a positive number of milliseconds, and, before starting anything, for a
+ * `status` or `diff*` call that `submoduleProblem` refuses.
  */
 export function git(args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
   const refused = submoduleProblem(args)
@@ -162,12 +202,21 @@ export function git(args: readonly string[], options: GitOptions = {}): Promise<
   const { signal } = options
   if (signal?.aborted) return Promise.resolve({ code: -1, stdout: '', stderr: '', timedOut: false, aborted: true })
 
+  let ceiling: string
+  try {
+    ceiling = ceilingFor(startDirectory(args, options.cwd))
+  } catch (error) {
+    // This process's directory is gone: git can't start in it either.
+    return Promise.reject(error)
+  }
+
   return new Promise((resolve, reject) => {
     const child: ChildProcess = spawn('git', [...SAFE_FLAGS, ...args], {
       cwd: options.cwd,
-      // GIT_GRAFT_FILE last: after the scrub (which dropped every inherited GIT_*) and after options.env, so no caller can
-      // turn a planted grafts file back on. Only this var switches grafts off.
-      env: { ...childEnvironment(), ...options.env, GIT_GRAFT_FILE: '/dev/null' },
+      // GIT_CEILING_DIRECTORIES and GIT_GRAFT_FILE last: after the scrub (which dropped every inherited GIT_*) and after
+      // options.env, so no caller can let discovery walk up, or turn a planted grafts file back on. Only the latter var
+      // switches grafts off.
+      env: { ...childEnvironment(), ...options.env, GIT_CEILING_DIRECTORIES: ceiling, GIT_GRAFT_FILE: '/dev/null' },
       detached: true,
       stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     })

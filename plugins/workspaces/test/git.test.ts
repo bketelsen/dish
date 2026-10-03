@@ -1,10 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { access, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DEFAULT_GIT_TIMEOUT_MS, GitError, SAFE_FLAGS, git, gitOk, maskUrlPasswords, submoduleProblem } from '../src/git.ts'
-import { NOSYSTEM, dishHome, makeClone, runOk, scratchGitEnv, tempDir, withEnv } from './helpers.ts'
+import { NOSYSTEM, dishHome, makeClone, run, runOk, scratchGitEnv, tempDir, withEnv } from './helpers.ts'
 import type { Clone } from './helpers.ts'
 
 /** Shaped like a GitHub installation token (`ghs_` and 40 letters and digits); not one. */
@@ -494,6 +494,37 @@ test('safe.bareRepository=explicit refuses a -C into a bare repository, but --gi
     assert.match(refused.stderr, /safe\.bareRepository/)
     // dish names a git dir explicitly, which is allowed.
     assert.equal(await gitOk(['--git-dir', made.bare, 'rev-parse', '--is-bare-repository'], { env: NOSYSTEM }), 'true\n')
+  })
+})
+
+test("a clone whose .git git won't accept, inside another repository, fails: dish's git never walks up into the outer one", async () => {
+  const dir = await tempDir()
+  // The outer repository (as the dish checkout is around a dev work root), and a clone inside it.
+  const outer = join(dir, 'outer')
+  const env = await scratchGitEnv(dir)
+  await runOk('git', ['init', '-q', '-b', 'main', outer], { env })
+  await runOk('git', ['-C', outer, 'commit', '-q', '--allow-empty', '-m', 'outer'], { env })
+  const made = await makeClone(join(outer, 'work'))
+  await rm(join(made.clone, '.git', 'HEAD'))
+  const plain = await run('git', ['-C', made.clone, 'rev-parse', '--show-toplevel'], { env })
+  assert.equal(plain.stdout.trim(), outer, 'the fixture is real: plain git walks up into the outer repository')
+  await asDish(dir, async () => {
+    for (const cwd of [undefined, made.clone]) {
+      const args = cwd === undefined ? ['-C', made.clone, 'rev-parse', '--show-toplevel'] : ['rev-parse', '--show-toplevel']
+      const result = await git(args, { cwd, env: NOSYSTEM })
+      assert.notEqual(result.code, 0, `dish's git found ${result.stdout.trim()}`)
+      assert.match(result.stderr, /not a git repository/)
+    }
+    // Two -C's are one directory, as git joins them; and a -C through a link stops at the link's target's parent.
+    const twice = await git(['-C', join(outer, 'work'), '-C', 'clone', 'rev-parse', '--show-toplevel'], { env: NOSYSTEM })
+    assert.match(twice.stderr, /not a git repository/)
+    const link = join(dir, 'link')
+    await symlink(made.clone, link)
+    const linked = await git(['-C', link, 'rev-parse', '--show-toplevel'], { env: NOSYSTEM })
+    assert.match(linked.stderr, /not a git repository/)
+    // A good clone still works.
+    await writeFile(join(made.clone, '.git', 'HEAD'), 'ref: refs/heads/main\n')
+    assert.equal(await gitOk(['-C', made.clone, 'rev-parse', '--show-toplevel'], { env: NOSYSTEM }), `${made.clone}\n`)
   })
 })
 

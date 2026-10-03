@@ -299,6 +299,22 @@ test(".git must be a directory: a worktree's or a submodule's .git file, a symbo
   assert.match(problemOf(await checkClone(join(dir, 'nothing-here'))), /\.git is missing/)
 })
 
+test(".git must be the repository git finds there: a clone whose HEAD is gone, inside another repository, is refused", async () => {
+  const { clone, dir, env } = await dishClone()
+  // The clone sits inside another repository, as a dev work root sits inside the dish checkout.
+  await runOk('git', ['init', '-q', '-b', 'main', dir], { env })
+  assert.deepEqual(await checkClone(clone, EXPECT), { ok: true })
+  await rm(join(clone, '.git', 'HEAD'))
+  const plain = await run('git', ['-C', clone, 'rev-parse', '--absolute-git-dir'], { env })
+  assert.equal(plain.stdout.trim(), join(dir, '.git'), 'the fixture is real: plain git takes the outer repository')
+  assert.match(problemOf(await checkClone(clone, EXPECT)), /^git doesn't take \.git as a repository \(git rev-parse failed .*not a git repository/)
+  // Reached through a link, a good clone still passes.
+  await writeFile(join(clone, '.git', 'HEAD'), 'ref: refs/heads/main\n')
+  const link = join(dir, 'link')
+  await symlink(clone, link)
+  assert.deepEqual(await checkClone(link, EXPECT), { ok: true })
+})
+
 test('.git/commondir, .git/config.worktree, and a .git/config that is missing or not a file, are refused', async () => {
   for (const [plant, expected] of [
     [async (git: string) => writeFile(join(git, 'commondir'), '../elsewhere\n'), /\.git\/commondir/],
