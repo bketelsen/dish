@@ -54,8 +54,8 @@
  * A child bound to a worktree (`ChildRecord.worktree`) has its gate's ending said after the report, from the last gate result
  * of the run the notice is of (`gateLine`; the results are dish-gates', recorded by `addGate`, and filed on the run by
  * `endRun`): a pass, a failure that used the last round, a failure that didn't (the run ended some other way), a skip, an
- * error, or no result. A notice with no run matched to it says nothing of a gate, as it names no report. The collapsed
- * row's sentence (`noticeSummary`) doesn't change.
+ * error, or no result. A notice with no run matched to it says nothing of a gate, as it names no report. The gate line
+ * doesn't change the collapsed row's sentence (`noticeSummary`).
  *
  * **Structured reports** (step 7). A coder or a reviewer (`reportRole`) finishes with crew's `report` tool, and dsh's notice of
  * a turn that call ended says only "It left no closing message.": dsh keeps the text blocks of the last message, and the
