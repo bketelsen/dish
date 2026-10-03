@@ -6,6 +6,7 @@ A fixed crew of specialists the main agent hands work to, with the conversation 
 - **`crew.yaml`** in the config store holds the roles, tiers, models and limits.
 - **Crew keeps its own record.** It saves every child's final report, and finish notices name the child's role and model.
 - **Children report once, in their closing message.** A new child is told so after its task. A child's `send_message` longer than `messageLimit` characters (1200 by default) is refused, and `send_message` stays closed to it until it finishes, so the main agent gets one delivery and not two.
+- **Its blocks are kept apart.** dsh's adapters join a message's text blocks with nothing between them, so crew ends each block it writes into a message (a child's task, its worktree block, a ruling's block, the closing note, and the first block of a finish notice when dsh's blocks follow it) with a blank line. The blocks themselves are as described here.
 - **This bundle ships the dish preset:** the main agent's preset, with `delegate`, and with dsh's own delegation tools turned off.
 
 The design and its reasoning are in the [spec](../../docs/specs/crew.md). Why this builds on dsh's subagents directly rather than its experimental agent teams is in the [research note](../../docs/research/2026-10-01-dsh-agent-team.md).

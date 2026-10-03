@@ -13,7 +13,7 @@ import * as promptsPlugin from 'dish-prompts'
 import * as row from '../src/delegate.ts'
 import { CrewRecords, isRunning } from '../src/record.ts'
 import type { ChildRecord, GateResult } from '../src/record.ts'
-import { gateOverrideBrief, worktreeBrief } from '../src/text.ts'
+import { BLOCK_END, gateOverrideBrief, worktreeBrief } from '../src/text.ts'
 import { DEFAULT_SETTINGS, parseSettings } from '../src/settings.ts'
 import type { CrewSettings } from '../src/settings.ts'
 import { provideStub, shippedWith, tempDir, watchLogs } from './helpers.ts'
@@ -519,7 +519,7 @@ test('a start gives startContinuable everything, and records the child before it
   assert.equal(spec.label, 'coder · claude-sonnet-5.5 · add login')
   assert.match(String(spec.childId), /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
   assert.equal(spec.request.parent, w.main)
-  assert.deepEqual(spec.request.prompt, [{ type: 'text', text: CODER.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.deepEqual(spec.request.prompt, [{ type: 'text', text: CODER.task + BLOCK_END }, { type: 'text', text: CLOSING_NOTE + BLOCK_END }])
   assert.equal(spec.request.persona, 'You are the coder. {{model}}')
   assert.deepEqual(spec.request.agentOptions, { provider: 'github-copilot', model: 'claude-sonnet-5.5' })
   assert.equal(spec.request.maxDepth, 1)
@@ -553,22 +553,31 @@ test('a child that has send_message is told, after its task, that its closing me
   for (const spec of w.starts) {
     assert.ok(spec.request.toolFilter?.allow?.includes('send_message'))
     assert.equal(spec.request.prompt.length, 2)
-    assert.deepEqual(spec.request.prompt[1], { type: 'text', text: CLOSING_NOTE })
+    assert.deepEqual(spec.request.prompt[1], { type: 'text', text: CLOSING_NOTE + BLOCK_END })
   }
-  assert.equal(w.starts[0]!.request.prompt[0]!.type === 'text' && w.starts[0]!.request.prompt[0]!.text, CODER.task, 'the task is first and unchanged')
+  assert.equal(w.starts[0]!.request.prompt[0]!.type === 'text' && w.starts[0]!.request.prompt[0]!.text, `${CODER.task}${BLOCK_END}`, 'the task is first, unchanged but for the blank line after it')
 
   // A role without it, or whose send_message the parent can't give (dropped from the list), gets the task alone.
   const without = await world({ settings: settingsFrom((d) => { d.roles.researcher.tools = ['read', 'grep'] }) })
   await without.delegate(RESEARCHER)
   assert.deepEqual(without.starts[0]!.request.toolFilter, { allow: ['grep', 'read'] })
-  assert.deepEqual(without.starts[0]!.request.prompt, [{ type: 'text', text: RESEARCHER.task }])
+  assert.deepEqual(without.starts[0]!.request.prompt, [{ type: 'text', text: RESEARCHER.task + BLOCK_END }])
+})
+
+test('crew\'s blocks end with a blank line: dsh\'s adapters join a message\'s text blocks with nothing between them', async () => {
+  assert.equal(BLOCK_END, '\n\n')
+  const w = await world()
+  await w.delegate(CODER)
+  // What a model reads of the prompt, as pi-ai's adapter joins it (dsh adds its own note after the closing note).
+  const read = w.starts[0]!.request.prompt.map(block => block.type === 'text' ? block.text : '').join('')
+  assert.equal(read, `${CODER.task}\n\n${CLOSING_NOTE}\n\n`)
 })
 
 test('the closing note is not added when the parent can not give send_message, even if the role lists it', async () => {
   const w = await world({ withoutTools: ['send_message'], settings: settingsFrom((d) => { d.roles.researcher.tools = ['read', 'send_message'] }) })
   await w.delegate(RESEARCHER)
   assert.deepEqual(w.starts[0]!.request.toolFilter, { allow: ['read'] })
-  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: RESEARCHER.task }])
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: RESEARCHER.task + BLOCK_END }])
 })
 
 test('the signal of the call goes to the route check and to startContinuable', async () => {
@@ -1570,9 +1579,9 @@ test('a coder bound to a worktree: the record has its path, and the prompt is th
   assert.deepEqual(w.resolveAsked, ['frostyard/snosi/fix-1'])
   assert.equal(w.starts.length, 1)
   assert.deepEqual(w.starts[0]!.request.prompt, [
-    { type: 'text', text: CODER.task },
-    { type: 'text', text: brief(tree.path, 'dish/fix-1') },
-    { type: 'text', text: CLOSING_NOTE },
+    { type: 'text', text: CODER.task + BLOCK_END },
+    { type: 'text', text: brief(tree.path, 'dish/fix-1') + BLOCK_END },
+    { type: 'text', text: CLOSING_NOTE + BLOCK_END },
   ])
   // Recorded before the start, with the binding.
   assert.equal(w.recordedAtStart.get(result.child)?.worktree, tree.path)
@@ -1590,13 +1599,13 @@ test('a bound child without send_message gets the task and the brief', async () 
   const w = await world({ settings: settingsFrom((d) => { d.roles.coder.tools = ['read', 'write', 'edit'] }) })
   const tree = await w.makeWorktree('fix-1')
   await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
-  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: CODER.task }, { type: 'text', text: brief(tree.path, 'dish/fix-1') }])
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: CODER.task + BLOCK_END }, { type: 'text', text: brief(tree.path, 'dish/fix-1') + BLOCK_END }])
 })
 
 test('a start without a worktree is as it was: no brief, no binding, and dish-workspaces is not asked', async () => {
   const w = await world()
   await w.delegate({ ...CODER, worktree: '' })
-  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: CODER.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: CODER.task + BLOCK_END }, { type: 'text', text: CLOSING_NOTE + BLOCK_END }])
   assert.ok(!('worktree' in (await w.records.children(SESSION))[0]!))
   assert.deepEqual(w.resolveAsked, [])
   // Nor is it needed: a start without one works with no dish-workspaces at all.
@@ -1671,7 +1680,7 @@ test('the path resolve gives is made canonical: a worktree reached through a lin
   w.worktrees.set('frostyard/snosi/fix-1', linked)
   const started = await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
   assert.equal((await w.records.lookup(started.child))?.record.worktree, tree.path)
-  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: brief(tree.path, 'dish/fix-1') })
+  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: brief(tree.path, 'dish/fix-1') + BLOCK_END })
   assert.deepEqual((await w.records.boundTo(tree.path)).map(({ record }) => record.id), [started.child])
   assert.deepEqual(await w.records.boundTo(linked.path), [])
 })
@@ -1929,14 +1938,14 @@ test('a bound coder\'s brief names its project\'s gate while dish-gates runs: af
   await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
   assert.deepEqual(w.gateAsked, ['frostyard/snosi'])
   assert.deepEqual(w.starts[0]!.request.prompt, [
-    { type: 'text', text: CODER.task },
-    { type: 'text', text: brief(tree.path, 'dish/fix-1') + gateSentence(GATE) },
-    { type: 'text', text: CLOSING_NOTE },
+    { type: 'text', text: CODER.task + BLOCK_END },
+    { type: 'text', text: brief(tree.path, 'dish/fix-1') + gateSentence(GATE) + BLOCK_END },
+    { type: 'text', text: CLOSING_NOTE + BLOCK_END },
   ])
   // An unbound coder gets no block, and dish-gates isn't asked.
   await finish(w, String(w.starts[0]!.childId))
   await w.delegate({ ...CODER, title: 'unbound' })
-  assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: CODER.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: CODER.task + BLOCK_END }, { type: 'text', text: CLOSING_NOTE + BLOCK_END }])
   assert.deepEqual(w.gateAsked, ['frostyard/snosi'])
 })
 
@@ -1946,7 +1955,7 @@ test('a credential in the gate dish-gates gives is masked in the coder\'s brief'
   w.gates.set('frostyard/snosi', `GH_TOKEN=${token} pnpm test`)
   const tree = await w.makeWorktree('fix-1')
   await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
-  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: brief(tree.path, 'dish/fix-1') + gateSentence(`GH_TOKEN=${maskSecrets(token)} pnpm test`) })
+  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: brief(tree.path, 'dish/fix-1') + gateSentence(`GH_TOKEN=${maskSecrets(token)} pnpm test`) + BLOCK_END })
   assert.ok(!JSON.stringify(w.starts[0]!.request.prompt).includes(token))
 })
 
@@ -1954,21 +1963,21 @@ test('without a gate to name, the brief is 6b\'s: no dish-gates, a project it ha
   const without = await world()
   const tree = await without.makeWorktree('fix-1')
   await without.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
-  assert.deepEqual(without.starts[0]!.request.prompt[1], { type: 'text', text: brief(tree.path, 'dish/fix-1') })
+  assert.deepEqual(without.starts[0]!.request.prompt[1], { type: 'text', text: brief(tree.path, 'dish/fix-1') + BLOCK_END })
 
   const w = await world({ dishGates: true })
   const other = await w.makeWorktree('fix-1')
   const first = await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
-  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: brief(other.path, 'dish/fix-1') })
+  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: brief(other.path, 'dish/fix-1') + BLOCK_END })
   await finish(w, first.child)
   const logs = watchLogs(w.ctx)
   w.gates.set('frostyard/snosi', GATE)
   w.stub.gateForFails = new Error('projects.yaml is unreadable')
   const second = await w.delegate({ ...CODER, title: 'again', worktree: 'frostyard/snosi/fix-1' })
   assert.deepEqual(w.starts[1]!.request.prompt, [
-    { type: 'text', text: CODER.task },
-    { type: 'text', text: brief(other.path, 'dish/fix-1') },
-    { type: 'text', text: CLOSING_NOTE },
+    { type: 'text', text: CODER.task + BLOCK_END },
+    { type: 'text', text: brief(other.path, 'dish/fix-1') + BLOCK_END },
+    { type: 'text', text: CLOSING_NOTE + BLOCK_END },
   ])
   assert.equal((await w.records.lookup(second.child))?.record.worktree, other.path)
   assert.ok(logs.some(line => /projects\.yaml is unreadable/.test(line)), logs.join('\n'))
@@ -2006,7 +2015,7 @@ test('a review of a bound coder that is still running is refused, saying to wait
   // With a ruling it starts, and the reviewer is told the coder was still running.
   const ruling = 'Ruling: review the plan so far — it is a draft — findings on code that changes'
   const result = await w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: ruling })
-  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: gateOverrideBrief(REVIEWED, 'it is still running', ruling) })
+  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: gateOverrideBrief(REVIEWED, 'it is still running', ruling) + BLOCK_END })
   assert.equal((await w.records.lookup(result.child))?.record.gateOverride, ruling)
 })
 
@@ -2044,7 +2053,7 @@ test('a pass counts only when its run ended completed: a run that ended another 
     // A ruling starts it, and the reviewer is told where the gate stands.
     const ruling = 'Ruling: review it anyway — the run was stopped by hand — a missed bug'
     await w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: ruling })
-    assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }, reason)
+    assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) + BLOCK_END }, reason)
   }
 
   // dsh stopped mid-run (a restart) after the gate passed: the record says running, there is no agent, and the pass is on
@@ -2062,12 +2071,12 @@ test('a review after the gate passed starts as before, and an override given is 
   // Failed once, fixed, passed: the latest result is the one that counts.
   await boundCoder(w, 'c1', [FAILED_3[0]!, gateResult({ round: 2 })])
   const result = await w.delegate({ ...REVIEW, reviews: 'c1' })
-  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: REVIEW.task + BLOCK_END }, { type: 'text', text: CLOSING_NOTE + BLOCK_END }])
   assert.ok(!('gateOverride' in (await w.records.lookup(result.child))!.record))
   // Not even a ruling with nothing in it is refused when there is nothing to override.
   await finish(w, result.child)
   const again = await w.delegate({ ...REVIEW, title: 'again', reviews: 'c1', gateOverride: 'Ruling:' })
-  assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: REVIEW.task + BLOCK_END }, { type: 'text', text: CLOSING_NOTE + BLOCK_END }])
   assert.ok(!('gateOverride' in (await w.records.lookup(again.child))!.record))
 })
 
@@ -2077,9 +2086,9 @@ test('a review with a ruling starts: the ruling, on one line, is recorded and to
   const result = await w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: '  Ruling: review it anyway —\n  the failure is a flaky\ttest —\r\n a missed bug  ' })
   const ruling = 'Ruling: review it anyway — the failure is a flaky test — a missed bug'
   assert.deepEqual(w.starts[0]!.request.prompt, [
-    { type: 'text', text: REVIEW.task },
-    { type: 'text', text: gateOverrideBrief(REVIEWED, `failed, round 3 of 3; log ${LOG_3}`, ruling) },
-    { type: 'text', text: CLOSING_NOTE },
+    { type: 'text', text: REVIEW.task + BLOCK_END },
+    { type: 'text', text: gateOverrideBrief(REVIEWED, `failed, round 3 of 3; log ${LOG_3}`, ruling) + BLOCK_END },
+    { type: 'text', text: CLOSING_NOTE + BLOCK_END },
   ])
   const recorded = (await w.records.lookup(result.child))!.record
   assert.equal(recorded.gateOverride, ruling)
@@ -2109,12 +2118,12 @@ test('not checked: an unbound coder, reviews "main", any review while dish-gates
   // An unbound coder has no gate.
   await w.seed({ id: 'u1', role: 'coder', last: 'finished' }, 'idle')
   const unbound = await w.delegate({ ...REVIEW, reviews: 'u1', gateOverride: 'Ruling: x — y — z' })
-  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: REVIEW.task + BLOCK_END }, { type: 'text', text: CLOSING_NOTE + BLOCK_END }])
   assert.ok(!('gateOverride' in (await w.records.lookup(unbound.child))!.record))
   await finish(w, unbound.child)
   // The main agent's own work.
   const main = await w.delegate({ ...REVIEW, title: 'review mine', reviews: 'main', gateOverride: 'Ruling: x — y — z' })
-  assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: REVIEW.task + BLOCK_END }, { type: 'text', text: CLOSING_NOTE + BLOCK_END }])
   assert.ok(!('gateOverride' in (await w.records.lookup(main.child))!.record))
   // A coder's start with an override: there is no review to override.
   await finish(w, main.child)
@@ -2126,7 +2135,7 @@ test('not checked: an unbound coder, reviews "main", any review while dish-gates
   const off = await world()
   await boundCoder(off, 'c1', FAILED_3)
   const failed = await off.delegate({ ...REVIEW, reviews: 'c1', gateOverride: 'Ruling:' })
-  assert.deepEqual(off.starts[0]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.deepEqual(off.starts[0]!.request.prompt, [{ type: 'text', text: REVIEW.task + BLOCK_END }, { type: 'text', text: CLOSING_NOTE + BLOCK_END }])
   assert.ok(!('gateOverride' in (await off.records.lookup(failed.child))!.record))
   await boundCoder(off, 'c2', [], false)
   await off.delegate({ ...REVIEW, title: 'review c2', reviews: 'c2' })
@@ -2156,7 +2165,7 @@ test('a re-review (a follow-up to a reviewer, with to) is checked the same way: 
   const ruling = 'Ruling: re-review anyway — the failing test is unrelated — a missed regression'
   await w.delegate({ ...again, gateOverride: `${ruling}\n` })
   assert.equal(w.sends.length, 1)
-  assert.deepEqual(w.sends[0]!.content, [{ type: 'text', text: 'Review the fix.' }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }])
+  assert.deepEqual(w.sends[0]!.content, [{ type: 'text', text: 'Review the fix.' + BLOCK_END }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }])
   const record = (await w.records.lookup(reviewer.child))!.record
   assert.equal(record.gateOverride, ruling)
   assert.equal(record.followUps, 1)
@@ -2195,7 +2204,7 @@ test('a ruling given on a re-review carries over to the next re-review, until th
   await pause()
   await w.delegate({ ...again, task: 'Once more.' })
   assert.equal(w.sends.length, 2)
-  assert.deepEqual(w.sends[1]!.content, [{ type: 'text', text: 'Once more.' }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }])
+  assert.deepEqual(w.sends[1]!.content, [{ type: 'text', text: 'Once more.' + BLOCK_END }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }])
   await finish(w, reviewer.child)
   // The coder runs again, and fails again: the ruling was on the work before, so it no longer stands.
   await pause()
@@ -2232,7 +2241,7 @@ test('a re-review keeps the reviewer\'s ruling while the coder hasn\'t run since
 
   // No new ruling: the one on record stands, and the reviewer is told it again.
   await w.delegate({ ...REVIEW, task: 'Look again at the form.', to: reviewer.child })
-  assert.deepEqual(w.sends[0]!.content, [{ type: 'text', text: 'Look again at the form.' }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }])
+  assert.deepEqual(w.sends[0]!.content, [{ type: 'text', text: 'Look again at the form.' + BLOCK_END }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }])
   let record = (await w.records.lookup(reviewer.child))!.record
   assert.equal(record.gateOverride, ruling)
   assert.equal(record.followUps, 1)
@@ -2240,7 +2249,7 @@ test('a re-review keeps the reviewer\'s ruling while the coder hasn\'t run since
   await finish(w, reviewer.child)
   const newer = 'Ruling: once more — the form changed little — a missed bug'
   await w.delegate({ ...REVIEW, task: 'Once more.', to: reviewer.child, gateOverride: newer })
-  assert.deepEqual(w.sends[1]!.content, [{ type: 'text', text: 'Once more.' }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, newer) }])
+  assert.deepEqual(w.sends[1]!.content, [{ type: 'text', text: 'Once more.' + BLOCK_END }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, newer) }])
   record = (await w.records.lookup(reviewer.child))!.record
   assert.equal(record.gateOverride, newer)
   await finish(w, reviewer.child)

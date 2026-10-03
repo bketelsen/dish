@@ -1,10 +1,18 @@
 /**
  * The text dish-crew writes: the two small things every refusal does to text it doesn't control (cut a name short, and list
- * names), the block a bound coder's brief gets (`worktreeBrief`), and the block a reviewer gets when the main agent overrode
- * the gate of the work it reviews (`gateOverrideBrief`).
+ * names), the block a bound coder's brief gets (`worktreeBrief`), the block a reviewer gets when the main agent overrode
+ * the gate of the work it reviews (`gateOverrideBrief`), and what goes between the blocks of a message (`BLOCK_END`).
  *
  * @module dish-crew/text
  */
+
+/**
+ * What crew puts after a text block it writes into a message, before the next block: a blank line. dsh's adapters join a
+ * message's text blocks with nothing between them (pi-ai's `flattenText` and `userContent`, and deepseek's), so without it
+ * a model reads "create ok.txtYour worktree is…". The blocks themselves (`worktreeBrief`, `CLOSING_NOTE`, `noticeText`) stay
+ * as they are, byte for byte; only the assembly of a message adds it.
+ */
+export const BLOCK_END = '\n\n'
 
 /** The longest a name or value from outside is shown in a message, so one bad key can't make a message the size of the file. */
 export const SHOWN = 40

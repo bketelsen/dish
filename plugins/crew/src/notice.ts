@@ -62,6 +62,7 @@ import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import { maskSecrets } from 'dish-kit'
 import type { DishCrew } from './index.ts'
 import { closingOf, reportContent } from './record.ts'
+import { BLOCK_END } from './text.ts'
 import type { ChildRecord, RunRecord } from './record.ts'
 
 /** The longest a notice waits for a run that is being recorded, in ms. */
@@ -317,11 +318,16 @@ async function runOf(parts: Parts, runs: readonly RunRecord[], claimed: Set<RunR
   return undefined
 }
 
-/** `message` with the text that leads it and its source's summary replaced. */
+/**
+ * `message` with the text that leads it and its source's summary replaced. When dsh's blocks follow it (the closing
+ * message), crew's text ends with a blank line (`BLOCK_END`): dsh's adapters join text blocks with nothing between them.
+ */
 function rewritten(message: UserMessage, child: ChildRecord, parts: Parts, run: RunRecord | undefined, gatesOn: boolean): UserMessage {
-  const text: ContentBlock = Object.freeze({ type: 'text', text: noticeText(child, run, parts.lead, parts.label, gatesOn) })
   // The blocks that stay are dsh's own, frozen already.
-  const content = Object.freeze([text, ...message.content.slice(parts.label === undefined ? 1 : 2)])
+  const rest = message.content.slice(parts.label === undefined ? 1 : 2)
+  const lead = noticeText(child, run, parts.lead, parts.label, gatesOn)
+  const text: ContentBlock = Object.freeze({ type: 'text', text: rest.length === 0 ? lead : `${lead}${BLOCK_END}` })
+  const content = Object.freeze([text, ...rest])
   const source = Object.freeze({ ...message.source, summary: bounded(noticeSummary(child, run, parts.lead)) })
   return Object.freeze({ ...message, content, source })
 }

@@ -19,7 +19,8 @@
  * 6. **The route** resolves (the model on its family's provider, else the file's, which is what the child starts on), and
  *    7. **the tools** the child may have (`allowList`) are not none.
  * 8. **The start or the send.** A new child's prompt is the task, and, if it has `send_message`, a note that its closing message
- *    is its report (`CLOSING_NOTE`).
+ *    is its report (`CLOSING_NOTE`). Each of crew's blocks ends with a blank line (`BLOCK_END`): dsh's adapters join a
+ *    message's text blocks with nothing between them.
  *
  * From 4 to the end, a call holds its session's lock, so two calls in one step can't both pass the same check. A start
  * writes the child's record before `startContinuable`, which is given the id the record has: a child that is quick finds
@@ -90,7 +91,7 @@ import { noticeListener } from './notice.ts'
 import { isRunning, latestGate } from './record.ts'
 import type { ChildRecord } from './record.ts'
 import type { CrewSettings, RoleSettings } from './settings.ts'
-import { gateOverrideBrief, listed, truncate, worktreeBrief } from './text.ts'
+import { BLOCK_END, gateOverrideBrief, listed, truncate, worktreeBrief } from './text.ts'
 
 export const name = 'dish-crew-delegate'
 
@@ -670,10 +671,11 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       throw new Error(`could not record the delegation, so nothing was started: ${describe(error)}. Try again, or tell the user.`, { cause: error })
     }
     // The closing note stays last: it refers to the note dsh adds after it, under the same condition (the child has `send_message`).
-    const prompt = [{ type: 'text' as const, text: call.task }]
-    if (bound !== undefined) prompt.push({ type: 'text', text: worktreeBrief(bound, gate) })
-    if (override !== undefined) prompt.push({ type: 'text', text: override.block })
-    if (allowed.allow.includes('send_message')) prompt.push({ type: 'text', text: CLOSING_NOTE })
+    // Each block ends with a blank line (`BLOCK_END`): dsh's adapters join text blocks with nothing between them.
+    const prompt = [{ type: 'text' as const, text: `${call.task}${BLOCK_END}` }]
+    if (bound !== undefined) prompt.push({ type: 'text', text: `${worktreeBrief(bound, gate)}${BLOCK_END}` })
+    if (override !== undefined) prompt.push({ type: 'text', text: `${override.block}${BLOCK_END}` })
+    if (allowed.allow.includes('send_message')) prompt.push({ type: 'text', text: `${CLOSING_NOTE}${BLOCK_END}` })
     try {
       await ctx.subagents.startContinuable({
         provider: call.crew.subagentProvider,
@@ -742,7 +744,8 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       const reviewer = reviewerName(call.settings)
       throw new Error(`reviews is for the reviewer role (${reviewer}), and ${call.role} doesn't review. Leave reviews out, or delegate to ${reviewer}.`)
     }
-    const content = [{ type: 'text' as const, text: call.task }]
+    // A blank line between the task and the ruling's block, as for a start; nothing follows the last block.
+    const content = [{ type: 'text' as const, text: override === undefined ? call.task : `${call.task}${BLOCK_END}` }]
     if (override !== undefined) content.push({ type: 'text', text: override.block })
     try {
       await ctx.subagents.sendMessage(call.agent, target.id as SessionId, content, { signal: call.signal })
