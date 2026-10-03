@@ -2,7 +2,9 @@
  * `deploy/dish-web.service`, read as data. The unit is the one place that decides what the VM's service is, so these
  * checks pin the properties that make it prod and keep dev's and the install's settings out of agent shells:
  *
- * - It runs the checkout's dsh binary, in `~/work`, never `pnpm` or the root scripts' launcher (which defaults to dev).
+ * - It runs dsh's own script in the checkout with the `PATH` line's Node, in `~/work`, never `pnpm`, the root scripts'
+ *   launcher (which defaults to dev) or a `node_modules/.bin` shim (pnpm's for dsh sets a `NODE_PATH` into the
+ *   checkout, which dsh would pass on to every agent shell).
  * - It sets exactly one environment variable (`PATH`) and loads exactly one file (`deploy.env`, which holds only
  *   `DISH_TRUSTED_HOST`). dsh passes its environment on to every agent shell, so anything the unit sets reaches agents.
  * - It has no sandboxing options, which would be inherited by the shells dsh starts under bubblewrap or Landlock.
@@ -12,10 +14,13 @@
 
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { relative } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { dshEntry } from '../../scripts/env.ts'
 
 const UNIT = fileURLToPath(new URL('../dish-web.service', import.meta.url))
+const REPO = fileURLToPath(new URL('../..', import.meta.url))
 
 type Sections = Record<string, Record<string, string[]>>
 
@@ -69,8 +74,8 @@ test('the service runs in ~/work, which update.sh creates', () => {
   assert.deepEqual(service.WorkingDirectory, ['%h/work'])
 })
 
-test('ExecStart is the checkout\'s dsh binary, with --trusted-host as the last option', () => {
-  const exec = '%h/dish/node_modules/.bin/dsh web --host 127.0.0.1 --port 3080 --no-open --trusted-host ${DISH_TRUSTED_HOST}'
+test('ExecStart is the checkout\'s dsh script run by the unit\'s Node, with --trusted-host as the last option', () => {
+  const exec = '/opt/dish/node/bin/node %h/dish/node_modules/@deepseek-ai/dsh/lib/bin.js web --host 127.0.0.1 --port 3080 --no-open --trusted-host ${DISH_TRUSTED_HOST}'
   assert.deepEqual(service.ExecStart, [exec])
   // --trusted-host takes any number of values, so nothing may follow it but its one value.
   const words = exec.split(' ')
@@ -80,10 +85,23 @@ test('ExecStart is the checkout\'s dsh binary, with --trusted-host as the last o
   assert.equal(words.at(-1), '${DISH_TRUSTED_HOST}')
 })
 
-test('the unit never goes through pnpm, env or the launcher', () => {
+test('the Node is the PATH line\'s, and the script is the bin of the checkout\'s @deepseek-ai/dsh, as pnpm\'s shim would run it', async () => {
+  const [node, script] = (service.ExecStart?.[0] ?? '').split(' ')
+  const [first] = (service.Environment?.[0] ?? '').replace(/^PATH=/, '').split(':')
+  assert.equal(node, `${first}/node`, 'the Node of the PATH line\'s first directory, which fleet links')
+  // A dsh that moved its bin would leave the service with nothing to start: this fails first.
+  const entry = await dshEntry(REPO)
+  assert.ok(entry !== undefined, 'the checkout has dsh (pnpm install)')
+  assert.equal(script, `%h/dish/${relative(REPO, entry)}`)
+})
+
+test('the unit never goes through pnpm, env, the launcher or a node_modules/.bin shim', () => {
   const [exec] = service.ExecStart ?? []
-  assert.ok(exec !== undefined && exec.startsWith('%h/dish/node_modules/.bin/dsh '), 'ExecStart starts with the binary')
+  assert.ok(exec !== undefined && exec.startsWith('/opt/dish/node/bin/node %h/dish/node_modules/@deepseek-ai/dsh/'), 'ExecStart is Node and dsh\'s script')
   for (const line of lines) {
+    // pnpm's shims export a NODE_PATH that names the checkout, and the one for dsh would reach every agent shell.
+    assert.doesNotMatch(line, /node_modules\/\.bin\//, `a unit line runs a shim: ${line}`)
+    assert.doesNotMatch(line, /NODE_PATH/, `a unit line sets NODE_PATH: ${line}`)
     assert.doesNotMatch(line, /\bpnpm\b/, `a unit line mentions pnpm: ${line}`)
     assert.doesNotMatch(line, /\/usr\/bin\/env\b/, `a unit line goes through env: ${line}`)
     assert.doesNotMatch(line, /scripts\/env\.ts/, `a unit line names the launcher: ${line}`)
