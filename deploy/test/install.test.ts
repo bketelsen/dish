@@ -339,7 +339,8 @@ test('install.sh makes a custom profile from the web one, takes an empty remote,
     XDG_CACHE_HOME: join(throwaway, 'cache'),
   })
   assert.equal(dump.code, 0, dump.stderr)
-  assert.match(dump.stdout, /^- id: sandbox\n {2}name: '@deepseek-ai\/dsh-sandbox-local'\n {2}config:\n {4}runnerCommand:\n {6}- \/.*\/deploy\/dish-sandbox\n/m)
+  // A long path is folded (`- >-` and the path on the next line).
+  assert.match(dump.stdout, /^# == @deepseek-ai\/dsh-base, patched by .*cordis\.patch\.yml\n- id: sandbox\n {2}name: '@deepseek-ai\/dsh-sandbox-local'\n {2}config:\n {4}runnerCommand:\n {6}- (?:>-\n {8})?\/\S*\/deploy\/dish-sandbox\n {4}runnerFailureSignatures:\n {6}- 'bwrap: '\n {6}- 'dish-sandbox: '\n/m)
 
   const second = await run(INSTALL, [], scratch)
   assert.equal(second.code, 0, second.stderr)
