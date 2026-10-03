@@ -44,6 +44,12 @@
  * - **Never a failed step.** Each message is rewritten on its own, and one that can't be is left as it was and logged
  *   once, under `dish-crew`.
  *
+ * A child bound to a worktree (`ChildRecord.worktree`) has its gate's ending said after the report, from the last gate result
+ * of the run the notice is of (`gateLine`; the results are dish-gates', recorded by `addGate`, and filed on the run by
+ * `endRun`): a pass, a failure that used the last round, a failure that didn't (the run ended some other way), a skip, an
+ * error, or no result. A notice with no run matched to it says nothing of a gate, as it names no report. The collapsed
+ * row's sentence (`noticeSummary`) doesn't change.
+ *
  * Messages are deep-frozen, so what is replaced is a new message with the same id (`agent/pre-step` replaces the messages
  * that enter the step by returning them; see `@deepseek-ai/dsh-tmux-context`, which does the same to add one).
  *
@@ -95,7 +101,7 @@ const ABNORMAL = /^ ended abnormally \((.*)\) before it finished\.$/s
 type Warn = (format: string, ...args: unknown[]) => void
 
 /** What a notice says of a child. */
-type Child = Pick<ChildRecord, 'id' | 'role' | 'title' | 'model'>
+type Child = Pick<ChildRecord, 'id' | 'role' | 'title' | 'model' | 'worktree'>
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -114,6 +120,76 @@ function oneLine(text: string | undefined): string | undefined {
 /** `summary` bounded to `SUMMARY_MAX_CHARS` as dsh's `boundContextSummary` does it. */
 function bounded(summary: string): string {
   return summary.length <= SUMMARY_MAX_CHARS ? summary : `${summary.slice(0, SUMMARY_MAX_CHARS - 1)}…`
+}
+
+/** The longest run of backticks in `text`, 0 if it has none. */
+function longestBackticks(text: string): number {
+  let longest = 0
+  for (const run of text.match(/`+/g) ?? []) longest = Math.max(longest, run.length)
+  return longest
+}
+
+/** `text` as an inline code span on one line, with marks longer than any run of backticks in it. */
+function codeSpan(text: string): string {
+  const line = text.replace(/\s+/g, ' ').trim()
+  const longest = longestBackticks(line)
+  if (longest === 0) return `\`${line}\``
+  const mark = '`'.repeat(longest + 1)
+  return `${mark} ${line} ${mark}`
+}
+
+/** `text` in a code fence longer than any run of backticks in it, and at least three. */
+function fenced(text: string): string {
+  const fence = '`'.repeat(Math.max(3, longestBackticks(text) + 1))
+  return `${fence}\n${text}\n${fence}`
+}
+
+/**
+ * The notice's line on how a bound child's gate ended in `run`, from the run's last gate result, in the words of the gates
+ * spec's "The finish notice":
+ *
+ * - passed: `Gate passed (round N).`
+ * - failed with `round >= maxRounds`: `Gate FAILED after N rounds (<command>, exit <code>); last lines:`, the excerpt in a
+ *   code fence, and `Full log: <log>. Start a fix round with `to` or a fresh coder (escalation ladder).` A gate that hit
+ *   its time limit says `stopped at its time limit` in place of the exit code;
+ * - failed with a round to spare (the run ended some other way): `Gate failed in round N of M (<command>, exit <code>), and
+ *   the run ended before the coder finished again. Full log: <log>.`
+ * - skipped: `Gate skipped: <reason>.`; error: `Gate not run: <reason>.`; a run with no result: `Gate not run.`
+ *
+ * The fence is written here, and is longer than any run of backticks in the excerpt: crew doesn't import dish-gates.
+ * @param child - the child the notice is of.
+ * @param run - the run the notice is of.
+ * @param gatesOn - whether dish-gates is running. Off, a run with no result says nothing: no gate was going to run.
+ * @returns `undefined` for a child that isn't bound to a worktree, which no gate ran for.
+ */
+export function gateLine(child: Pick<ChildRecord, 'worktree'>, run: RunRecord, gatesOn = true): string | undefined {
+  if (child.worktree === undefined) return undefined
+  const result = run.gates?.at(-1)
+  if (result === undefined) return gatesOn ? 'Gate not run.' : undefined
+  const reason = oneLine(result.reason)
+  const because = reason === undefined ? '' : `: ${reason}`
+  switch (result.outcome) {
+    case 'passed':
+      return `Gate passed (round ${result.round}).`
+    case 'skipped':
+      return `Gate skipped${because}.`
+    case 'error':
+      return `Gate not run${because}.`
+    case 'failed': {
+      const ended = result.timedOut ? 'stopped at its time limit' : result.exitCode === null ? 'no exit code' : `exit ${result.exitCode}`
+      const what = `${result.command === '' ? '' : `${codeSpan(result.command)}, `}${ended}`
+      const log = result.log === null ? undefined : `Full log: ${codeSpan(result.log)}.`
+      if (result.round < result.maxRounds) {
+        return `Gate failed in round ${result.round} of ${result.maxRounds} (${what}), and the run ended before the coder finished again.${log === undefined ? '' : ` ${log}`}`
+      }
+      const lines = result.excerpt.replace(/\n+$/, '')
+      const next = 'Start a fix round with `to` or a fresh coder (escalation ladder).'
+      const head = `Gate FAILED after ${result.round} ${result.round === 1 ? 'round' : 'rounds'} (${what});`
+      return lines.trim() === ''
+        ? [`${head} it printed no output.`, log, next].filter(part => part !== undefined).join(' ')
+        : `${head} last lines:\n${fenced(lines)}\n${[log, next].filter(part => part !== undefined).join(' ')}`
+    }
+  }
 }
 
 /**
@@ -136,16 +212,19 @@ export function noticeSummary(child: Child, run: RunRecord | undefined, lead: st
 }
 
 /**
- * The text that leads a notice: its first sentence, the report, and what dsh put before the closing message.
+ * The text that leads a notice: its first sentence, the report, the gate line of a bound child (`gateLine`), and what dsh put
+ * before the closing message.
  * @param child - the child the notice is of.
  * @param run - the run that ended, or `undefined` if the record has none for this notice (no report is named then).
  * @param lead - dsh's own opening line.
  * @param label - what dsh put after its opening line: `Its closing message:` or `It left no closing message.`. Left out if
  * the message has no such block.
+ * @param gatesOn - whether dish-gates is running (`gateLine`).
  */
-export function noticeText(child: Child, run: RunRecord | undefined, lead: string, label?: string): string {
+export function noticeText(child: Child, run: RunRecord | undefined, lead: string, label?: string, gatesOn = true): string {
   const head = noticeSummary(child, run, lead)
-  const reported = run === undefined ? head : `${head} Report: \`${run.report}\`.`
+  const gate = run === undefined ? undefined : gateLine(child, run, gatesOn)
+  const reported = run === undefined ? head : `${head} Report: \`${run.report}\`.${gate === undefined ? '' : ` ${gate}`}`
   return label === undefined ? reported : `${reported} ${label}`
 }
 
@@ -231,8 +310,8 @@ async function runOf(parts: Parts, runs: readonly RunRecord[], claimed: Set<RunR
 }
 
 /** `message` with the text that leads it and its source's summary replaced. */
-function rewritten(message: UserMessage, child: ChildRecord, parts: Parts, run: RunRecord | undefined): UserMessage {
-  const text: ContentBlock = Object.freeze({ type: 'text', text: noticeText(child, run, parts.lead, parts.label) })
+function rewritten(message: UserMessage, child: ChildRecord, parts: Parts, run: RunRecord | undefined, gatesOn: boolean): UserMessage {
+  const text: ContentBlock = Object.freeze({ type: 'text', text: noticeText(child, run, parts.lead, parts.label, gatesOn) })
   // The blocks that stay are dsh's own, frozen already.
   const content = Object.freeze([text, ...message.content.slice(parts.label === undefined ? 1 : 2)])
   const source = Object.freeze({ ...message.source, summary: bounded(noticeSummary(child, run, parts.lead)) })
@@ -272,6 +351,8 @@ export interface NoticeContext {
   waitMs?: number
   /** The turn's signal. A step that is cancelled isn't rewritten, and doesn't wait. */
   signal?: AbortSignal
+  /** Whether dish-gates is running. Defaults to `true`. Off, a bound child's run with no gate result gets no gate line. */
+  gatesOn?: boolean
 }
 
 function tell(context: NoticeContext, format: string, ...args: unknown[]): void {
@@ -309,7 +390,7 @@ async function rewriteChild(id: string, indexes: readonly number[], messages: re
       try {
         const parts = partsOf(message, id)
         if (parts === undefined) continue
-        out[index] = rewritten(message, record, parts, await runOf(parts, record.runs, claimed, unreadable))
+        out[index] = rewritten(message, record, parts, await runOf(parts, record.runs, claimed, unreadable), context.gatesOn ?? true)
       } catch (error) {
         tell(context, 'could not rewrite a finish notice of child %s, which is left as dsh wrote it: %s', id, describe(error))
       }
@@ -348,7 +429,8 @@ export function noticeListener(ctx: Context, warn: Warn) {
       const crew = ctx.get('dishCrew')
       if (crew === undefined) return decision
       const messages = await rewriteNotices(decision.messages, {
-        crew, sessionId: String(payload.agent.id), warn, ...payload.signal === undefined ? {} : { signal: payload.signal },
+        crew, sessionId: String(payload.agent.id), warn, gatesOn: ctx.get('dishGates' as never) !== undefined,
+        ...payload.signal === undefined ? {} : { signal: payload.signal },
       })
       return messages === decision.messages ? decision : { ...decision, messages }
     } catch (error) {

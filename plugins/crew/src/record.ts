@@ -324,11 +324,12 @@ function parseGates(value: unknown): GateResult[] | undefined {
 }
 
 /**
- * The newest gate result of `record`: the run in progress's last, else its latest run's last; `undefined` if neither has
- * one. An older run's result is never the latest run's.
+ * The newest gate result of `record`: the run in progress's last, else (when no run is in progress) its latest run's last;
+ * `undefined` if neither has one. An older run's result is never the latest run's: while a run is in progress (`last` is
+ * `running`, a restart included) and has no result yet, there is none, not the previous run's.
  */
 export function latestGate(record: ChildRecord): GateResult | undefined {
-  return record.gates?.at(-1) ?? record.runs.at(-1)?.gates?.at(-1)
+  return record.gates?.at(-1) ?? (record.last === 'running' ? undefined : record.runs.at(-1)?.gates?.at(-1))
 }
 
 /** The run in `value`, or `undefined` if it isn't shaped like one. Other fields are dropped. */
