@@ -1,6 +1,6 @@
 /**
  * `deploy/pnpm-copies.ts`: dish's own installs copy pnpm's store instead of hard-linking it. The setting it writes into
- * a profile's pnpm-workspace.yaml, the checkout's own setting, and the replacing of files that are links already, on
+ * a profile's pnpm-workspace.yaml, install.sh's flag for the checkout, and the replacing of files that are links already, on
  * real hard links in a temp directory. Nothing here touches a real store or home.
  */
 
@@ -41,9 +41,13 @@ function run(args: string[]): Promise<{ code: number, stdout: string, stderr: st
   })
 }
 
-test("the checkout's own pnpm installs copy", () => {
+test("install.sh's own pnpm install copies, and the checkout's pnpm-workspace.yaml doesn't, so clones of dish still link", () => {
+  // The setting in pnpm-workspace.yaml would go with every clone and worktree of dish, and each agent install in one would
+  // copy the whole store's share (~545 MB) on ext4. So it is a flag on install.sh's own install only.
   const settings = parse(readFileSync(join(ROOT, 'pnpm-workspace.yaml'), 'utf8')) as Record<string, unknown>
-  assert.equal(settings.packageImportMethod, 'clone-or-copy')
+  assert.equal(settings.packageImportMethod, undefined)
+  const install = readFileSync(join(ROOT, 'deploy', 'install.sh'), 'utf8')
+  assert.match(install, /^pnpm install --frozen-lockfile --package-import-method=clone-or-copy$/m)
 })
 
 test("a profile's pnpm-workspace.yaml gets packageImportMethod: clone-or-copy, and keeps the rest", () => {
