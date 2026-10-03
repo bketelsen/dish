@@ -263,7 +263,7 @@ dish's projects ([`dish-projects`](../plugins/projects/) and [`dish-workspaces`]
 - **The key** is kept in dsh's credential file (`~/.dsh/.credentials.yaml`), never in the config store, and never shown again.
 - **Agents' git** gets a read token for the projects' repos through a credential helper each clone's config names, so `git fetch` works and `git push` is refused. Only the harness will push (step 7).
 - **The clones** are `~/work/<owner>/<repo>`. A clone already there is adopted if its origin is the repo on GitHub; one with a deploy-key alias origin (`git@github-dish:…`, from before 6b) isn't. Onboarding names it; move it aside.
-- **Setup** (a project's `setup`, such as `pnpm install`) runs outside the sandbox only in dish's own fresh clone, at onboarding, with the unit's `PATH` (dish's Node and pnpm; a repo on mise needs a setup such as `mise trust && mise exec -- pnpm install --frozen-lockfile`). In a task worktree, the main agent runs it escalated, which the judge may allow or put to you.
+- **Setup** (a project's `setup`, such as `pnpm install`) runs outside the sandbox only in dish's own fresh clone, at onboarding, with the unit's `PATH` (dish's Node and pnpm; a repo on mise needs a setup such as `mise trust && mise exec -- pnpm install --frozen-lockfile`). In a task worktree it doesn't run outside the sandbox: the `worktree` tool gives the command, which runs in the sandbox before the work starts (the home directory is writable on the VM, so it needs no escalation), and the main agent runs it escalated only if that fails with "Read-only file system", which the judge may allow or put to you.
 
 ## Prod and dev
 

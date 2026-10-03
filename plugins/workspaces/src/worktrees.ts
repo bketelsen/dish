@@ -150,16 +150,19 @@ export interface WorktreeState {
 }
 
 /**
- * What the `worktree` tool says of a new worktree's setup: it didn't run, why, and that the main agent runs it itself,
- * escalated (so the judge allows it or asks the user), before it delegates: a coder can't.
+ * What the `worktree` tool says of a new worktree's setup: it didn't run outside the sandbox, why, and that it is run in
+ * the sandbox, in the worktree, before the work starts (by the main agent, or by the coder as its first step: since
+ * sandbox-home the sandbox can write the home directory on dish's VM). Only a failure with "Read-only file system" needs
+ * an escalation, which the main agent makes (so the judge allows it or asks the user): a coder can't, and reports it.
  */
 export function worktreeSetupReason(path: string, command: string): string {
-  return `Setup didn't run outside the sandbox: ${WORKTREE_SETUP_SKIPPED}. Before you delegate, run its setup yourself in ${path}, `
-    + `escalated (\`sandbox_permissions: "danger-full-access"\`), so the judge allows it or asks the user: ${command}. A coder can't.`
+  return `Setup didn't run outside the sandbox: ${WORKTREE_SETUP_SKIPPED}. Run it in ${path} in the sandbox before the work starts `
+    + `(yourself, or tell the coder to run it first): ${command}. If it fails with "Read-only file system", run it again escalated `
+    + `(\`sandbox_permissions: "danger-full-access"\`), so the judge allows it or asks the user; a coder can't escalate, and reports it instead.`
 }
 
 /**
- * Setup in a new worktree: not run, with the command for the main agent to run instead (`worktreeSetupReason`).
+ * Setup in a new worktree: not run outside the sandbox, with the command to run in the sandbox instead (`worktreeSetupReason`).
  *
  * This is A, which the user chose on 2026-10-02. A worktree sits inside the clone, and tools read config
  * from parent directories (`pnpm-workspace.yaml`, `.pnpmfile.cjs`, `.npmrc`, a parent `package.json`'s workspaces,
