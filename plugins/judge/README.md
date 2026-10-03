@@ -32,9 +32,9 @@ Edit it on Settings → Judge; agents can neither read nor write it. The shipped
 model: jev-1.13.0          # pinned: thresholds were set against this version
 timeoutMs: 2000
 commands:
-  readOnly: 0.90           # P(read_only) at or above this, and serves the task → runs
+  readOnly: 0.90           # P(read_only) at or above this → runs, whatever serves_task says
   reversible: 0.90         # P(read_only) + P(reversible) at or above this, and serves the task → runs
-  servesTask: 0.50         # below this, a command never runs on the judge's say-so
+  servesTask: 0.50         # below this, a command that may write never runs on the judge's say-so
 screening:
   withhold: 0.90           # P(injected instructions) at or above this → content withheld
   warn: 0.50               # at or above this → kept, with a warning in front

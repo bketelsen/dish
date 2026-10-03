@@ -390,9 +390,13 @@ const ROWS: Row[] = [
   },
   { name: 'read-only + reversible just under 0.90', probabilities: { read_only: 0.5, reversible: 0.39, irreversible: 0.08, other: 0.03 }, serves: 0.9, allowed: false },
   { name: 'irreversible', probabilities: IRREVERSIBLE, serves: 0.91, allowed: false },
-  { name: 'read-only, but not serving the task', probabilities: READ_ONLY, serves: 0.12, allowed: false },
-  { name: 'serving the task exactly at the bar (0.50)', probabilities: READ_ONLY, serves: 0.5, allowed: true },
-  { name: 'serving the task just under the bar', probabilities: READ_ONLY, serves: 0.49, allowed: false },
+  // A read-only command runs whatever serves_task says (2026-10-03): it changes nothing on its own.
+  { name: 'read-only, though not serving the task', probabilities: READ_ONLY, serves: 0.12, allowed: true },
+  { name: 'read-only exactly at the bar, serving the task not at all', probabilities: { read_only: 0.9, reversible: 0.05, irreversible: 0.03, other: 0.02 }, serves: 0, allowed: true },
+  { name: 'read-only just under the first bar, reaching the second only with reversible, not serving the task', probabilities: { read_only: 0.89, reversible: 0.07, irreversible: 0.03, other: 0.01 }, serves: 0.3, allowed: false },
+  { name: 'reversible, but not serving the task', probabilities: REVERSIBLE, serves: 0.12, allowed: false },
+  { name: 'reversible, serving the task exactly at the bar (0.50)', probabilities: REVERSIBLE, serves: 0.5, allowed: true },
+  { name: 'reversible, serving the task just under the bar', probabilities: REVERSIBLE, serves: 0.49, allowed: false },
   { name: 'other', probabilities: { read_only: 0.1, reversible: 0.05, irreversible: 0.05, other: 0.8 }, serves: 0.9, allowed: false },
   {
     name: 'irreversible is the likeliest reading, though read-only + reversible reaches a lowered bar',
@@ -456,9 +460,9 @@ test('the main agent\'s ask carries the judge\'s reading, with the spec\'s wordi
 })
 
 test('a command that does not serve the task says so, as an unlikely reading and not as a likely one', async () => {
-  const { gate } = gateOf(() => answers(READ_ONLY, 0.12))
+  const { gate } = gateOf(() => answers(REVERSIBLE, 0.12))
   const { decision } = await run(gate)
-  assert.equal(decision.kind === 'ask' && decision.displayReason?.en, 'The judge reads this as read-only (p 0.97), and as unlikely to serve the task (p 0.12).')
+  assert.equal(decision.kind === 'ask' && decision.displayReason?.en, 'The judge reads this as reversible (p 0.96), and as unlikely to serve the task (p 0.12).')
 })
 
 test('a child\'s denial is written for the model, with the spec\'s wording', async () => {
@@ -468,7 +472,7 @@ test('a child\'s denial is written for the model, with the spec\'s wording', asy
     kind: 'deny',
     reason: 'The judge didn\'t let this run: it reads as irreversible (p 0.87). Report it to the main agent instead, or find a reversible way.',
   })
-  const offTask = await run(gateOf(() => answers(READ_ONLY, 0.12)).gate, { agent: child })
+  const offTask = await run(gateOf(() => answers(REVERSIBLE, 0.12)).gate, { agent: child })
   assert.deepEqual(offTask.decision, {
     kind: 'deny',
     reason: 'The judge didn\'t let this run: it doesn\'t look like it serves the task (p 0.12). Report it to the main agent instead, or find a step that serves the task.',

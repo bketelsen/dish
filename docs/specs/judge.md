@@ -113,9 +113,9 @@ A document in the config store, claimed by `dish-judge` with agent policy **`non
 model: jev-1.13.0          # pinned: thresholds were set against this version
 timeoutMs: 2000
 commands:
-  readOnly: 0.90           # P(read_only) at or above this, and serves the task → runs
+  readOnly: 0.90           # P(read_only) at or above this → runs, whatever serves_task says
   reversible: 0.90         # P(read_only) + P(reversible) at or above this, and serves the task → runs
-  servesTask: 0.50         # below this, a command never runs on the judge's say-so
+  servesTask: 0.50         # below this, a command that may write never runs on the judge's say-so
 screening:
   withhold: 0.90           # P(injected instructions) at or above this → content withheld
   warn: 0.50               # at or above this → kept, with a warning in front
@@ -174,7 +174,7 @@ A host-level `tools/pre-execute` listener, prepended, for tools listed in `tools
 
 | Answer | Main agent | Crew child |
 |---|---|---|
-| P(read_only) ≥ `readOnly`, and `serves_task` ≥ `servesTask` | allow | allow |
+| P(read_only) ≥ `readOnly`, whatever `serves_task` says | allow | allow |
 | P(read_only) + P(reversible) ≥ `reversible`, and `serves_task` ≥ `servesTask`, and the choice isn't `irreversible` | allow | allow |
 | Anything else, including `irreversible` | **ask you**, with the judge's reading (below) | **deny**, with the reason |
 | Jev unavailable | ask you: "the judge is unavailable" | deny: "the judge is unavailable; nothing ran" |
@@ -188,6 +188,7 @@ A host-level `tools/pre-execute` listener, prepended, for tools listed in `tools
 
 **What this means in practice:**
 - `git status`, `ls` and `npm test` run.
+- **A read-only command runs without the task check** (2026-10-03). A command the judge reads as read-only at `readOnly` or above changes nothing on its own, and anything that would send what it read is judged as a command of its own. In the first session on a 6b project, nine of ten asks were read-only commands (`git status`, `ls`, `date`, `head README.md`) that scored 0.20–0.45 on `serves_task` against a short request. The task check stays for commands that write. The cost: a command that reads and sends in one, such as `curl` with a secret in its URL, now rests on the effect reading alone, which should call it `irreversible` ("sends").
 - The `reversible` threshold is 0.90, measured live on jev-1.13.0. At 0.95, everyday build and test commands (`npm test`, `make test`, `npm run build`) came back 0.00–0.03 above the line and could flip to "ask" between runs. At 0.90 they run with margin, while `echo > file` (0.86–0.87), `rm -rf build/` (0.55–0.59) and `rm -rf node_modules && npm install` (0.62–0.66) still ask.
 - `git push`, `rm -rf build/`, `gh pr merge` and `curl … | sh` ask you, or are refused for a child.
 - An injected command that has nothing to do with the task asks you, or is refused, even if it would be harmless.
