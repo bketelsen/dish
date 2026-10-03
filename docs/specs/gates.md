@@ -1,6 +1,6 @@
 # Spec: gates (`dish-gates`)
 
-Status: approved 2026-10-02, revised 2026-10-03 (below). This is roadmap step 6c. It builds on [projects and workspaces](projects-workspaces.md) (6b: the registry's `gate` and `gateTimeout`, worktrees, and `delegate`'s worktree binding), [crew](crew.md), [sandbox-home](sandbox-home.md) and the [design](../design.md) ("Gates (structural)"). The plan is [docs/plans/2026-10-03-gates.md](../plans/2026-10-03-gates.md).
+Status: built on branch `gates` (2026-10-03) and checked end to end in a scratch dsh; awaiting review and the rollout. What the build added is under [Notes from the build](#notes-from-the-build). Approved 2026-10-02, revised 2026-10-03 (below). This is roadmap step 6c. It builds on [projects and workspaces](projects-workspaces.md) (6b: the registry's `gate` and `gateTimeout`, worktrees, and `delegate`'s worktree binding), [crew](crew.md), [sandbox-home](sandbox-home.md) and the [design](../design.md) ("Gates (structural)"). The plan is [docs/plans/2026-10-03-gates.md](../plans/2026-10-03-gates.md).
 
 **Revised 2026-10-03 (from the plan).** The plan checked this spec against `main` and dsh 0.2.0-rc.2's sources, and this text now says what the plan builds. Its "Spec corrections" section has each change, the evidence and why.
 - **Two of your decisions:**
@@ -256,3 +256,31 @@ interface DishGates {
    - Nothing is recorded for that run.
    - dsh doesn't resume the child by itself: a message from the main agent cold-resumes it into a new turn, gated from round 1.
    - The run before has no gate result, so a review of it needs a ruling.
+
+## Notes from the build
+
+What the build decided within this spec, or added to it, beyond the plan's corrections (which are in the text above).
+
+**The hook.**
+- **Skip reasons are read after "Gate skipped: ",** with no "not gated: " prefix: "Gate skipped: its worktree is gone, or its project is no longer registered." A project removed from `projects.yaml` between the worktree's check and the gate is "<project> isn't in projects.yaml".
+- **Without dish-projects,** as without dish-workspaces or dsh's shell, dish-gates' own check records an `error`. In practice dish-workspaces resolves no worktree without dish-projects, so such a stop is `skipped` as a worktree that is gone, before that check. Nothing runs either way, and a review still needs a pass or a ruling.
+- **The opt-out is per turn.** Each turn's `turn/start` clears the closing message held for its session, so a `BLOCKED:` that closed an earlier turn doesn't skip a later turn's gate (a follow-up whose last step has no text, say).
+- **Cancels.** A stop whose signal aborts while it waits for the worktree's lock returns at once, recording nothing, and the lock still passes to the stops after it in order. A result that comes back after an abort is dropped: once the signal is aborted, nothing is recorded or steered.
+- **Every steer adds a failure to the record.** A failure that couldn't be recorded (crew no longer has the child) isn't steered, so a turn's rounds always run out. When the steer itself throws, the failure stays on the record and an `error` ("dish-gates failed: …") is recorded after it, so the run's last result, which the notice and the review check read, is that error.
+
+**Running the gate.**
+- **A cut output** (over 4 MiB) loses its partial first line before it is masked: a secret cut at its start would no longer match its pattern.
+- **dsh's spill files.** For a cut run, dsh keeps the whole stream in a spill file in its temp directory, unmasked. dish-gates removes them; its own log has what it keeps.
+
+**Logs** are pruned at start and every day while dish-gates runs, not only at start: dsh web runs for days.
+
+**Crew.**
+- **`latestGate`** gives no result while a run is in progress and has none yet, never the previous run's.
+- **The finish notice** says "Gate not run." for a bound coder's run with no result only while dish-gates runs. Without it no gate was going to run, so the line is left out.
+- **The review check's refusal** names the fix round's target (`to: "<id>"`), and for a coder still running says to wait for its finish notice. "No gate result" gives the likeliest cause as an example: "no gate result: it didn't run (for example, the coder ran before dish-gates was on)". Work done before dish-gates was installed needs a ruling to be reviewed.
+- **Rulings.** The placeholder copied back (`Ruling: what — why — cost if wrong`, with or without `Ruling:`) is no ruling, and is refused as `Ruling:` alone is. A re-review without `gateOverride` keeps the reviewer's ruling while the reviewed coder hasn't run since the reviewer started (its latest run ended before then, and it isn't running): the ruling was given on the standing it still has. A fix round, a crash or a resume of the coder ends it.
+
+**End to end (2026-10-03).** In a scratch `dsh web` (`env -i`, every directory scratch), installed by `deploy/install.sh`, on the dish preset with crew's `delegate`, and a scripted model on `127.0.0.1`. The project `bketelsen/gates-e2e` (gate `test -f ok.txt`) had a clone and two worktrees made by hand; its onboarding failed at the App, as expected, and `resolve` took the worktrees.
+- A coder bound to `e2e` finished without the file. Its session got "The gate failed (round 1 of 3): `test -f ok.txt` exited 1 after 31 ms." with the log's path; it wrote `ok.txt` and finished again.
+- Its run in `children.json` held `failed`, round 1, then `passed`, round 2, and the child had no `gates` left. The main agent's notice said "Gate passed (round 2).", and the reviewer it then started ran. The two logs were `-rw-------`, in 0700 directories.
+- A coder bound to `e2e-blocked` closed with "BLOCKED: which file?": recorded `skipped`, and the notice said "Gate skipped: the coder reported BLOCKED / NEEDS CONTEXT." The review was refused with "coder «blocked coder» (child …)'s gate hasn't passed (skipped: the coder reported BLOCKED / NEEDS CONTEXT). Send it a fix round with `to: "…"`, or start the review anyway with `gateOverride: …`". With `gateOverride: "Ruling: nothing changed — a check of the override — none"` it started: the ruling was on the reviewer's record, and the block with it came right after the reviewer's task.

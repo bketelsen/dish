@@ -36,10 +36,33 @@ Talk to the main agent as usual. It delegates by itself, as its prompt (`prompts
 
 In a chat whose workspace is a project's clone ([`dish-workspaces`](../workspaces/)), the main agent makes a worktree with the `worktree` tool and passes it to `delegate` as `worktree`: `<project>/<slug>`, or the path the tool returned.
 - **Crew checks it before anything starts:** the role writes (a reviewer is given the path in its task instead), `dish-workspaces` is running and knows the worktree, the worktree is inside the chat's workspace (a child works in its parent's sandbox, and couldn't write anywhere else), and no running crew child, of any chat, is bound to it.
-- **The child is bound:** its record keeps the worktree's path (`worktree` in `children.json`), and its brief gets a block after the task naming the worktree and its branch, and telling it to work only there.
+- **The child is bound:** its record keeps the worktree's path (`worktree` in `children.json`), and its brief gets a block after the task naming the worktree and its branch, and telling it to work only there. While [`dish-gates`](../gates/) runs, the block goes on to name the project's gate and the opt-out ([Gates](#gates)).
 - **Follow-ups keep the binding** and add nothing to the text. One that names another worktree is refused, and so is one to a child whose worktree has been merged or removed: start a new coder.
 - **A worktree dish made that fails a check is refused with the reason.** When `resolve` gives nothing, crew asks `dishWorkspaces.resolveProblem(ref)` why: the project's clone, or the worktree itself, failed dish's safety check (with the finding), or its branch is gone. A start says "worktree `<ref>` can't be bound: <reason>. Nothing was started or sent; tell the user."; a follow-up to a bound child says its worktree "can't be used: <reason>" instead of calling it gone. Without a reason (a worktree dish doesn't know), the refusals are as above.
 - **`dishCrew.worktreeBindings(path)`** lists the children bound to a worktree, with whether each is running, for `dish-workspaces`' `list`, `remove` and sweep.
+
+### Gates
+
+While [`dish-gates`](../gates/) runs, a bound coder's work is gated each time it is about to finish: dish runs the project's gate in its worktree, and a failure goes back to the coder, up to 3 gate runs a turn. Crew's part:
+- **The brief.** A bound coder's block ends with: "When you finish, dish runs this project's gate (`<gate>`) in your worktree, and a failure comes back to you. If you're blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped." The gate comes from `dishGates.gateFor(project)`. Without dish-gates, or a gate, the block is as above.
+- **The record.** Each gate result is a `GateResult` (the turn, the round of `maxRounds`, `passed`, `failed`, `skipped` or `error`, the command, the exit code, whether it timed out, how long it took, the log, the output's last lines, and why for a skip or an error). dish-gates adds it with `records.addGate(child, result)`. A run in progress keeps its results on the child (`gates`), and they move onto the run when it ends (`runs[].gates`).
+- **The finish notice** of a bound coder says how its gate ended, after the report, from the run's last result:
+  - "Gate passed (round 2)."
+  - "Gate FAILED after 3 rounds (`<gate>`, exit 1); last lines:", the output's last lines in a code fence, then "Full log: `<path>`. Start a fix round with `to` or a fresh coder (escalation ladder)." A gate that hit its time limit says "stopped at its time limit" in place of the exit code.
+  - "Gate failed in round 1 of 3 (`<gate>`, exit 1), and the run ended before the coder finished again. Full log: `<path>`." The run ended some other way, such as an error.
+  - "Gate skipped: the coder reported BLOCKED / NEEDS CONTEXT." or another skip's reason, such as "its worktree is gone, or its project is no longer registered".
+  - "Gate not run: <reason>." for an error, such as a clone that failed dish's safety check.
+  - "Gate not run." for a run with no result. That line is left out while dish-gates isn't running: no gate was going to run.
+- **The review check.** A review of a bound coder's work, a reviewer started with `reviews: <child>` or a follow-up to a reviewer (a re-review), is refused while that coder's gate hasn't passed:
+  - it is still running: wait for its finish notice;
+  - its latest run's last result isn't a pass;
+  - or that run has none (an error or an abort ended it before its turn could, dsh restarted mid-gate, or it ran before dish-gates was on).
+
+  The refusal says where the gate stands and what to do: "coder «add login» (child <id>)'s gate hasn't passed (skipped: the coder reported BLOCKED / NEEDS CONTEXT). Send it a fix round with `to: "<id>"`, or start the review anyway with `gateOverride: "Ruling: what — why — cost if wrong"`."
+- **`gateOverride`,** a `delegate` parameter, is the main agent's ruling to review work whose gate hasn't passed, on one line (line breaks are folded). It is recorded on the reviewer (`gateOverride` in `children.json`), and the reviewer gets a block after its task: "The harness's gate for the work you review (<role> «<title>», child <id>) hasn't passed: <where it stands>. The main agent started this review anyway, with this ruling: <ruling>". A follow-up with a ruling replaces the recorded one, and its text gets the same block.
+  - An empty `gateOverride` is none. `Ruling:` alone, or the placeholder `Ruling: what — why — cost if wrong` copied back, is refused: "gateOverride needs the ruling itself: what — why — cost if wrong".
+  - A re-review without one keeps the reviewer's ruling while the reviewed coder hasn't run since the reviewer started: the ruling was given on the standing it still has.
+  - When nothing is refused (the gate passed, the coder isn't bound, `reviews: "main"`, or dish-gates isn't running), `gateOverride` is ignored and not recorded.
 
 ## crew.yaml
 
@@ -88,7 +111,7 @@ A role also needs a prompt: `prompts/crew/<role>.md`, or a shipped default.
 ## What crew records
 
 In `$XDG_DATA_HOME/dish/crew/`:
-- `sessions/<hash of the session>/children.json` holds each child's role, model, family, what it reviews, the worktree it is bound to, its follow-ups and its runs.
+- `sessions/<hash of the session>/children.json` holds each child's role, model, family, what it reviews, the worktree it is bound to, its follow-ups and its runs, and, with [`dish-gates`](../gates/), each run's gate results and a reviewer's `gateOverride` ([Gates](#gates)).
 - `<n>-<role>-<run>.md` in the same folder holds each run's closing message, the child's report.
 - `by-child/` holds pointers, so a child resumed after a restart is filed under the right session.
 

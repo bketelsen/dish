@@ -33,6 +33,7 @@ pnpm dsh plugin --profile web add ./plugins/judge
 pnpm dsh plugin --profile web add ./plugins/web
 pnpm dsh plugin --profile web add ./plugins/projects
 pnpm dsh plugin --profile web add ./plugins/workspaces
+pnpm dsh plugin --profile web add ./plugins/gates
 pnpm dsh web        # prints the UI URL (with its access token)
 ```
 
@@ -63,6 +64,7 @@ Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, termin
 | [`judge`](plugins/judge) | TypeSafe's Jev in front of every agent's risky edges: a gate on each shell command (read-only, reversible or irreversible, and does it serve the task), an answerer for crew children's approvals, a screen on web and MCP results for injected instructions, `ask_judge` for every agent, and Settings → Judge with the key, thresholds and a decision log. |
 | [`projects`](plugins/projects) | The repos dish works on: `projects.yaml` in the config store (family, role, gate, setup), onboarding each one in the background, one at a time, and Settings → Projects with its status, Retry, and add, edit and remove. |
 | [`workspaces`](plugins/workspaces) | The mechanics behind projects: a clone of each under the work root through a read-only GitHub App (agents can fetch, not push), setup on dish's own fresh clone, a dsh workspace per clone plus a `scratch` one, task worktrees through the main agent's `worktree` tool (crew's `delegate` binds a coder to one), a sweep that removes merged ones, and Settings → GitHub App. |
+| [`gates`](plugins/gates) | The harness's check on a coder's work: when a crew coder bound to a worktree is about to finish, the project's gate runs in that worktree through dsh's sandbox, and a failure goes back to the coder (up to 3 gate runs a turn). Crew records each result, the finish notice says how the gate ended, and a review of work whose gate didn't pass needs the main agent's ruling. |
 | [`web`](plugins/web) | Settings over the tailnet. On your trusted host (`--trusted-host`), pages count as the operator's own machine, so Settings → Models, provider sign-ins and durable UI preferences work there as they do on `127.0.0.1`. Host-only, with no browser half. |
 
 ## Deploying
