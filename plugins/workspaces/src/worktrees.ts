@@ -26,6 +26,9 @@
  *   worktree wherever the link points. `create` sees it afterwards (git's record of the new worktree, or the path
  *   itself, isn't canonical), removes what git just made where git put it, and refuses; if that removal fails, it says
  *   so and keeps the branch and the record. The check and the add are still two steps.
+ * - **Removal checks, then acts:** right before `git worktree remove`, `discard` checks again that `.worktrees` is a
+ *   real directory and the worktree's path its own real path, but a link swapped in between that check and git's
+ *   removal is still followed.
  *
  * Nothing here takes the project's lock: the service runs `create`, `remove` and the sweep under it.
  *
@@ -41,7 +44,6 @@ import type { PullSummary } from './github.ts'
 import { clonePath, projectStateDir, worktreeRecordFile, worktreeSetupLogFile, writeFileAtomic } from './paths.ts'
 import { checkClone, checkWorktree } from './safety.ts'
 import type { CloneExpectations } from './safety.ts'
-import { skipReason } from './setup.ts'
 import type { GitHubDefault, SetupOutcome } from './setup.ts'
 import { checkMerged, defaultBranchOf, githubWord } from './sweep.ts'
 
@@ -49,7 +51,7 @@ import { checkMerged, defaultBranchOf, githubWord } from './sweep.ts'
 export const SLUG = /^[a-z0-9][a-z0-9-]{0,39}$/
 /** How long after a `resolve` the sweep leaves a worktree alone: a coder about to start in it. */
 export const RECENT_RESOLVE_MS = 300_000
-/** Why setup doesn't run in a new worktree (see `worktreeSetup`). */
+/** Why setup doesn't run in a new worktree (see `worktreeSetup`): the start of `worktreeSetupReason`'s reason. */
 export const WORKTREE_SETUP_SKIPPED = 'a worktree picks up config from the clone, which agents can change'
 
 /**
@@ -147,7 +149,16 @@ export interface WorktreeState {
 }
 
 /**
- * Setup in a new worktree: not run, with the command to run instead.
+ * What the `worktree` tool says of a new worktree's setup: it didn't run, why, and that the main agent runs it itself,
+ * escalated (so the judge allows it or asks the user), before it delegates: a coder can't.
+ */
+export function worktreeSetupReason(path: string, command: string): string {
+  return `Setup didn't run outside the sandbox: ${WORKTREE_SETUP_SKIPPED}. Before you delegate, run its setup yourself in ${path}, `
+    + `escalated (\`sandbox_permissions: "danger-full-access"\`), so the judge allows it or asks the user: ${command}. A coder can't.`
+}
+
+/**
+ * Setup in a new worktree: not run, with the command for the main agent to run instead (`worktreeSetupReason`).
  *
  * This is A, which the user chose on 2026-10-02. A worktree sits inside the clone, and tools read config
  * from parent directories (`pnpm-workspace.yaml`, `.pnpmfile.cjs`, `.npmrc`, a parent `package.json`'s workspaces,
@@ -159,7 +170,7 @@ export interface WorktreeState {
  */
 function worktreeSetup(project: Project, path: string): SetupOutcome {
   if (project.setup === undefined || project.setup.trim() === '') return { ran: false, reason: 'no setup' }
-  return { ran: false, reason: skipReason(WORKTREE_SETUP_SKIPPED, path, project.setup) }
+  return { ran: false, reason: worktreeSetupReason(path, project.setup) }
 }
 
 export class Worktrees {
@@ -175,7 +186,8 @@ export class Worktrees {
    * The spec's create. The new path must be inside `options.cwd` (the calling chat's workspace), which must be the
    * clone or inside it: crew's children work in the chat's sandbox. Then the slug must be free (no record, no
    * directory, no branch `dish/<slug>`); fetch; resolve `base` (default `origin/<default>`) to a commit; record it;
-   * `git worktree add --no-track -b dish/<slug> <path> <commit>`. Setup is not run (`worktreeSetup`).
+   * `git worktree add --no-track -b dish/<slug> <path> <commit>`. If the add fails or is aborted, the record goes, and so
+   * does the branch git made for it (`#dropStrayBranch`). Setup is not run (`worktreeSetup`).
    */
   async create(project: Project, slug: string, base: string | undefined, options: { cwd: string, signal?: AbortSignal }): Promise<CreatedWorktree> {
     const { signal } = options
@@ -203,8 +215,10 @@ export class Worktrees {
     await writeFileAtomic(file, `${JSON.stringify(record, null, 2)}\n`)
     try {
       await internals.beforeAdd?.()
-      await gitOk(['-C', clone, 'worktree', 'add', '--no-track', '-b', record.branch, path, commit], this.#options(signal))
+      // --quiet: git's first stderr line is then its `fatal:`, not "Preparing worktree".
+      await gitOk(['-C', clone, 'worktree', 'add', '--quiet', '--no-track', '-b', record.branch, path, commit], this.#options(signal))
     } catch (error) {
+      await this.#dropStrayBranch(clone, record.branch, commit)
       await rm(file, { force: true }).catch(() => {})
       throw new Error(`${project.name}: couldn't make worktree ${slug}: ${messageOf(error)}`, { cause: error })
     }
@@ -282,18 +296,41 @@ export class Worktrees {
    * recently resolved. Anything else is `undefined`.
    */
   async resolve(ref: string, projects: readonly Project[]): Promise<Worktree | undefined> {
+    const found = await this.#lookup(ref, projects)
+    if (found === undefined || 'problem' in found) return undefined
+    this.#resolved.set(found.worktree.path, this.#now())
+    return found.worktree
+  }
+
+  /**
+   * Why `resolve(ref, projects)` gives `undefined` for a worktree dish made (its record and its directory are there):
+   * its clone fails `checkClone` ("<project>'s clone (<clone>) failed dish's safety check: <finding>"), `.worktrees`
+   * isn't a directory, the worktree fails `checkWorktree` ("worktree <slug> failed dish's safety check: <finding>"), or
+   * its branch is gone ("its branch dish/<slug> is gone"). `undefined` when `resolve` would give it, and when `ref` names
+   * nothing dish made. Marks nothing resolved.
+   */
+  async problem(ref: string, projects: readonly Project[]): Promise<string | undefined> {
+    const found = await this.#lookup(ref, projects)
+    return found !== undefined && 'problem' in found ? found.problem : undefined
+  }
+
+  /** `resolve`'s checks, in order: the worktree, why a worktree dish made fails them, or `undefined` for anything else. */
+  async #lookup(ref: string, projects: readonly Project[]): Promise<{ worktree: Worktree } | { problem: string } | undefined> {
     const found = await this.#find(ref, projects)
     if (found === undefined) return undefined
     const { project, clone, slug } = found
     const record = await this.#record(project, slug)
     if (record === undefined) return undefined
-    if (!(await checkClone(clone, this.#deps.cloneExpectations(project))).ok) return undefined
-    if (!await isDirectory(join(clone, '.worktrees'))) return undefined
-    const path = join(clone, '.worktrees', slug)
-    if (!(await checkWorktree(clone, path)).ok) return undefined
-    if (await branchTip(clone, record.branch) === undefined) return undefined
-    this.#resolved.set(path, this.#now())
-    return { project: project.name, slug, branch: record.branch, path, clone, base: record.base }
+    const cloneCheck = await checkClone(clone, this.#deps.cloneExpectations(project))
+    if (!cloneCheck.ok) return { problem: `${project.name}'s clone (${clone}) failed dish's safety check: ${cloneCheck.problem}` }
+    const dir = join(clone, '.worktrees')
+    if (await present(dir) && !await isDirectory(dir)) return { problem: `${dir} is not a directory (a link?)` }
+    const path = join(dir, slug)
+    if (!await present(path)) return undefined
+    const check = await checkWorktree(clone, path)
+    if (!check.ok) return { problem: `worktree ${slug} failed dish's safety check: ${check.problem}` }
+    if (await branchTip(clone, record.branch) === undefined) return { problem: `its branch ${record.branch} is gone` }
+    return { worktree: { project: project.name, slug, branch: record.branch, path, clone, base: record.base } }
   }
 
   /** Whether `resolve` gave the worktree at `path` (canonical, as `resolve` returns it) within the last 5 minutes. */
@@ -377,9 +414,10 @@ export class Worktrees {
   /**
    * For `remove` and the sweep, once they've decided. Refused, with everything kept, when another worktree is inside this
    * one (force or not: it isn't this worktree's to delete) or when another worktree (the clone's own checkout included)
-   * has its branch checked out. Then, with something at the path, `checkWorktree` again and `git worktree remove` on the
-   * resolved path (`--force` only with `force`); with nothing there, `git worktree remove` on the path only if git still
-   * has an entry for it (never `git worktree prune`, which would drop other worktrees' entries too). Then the branch,
+   * has its branch checked out. Then, with something at the path, `checkWorktree` again, and right before the removal
+   * `.worktrees` a real directory and the path its own real path once more (`stillInPlace`), then `git worktree remove`
+   * on the resolved path (`--force` only with `force`); with nothing there, `git worktree remove` on the path only if git
+   * still has an entry for it (never `git worktree prune`, which would drop other worktrees' entries too). Then the branch,
    * only if it is still at the tip `inspect` found (`update-ref -d <ref> <tip>`), so a commit made since stays; then the
    * record and its setup log.
    */
@@ -399,6 +437,8 @@ export class Worktrees {
     if (state.exists) {
       const check = await checkWorktree(clone, path)
       if (!check.ok) throw new Error(`worktree ${record.slug} can't be removed: ${check.problem}`)
+      const moved = await stillInPlace(clone, path)
+      if (moved !== undefined) throw new Error(`worktree ${record.slug} can't be removed: ${moved}; dish keeps it, its branch and its record`)
       await gitOk(['-C', clone, 'worktree', 'remove', ...(force ? ['--force'] : []), path], this.#options())
     } else if (entries.some(entry => entry.at(path))) {
       // git 2.47 removes the entry of a worktree whose directory is gone, and only that one, without --force.
@@ -433,6 +473,21 @@ export class Worktrees {
     }
     const by = landed === undefined ? '' : `: git -C ${clone} worktree remove --force ${shown(landed, 200)}, then git -C ${clone} branch -D ${record.branch}`
     throw new Error(`${project.name}: ${where}, and dish couldn't remove it there (${shown(failure, 200)}), so its branch ${record.branch} and its record are kept; remove it yourself${by}`)
+  }
+
+  /**
+   * After a `worktree add -b` that failed or was aborted: git makes the branch first (`git branch`, then the checkout),
+   * and doesn't remove it when what follows fails, or when it is ended, so the slug would stay in use. The branch goes
+   * (`update-ref -d <ref> <commit>`) when no worktree has it and it is still at `commit`, the one dish asked for. Never
+   * throws: a branch that can't go is in the way of the slug, which `create` then says.
+   */
+  async #dropStrayBranch(clone: string, branch: string, commit: string): Promise<void> {
+    try {
+      if ((await worktreeEntries(clone)).some(entry => entry.branch === `refs/heads/${branch}`)) return
+      await git(['-C', clone, 'update-ref', '-d', `refs/heads/${branch}`, commit], this.#options())
+    } catch {
+      // git couldn't be asked: the branch stays.
+    }
   }
 
   #now(): number {
@@ -565,6 +620,20 @@ async function isDirectory(path: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+/**
+ * Why `path` (canonical, `<clone>/.worktrees/<slug>`) isn't where `git worktree remove` may be given it any more, or
+ * `undefined`: `.worktrees` must still be a real directory, and `path` its own real path. Asked right before the removal,
+ * so a link swapped in since `inspect` (with git's records rewritten to agree, which `checkWorktree` can't tell) doesn't
+ * lead git to delete what the link reaches. Still a check, then an act: a swap between the two is a known limit.
+ */
+async function stillInPlace(clone: string, path: string): Promise<string | undefined> {
+  const dir = join(clone, '.worktrees')
+  if (!await isDirectory(dir)) return `${dir} is not a directory (a link?)`
+  const real = await realpath(path).catch(() => undefined)
+  if (real !== path) return `${path} resolves to ${shown(real ?? 'nothing', 200)}, not itself (a link on the way?)`
+  return undefined
 }
 
 /** Whether anything (a link included) is at `path`. */

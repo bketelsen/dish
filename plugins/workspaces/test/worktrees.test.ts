@@ -1,13 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { access, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, chmod, lstat, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { worktreeRecordFile, worktreeSetupLogFile } from '../src/paths.ts'
-import { skipReason } from '../src/setup.ts'
 import { internals as sweepInternals } from '../src/sweep.ts'
-import { RECENT_RESOLVE_MS, SLUG, WORKTREE_SETUP_SKIPPED, internals } from '../src/worktrees.ts'
+import { RECENT_RESOLVE_MS, SLUG, internals, worktreeSetupReason } from '../src/worktrees.ts'
 import type { CreatedWorktree, WorktreeRecord } from '../src/worktrees.ts'
-import { NOSYSTEM, run, tempDir } from './helpers.ts'
+import { NOSYSTEM, run, tempDir, withEnv } from './helpers.ts'
 import { mergedPull, projectOf, worktreeFixture } from './worktree-helpers.ts'
 import type { WorktreeFixture } from './worktree-helpers.ts'
 
@@ -171,7 +170,7 @@ test('create: paths are canonical when the work root is reached through a link',
 test('create: setup is not run in a worktree (default A): the answer gives the reason and the command, and the worktree stays', async () => {
   const f = await worktreeFixture({ setup: 'touch setup-ran' })
   const made = await create(f, 'one')
-  assert.deepEqual(made.setup, { ran: false, reason: skipReason(WORKTREE_SETUP_SKIPPED, made.path, 'touch setup-ran') })
+  assert.deepEqual(made.setup, { ran: false, reason: worktreeSetupReason(made.path, 'touch setup-ran') })
   assert.match(made.setup.ran ? '' : made.setup.reason, /touch setup-ran/)
   assert.ok(!await exists(join(made.path, 'setup-ran')))
   assert.ok(!await exists(worktreeSetupLogFile(f.state, 'acme', 'widget', 'one')))
@@ -251,6 +250,71 @@ test("create: when the undo fails, it says so, and the branch and the record are
   assert.ok(await exists(join(elsewhere, 'two', 'README.md')))
   assert.ok(await hasBranch(f, 'dish/two'))
   assert.deepEqual(await recordNames(f), ['two.json'])
+})
+
+test('create: a worktree add that fails after git made the branch removes the branch, so the slug is free again', async () => {
+  const f = await worktreeFixture()
+  // Something appears at the path between create's check and the add: git makes dish/late, then refuses the path.
+  internals.beforeAdd = async () => {
+    await mkdir(join(f.clone, '.worktrees', 'late'), { recursive: true })
+    await writeFile(join(f.clone, '.worktrees', 'late', 'mine.txt'), 'mine\n')
+  }
+  try {
+    // git's own fatal line, not its "Preparing worktree" (which names the path, and may be cut under a long TMPDIR).
+    await assert.rejects(create(f, 'late'), /couldn't make worktree late: git worktree failed \(exit 128\): fatal: '/)
+  } finally {
+    internals.beforeAdd = undefined
+  }
+  assert.ok(!await hasBranch(f, 'dish/late'), 'the branch git made is gone')
+  assert.deepEqual(await recordNames(f), [])
+  assert.equal(await readFile(join(f.clone, '.worktrees', 'late', 'mine.txt'), 'utf8'), 'mine\n', 'what was there stays')
+  await rm(join(f.clone, '.worktrees', 'late'), { recursive: true })
+  const made = await create(f, 'late')
+  assert.equal(made.branch, 'dish/late')
+})
+
+test('create: an add aborted after git made the branch removes the branch too', async () => {
+  const f = await worktreeFixture()
+  const commit = await f.git(['rev-parse', 'refs/remotes/origin/main'])
+  const real = (await run('sh', ['-c', 'command -v git'], { env: f.env })).stdout.trim()
+  const bin = join(f.dir, 'abort-shim')
+  await mkdir(bin)
+  // A worktree add makes its branch, as git does first, then hangs in dish's process group until it is ended.
+  await writeFile(join(bin, 'git'), [
+    '#!/bin/sh',
+    `case " $* " in *" worktree add "*) '${real}' -C '${f.clone}' branch dish/stop ${commit} && exec sleep 30 ;; esac`,
+    `exec '${real}' "$@"`,
+    '',
+  ].join('\n'))
+  await chmod(join(bin, 'git'), 0o755)
+  const controller = new AbortController()
+  const started = Date.now()
+  const creating = withEnv({ PATH: `${bin}:${process.env.PATH ?? ''}` }, () => f.call(() => f.worktrees().create(f.project, 'stop', undefined, { cwd: f.clone, signal: controller.signal })))
+  while (!await hasBranch(f, 'dish/stop')) {
+    assert.ok(Date.now() - started < 20_000, 'the shim made the branch')
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  controller.abort()
+  await assert.rejects(creating, /couldn't make worktree stop: git worktree was aborted/)
+  assert.ok(Date.now() - started < 20_000, 'ended, not waited out')
+  assert.ok(!await hasBranch(f, 'dish/stop'), 'the branch git made is gone')
+  assert.deepEqual(await recordNames(f), [])
+})
+
+test('create: a failed add leaves a branch dish/<slug> alone when it isn\'t at the commit dish asked for', async () => {
+  const f = await worktreeFixture()
+  const other = await f.commit(f.clone, 'other.txt', 'other\n')
+  await f.git(['reset', '-q', '--hard', 'HEAD~1'])
+  internals.beforeAdd = async () => {
+    // Someone makes the branch, elsewhere, first: git's add then fails on it.
+    await f.git(['branch', 'dish/taken', other])
+  }
+  try {
+    await assert.rejects(create(f, 'taken'), /couldn't make worktree taken/)
+  } finally {
+    internals.beforeAdd = undefined
+  }
+  assert.equal(await f.git(['rev-parse', 'refs/heads/dish/taken']), other)
 })
 
 test("create: a project without a clone is refused", async () => {
@@ -468,6 +532,27 @@ test('remove: a worktree whose directory was swapped for a link is refused, and 
   assert.equal(await readFile(join(victim, 'keep.txt'), 'utf8'), 'keep\n')
 })
 
+test('discard: a .worktrees swapped for a link after inspect, with git\'s records made to agree, is refused, and what the link reaches stays', async () => {
+  const f = await worktreeFixture()
+  const made = await create(f, 'swap')
+  const worktrees = f.worktrees()
+  const record = await recordOf(f, 'swap')
+  const state = await f.call(() => worktrees.inspect(f.project, record))
+  // An agent moves .worktrees aside, puts a link in its place, and rewrites the worktree's administrative files to
+  // match (detached, so no other worktree has the branch): every other check passes.
+  const moved = join(f.clone, 'moved')
+  await rename(join(f.clone, '.worktrees'), moved)
+  await symlink(moved, join(f.clone, '.worktrees'))
+  const admin = join(f.clone, '.git', 'worktrees', 'swap')
+  await writeFile(join(admin, 'gitdir'), `${join(moved, 'swap', '.git')}\n`)
+  await writeFile(join(admin, 'HEAD'), `${made.base}\n`)
+  await writeFile(join(moved, 'swap', 'keep.txt'), 'keep\n')
+  await assert.rejects(f.call(() => worktrees.discard(f.project, state, true)), /worktree swap can't be removed: .*\.worktrees is not a directory/)
+  assert.equal(await readFile(join(moved, 'swap', 'keep.txt'), 'utf8'), 'keep\n')
+  assert.ok(await hasBranch(f, 'dish/swap'))
+  assert.deepEqual(await recordNames(f), ['swap.json'])
+})
+
 // --- resolve --------------------------------------------------------------------------------------------------------
 
 test('resolve: by <project>/<slug> in any case of the project, and by path (canonical, through a link, with a trailing /)', async () => {
@@ -511,6 +596,33 @@ test('resolve: what is not a managed worktree of a registered project is undefin
   assert.equal(await f.call(() => worktrees.resolve(made.path, [projectOf('acme', 'other')])), undefined, 'a project not in projects')
   assert.equal(await f.call(() => worktrees.resolve('acme/widget/one', [])), undefined)
   for (const ref of refs) assert.equal(worktrees.recentlyResolved(ref), false)
+})
+
+test('problem: why resolve gives nothing for a worktree dish made (a safety check fails, its branch is gone); nothing for anything else', async () => {
+  const f = await worktreeFixture()
+  await create(f, 'one')
+  const odd = await create(f, 'odd')
+  const branchless = await create(f, 'branchless')
+  await f.git(['worktree', 'add', '-q', '-b', 'dish/manual', join(f.clone, '.worktrees', 'manual')])
+  const worktrees = f.worktrees()
+  const projects = [f.project]
+  const problem = (ref: string) => f.call(() => worktrees.problem(ref, projects))
+  assert.equal(await problem('acme/widget/one'), undefined, 'it resolves')
+  await writeFile(join(odd.path, '.git'), `gitdir: ${await tempDir()}\n`)
+  assert.match(await problem('acme/widget/odd') ?? '', /^worktree odd failed dish's safety check: .*\.git does not point at a worktree/)
+  await f.git(['checkout', '-q', '--detach'], branchless.path)
+  await f.git(['branch', '-D', 'dish/branchless'])
+  assert.equal(await problem('acme/widget/branchless'), 'its branch dish/branchless is gone')
+  for (const ref of ['acme/widget/manual', 'acme/widget/nope', 'acme/other/one', await tempDir(), '']) {
+    assert.equal(await problem(ref), undefined, ref)
+  }
+  // A clone that fails its check: every worktree of it says so, and none resolves.
+  await f.git(['config', 'core.pager', 'less'])
+  for (const ref of ['acme/widget/one', join(f.clone, '.worktrees', 'one')]) {
+    assert.equal(await problem(ref), `acme/widget's clone (${f.clone}) failed dish's safety check: .git/config sets core.pager, which dish doesn't allow`)
+    assert.equal(await f.call(() => worktrees.resolve(ref, projects)), undefined)
+  }
+  assert.equal(worktrees.recentlyResolved(join(f.clone, '.worktrees', 'one')), false)
 })
 
 test('recentlyResolved: within 5 minutes of a resolve, by its canonical path', async () => {

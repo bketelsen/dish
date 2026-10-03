@@ -4,6 +4,7 @@ import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { DishWorkspaces } from '../src/service.ts'
 import { MAIN_ONLY, worktreeTool } from '../src/tool.ts'
+import { worktreeSetupReason } from '../src/worktrees.ts'
 import type { CreatedWorktree, WorktreeInfo } from '../src/worktrees.ts'
 
 const SHA = 'a'.repeat(40)
@@ -41,7 +42,7 @@ function stub(overrides: Partial<DishWorkspaces> = {}): { service: DishWorkspace
       calls.create.push({ project, slug, base, cwd: options?.cwd, signal: options?.signal })
       const created: CreatedWorktree = {
         project, slug, branch: `dish/${slug}`, path: `${CLONE}/.worktrees/${slug}`, clone: CLONE, base: SHA,
-        setup: { ran: false, reason: `setup didn't run outside the sandbox: a worktree picks up config from the clone, which agents can change. Run it yourself in ${CLONE}/.worktrees/${slug}: pnpm install` },
+        setup: { ran: false, reason: worktreeSetupReason(`${CLONE}/.worktrees/${slug}`, 'pnpm install') },
       }
       return created
     },
@@ -113,13 +114,17 @@ test('create passes the session\'s cwd and the call\'s signal, and answers the p
   assert.equal(answer.branch, 'dish/fix-1')
   assert.equal(answer.base, SHA)
   assert.equal((answer.setup as { ran: boolean }).ran, false)
-  assert.match((answer.setup as { reason: string }).reason, /Run it yourself in .*: pnpm install/)
+  assert.equal((answer.setup as { reason: string }).reason, worktreeSetupReason(`${CLONE}/.worktrees/fix-1`, 'pnpm install'))
   const text = tool.output.render({}, value as never).map(block => (block as { text?: string }).text ?? '').join('\n')
   assert.ok(text.includes(`${CLONE}/.worktrees/fix-1`))
   assert.ok(text.includes('dish/fix-1'))
   assert.ok(text.includes(SHA))
-  assert.match(text, /pnpm install/)
   assert.match(text, /delegate/)
+  // What setup didn't do is said once, with how the main agent runs it: escalated, before it delegates.
+  assert.equal(text.match(/setup didn't run/gi)?.length, 1, text)
+  assert.ok(text.includes(`Setup didn't run outside the sandbox: a worktree picks up config from the clone, which agents can change. `
+    + `Before you delegate, run its setup yourself in ${CLONE}/.worktrees/fix-1, escalated (\`sandbox_permissions: "danger-full-access"\`), `
+    + 'so the judge allows it or asks the user: pnpm install. A coder can\'t.'), text)
 
   // A base, and a chat with no workspace (the service refuses that, not the tool).
   await tool.execute({ action: 'create', project: 'acme/widget', slug: 'fix-2', base: 'origin/dish/plan' }, exec({ cwd: null }))
