@@ -1215,8 +1215,10 @@ test('the notice\'s id: an end in a later turn gets none, and one child\'s notic
     inserted(ctx, settlement('c2', 'msg-c2'))
     ended(ctx, 'c1', 'completed', [{ type: 'text', text: 'again' }])
     ended(ctx, 'c2', 'completed', [{ type: 'text', text: 'found it' }])
-    assert.ok(!('notice' in (await ctx.dishCrew.whenRecorded('c1'))!.run))
-    assert.equal((await ctx.dishCrew.whenRecorded('c2'))?.run.notice, 'msg-c2')
+    // Both taken now: `whenRecorded` is only the run being recorded, and c2's may be done while c1's is awaited.
+    const [first, second] = [ctx.dishCrew.whenRecorded('c1'), ctx.dishCrew.whenRecorded('c2')]
+    assert.ok(!('notice' in (await first)!.run))
+    assert.equal((await second)?.run.notice, 'msg-c2')
     // Taken: the next end of c2 in the same run of the loop has none.
     inserted(ctx, settlement('c2', 'msg-c2b'))
     ended(ctx, 'c2', 'completed', [{ type: 'text', text: 'one' }])
