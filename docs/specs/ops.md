@@ -149,7 +149,7 @@ incus exec minideb:dish --project dish -- dish-update --apply            # updat
 incus exec minideb:dish --project dish -- dish-update --apply 4b23ff0    # roll back to a commit
 ```
 
-Without the remote, go through Minideb: `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-update`.
+Without the remote, go through Minideb: `ssh <you>@<minideb-host> incus exec dish --project dish -- dish-update`.
 
 ### Who it runs as and how
 
