@@ -117,7 +117,8 @@ export interface CreatedForRun {
 }
 
 export interface RunsHooks {
-  worktreeCreated(sessionId: string, created: CreatedForRun): Promise<{ id: string, opened: boolean } | undefined>
+  /** `released`, with `opened`: the id of the run the chat drove in another project, which opening this one released. */
+  worktreeCreated(sessionId: string, created: CreatedForRun): Promise<{ id: string, opened: boolean, released?: string } | undefined>
   worktreeRemoved(project: string, slug: string): Promise<void>
 }
 

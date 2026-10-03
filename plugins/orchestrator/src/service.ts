@@ -86,6 +86,8 @@ export interface JoinedRun {
   id: string
   /** true: a run was opened around the worktree; false: it joined the run this chat drives. */
   opened: boolean
+  /** With `opened`: the id of the run this chat drove (in another project) and no longer does: released, still open. */
+  released?: string
 }
 
 export interface DishRuns {

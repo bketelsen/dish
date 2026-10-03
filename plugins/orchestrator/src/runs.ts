@@ -37,7 +37,7 @@ import { parseRef, runRef, SEGMENT, SLUG, splitProject } from './paths.ts'
 import type { CreatedForRun, JoinedRun, LadderEntry, Placement, PlaceTarget, RunInfo } from './service.ts'
 import type { Services } from './services.ts'
 import type { Run, RunStore } from './store.ts'
-import { cut, given, oneLine, rulingBody, shortSession } from './text.ts'
+import { cut, given, oneLine, rulingBody, shortSession, shortSha } from './text.ts'
 
 export interface Logger {
   info(format: string, ...args: unknown[]): void
@@ -94,6 +94,8 @@ const CHILDREN_MAX = 1000
 const RULING_MAX = 1000
 
 const TIMED_OUT: unique symbol = Symbol('timed out')
+/** What `#owner` gives for a worktree that only a run that isn't open owns. */
+const CLOSED_OWNER: unique symbol = Symbol('owned by a run that isn\'t open')
 
 /** `promise`, or TIMED_OUT once `ms` have passed. The timer goes when either settles. */
 function within<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
@@ -131,6 +133,17 @@ function isText(value: unknown): value is string {
 
 function sameProject(a: string, b: string): boolean {
   return a.toLowerCase() === b.toLowerCase()
+}
+
+/**
+ * Whether the worktree dish-workspaces resolved at a run's path is another one: cut from another commit than the run's (a
+ * later run of the same slug makes its worktree at the same path, on a fresh `dish/<slug>`). Gives that commit's first 7
+ * characters, or undefined for the run's own, and when `resolve` gave no commit to compare.
+ */
+export function otherBase(resolved: unknown, run: Run): string | undefined {
+  const base = isObject(resolved) ? resolved.base : undefined
+  if (typeof base !== 'string' || base === '' || base.toLowerCase() === run.baseCommit.toLowerCase()) return undefined
+  return shortSha(base)
 }
 
 /** A run as `driving` gives it. */
@@ -358,8 +371,9 @@ export class Runs {
 
   /**
    * Where a child `delegate` is starting or following up belongs: a bound child in the run that owns its worktree, a
-   * reviewer where the child it reviews is, anything else in the run the session drives; undefined for no open run. Takes
-   * no lock. Never rejects (a failure is logged, and gives undefined).
+   * reviewer where the child it reviews is, anything else in the run the session drives; undefined for no open run. A
+   * worktree that only a run that isn't open owns (a `pr` run not reopened, an abandoned one) is that run's work, so a child
+   * bound to it is in no run, never the session's. Takes no lock. Never rejects (a failure is logged, and gives undefined).
    */
   place(sessionId: string, target: PlaceTarget): Promise<Placement | undefined> {
     return this.#guarded(`place a delegation of session ${String(sessionId)} in a run`, () => this.#place(sessionId, target), this.#placeMs, undefined,
@@ -373,7 +387,12 @@ export class Runs {
     const worktree = typeof asked.worktree === 'string' ? given(asked.worktree) : undefined
     const reviews = typeof asked.reviews === 'string' ? given(asked.reviews) : undefined
     let found: Found | undefined
-    if (worktree !== undefined) found = await this.#owner(worktree)
+    if (worktree !== undefined) {
+      const owner = await this.#owner(worktree)
+      // Tagged with the session's run, its entries would land in a run whose branch it never touched.
+      if (owner === CLOSED_OWNER) return undefined
+      found = owner
+    }
     if (found === undefined && reviews !== undefined && reviews !== 'main') found = await this.#reviewed(reviews)
     if (found === undefined) {
       const run = isText(sessionId) ? this.store.drivenBy(sessionId) : undefined
@@ -389,8 +408,12 @@ export class Runs {
     return placement
   }
 
-  /** The open run whose open tasks hold `worktree` (a path, or `<owner>/<repo>/<slug>`), newest first; with its task. */
-  async #owner(worktree: string): Promise<Found | undefined> {
+  /**
+   * The open run whose open tasks hold `worktree` (a path, or `<owner>/<repo>/<slug>`), newest first; with its task. When no
+   * open run has it and a run that isn't open does (a `pr` run not reopened, an abandoned one), CLOSED_OWNER. Those runs are
+   * searched only after the open ones, and one whose ledger can't be read is passed over.
+   */
+  async #owner(worktree: string): Promise<Found | typeof CLOSED_OWNER | undefined> {
     const resolved = await this.#resolve(worktree)
     const absolute = isAbsolute(worktree)
     const paths = new Set<string>([worktree])
@@ -398,12 +421,23 @@ export class Runs {
     if (resolved !== undefined) paths.add(resolved.path)
     const asRef = absolute ? undefined : worktreeRef(worktree)
     const project = resolved?.project
-    const candidates = this.store.list().filter(run => run.state === 'open' && (project === undefined || sameProject(run.project, project)))
-    for (const run of candidates) {
-      const entries = await this.entries(run)
+    const holds = (run: Run, entries: readonly LedgerEntry[]): string | undefined => {
       for (const [slug, path] of openTasks(run, entries)) {
-        if (paths.has(path) || (asRef !== undefined && slug === asRef.slug && sameProject(run.project, asRef.project))) return { run, task: slug, entries }
+        if (paths.has(path) || (asRef !== undefined && slug === asRef.slug && sameProject(run.project, asRef.project))) return slug
       }
+      return undefined
+    }
+    const candidates = this.store.list().filter(run => project === undefined || sameProject(run.project, project))
+    for (const run of candidates) {
+      if (run.state !== 'open') continue
+      const entries = await this.entries(run)
+      const task = holds(run, entries)
+      if (task !== undefined) return { run, task, entries }
+    }
+    for (const run of candidates) {
+      if (run.state === 'open') continue
+      const entries = await this.entries(run).catch(() => undefined)
+      if (entries !== undefined && holds(run, entries) !== undefined) return CLOSED_OWNER
     }
     return undefined
   }
@@ -511,7 +545,7 @@ export class Runs {
     }
     const { run: opened, released } = await this.openAround(sessionId, created, { goal: created.slug, how: 'auto' })
     if (released !== undefined) this.#info(`released run ${released.id} of ${released.project}: this chat opened run ${opened.id} in ${opened.project}`)
-    return { id: opened.id, opened: true }
+    return { id: opened.id, opened: true, ...released === undefined ? {} : { released: released.id } }
   }
 
   /**
@@ -659,8 +693,20 @@ export class Runs {
     })
   }
 
-  /** A `pr` run can be reopened while its worktree is one dish made. @throws Error with the refusal's words. */
+  /**
+   * A `pr` run can be reopened while its own worktree is one dish made: not removed (its ledger), and the worktree at its
+   * path cut from the run's commit (a later run of the same slug makes one at the same path, on a fresh `dish/<slug>`).
+   * @throws Error with the refusal's words.
+   */
   async #checkReopen(run: Run): Promise<void> {
+    const gone = `run \`${run.id}\` can't be reopened: its worktree is gone (the sweep removes it once its pull request ${run.pr?.url ?? ''} is merged). Open a new run with \`run\` \`open\`.`
+    let entries: LedgerEntry[]
+    try {
+      entries = await this.entries(run)
+    } catch (error) {
+      throw new Error(`run \`${run.id}\`'s ledger can't be read: ${describe(error)}`, { cause: error })
+    }
+    if (!openTasks(run, entries).has(run.slug)) throw new Error(gone)
     const workspaces = this.services.workspaces()
     if (workspaces === undefined) throw new Error(`dish-workspaces isn't running, so run \`${run.id}\`'s worktree can't be checked`)
     let resolved: unknown
@@ -670,7 +716,14 @@ export class Runs {
       throw new Error(`run \`${run.id}\`'s worktree can't be checked: ${describe(error)}`, { cause: error })
     }
     if (resolved === TIMED_OUT) throw new Error(`run \`${run.id}\`'s worktree can't be checked: dish-workspaces took longer than ${seconds(this.#lookupMs)}`)
-    if (resolved !== undefined && resolved !== null) return
+    if (resolved !== undefined && resolved !== null) {
+      const base = otherBase(resolved, run)
+      if (base !== undefined) {
+        throw new Error(`run \`${run.id}\` can't be reopened: its worktree is gone (${run.worktree} is now another worktree, cut from ${base}, not ${shortSha(run.baseCommit)}). `
+          + 'Open a new run with `run` `open`.')
+      }
+      return
+    }
     // A worktree dish made that fails its safety check resolves to nothing too: say why, as open_pr does.
     let problem: unknown
     try {

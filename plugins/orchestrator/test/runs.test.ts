@@ -90,6 +90,30 @@ test('place: a task.opened worktree is that task; once removed, the session\'s r
   assert.deepEqual(await w.runs.place(SESSION, { worktree: stray }), { run: w.runs.refOf(run) })
 })
 
+test('place: a worktree that a run with a pull request (not reopened) or an abandoned run owns is no run\'s, never the chat\'s other run; one no run owns is still the chat\'s run', async () => {
+  const w = await world()
+  const merged = await w.open({ slug: 'feat' })
+  const api = await w.created('api')
+  await w.runs.worktreeCreated(SESSION, api)
+  await w.runs.withRun(merged, () => w.runs.close(merged, SESSION, { state: 'pr', pr: { url: `https://github.com/${PROJECT}/pull/3`, number: 3 } }))
+  const dropped = await w.open({ slug: 'dropped' })
+  await w.runs.withRun(dropped, () => w.runs.close(dropped, SESSION, { state: 'abandoned', reason: 'not needed' }))
+  const mine = await w.open({ slug: 'mine' })
+  const own = { run: w.runs.refOf(mine) }
+  assert.equal(await w.runs.place(SESSION, { worktree: merged.worktree }), undefined)
+  assert.equal(await w.runs.place(SESSION, { worktree: `${PROJECT}/feat` }), undefined)
+  assert.equal(await w.runs.place(SESSION, { worktree: api.path }), undefined)
+  assert.equal(await w.runs.place(SESSION, { worktree: dropped.worktree }), undefined)
+  assert.equal(await w.runs.place(SESSION, { worktree: merged.worktree, reviews: 'main', final: true }), undefined)
+  // One no run owns, and one a closed run's ledger says was removed, are the chat's run, with no task.
+  assert.deepEqual(await w.runs.place(SESSION, { worktree: await w.worktree('stray') }), own)
+  await w.runs.worktreeRemoved(PROJECT, 'api')
+  assert.deepEqual(await w.runs.place(SESSION, { worktree: api.path }), own)
+  // Reopened, the pull request's run owns its worktree again.
+  await w.runs.withSession(SESSION, () => w.runs.drive(SESSION, merged, { takeover: false }))
+  assert.deepEqual(await w.runs.place(SESSION, { worktree: merged.worktree }), { run: w.runs.refOf(merged), task: 'feat', round: 0 })
+})
+
 test('place: a worktree is placed in the run that owns it, whichever chat drives it (a takeover), with its task and round', async () => {
   const w = await world()
   const run = await w.open({ session: SESSION })
@@ -296,6 +320,8 @@ test('worktreeCreated: a run in another project is released, logged, and a new o
   const created = await w.created('gizmo', { project: OTHER_PROJECT })
   const joined = await w.runs.worktreeCreated(SESSION, created)
   assert.equal(joined?.opened, true)
+  // The answer names the run it released, so the worktree tool can say so.
+  assert.deepEqual(joined, { id: joined!.id, opened: true, released: old.id })
   assert.equal(w.record(old)?.driver.session, '')
   assert.equal(w.record(old)?.state, 'open')
   assert.equal((await w.runs.driving(SESSION))?.project, OTHER_PROJECT)

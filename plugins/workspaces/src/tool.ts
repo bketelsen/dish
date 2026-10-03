@@ -13,7 +13,8 @@
  *   one a running coder is bound to, even with `force`.
  * - **dish-orchestrator's hooks** (`dishRuns`, read on each call; without it, nothing changes): after `create`,
  *   `worktreeCreated` with the main agent's session (`String(exec.agent.id)`, as crew's `delegate` takes it) and the new
- *   worktree, and the answer says the run it opened or joined; after `remove`, `worktreeRemoved`. Both run after the
+ *   worktree, and the answer says the run it opened or joined (and the run in another project that opening one released,
+ *   as `run open` says it); after `remove`, `worktreeRemoved`. Both run after the
  *   service's call returned, so never under the project's lock. A hook that throws, or answers what isn't a run, is
  *   logged once and leaves the worktree as it is: `create` says why it has no run, `remove` stands.
  * - The service's refusals reach the model as plain `Error`s with its message (masked already). Models fill every
@@ -82,7 +83,7 @@ const OUTPUT = {
         action: { type: 'string', const: 'create', required: true },
         project: STRING, slug: STRING, path: STRING, branch: STRING, base: STRING,
         setup: { ...SETUP, required: true },
-        run: { type: 'object', additionalProperties: false, properties: { id: STRING, opened: BOOLEAN } },
+        run: { type: 'object', additionalProperties: false, properties: { id: STRING, opened: BOOLEAN, released: { type: 'string' } } },
         runProblem: { type: 'string' },
       },
     },
@@ -153,21 +154,36 @@ function line(item: Pick<WorktreeInfo, 'project' | 'slug' | 'branch' | 'path' | 
   return parts.join('; ')
 }
 
-/** What dish-orchestrator answered `worktreeCreated`: a run, nothing, or why its answer can't be used. */
-function runOf(answer: unknown): { run?: { id: string, opened: boolean }, runProblem?: string } {
+/** The run `create`'s answer gives: `released`, with `opened`, the run this chat drove (in another project) and no longer does. */
+interface JoinedRun {
+  id: string
+  opened: boolean
+  released?: string
+}
+
+/**
+ * What dish-orchestrator answered `worktreeCreated`: a run, nothing, or why its answer can't be used. A `released` that
+ * isn't a run id is left out: the run stands.
+ */
+function runOf(answer: unknown): { run?: JoinedRun, runProblem?: string } {
   if (answer === undefined) return {}
   if (typeof answer === 'object' && answer !== null && typeof (answer as { id?: unknown }).id === 'string' && RUN_ID.test((answer as { id: string }).id)) {
-    return { run: { id: (answer as { id: string }).id, opened: (answer as { opened?: unknown }).opened === true } }
+    const opened = (answer as { opened?: unknown }).opened === true
+    const released = (answer as { released?: unknown }).released
+    const run: JoinedRun = { id: (answer as { id: string }).id, opened }
+    if (opened && typeof released === 'string' && RUN_ID.test(released)) run.released = released
+    return { run }
   }
   return { runProblem: 'dish-orchestrator gave a malformed run' }
 }
 
-/** The line `create`'s answer adds for its run, if any. */
-function runLine(slug: string, run: { id: string, opened: boolean } | undefined, problem: string | undefined): string | undefined {
+/** The line `create`'s answer adds for its run, if any (two, for a run it released). */
+function runLine(slug: string, run: JoinedRun | undefined, problem: string | undefined): string | undefined {
   if (run !== undefined) {
-    return run.opened
-      ? `Opened run \`${run.id}\` for this worktree; \`run\` with \`action: goal\` names it, and \`open_pr\` ends it.`
-      : `It is task \`${slug}\` of run \`${run.id}\`, which this chat drives.`
+    if (!run.opened) return `It is task \`${slug}\` of run \`${run.id}\`, which this chat drives.`
+    const opened = `Opened run \`${run.id}\` for this worktree; \`run\` with \`action: goal\` names it, and \`open_pr\` ends it.`
+    // As `run open` says it.
+    return run.released === undefined ? opened : `${opened}\nReleased run \`${run.released}\`: it stays open, and \`run\` \`resume\` takes it back.`
   }
   return problem === undefined ? undefined : `dish couldn't add it to a run: ${problem.replace(/\.+$/, '')}.`
 }
