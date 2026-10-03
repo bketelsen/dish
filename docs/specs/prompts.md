@@ -15,7 +15,7 @@ Status: implemented 2026-10-01 (branch `prompts`). Implements roadmap step 3. Bu
 |---|---|
 | What you edit | The **persona** part of the prompt only. dsh keeps writing its identity line, tool and skill guidance, and runtime context, so they stay correct as tools change. |
 | Shared rules | `prompts/common.md` goes into every role. You have no `~/.dsh/AGENTS.md`, and none is needed: global rules live here. A repo's own `AGENTS.md`/`CLAUDE.md` stay as dsh loads them. |
-| Main agent before `orchestrator` | A **"dish" preset**, which you set as your default. It was shipped here first and moved to `dish-crew` with the crew step (see the [crew spec](crew.md#the-dish-preset)). dsh's stock presets stay available. |
+| Main agent | A **"dish" preset**, which you set as your default. It was shipped here first and moved to `dish-crew` with the crew step (see the [crew spec](crew.md#the-dish-preset)). dsh's stock presets stay available. |
 | Agent edits | Crew prompts: `config_write` when you ask. `main.md` and `common.md`: **proposal only**, so the agent never rewrites its own instructions without your click. |
 | Editor extras | A "what the model sees" preview, a diff against the shipped default with reset, and the list of prompt variables. |
 | Defaults | Drafted by Claude in the superpowers style, seeded once, then yours to revise. |
@@ -109,7 +109,7 @@ The row needs the `dishPrompts` service. If the `dish-prompts` plugin isn't load
 - You make it the default once on **Settings → Agent presets**, which dsh stores in your profile. The bundle doesn't touch `agent-preset-registry`.
 - **Drift check:** `dish-crew`'s test reads the installed `dsh-web-app` `presets/standard.patch.yml` and fails when the copy no longer matches what the generator makes from it. A dsh upgrade then says what to update, instead of silently giving the dish preset an old tool set.
 - The Prompts page's preview assembles the system prompt in the dish preset's scope, so it needs `dish-crew` installed; without it the preview falls back, with a banner.
-- `orchestrator` (step 7) takes this preset over from `crew` later.
+- Step 7 (`orchestrator`) left the preset in `crew`.
 
 ### Delegated children (for `crew`, step 4)
 
@@ -148,14 +148,14 @@ Shipped as files in `plugins/prompts/defaults/` (laid out like the store: `commo
 
 | Role | Covers |
 |---|---|
-| `common` | Ends with the stock suffix, "Your working directory is {{cwd}}." Humans merge. Never store or echo secrets. Ask before irreversible or outward-facing actions. Report results faithfully, including failures. Prefer small, verifiable steps. |
-| `main` | Opens like the stock persona: "You are dish's main agent, powered by the {{model}} model." You're the controller: keep the conversation open and delegate about 90% of the work to the crew with `delegate`; do small things and judgment calls yourself. When `delegate` isn't available, do the work yourself. Record rulings (`what — why — cost if wrong`). Changes to your own prompt or `common` go through proposals. |
+| `common` | Ends with the stock suffix, "Your working directory is {{cwd}}." Humans merge. Pull requests are opened with the main agent's `open_pr`: agents don't push, and never rebase, amend or squash commits a run's branch already has (dish never force-pushes, so a branch is brought up to date with `git merge`). Never store or echo secrets. Ask before irreversible or outward-facing actions. Report results faithfully, including failures. Prefer small, verifiable steps. "This machine": how the sandbox, `/tmp`, escalations and mise's tools work on dish's VM. |
+| `main` | Opens like the stock persona: "You are dish's main agent, powered by the {{model}} model." You're the controller: keep the conversation open and delegate about 90% of the work to the crew with `delegate`; do small things and judgment calls yourself. When `delegate` isn't available, do the work yourself. Coders and reviewers finish with `report`, and the notice's opening is dish's own. **Runs** (step 7): every change that ends in a pull request is a run; open or resume one with `run`, record rulings, deferred findings and notes there, read `run` `status` after a compaction; from round 5 `delegate` needs a `ruling`; a run ends with `open_pr` (the final review with `final: true`) or `abandon`; review feedback goes through `pr_feedback`, `resume`, a merge (never a rebase) and `open_pr` again. Never push: no `git push`, no `gh pr create`. A finished run's `open_pr` needs no yes from the user: it merges nothing. Record rulings (`what — why — cost if wrong`). Changes to your own prompt or `common` go through proposals. |
 | `architect` | Turn a goal into a spec and a plan of small tasks a mid-tier model can do, each with files, tests and a done condition. |
-| `coder` | Test first. Stay inside the task. Run the repo's gate before saying done. Report what changed and anything left undone. |
+| `coder` | Test first. Stay inside the task. When the brief says dish runs the gate, leave the finishing run to dish, which runs it on `report` `done`; otherwise run the repo's gate before saying done. Finish by calling `report` (`status`, `summary`, `commits`, `rulings`, `concerns`, `notFixed`); `send_message` only for a question it's blocked on. |
 | `researcher` | Find, read and cite sources. Separate what the sources say from inference. Say when the answer is unknown. |
 | `ops` | Read before changing. Smallest reversible change. Say what you'd run before anything irreversible. |
 | `writer` | Write for the reader named in the task. Plain, short, accurate. |
-| `reviewer` | Review against the spec and the task, not taste. Findings ranked by severity, each with a concrete failure. No edits. |
+| `reviewer` | Review against the spec and the task, not taste. Run the tests and the gate yourself. Findings ranked by severity (`blocking`, `should_fix`, `nit`), each with a concrete failure and the fix. No edits. Finish by calling `report`: the `verdict`, the `head` reviewed (`git rev-parse HEAD`), `findings`, `checks`, and in a re-review `addressed`. |
 
 ## Web UI: Settings → Prompts
 

@@ -20,7 +20,7 @@ Status: implemented, 2026-10-01 (see [notes from the build](#notes-from-the-buil
 |---|---|
 | Who it guards | The main agent and the crew. A crew child whose parent is at approval policy `ask` switches from `never` to `ask`, with the judge as its only answerer; any other child stays at `never`. |
 | Gating | Read-only runs at ≥ 0.90 and reversible at ≥ 0.90. Irreversible never runs on the judge's say-so. Below a threshold, the main agent asks you and a child is refused with the reason. |
-| Screening | Covers web, MCP and resource tools. At ≥ 0.90 the content is withheld and replaced by a note. From 0.50 to 0.90 the content stays, with a warning in front. Local file reads and bash output are not screened (yet). |
+| Screening | Covers web, MCP and resource tools, and `pr_feedback` (since step 7). At ≥ 0.90 the content is withheld and replaced by a note. From 0.50 to 0.90 the content stays, with a warning in front. Local file reads and bash output are not screened (yet). |
 | `ask_judge` | Every agent, crew included. Rubric scores are the main draw. |
 | Thresholds | In `judge.yaml` in the config store, with agent policy `none`. You edit them on the Judge page. |
 | Visibility | The Settings → Judge page: key, status, thresholds and a decision log. Every judgment is recorded. |
@@ -124,6 +124,8 @@ tools:
   gated: [bash, pwsh]
   screened: [web_search, web_fetch, read_mcp_resource, "mcp__*", pr_feedback]
 ```
+
+**`pr_feedback`** (since step 7, the [orchestrator spec](orchestrator.md#the-tools)) is the main agent's read of a pull request's reviews and comments, which anyone with access to the repository can write, so the shipped `tools.screened` names it. The judge seeds only a missing `judge.yaml` (there is no `previous.json` for it), so an existing one doesn't move on its own: add `pr_feedback` to its screened tools on Settings → Judge.
 
 **Validation:**
 - unknown keys are refused;

@@ -101,9 +101,11 @@ delegate({
   reviews?,        // reviewer only: the crew child id whose work is reviewed, or "main" for the main agent's own work
   model?,          // optional override, a model id from crew.yaml's families; not allowed to break the reviewer rule
   worktree?,       // a coder's worktree, from dish-workspaces (6b: see the projects and workspaces spec)
-  gateOverride?,   // the main agent's ruling to review work whose gate hasn't passed (6c: see Gates, below)
+  ruling?,         // the main agent's ruling past a check: a review of work whose gate hasn't passed (6c), or a coder from round 5 (step 7)
+  gateOverride?,   // 6c's name for `ruling`, still accepted
+  final?,          // reviewer only: the run's final review (step 7)
 })
-→ { child, role, model, label }
+→ { child, role, model, label, note? }   // note: a coder's round on a run's task, or why `final` had no effect
 ```
 
 Empty strings are treated as absent. The checks run in this order, before anything starts, and each failure is an error the model can act on:
@@ -142,7 +144,7 @@ A child's allow list is its role's `tools` from `crew.yaml`, intersected with th
 - A tool that's missing then, such as `bash` on Windows (where it's `pwsh`) or `read_image` without attachments, is dropped, not an error.
 - **`ask_judge`** is in every shipped role. It belongs to `dish-judge`, which registers it as a global tool, so children inherit it. Without `dish-judge` installed no such tool exists, so the name is dropped like any other missing one: the child starts with the rest of its role. A role whose only tool is `ask_judge` is the "no tools" refusal below.
 - `pwsh` is added wherever `bash` is listed.
-- Whatever the file says, a child never gets these, even if a role lists them: `delegate`, `subagent`, `subagent_fork`, `subagent_codex`, `subagent_claude_code`, `list_subagent_models`, `workflow`, `ralph`, `interrupt_agent`, `list_agents`, `ask_user_question`, `create_goal`, `update_goal`, `exit_plan_mode`, `present`, `worktree` (dish-workspaces' tool for the main agent), or dsh's reserved `run_code`.
+- Whatever the file says, a child never gets these, even if a role lists them: `delegate`, `subagent`, `subagent_fork`, `subagent_codex`, `subagent_claude_code`, `list_subagent_models`, `workflow`, `ralph`, `interrupt_agent`, `list_agents`, `ask_user_question`, `create_goal`, `update_goal`, `exit_plan_mode`, `present`, `worktree` (dish-workspaces' tool for the main agent), `run`, `open_pr` and `pr_feedback` (dish-orchestrator's, step 7), or dsh's reserved `run_code`.
 - "Tools the parent can see" means tools the child can inherit: those in the parent's preset and global layers, not tools installed on the parent agent's own scope (such as dsh-schedule's), which dsh won't let a child's filter name. Children can't ask you anything: dsh runs them with approval policy `never`.
 - **A crew child's approvals are refused when `dish-judge` isn't loaded.** [`dish-judge`](judge.md) switches crew's children to approval policy `ask` and answers their requests itself; it puts `never` back on the live ones when it unloads. A child that settled keeps `ask` in its log and is resumed at `ask` by a follow-up. If `dish-judge` is absent then (disabled, uninstalled, failed to load, or a restart without it), dsh would put the child's request to the browser, which shows it in the child's own session and has no time limit. So crew registers an `approval/request` listener, prepended, that does nothing when `dishJudge` is there, and otherwise returns `rejected` for a request from a child that isn't top-level and that crew's record knows (also `rejected` if the record can't be read within 2 s). Anything else goes on to `next()`.
 
@@ -175,7 +177,7 @@ It moves here from `dish-prompts`, as `presets/dish.patch.yml`, still generated 
 - **removes dsh's own delegation:** the rows for `subagent`, `subagent_fork`, `workflow` and their engine. The main agent delegates through crew only, which is structural rather than a prompt request. It keeps `send_message`, `interrupt_agent` and `list_agents`;
 - **swaps in crew's `send_message`** (2026-10-03): the `tool-subagent-control` row becomes `dish-crew/control`, the same `send_message` and `interrupt_agent` without dsh's mark, so dsh adds no "send your result" note to a crew child's task (see [What dsh gives us](#what-dsh-gives-us-checked-in-020-rc2)). The generator refuses a list that would still load dsh's package: two `send_message` tools in one scope is a registration error. `list_agents` (`tool-subagent-control/list-agents`) stays dsh's.
 
-`dish-prompts` keeps its persona row and loses the preset. `dish-crew` depends on `dish-prompts` and `dish-config`. Without `dish-prompts`, the persona row logs once and `delegate` refuses every call, naming the missing plugin; nothing refuses at load. `orchestrator` takes the preset over in step 7.
+`dish-prompts` keeps its persona row and loses the preset. `dish-crew` depends on `dish-prompts` and `dish-config`. Without `dish-prompts`, the persona row logs once and `delegate` refuses every call, naming the missing plugin; nothing refuses at load. Step 7 left the preset here.
 
 ## Notices and labels
 
@@ -192,6 +194,15 @@ It moves here from `dish-prompts`, as `presets/dish.patch.yml`, still generated 
 
   A coder bound to a worktree gets one more sentence after the report, on how its gate ended ([Gates](#gates-6c)).
 
+  Since step 7, a coder's or reviewer's run that ended with a structured report is told as the report, from its `.json`, with the gate line before `Its report:` ([Reports, runs and the ladder](#reports-runs-and-the-ladder-step-7)):
+
+  > coder «add login» (claude-sonnet-5.5) finished: done. Report: `…/3-coder-1.json`. Gate passed (round 1). Its report:
+  >
+  > Status: done
+  > Summary: …
+
+  One without a report says "It ended without a successful `report`, so there is no structured report." before dsh's label.
+
 ## The record
 
 Crew keeps its own runtime record, because the session log can't hold custom events. It lives in `$XDG_DATA_HOME/dish/crew/`: `sessions/<sha256(parent session id)>/` per session, and `by-child/<sha256(child id)>` pointers so a child's runs are filed after a restart. Each session directory holds:
@@ -203,7 +214,23 @@ Crew keeps its own runtime record, because the session log can't hold custom eve
 
 The notice gives the report's path. The main agent decides whether to promote a report into a repo's docs or, later, the memory vault.
 
-Since 6c, a run also keeps its gate results (`runs[].gates`), and a reviewer the main agent's `gateOverride` ([Gates](#gates-6c)).
+Since 6c, a run also keeps its gate results (`runs[].gates`), and a reviewer the main agent's `gateOverride` ([Gates](#gates-6c)). Since step 7, a coder's or reviewer's structured report (`report` on the child while its run is in progress, then `runs[].structured` with its `.json` as `structuredFile`), the finish notice's id (`runs[].notice`), and, with dish-orchestrator, a child's `run`, `task` and `final` ([Reports, runs and the ladder](#reports-runs-and-the-ladder-step-7)).
+
+## Reports, runs and the ladder (step 7)
+
+Step 7 ([orchestrator](orchestrator.md)) gives coders and reviewers a structured report, and `delegate` the run's tags, `ruling`, `final` and the ladder's last rung. The schemas and the ledger are in the [orchestrator spec](orchestrator.md#structured-reports-coder-and-reviewer); the [README](../../plugins/crew/README.md#reports) has the words.
+- **`report`.** A coder (role `coder`) and a reviewer (a child with `reviews`; `reportRole`) finish by calling `report`, with the coder's or the reviewer's schema. dsh-tools checks the schema; crew then checks a blank `summary`, `blockedOn` for a coder that isn't `done`, and a reviewer's `head` that isn't 40 or 64 hex digits, all at once, and records nothing on a problem. A report that passes is masked and kept on the child (`setReport`), its turn is concluded (`concludeTurn`), and the stored report is the tool's value. A later `report` in the same turn replaces the earlier one.
+- **Where it is registered.** On each coder's and reviewer's own scope at `agent/created` (and on each one in dsh's registry when crew loads), so a cold resume gets it again; taken back at `agent/disposed`. Never in the preset: the main agent and the other roles never see it.
+- **The steer.** A prepended `agent/turn-stopping` listener sends a coder or reviewer crew gave `report`, whose turn is about to end without a successful `report` since its newest assistant message, back with "Finish by calling `report`: …", at most `reportSteers` (2) times a turn. `0` turns the steer off, and `report` stays. `dishCrew.reportSteered(childId)` is true from the steer until the child's next assistant message or turn, for dish-gates at the same stop.
+- **The closing note.** Coders and reviewers get `reportNote` in place of `closingNote`. It begins with `RETURN_NOTE_LEAD` and the parent's id, as `closingNote` does (dish-judge ends a child's brief there), says to finish with `report` ("it is your report, and the main agent receives it in full, automatically"), and keeps `send_message` for a short question the child is blocked on.
+- **The report guard's words.** For a child crew gave `report`, its two refusals name `report` in place of the closing message: "Not sent: this is your result, and in this crew you report with `report`. … Finish the work and call `report`. If this was a question you're blocked on, put it in your report instead; the main agent will follow up.", and later "… Put everything for the main agent in your `report`, and finish." Every other role keeps `closingNote` and the guard's two refusals byte for byte.
+- **The record and the file.** `endRun` writes the report as `<n>-<role>-<run>.json` beside the `.md`, and moves it onto the run (`RunRecord.structured`, with `structuredFile`); `RunRecord.report` stays the `.md`.
+- **The notice** renders the report, and is matched to its run by the notice's id (`RunRecord.notice`, which crew notes when it sees the notice enter the parent's inbox), and otherwise by its text ([Notices and labels](#notices-and-labels)).
+- **Runs.** While dish-orchestrator runs, `delegate` asks `dishRuns.place` where a call belongs, inside its locks, after every check that refuses without writing, and records a start with the run's ref (`ChildRecord.run`, `<owner>/<repo>/<id>`) and its task. A bound child is placed in the run that owns its worktree, whichever chat drives it, and a reviewer where the child it reviews is. A follow-up keeps its child's tags.
+- **`ruling` and `final`.** `ruling` is the one parameter for ruling past a check, and `gateOverride` its synonym. `final: true` (the reviewer role only) marks the run's final review; it is sticky on the record, and recorded only when `place` gives it.
+- **The ladder.** A coder start or follow-up on a run's task is a round, counted by `place` from the run's ledger. Rounds 1–4 add an advisory `note` to the answer; from round 5 the call is refused unless `ruling` carries a ruling, and either outcome is recorded with `dishRuns.ladder`.
+- **Events.** `dish-crew/delegated` (`{ sessionId, child, followUp }`, after `addChild` or `addFollowUp`, awaited inside `delegate`'s session lock) and `dish-crew/settled` (`{ sessionId, child, run }`, after `endRun`), each published with `ctx.parallel` and awaited for at most 10 s.
+- **Without dish-orchestrator,** there are no tags and no ladder, and `final` only says it had no effect. `report`, its steer and the notes are crew's own, and work without it.
 
 ## Gates (6c)
 
@@ -212,7 +239,7 @@ Since 6c, a run also keeps its gate results (`runs[].gates`), and a reviewer the
   - **Where it lives.** dish-gates writes it with `records.addGate(child, result)`, through the session's queue, awaited before the coder's turn can close. While the run is in progress the results are on the child (`ChildRecord.gates`); `endRun` moves them onto the run it files (`RunRecord.gates`), and the next run starts with none.
   - **`latestGate(record)`** is the run in progress's last result, or, when no run is in progress, the latest run's last; none while a run is in progress and has none yet.
   - A malformed result is refused (`TypeError`) and nothing is written; a file with one is set aside as corrupt, like any malformed field. Files from before 6c parse.
-- **The brief.** A bound coder's worktree block gains: "When you finish, dish runs this project's gate (`<gate>`) in your worktree, and a failure comes back to you. If you're blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped." The gate is `dishGates.gateFor(project)`. Without it, 6b's block is unchanged.
+- **The brief.** A bound coder's worktree block gains: "When you finish, dish runs this project's gate (`<gate>`) in your worktree, and a failure comes back to you. If you're blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped." The gate is `dishGates.gateFor(project)`. Without it, 6b's block is unchanged. Since step 7, a coder's block speaks of `report` instead: "When you finish with `report` and `status: "done"`, dish runs this project's gate (`<gate>`) in your worktree, and a failure comes back to you. If you're blocked, report `status: "blocked"` or `"needs_context"` with `blockedOn`, and the gate is skipped." Other bound roles keep the words above.
 - **The notice line,** after the report, from the run's last result:
   - passed: "Gate passed (round N)."; in a run that ended another way than `completed` after its gate passed, "Gate passed earlier in this run (round N), but the run ended (<reason>) after it, so any work after the gate wasn't gated."
   - failed in the last round: "Gate FAILED after N rounds (`<gate>`, exit <code>); last lines:", the excerpt in a code fence longer than any run of backticks in it, then "Full log: `<log>`. Start a fix round with `to` or a fresh coder (escalation ladder)." A timeout says "stopped at its time limit" in place of the exit code;
@@ -221,14 +248,14 @@ Since 6c, a run also keeps its gate results (`runs[].gates`), and a reviewer the
   - no result: "Gate not run.", only while dish-gates runs.
 
   The collapsed row's sentence doesn't change.
-- **The review check.** A start with `reviews: <child>`, and a follow-up to a reviewer (a re-review), read the reviewed child's record through `lookup`, inside the session's lock. While that child is bound to a worktree and its gate hasn't passed, the call is refused, with where the gate stands and how to go on: "<role> «<title>» (child <id>)'s gate hasn't passed (<standing>). Send it a fix round with `to: "<id>"`, or start the review anyway with `gateOverride: "Ruling: what — why — cost if wrong"`." Not passed is:
+- **The review check.** A start with `reviews: <child>`, and a follow-up to a reviewer (a re-review), read the reviewed child's record through `lookup`, inside the session's lock. While that child is bound to a worktree and its gate hasn't passed, the call is refused, with where the gate stands and how to go on: "<role> «<title>» (child <id>)'s gate hasn't passed (<standing>). Send it a fix round with `to: "<id>"`, or start the review anyway with `ruling: "Ruling: what — why — cost if wrong"`." (`gateOverride:` before step 7). Not passed is:
   - the child is still running ("it is still running"; wait for its notice);
   - its latest run's last result isn't a pass ("failed, round 3 of 3; log <path>", "skipped: <reason>", "error: <reason>");
   - that run has no result ("no gate result: it didn't run (for example, the coder ran before gates were on)");
   - its last result is a pass, but the run didn't end `completed` after it ("the run ended (<reason>) after its gate passed, so any work after the gate wasn't gated", or "dsh stopped the run after its gate passed, …" for a run still in progress): a follow-up steered into that turn had the coder go on, and only a normal end gates that work again.
 
   Not checked: unbound children, `reviews: "main"`, and any review while dish-gates isn't running.
-- **`gateOverride`** is the ruling, folded onto one line. An empty one is none, as for every optional parameter. One with nothing past a leading `Ruling:`, or the placeholder itself, is refused: "gateOverride needs the ruling itself: what — why — cost if wrong". A ruling is recorded on the reviewer (`ChildRecord.gateOverride`; a follow-up's replaces it), and the reviewer gets a block after its task, before the closing note: "The harness's gate for the work you review (<role> «<title>», child <id>) hasn't passed: <standing>. The main agent started this review anyway, with this ruling: <ruling>", without the ruling's leading `Ruling:`. A re-review without one keeps the reviewer's ruling while the reviewed child hasn't run since the ruling was given (`ChildRecord.gateOverrideAt`). When nothing is refused, `gateOverride` is ignored and not recorded.
+- **`gateOverride`** (since step 7, `ruling`, with `gateOverride` its synonym) is the ruling, folded onto one line. An empty one is none, as for every optional parameter. One with nothing past a leading `Ruling:`, or the placeholder itself, is refused: "ruling needs the ruling itself: what — why — cost if wrong." and the refusal above. A ruling is recorded on the reviewer (`ChildRecord.gateOverride`; a follow-up's replaces it), and the reviewer gets a block after its task, before the closing note: "The harness's gate for the work you review (<role> «<title>», child <id>) hasn't passed: <standing>. The main agent started this review anyway, with this ruling: <ruling>", without the ruling's leading `Ruling:`. A re-review without one keeps the reviewer's ruling while the reviewed child hasn't run since the ruling was given (`ChildRecord.gateOverrideAt`). When nothing is refused, `gateOverride` is ignored and not recorded.
 
 ## Seeing the crew
 
@@ -253,6 +280,7 @@ Both changes are made to the shipped defaults. Seeding never overwrites, so your
 | `dish-crew` | `dataDirectory` | `$XDG_DATA_HOME/dish/crew` | Where records and reports go. |
 | `dish-crew` | `subagentProvider` | `spawn` | The `ctx.subagents` provider for children. |
 | `dish-crew` | `messageLimit` | `1200` | The most characters a crew child's `send_message` may have before it is taken for a report and refused, which closes `send_message` to that child until its run ends; `0` turns the report guard off. |
+| `dish-crew` | `reportSteers` | `2` | How many times in one turn a coder or reviewer that ends without a successful `report` is sent back to call it (step 7). `0` turns the steer off; `report` stays. |
 | `dish-crew` | `terminal` | `true` | Print this plugin's messages. |
 | `dish-crew/delegate` | — | | The preset row: the tool, the notice rewriter. |
 
@@ -303,3 +331,11 @@ Roles, models and limits live in `crew.yaml`, not here.
 
   The records, reports and labels were as specified. It also found a `dish-copilot` catalog bug: Sonnet 5.5 was copied from Sonnet 5 and rejected every request. That's fixed by preferring the closest version of the same vendor.
 - **Small follow-up, done in the skills step:** the Prompts remote's `reset` defaults its note to "Reset to the default" itself, as the page does. Before, a reset made through the remote without a note read as an edit in History.
+- **Step 7, the orchestrator build (2026-10-03),** Tasks 1 to 4 ([orchestrator spec](orchestrator.md#notes-from-the-build)):
+  - **Order.** Changes to one child's record reach the session's queue in the order they were called, so a report lands on the run it ended and a start's `delegated` comes before anything it ends with.
+  - **Events never reject.** The publisher logs a listener's failure, even one that can't be turned into text, and goes on. `dish-crew/settled` is awaited, up to 10 s, before `whenRecorded` resolves, so a child's next start or end waits for it too. A start dsh refused publishes `settled` for the run `markFailed` filed, so every published start also ends.
+  - **`report`.** A reviewer's `head` is stored trimmed and lowercased; blank optional fields and empty lists are dropped. Giving `report` to an agent whose scope is going away is silent. When the record has lost the child (`setReport` gives nothing), the child is told to end with its report as its closing message, and from then on crew doesn't steer it to `report`, and the report guard's refusals are the closing message's again.
+  - **Notices are matched by id first.** crew notes the id of each finish notice it sees enter the parent's inbox and files it on the run whose `subagent/end` follows (`RunRecord.notice`); a notice with an id is that run's. Matching by text is left for runs filed without one, which two report-only rounds would otherwise confuse. The notice says `NO_STRUCTURED_REPORT` for every coder or reviewer run without a structured report, with `reportSteers: 0` and for runs that ended abnormally too; in the report it renders, empty lists and a blank `blockedOn` read as absent.
+  - **`final`** is recorded only when the call asked for it and `place` gave it, and on a follow-up only when `place` puts it in the run the reviewer is tagged with; otherwise the answer says why. `final` on a role that doesn't review is refused before anything is read.
+  - **`place` fails open.** A `place` that throws, or answers something malformed, is logged and counts as no run: the child goes untagged and outside the ladder, and a delegation is never refused for it.
+  - **The ladder's refusal is the only one that writes,** and only to the run's ledger (`ladder.refused`), before it is thrown. A follow-up is counted only when `place` still puts it where its child's tags say.

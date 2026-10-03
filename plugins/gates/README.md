@@ -2,10 +2,11 @@
 
 Runs a project's gate in a crew coder's worktree when the coder is about to finish, and sends a failure back to it.
 - **Who is gated.** A crew child bound to a worktree of a registered project ([crew's `delegate`](../crew/README.md#binding-a-coder-to-a-worktree) with `worktree`). Never the main agent, and never anything outside a project.
-- **When.** At every end of the coder's turn (dsh's `agent/turn-stopping`), unless its closing message starts with `BLOCKED:` or `NEEDS CONTEXT:`.
+- **When.** At every end of the coder's turn (dsh's `agent/turn-stopping`) once it has finished: a successful `report` with `status: "done"` ended the turn, or its newest message calls no tool and crew didn't just send it back to call `report`. Not when it reported `blocked` or `needs_context`, or, for one that ends with text, when its closing message starts with `BLOCKED:` or `NEEDS CONTEXT:`.
 - **What runs.** The project's `gate` from `projects.yaml`, as it is at that moment, in the coder's worktree, through dsh's sandboxed shell. Never a command the coder chose.
 - **A failure** goes back to the coder, and its turn goes on. At most 3 gate runs per turn: the failure in the last one isn't sent back, and the turn ends with it.
-- **The result** goes in crew's record. The main agent's finish notice says how the gate ended, and crew refuses a review of work whose gate didn't pass, unless the main agent gives a ruling ([crew's README](../crew/README.md#gates)).
+- **The result** goes in crew's record, with the worktree's head, and on `dish-gates/result` for [dish-orchestrator](../orchestrator/)'s ledger. The main agent's finish notice says how the gate ended, and crew refuses a review of work whose gate didn't pass, unless the main agent gives a ruling ([crew's README](../crew/README.md#gates)).
+- **`open_pr`'s gate.** `runAt` runs the same gate on a run's head before dish pushes it ([The service](#the-service)).
 
 So "done" means the gate passed, not that the coder said so. The design is in the [spec](../../docs/specs/gates.md) and the [plan](../../docs/plans/2026-10-03-gates.md). The spec's "Notes from the build" say what changed on the way.
 
@@ -15,21 +16,24 @@ So "done" means the gate passed, not that the coder said so. The design is in th
 pnpm dsh plugin --profile web add ./plugins/gates
 ```
 
-`deploy/install.sh` links it, last. It needs nothing at load: it reads `dishCrew`, `dishWorkspaces`, `dishProjects` and dsh's `shell` with `ctx.get` each time it uses them, so there is no order to keep. It is a host plugin, so it hears every agent's end of turn, crew's children included.
+`deploy/install.sh` links it after workspaces; orchestrator comes last. It needs nothing at load: it reads `dishCrew`, `dishWorkspaces`, `dishProjects` and dsh's `shell` with `ctx.get` each time it uses them, so there is no order to keep. It is a host plugin, so it hears every agent's end of turn, crew's children included.
 
-Without [`dish-crew`](../crew/) it does nothing. Without [`dish-workspaces`](../workspaces/), a bound coder's stop is recorded as an `error`, "dish-workspaces isn't running". Without [`dish-projects`](../projects/), dish-workspaces resolves no worktree, so the stop is `skipped` as a worktree that is gone. Either way nothing runs, and a review of the work needs a ruling.
+Without [`dish-crew`](../crew/) it gates no coder (`runAt` still runs `open_pr`'s gate). Without [`dish-workspaces`](../workspaces/), a bound coder's stop is recorded as an `error`, "dish-workspaces isn't running". Without [`dish-projects`](../projects/), dish-workspaces resolves no worktree, so the stop is `skipped` as a worktree that is gone. Either way nothing runs, and a review of the work needs a ruling.
 
 ## A gated stop, step by step
 
 For each end of turn of any agent:
-1. **Not gated:** the turn was cancelled, the agent is the main agent, crew isn't running, or crew's record has no worktree for the child. Nothing is recorded. Nor is a stop whose newest message holds tool calls: the coder hasn't finished. dsh fires such stops only after a step of the turn was cut at `max-tokens`, as it then keeps `max-tokens` as the turn's end; the cut message holds no tool calls (dsh drops them), so its stop is gated once.
+1. **Not gated:** the turn was cancelled, the agent is the main agent, crew isn't running, or crew's record has no worktree for the child. Nothing is recorded. Nor is a stop of a coder that hasn't finished:
+   - **After a `report`** (crew's tool, step 7): a successful `report` that concluded the turn means it has finished, whatever its message holds. dish-gates hears it on dsh-tools' `tools/result`, and forgets it at the next assistant message or turn.
+   - **Otherwise,** a stop whose newest message holds tool calls hasn't finished. dsh fires such stops only after a step of the turn was cut at `max-tokens`, as it then keeps `max-tokens` as the turn's end; the cut message holds no tool calls (dsh drops them), so its stop is gated once.
+   - **Nor a stop crew sent back to call `report`** (`dishCrew.reportSteered(childId)`): crew's `agent/turn-stopping` listener is prepended, so its steer comes first, and a report steer and a gate steer never both happen at one stop. With crew's `reportSteers: 0`, the rule is the one from before step 7.
 2. **One gate per worktree.** A second stop for the same worktree waits for the first. A stop cancelled while it waits returns at once.
 3. **The round** is 1 + the failed gates already recorded for this turn of the child.
 4. **The worktree** must resolve (`dishWorkspaces.resolve`, which runs dish's checks on the clone and the worktree). When it doesn't:
    - a clone or worktree that fails dish's safety check is an `error`, with the finding. So a coder can't skip its gate by breaking its clone's `.git/config`;
    - a worktree that is gone, or whose project was removed, is `skipped`: "its worktree is gone, or its project is no longer registered";
    - a project no longer in `projects.yaml` is `skipped`: "<project> isn't in projects.yaml".
-5. **The opt-out:** a closing message that starts with `BLOCKED:` or `NEEDS CONTEXT:` is `skipped`: "the coder reported BLOCKED / NEEDS CONTEXT". Markdown marks may come first (`**BLOCKED:**`, `# NEEDS CONTEXT:`), any case is fine, and `NEEDS_CONTEXT:` counts too. The closing message is the newest assistant message with text in this turn.
+5. **The opt-out.** After a `report`, its `status`: `done` goes on, and `blocked` or `needs_context` is `skipped` ("the coder reported status blocked", "… needs_context"); the text isn't read. Without a `report`, a closing message that starts with `BLOCKED:` or `NEEDS CONTEXT:` is `skipped`: "the coder reported BLOCKED / NEEDS CONTEXT". Markdown marks may come first (`**BLOCKED:**`, `# NEEDS CONTEXT:`), any case is fine, and `NEEDS_CONTEXT:` counts too. The closing message is the newest assistant message with text in this turn.
 6. **Rounds used up:** with `maxRounds` failures in this turn already, nothing runs and nothing is recorded. Only another plugin's steer can bring a turn here.
 7. **The run** (below). A pass is recorded. A failure is recorded and, with rounds left, sent back to the coder as a message from `dish-gates`; in the last round it isn't sent back, and the turn ends with it. So a turn has at most `maxRounds` gate runs and `maxRounds - 1` fix attempts.
 
@@ -74,10 +78,10 @@ Sent after a failure with rounds left (round 1 and 2 of 3), as a message in the 
 > ```
 > …the last `tailLines` lines, at most 16 KiB…
 > ```
-> Full log: `<path>`. Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do.
-> If you're blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.
+> Full log: `<path>`. Fix it in your worktree, then call `report` again: the new report replaces the one you made. The gate runs again when you do.
+> If you're blocked, call `report` with `status: "blocked"` or `"needs_context"` and `blockedOn`, and the gate is skipped.
 
-On a timeout the first line says the gate "was stopped at its time limit (<limit>)", and with no exit code that it "was killed". A gate that printed nothing says so. A sandbox refusal adds where a gate can write. In the next-to-last round the message adds "If it fails once more, your turn ends with the failure, and the main agent decides what's next." The output isn't screened (it is the coder's own), but secrets in it are masked (dish-kit's `maskSecrets`) before it reaches the message, the log or the record.
+That is the message after a stop a `report` ended. After a stop that ended with text (a coder from before crew loaded, or `reportSteers: 0`), the last two lines are 6c's: "Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do." and "If you're blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped." On a timeout the first line says the gate "was stopped at its time limit (<limit>)", and with no exit code that it "was killed". A gate that printed nothing says so. A sandbox refusal adds where a gate can write, ending "If it needs another directory, say so in your report's `concerns`." after a `report` ("… in your closing message." otherwise). In the next-to-last round the message adds "If it fails once more, your turn ends with the failure, and the main agent decides what's next." The output isn't screened (it is the coder's own), but secrets in it are masked (dish-kit's `maskSecrets`) before it reaches the message, the log or the record.
 
 The judge never reads this message: a child's task, for the judge, is its brief and its latest instruction from its parent or a person.
 
@@ -90,7 +94,7 @@ The judge never reads this message: a child's task, for the judge, is its brief 
 
 ## The record
 
-Each result is a `GateResult` in crew's record of the child: on the child while its run is in progress, then on the run when it ends (`children.json`, see [crew's README](../crew/README.md#gates)). dish-gates writes it with `dishCrew.records.addGate`, awaited before the turn can close, so it lands before crew files the run. Restarts don't reset the rounds of a turn. A gate cut short by a restart records nothing: the gate dies with dsh, and the run it was in has no gate result, so a review of it needs a ruling.
+Each result is a `GateResult` in crew's record of the child: on the child while its run is in progress, then on the run when it ends (`children.json`, see [crew's README](../crew/README.md#gates)). Since step 7 it carries `head`: the worktree's HEAD when the gate ran (`dishWorkspaces.headOf`, since dish-gates runs no git), or `null` when it couldn't be read, the worktree didn't resolve, or the answer wasn't a full sha. Results from before step 7 have none. dish-gates writes it with `dishCrew.records.addGate`, awaited before the turn can close, so it lands before crew files the run. Restarts don't reset the rounds of a turn. A gate cut short by a restart records nothing: the gate dies with dsh, and the run it was in has no gate result, so a review of it needs a ruling.
 
 ## The service
 
@@ -98,10 +102,20 @@ Each result is a `GateResult` in crew's record of the child: on the child while 
 interface DishGates {
   /** The gate dish-gates runs for a project's bound coders: projects.yaml's `gate` as it is now; undefined for a project that isn't registered, or without dish-projects. */
   gateFor(project: string): Promise<string | undefined>
+  /** The project's gate in a worktree dish made, at its HEAD, for open_pr (step 7). Recorded nowhere. */
+  runAt(project: string, worktreePath: string, options: { sessionId: string, head?: string, signal?: AbortSignal }): Promise<GateCheck>
 }
+type GateCheck = Omit<GateResult, 'turn' | 'round' | 'maxRounds'>
 ```
 
 Crew reads `dishGates` without depending on this plugin. The service being there is what turns on crew's side: the gate sentence in a bound coder's brief (from `gateFor`), the finish notice's "Gate not run." for a run with no result, and the review check.
+
+**`runAt`** is [`open_pr`](../orchestrator/README.md#open_pr)'s gate. It runs the project's gate in the worktree as a coder's runs (the sandbox, `gateTimeout`, `gateEnv` with mise's shims), for `options.sessionId` (the main agent's), in the same per-worktree lock as a coder's gate, so the two never run at once in a worktree.
+- **The head.** It reads the worktree's HEAD in the lock and gives it as the result's `head`. Given `options.head`, a worktree whose HEAD isn't that commit isn't gated: an `error`, "the worktree's HEAD is <sha>, not <sha>: it moved after the caller read it". So the head that was checked is the head `open_pr` pushes.
+- **Nothing kept.** It records nothing in crew's record, steers nothing and publishes nothing: `open_pr` records `pr.checked`. Its log is `<state>/gates/<owner>/<repo>/<slug>/open_pr.log` (`open_pr.2.log`, … after the first), and its terminal line "open_pr's gate for <owner>/<repo>/<slug> at <head12>: passed in 42 s" (or "failed in … (exit 1)").
+- **Errors are results.** A gate that can't run is an `error` result with why, and so is a throw of dish's own code. It rejects only without a `sessionId` (a `TypeError`) and when the caller's `signal` aborts.
+
+**`dish-gates/result`** `{ childId, sessionId, result }` is published with `ctx.parallel` after each result `addGate` kept, for dish-orchestrator's ledger. dish-gates waits at most 10 s for its listeners (open_pr holds a run's lock while `runAt` waits for the worktree's, so a listener that waited on that run can't hold the coder's turn), then goes on and logs once. A listener's failure changes nothing.
 
 ## Configuration
 
@@ -115,7 +129,8 @@ Crew reads `dishGates` without depending on this plugin. The service being there
 
 - **10 minutes at most.** dsh caps a shell run at 10 minutes, and a turn stays running for as long as its gate does. A long build like an image isn't a gate: use its lint or validate step. dish could wait longer with a deadline of its own (`onExpiry: 'none'`); it doesn't.
 - **A long gate holds the turn.** At worst a turn takes `maxRounds` × `gateTimeout`. The coder counts as running all that time, so the writer limit keeps another coder from starting.
-- **Gates can run twice.** The coder's prompt and skills tell it to run the gate before it finishes, and then dish runs it again.
+- **Gates can run twice.** Since step 7, coders' prompts and skills leave the gate to dish when their brief names it; a plan's task steps may still say to run it (writing-plans).
+- **A reviewer's concluding `report` isn't gated.** Only a writing reviewer bound to a worktree could hit it, and the shipped `crew.yaml` has none.
 - **The closing message comes from `session/event`.** A message written before dish-gates loaded is missed, which matters only for a turn that ends right after a reload: then there is no opt-out, and the gate runs.
 - **The home directory is shared.** A gate's caches and installs land where the coder's do, across workspaces (sandbox-home's limits).
 - **dsh's `agent/turn-stopping` and `steer`** are relied on as dsh 0.2.0-rc.2 has them; `test/plugin.test.ts` runs real crew children through dsh's agent loop to pin them. Check again after a dsh upgrade.
