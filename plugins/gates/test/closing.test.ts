@@ -132,6 +132,20 @@ test('a newer text replaces it', () => {
   assert.equal(optsOut(heads.headOf(session)), false)
 })
 
+test('a turn/start clears the head: a BLOCKED that closed an earlier turn says nothing about the next', () => {
+  const heads = new ClosingHeads()
+  const session = {}
+  heads.observe(session, assistantEvent([text('BLOCKED: need the key')]))
+  heads.observe(session, { type: 'turn/start', seq: 9, time: 2, data: { turn: 2 } })
+  assert.equal(heads.headOf(session), '')
+  // The new turn's last step had only tool calls, or reasoning: still nothing, not the old BLOCKED.
+  heads.observe(session, assistantEvent([call()]))
+  assert.equal(heads.headOf(session), '')
+  assert.equal(optsOut(heads.headOf(session)), false)
+  heads.observe(session, assistantEvent([text('Done.')]))
+  assert.equal(heads.headOf(session), 'Done.')
+})
+
 test('none seen is the empty string', () => {
   const heads = new ClosingHeads()
   assert.equal(heads.headOf({}), '')
@@ -214,6 +228,8 @@ test('a real session publishes events that give the head, keyed by the session',
   assert.equal(heads.headOf(first), 'BLOCKED: the schema is missing')
   assert.equal(optsOut(heads.headOf(first)), true)
   assert.equal(heads.headOf(second), 'Finished.')
+  first.append('turn/start', { turn: 2 } as never)
+  assert.equal(heads.headOf(first), '', 'a new turn starts with no head')
   first.append('assistant/message', { turn: 2, step: 1, message: message([text('Done, with tests.')]), stream: [] }, { surfaceOp: 'append' })
   assert.equal(heads.headOf(first), 'Done, with tests.')
 })

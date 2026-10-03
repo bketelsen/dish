@@ -9,8 +9,9 @@
  * What dsh publishes, checked against 0.2.0-rc.2 (`dsh-session`, `dsh-llm`): `session/event(session, event)`, where `session` is
  * the `Session` itself, the same object as an agent's `agent.session`. An `assistant/message` event is
  * `{ type, seq, time, data: { turn, step, message: { role: 'assistant', content: ContentBlock[] }, stream, … } }`, and a
- * block of visible text is `{ type: 'text', text }`. Reasoning and tool calls are other block types. A step that produced
- * nothing is never appended.
+ * block of visible text is `{ type: 'text', text }`. Reasoning and tool calls are other block types. A message can hold no
+ * text (reasoning only, only blanks, or a `max-tokens` cut), so the head is the newest message *with* text. Every turn opens
+ * with a `turn/start` event, which clears the head: a `BLOCKED:` that closed an earlier turn says nothing about this one.
  *
  * @module dish-gates/closing
  */
@@ -31,7 +32,7 @@ export function optsOut(head: string): boolean {
 }
 
 /**
- * The head of the newest assistant message with text, per session. Keyed by the session object, in a `WeakMap`, as dsh's own
+ * The head of the newest assistant message with text in the session's current turn, per session. Keyed by the session object, in a `WeakMap`, as dsh's own
  * recorders are: a session that is gone takes its head with it, and nothing needs disposing.
  */
 export class ClosingHeads {
@@ -40,11 +41,18 @@ export class ClosingHeads {
   /**
    * An `assistant/message` event with text blocks: their text joined by a newline, leading whitespace dropped, its first
    * `HEAD_CHARS` characters. A message with no text (only tool calls or reasoning, or only blanks) leaves the head before it.
-   * Anything else is ignored. Never throws: it runs inside a session's append, and a throw there would fail the agent.
+   * A `turn/start` clears the head. Anything else is ignored. Never throws: it runs inside a session's append, where dsh
+   * would only log a throw, but that event's head would be lost.
    */
   observe(session: object, event: unknown): void {
     try {
-      if (typeof event !== 'object' || event === null || (event as { type?: unknown }).type !== 'assistant/message') return
+      if (typeof event !== 'object' || event === null) return
+      const kind = (event as { type?: unknown }).type
+      if (kind === 'turn/start') {
+        this.#heads.delete(session)
+        return
+      }
+      if (kind !== 'assistant/message') return
       const data = (event as { data?: unknown }).data
       if (typeof data !== 'object' || data === null) return
       const message = (data as { message?: unknown }).message
@@ -65,7 +73,7 @@ export class ClosingHeads {
     }
   }
 
-  /** The head the session's newest message with text had, or `''` when none was seen. */
+  /** The head the newest message with text in the session's current turn had, or `''` when none was seen. */
   headOf(session: object): string {
     return this.#heads.get(session) ?? ''
   }
