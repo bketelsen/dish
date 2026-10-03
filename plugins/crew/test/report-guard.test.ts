@@ -80,6 +80,17 @@ const REFUSED = 'Not sent: this is your result, and in this crew your closing me
 const CLOSED = 'Not sent: send_message is closed to you until you finish, because your report was refused here once already. '
   + 'Put everything for the main agent in your closing message, and finish.'
 
+/** What a child crew gave `report` (a coder or a reviewer) reads the first time: it reports with `report`, not its closing message. */
+const REFUSED_REPORT = 'Not sent: this is your result, and in this crew you report with `report`. '
+  + 'It reaches the main agent in full, automatically, when you call it, whatever your task says about sending your result with send_message. '
+  + 'Don\'t resend it shorter or in parts: send_message is closed to you until you finish. '
+  + 'Finish the work and call `report`. '
+  + 'If this was a question you\'re blocked on, put it in your report instead; the main agent will follow up.'
+
+/** And for every later send_message in the same run. */
+const CLOSED_REPORT = 'Not sent: send_message is closed to you until you finish, because your report was refused here once already. '
+  + 'Put everything for the main agent in your `report`, and finish.'
+
 // --- the guard on its own ----------------------------------------------------------------------------
 
 test('the default limit is 1200 characters', () => {
@@ -335,6 +346,44 @@ test('with the guard off, a refusal can not have happened: a limit of 0 holds no
   const { guard } = guardOf({ messageLimit: 0 })
   assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-1') }), nextOf().next), ALLOW)
   assert.deepEqual(await guard(execOf('hi', { agent: childOf('crew-1') }), nextOf().next), ALLOW)
+})
+
+// --- the words for a child crew gave `report` (step 7) ------------------------------------------------------
+
+test('a child crew gave report reads REFUSED_REPORT the first time and CLOSED_REPORT after, word for word; the checks and the hold are as before', async () => {
+  const reporter = childOf('crew-coder')
+  const asked: unknown[] = []
+  const { guard } = guardOf({ reports: (agent) => { asked.push(agent); return agent === reporter } })
+  const short = nextOf()
+  assert.deepEqual(await guard(execOf('Which file?', { agent: reporter }), short.next), ALLOW, 'a short message from a child with report is still next()')
+  assert.equal(short.spy.calls, 1)
+  assert.deepEqual(asked, [], 'reports is read for a refusal\'s words only')
+  const first = await guard(execOf(text(5000), { agent: reporter }), nextOf().next)
+  assert.deepEqual(first, { kind: 'deny', reason: REFUSED_REPORT })
+  for (const message of ['Which file?', text(5000)]) {
+    assert.deepEqual(await guard(execOf(message, { agent: reporter }), nextOf().next), { kind: 'deny', reason: CLOSED_REPORT })
+  }
+  const reason = (first as { reason: string }).reason
+  assert.doesNotMatch(reason, /\d/)
+  assert.doesNotMatch(reason, /closing message/, 'a child that reports with report is never told its closing message is its report')
+  assert.doesNotMatch(CLOSED_REPORT, /closing message/)
+  // Another child of the same guard, which crew didn't give report, reads today's words.
+  assert.deepEqual(await guard(execOf(text(5000), { agent: childOf('crew-researcher') }), nextOf().next), { kind: 'deny', reason: REFUSED })
+  assert.deepEqual(await guard(execOf('hi', { agent: childOf('crew-researcher') }), nextOf().next), { kind: 'deny', reason: CLOSED })
+})
+
+test('with reports false, throwing or absent, a refusal is today\'s two texts, byte for byte', async () => {
+  const cases: Array<[string, Partial<ReportGuardDeps>]> = [
+    ['false', { reports: () => false }],
+    ['throwing', { reports: () => { throw new Error('the registrar is gone') } }],
+    ['absent', {}],
+  ]
+  for (const [name, more] of cases) {
+    const { guard, told } = guardOf(more)
+    assert.deepEqual(await guard(execOf(text(5000)), nextOf().next), { kind: 'deny', reason: REFUSED }, name)
+    assert.deepEqual(await guard(execOf('hi'), nextOf().next), { kind: 'deny', reason: CLOSED }, name)
+    assert.deepEqual(told, [], name)
+  }
 })
 
 // --- through the plugin and the real tool registry ----------------------------------------------------

@@ -30,7 +30,14 @@
  * - guards its children's reports (see `report-guard.ts`): a prepended `tools/pre-execute` listener that refuses a crew child's
  *   `send_message` longer than `messageLimit` characters and then closes `send_message` to that child until its run ends
  *   (`subagent/end` opens it), so that a child reports once, in its closing message, and the main agent gets one delivery.
- *   Registered with the approval guard, before anything is awaited;
+ *   Registered with the approval guard, before anything is awaited. A coder or a reviewer that has `report` is told to report
+ *   with it instead (the guard's `reports`);
+ * - gives each crew coder and reviewer the `report` tool (see `report.ts`), on its own scope at `agent/created` (and, when crew
+ *   loads, each child already in dsh's agent registry), and takes it back at `agent/disposed`: it records the child's
+ *   structured report (`setReport`) and ends its turn. A prepended `agent/turn-stopping` listener sends a coder or reviewer
+ *   whose turn ends without a successful `report` back to call it, at most `reportSteers` times a turn (0 turns it off; the
+ *   tool stays), and `reportSteered(childId)` says it did, for dish-gates at the same stop. What it needs of each session
+ *   comes from `session/event` and `tools/result`. All of it is registered before anything is awaited;
  * - claims `crew.yaml` in the store and seeds it when `dishConfig` is there, moving an unedited earlier default to the
  *   current one. `dishConfig` is optional, so there is no order to keep: with no store, every answer is the shipped
  *   default;
@@ -50,6 +57,8 @@ import { approvalGuard } from './guard.ts'
 import { CrewRecords, closingOf, isRunning } from './record.ts'
 import type { EndedRun, LiveAgents } from './record.ts'
 import { DEFAULT_MESSAGE_LIMIT, reportGuard } from './report-guard.ts'
+import { DEFAULT_REPORT_STEERS, ReportRegistrar, ReportTracker, reportSteerListener } from './report.ts'
+import type { RegisteringAgent } from './report.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, PREVIOUS_HASHES, parseSettings } from './settings.ts'
 import type { CrewSettings } from './settings.ts'
 
@@ -104,6 +113,11 @@ export interface DishCrew {
    * `last === 'running'`. Rejects only if the record can't be read.
    */
   worktreeBindings(worktree: string): Promise<WorktreeBinding[]>
+  /**
+   * Whether crew sent this child back to call `report` at its current stop: true from that steer until the child's next
+   * assistant message, or its next turn. dish-gates reads it at agent/turn-stopping, after crew's prepended listener.
+   */
+  reportSteered(childId: string): boolean
 }
 
 // Here, with the type, so that whoever imports it also gets `ctx.get('dishCrew')` typed.
@@ -117,6 +131,7 @@ export interface Config {
   dataDirectory: string
   subagentProvider: string
   messageLimit: number
+  reportSteers: number
   terminal: boolean
 }
 
@@ -127,6 +142,8 @@ export const Config: Schema<Config> = Schema.object({
     .description('The ctx.subagents provider that creates the crew\'s children in-process.'),
   messageLimit: Schema.natural().default(DEFAULT_MESSAGE_LIMIT)
     .description('The most characters a crew child\'s send_message may have. A longer one is taken for the child\'s report: it is refused, and send_message stays closed to that child until it finishes, so that its closing message is its report and the main agent gets one delivery, not two. 0 turns this off.'),
+  reportSteers: Schema.natural().default(DEFAULT_REPORT_STEERS)
+    .description('How many times in one turn a coder or reviewer that ends its turn without calling report is sent back to call it. 0 turns this off: the tool is still there, and nothing asks for it.'),
   terminal: Schema.boolean().default(true)
     .description('Print this plugin\'s messages to the terminal.'),
 })
@@ -289,6 +306,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     },
   }), { prepend: true })
 
+  // Who crew gave `report` (see `report.ts`): made before the guard, whose refusals name `report` for those children.
+  const tracker = new ReportTracker()
+  const registrar = new ReportRegistrar({ records, tracker, effect: execute => ctx.effect(execute), warn })
+
   // A crew child reports once, in its closing message: a `send_message` longer than `messageLimit` is refused, and the child may not
   // send another until its run ends (see `report-guard.ts`; `subagent/end` below opens it). Prepended, like the guard above, so
   // that a call it refuses reaches nothing after it: no PreToolUse hook, no auto-review classifier (an LLM call) and no
@@ -301,8 +322,35 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     messageLimit: config.messageLimit,
     isCrewChild,
     tell: (message) => { warn('%s', message) },
+    reports: (agent) => {
+      try {
+        return registrar.roleOf(agent as object) !== undefined
+      } catch {
+        return false
+      }
+    },
   })
   ctx.on('tools/pre-execute', report, { prepend: true })
+
+  // The `report` tool and its steer (see `report.ts`). Before the first `await`, like the guards: a child created while crew
+  // loads gets its `report`, and a stop is never heard without the steer. What crew needs of each session comes from
+  // `session/event` (the turn, and each assistant message, which clears a report and a steer) and `tools/result` (a successful
+  // `report` that concluded the turn). The steer is prepended, so dish-gates' listener, whatever the load order, runs after it
+  // and reads `reportSteered` at the same stop.
+  ctx.on('session/event', (session, event) => { tracker.observe(session, event) })
+  ctx.on('tools/result', (exec, result) => { tracker.result(exec, result) })
+  ctx.on('agent/created', async (payload): Promise<undefined> => {
+    await registrar.attach((payload as { agent?: unknown } | null | undefined)?.agent as RegisteringAgent)
+    return undefined
+  })
+  ctx.on('agent/disposed', (payload) => {
+    const agent: unknown = (payload as { agent?: unknown } | null | undefined)?.agent
+    if (typeof agent !== 'object' || agent === null) return
+    registrar.detach(agent)
+    const id = idOf(agent)
+    if (id !== undefined) tracker.forget(id)
+  })
+  ctx.on('agent/turn-stopping', reportSteerListener({ limit: config.reportSteers, tracker, roleOf: agent => registrar.roleOf(agent), warn }), { prepend: true })
 
   // The error each crew child's agent last reported, until its `subagent/end`. The promise answers whether the agent is a
   // crew child (the record has to be asked), and an agent that isn't takes its entry out, so what is kept is the
@@ -475,10 +523,20 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   try {
     ctx.provide('dishCrew', {
       settings, records, whenRecorded: (childId: string) => pending.get(childId), subagentProvider: text(config.subagentProvider) ?? 'spawn', worktreeBindings,
+      reportSteered: (childId: string) => tracker.steered(childId),
     })
   } catch (error) {
     // Unloaded while it was pruning: the plugin is going away, and didn't fail.
     if (unloaded(error)) return
     throw error
+  }
+
+  // Children already running when crew loads (crew reloaded, or loaded after them) were created before its `agent/created`
+  // listener was there: they get their `report` now. `attach` never rejects, and leaves alone what isn't a crew coder or reviewer.
+  try {
+    const agents = (lookup.get('agents') as { list?(): unknown[] } | undefined)?.list?.() ?? []
+    for (const agent of agents) void registrar.attach(agent as RegisteringAgent)
+  } catch (error) {
+    warn('could not give the crew children already running the report tool: %s', describe(error))
   }
 }

@@ -17,11 +17,12 @@ import * as plugin from '../src/index.ts'
 import type { CoderReport, CrewSettled, DishCrew } from '../src/index.ts'
 import { CrewRecords } from '../src/record.ts'
 import type { NewChild, RunEnd } from '../src/record.ts'
+import { CODER_PARAMETERS, REVIEWER_PARAMETERS, reportSteerText } from '../src/report.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, PREVIOUS_HASHES, parseSettings } from '../src/settings.ts'
 import {
-  captureStderr, dirs, mountConfig, mountCrew, provideStub, seeded, shippedWith, tempDir, waitFor, watchLogs, withEnv,
+  agentScopes, captureStderr, dirs, mountConfig, mountCrew, provideStub, seeded, shippedWith, tempDir, waitFor, watchLogs, withEnv,
 } from './helpers.ts'
-import type { Dirs } from './helpers.ts'
+import type { AgentScopes, Dirs, ScopedAgent } from './helpers.ts'
 
 const AGENT = { kind: 'agent', sessionId: 's1', role: 'main' } as const
 const USER = { kind: 'user' } as const
@@ -73,7 +74,7 @@ test('dishCrew is provided when the plugin loads, with settings(), and goes when
   const handle = mountCrew(ctx, where.data)
   await handle
   const service: DishCrew = ctx.dishCrew
-  assert.deepEqual(Object.keys(service), ['settings', 'records', 'whenRecorded', 'subagentProvider', 'worktreeBindings'])
+  assert.deepEqual(Object.keys(service), ['settings', 'records', 'whenRecorded', 'subagentProvider', 'worktreeBindings', 'reportSteered'])
   await handle.dispose()
   assert.equal(ctx.get('dishCrew'), undefined)
 })
@@ -503,10 +504,19 @@ test('a blank dataDirectory is the default, and a relative one fails the plugin 
   assert.equal(ctx.get('dishCrew'), undefined)
 })
 
-test('the configuration has dataDirectory, subagentProvider (spawn), messageLimit (1200) and terminal, and nothing of the spike', () => {
+test('the configuration has dataDirectory, subagentProvider (spawn), messageLimit (1200), reportSteers (2) and terminal, and nothing of the spike', () => {
   const config = plugin.Config({} as plugin.Config)
-  assert.deepEqual({ ...config }, { dataDirectory: '', subagentProvider: 'spawn', messageLimit: 1200, terminal: true })
+  assert.deepEqual({ ...config }, { dataDirectory: '', subagentProvider: 'spawn', messageLimit: 1200, reportSteers: 2, terminal: true })
   assert.equal(plugin.name, 'dish-crew')
+})
+
+test('reportSteers is a natural number: 0 is accepted (the steer is off), and a negative, a fraction or a string is not', () => {
+  const parse = (input: Record<string, unknown>): plugin.Config => plugin.Config(input as unknown as plugin.Config)
+  assert.equal(parse({ reportSteers: 0 }).reportSteers, 0)
+  assert.equal(parse({ reportSteers: 5 }).reportSteers, 5)
+  assert.throws(() => parse({ reportSteers: -1 }))
+  assert.throws(() => parse({ reportSteers: 1.5 }))
+  assert.throws(() => parse({ reportSteers: '2' }))
 })
 
 test('terminal prints this plugin\'s warnings to stderr, and terminal: false does not', async () => {
@@ -1253,5 +1263,348 @@ test('the notice\'s id: other messages and malformed payloads are ignored, and n
     assert.deepEqual(logs, [])
   } finally {
     await handle.dispose()
+  }
+})
+
+// --- the report tool, its steer and reportSteered (step 7) -----------------------------------------------------------
+
+const HEAD = '3d412b9e0c85d50cce297dbd2bd3d3e44720aaaa'
+
+/** What dsh's registry gives back for a call: enough of it to read. */
+interface CallResult { isError: boolean, concludesTurn?: true, value?: unknown, content: Array<{ type: string, text?: string }> }
+
+/** dish-crew mounted over dsh's real tool registry, with agents on scopes of their own (`agentScopes`). */
+interface ReportWorld {
+  ctx: Context
+  where: Dirs
+  scopes: AgentScopes
+  logs: string[]
+  handle: ReturnType<typeof mountCrew>
+  crew(): DishCrew
+  /** dsh's `agent/created` for `agent`, awaited as dsh awaits it. */
+  created(agent: ScopedAgent): Promise<void>
+  disposed(agent: ScopedAgent): void
+  /** A `session/event` in `agent`'s session: its turn starts, or it says something in `turn`. */
+  turnStarts(agent: ScopedAgent, turn: number): void
+  says(agent: ScopedAgent, turn: number, step?: number): void
+  /** dsh's `agent/turn-stopping` for `agent`, awaited as dsh awaits it. */
+  stop(agent: ScopedAgent, turn?: number): Promise<void>
+  /** Call `name` as `agent`, through dsh's registry. */
+  call(agent: ScopedAgent | object, name: string, args: Record<string, unknown>): Promise<CallResult>
+  dispose(): Promise<void>
+}
+
+/** `before` runs once the registry is there and before crew is mounted: for what has to be there when crew loads. */
+async function reportWorld(options: { config?: Partial<plugin.Config>, before?(ctx: Context, scopes: AgentScopes, where: Dirs): Promise<void> } = {}): Promise<ReportWorld> {
+  const where = await dirs()
+  const ctx = new Context()
+  const logs = watchLogs(ctx)
+  const scopes = await agentScopes(ctx)
+  await options.before?.(ctx, scopes, where)
+  const handle = mountCrew(ctx, where.data, options.config)
+  await handle
+  const serial = (name: string, payload: unknown) => (ctx as unknown as { serial(name: string, payload: unknown): Promise<unknown> }).serial(name, payload)
+  const emit = (name: string, ...args: unknown[]) => { (ctx as unknown as { emit(name: string, ...args: unknown[]): void }).emit(name, ...args) }
+  let calls = 0
+  return {
+    ctx, where, scopes, logs, handle,
+    crew: () => ctx.get('dishCrew') as DishCrew,
+    async created(agent) { await serial('agent/created', { agent, source: 'startup' }) },
+    disposed(agent) { emit('agent/disposed', { agent }) },
+    turnStarts(agent, turn) { emit('session/event', agent.session, { type: 'turn/start', seq: 0, time: 0, data: { turn } }) },
+    says(agent, turn, step = 1) {
+      emit('session/event', agent.session, { type: 'assistant/message', seq: step, time: 0, data: { turn, step, message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] } } })
+    },
+    async stop(agent, turn = 1) { await serial('agent/turn-stopping', { agent, turn, signal: new AbortController().signal }) },
+    call: (agent, name, args) => ctx.tools.execute({
+      callId: `call-${++calls}` as never, name, arguments: args, agent: agent as never, signal: new AbortController().signal,
+    }) as unknown as Promise<CallResult>,
+    async dispose() {
+      await handle.dispose()
+      await scopes.dispose()
+    },
+  }
+}
+
+const reportOf = (w: ReportWorld, agent: object) => w.ctx.tools.get('report', agent)
+
+/** A `send_message` in dsh's registry that delivers anything, for the report guard to stand in front of. */
+function registerSendMessage(w: ReportWorld): void {
+  w.ctx.tools.register({
+    name: 'send_message', description: 'Send a message to an agent.',
+    parameters: { type: 'object', properties: { agent_id: { type: 'string' }, message: { type: 'string' } }, required: ['agent_id', 'message'] },
+    output: { schema: { type: 'string' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }] },
+    async execute() { return 'delivered' },
+  } as never)
+}
+
+/** A result's text. */
+const resultText = (result: CallResult): string => result.content.map(block => block.text ?? '').join('')
+
+/** What the report tool says when the record has no such child. */
+const NOT_RECORDED = 'Error: dish-crew has no record of you as a crew child, so the report wasn\'t recorded; end your turn with your report as your closing message'
+
+test('report is on a crew coder\'s and a reviewer\'s own scope after agent/created, each with its role\'s schema; not on the main agent, a researcher or an agent crew doesn\'t know', async () => {
+  const w = await reportWorld()
+  try {
+    const { records } = w.crew()
+    await records.addChild('main-1', crewChild('c1'))
+    await records.addChild('main-1', crewChild('r1', { role: 'reviewer', reviews: 'c1' }))
+    await records.addChild('main-1', crewChild('x1', { role: 'researcher' }))
+    const [coder, reviewer, researcher, stranger] = ['c1', 'r1', 'x1', 'nobody'].map(id => w.scopes.child(id))
+    const main = w.scopes.main('main-1')
+    for (const agent of [coder!, reviewer!, researcher!, stranger!, main]) await w.created(agent)
+    assert.deepEqual(Object.keys(reportOf(w, coder!)!.parameters.properties!), Object.keys(CODER_PARAMETERS))
+    assert.deepEqual(Object.keys(reportOf(w, reviewer!)!.parameters.properties!), Object.keys(REVIEWER_PARAMETERS))
+    for (const agent of [researcher!, stranger!, main]) assert.equal(reportOf(w, agent), undefined, agent.id)
+    assert.equal(w.ctx.tools.get('report'), undefined, 'it is no global tool: nobody else sees it')
+    assert.deepEqual(w.logs, [])
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('report: a second agent object for the same child (a cold resume) gets it too, and the same object twice registers once', async () => {
+  const w = await reportWorld()
+  try {
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    const first = w.scopes.child('c1')
+    const resumed = w.scopes.child('c1')
+    // Two agent/created for one object, at once: the second can race the first's lookup.
+    await Promise.all([w.created(first), w.created(first)])
+    await w.created(resumed)
+    assert.ok(reportOf(w, first))
+    assert.ok(reportOf(w, resumed))
+    assert.notEqual(reportOf(w, first), reportOf(w, resumed), 'each agent object has its own')
+    assert.deepEqual(w.logs, [], 'a second registration in one scope would have failed, and been logged')
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('report is gone after agent/disposed, and after crew unloads', async () => {
+  const w = await reportWorld()
+  try {
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    await w.crew().records.addChild('main-1', crewChild('c2'))
+    const one = w.scopes.child('c1')
+    const two = w.scopes.child('c2')
+    await w.created(one)
+    await w.created(two)
+    w.disposed(one)
+    assert.equal(reportOf(w, one), undefined)
+    assert.ok(reportOf(w, two))
+    // Disposed twice, or never given it: nothing happens.
+    w.disposed(one)
+    w.disposed(w.scopes.child('c3'))
+    await w.handle.dispose()
+    assert.equal(reportOf(w, two), undefined)
+    assert.deepEqual(w.logs, [])
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('report: a child already in dsh\'s agent registry when crew loads (crew reloaded) gets it', async () => {
+  let running!: ScopedAgent
+  const w = await reportWorld({
+    async before(ctx, scopes, where) {
+      const records = new CrewRecords(where.data)
+      await records.addChild('main-1', crewChild('c1'))
+      await records.flush()
+      running = scopes.child('c1')
+      await provideStub(ctx, 'agents', { list: () => [scopes.main('main-1'), running], get: () => undefined })
+    },
+  })
+  try {
+    await waitFor('report on the running child', () => reportOf(w, running) !== undefined)
+    assert.deepEqual(w.logs, [])
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('report: a lookup that throws is logged once, and the child\'s creation goes on', async () => {
+  const w = await reportWorld()
+  try {
+    ;(w.crew().records as unknown as { lookup: () => Promise<never> }).lookup = () => Promise.reject(new Error('EIO: the record is unreadable'))
+    const agent = w.scopes.child('c1')
+    await w.created(agent)
+    await w.created(w.scopes.child('c1'))
+    assert.equal(reportOf(w, agent), undefined)
+    assert.deepEqual(w.logs, ['[dish-crew] warn: could not give crew child c1 the report tool: EIO: the record is unreadable'])
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('the order at a stop: crew\'s steer is before a sibling\'s listener registered before crew, which reads reportSteered true; after a concluding report, false and no steer', async () => {
+  const seen: Array<boolean | undefined> = []
+  const w = await reportWorld({
+    async before(ctx) {
+      await ctx.plugin({
+        name: 'sibling',
+        apply(own: Context) {
+          own.on('agent/turn-stopping', ({ agent }) => { seen.push((own.get('dishCrew') as DishCrew | undefined)?.reportSteered(String(agent.id))) })
+        },
+      } as never, undefined as never)
+    },
+  })
+  try {
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    const coder = w.scopes.child('c1')
+    await w.created(coder)
+    w.turnStarts(coder, 1)
+    w.says(coder, 1)
+    await w.stop(coder)
+    assert.deepEqual(seen, [true])
+    assert.equal(coder.steers.length, 1)
+    assert.equal(coder.steers[0]!.content.map(block => block.type === 'text' ? block.text : '').join(''), reportSteerText('coder', 1, 2))
+    assert.deepEqual(coder.steers[0]!.source, { kind: 'dish-crew', form: 'notice', summary: 'Asked to finish with report (1 of 2)' })
+
+    // It goes on, and finishes with report.
+    w.says(coder, 1, 2)
+    assert.equal(w.crew().reportSteered('c1'), false, 'the next assistant message clears it')
+    const result = await w.call(coder, 'report', { status: 'done', summary: 'Added the form.', commits: [HEAD] })
+    assert.equal(result.isError, false)
+    assert.equal(result.concludesTurn, true)
+    await w.stop(coder)
+    assert.deepEqual(seen, [true, false])
+    assert.equal(coder.steers.length, 1, 'not steered after a concluding report')
+    assert.deepEqual(w.logs, [])
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('reportSteers: 0 turns the steer off, and report stays', async () => {
+  const w = await reportWorld({ config: { reportSteers: 0 } })
+  try {
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    const coder = w.scopes.child('c1')
+    await w.created(coder)
+    w.says(coder, 1)
+    await w.stop(coder)
+    assert.equal(coder.steers.length, 0)
+    assert.equal(w.crew().reportSteered('c1'), false)
+    assert.ok(reportOf(w, coder))
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('through the record: a coder\'s report, then its subagent/end, leaves the run\'s structured report and its .json', async () => {
+  const w = await reportWorld()
+  try {
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    const coder = w.scopes.child('c1')
+    await w.created(coder)
+    w.turnStarts(coder, 1)
+    w.says(coder, 1)
+    const result = await w.call(coder, 'report', { status: 'done', summary: 'Added the form.', commits: [HEAD], concerns: [] })
+    assert.equal(result.isError, false)
+    assert.deepEqual(result.content, [{ type: 'text', text: 'Report recorded: done.' }])
+    ended(w.ctx, 'c1', 'completed', [{ type: 'tool-call', id: 't1', name: 'report' }])
+    const recorded = await w.crew().whenRecorded('c1')
+    const structured = recorded!.run.structured as CoderReport
+    assert.deepEqual({ ...structured, at: 0 }, { role: 'coder', turn: 1, at: 0, status: 'done', summary: 'Added the form.', commits: [HEAD] })
+    assert.equal(recorded!.run.structuredFile, sessionPath(w.where, 'main-1', '1-coder-1.json'))
+    assert.deepEqual(JSON.parse(await readFile(recorded!.run.structuredFile!, 'utf8')), structured)
+    assert.equal((await w.crew().records.lookup('c1'))!.record.report, undefined)
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('a report the record can\'t file (setReport gives undefined): crew stops sending that child back to call report, and the guard goes back to today\'s words', async () => {
+  const w = await reportWorld()
+  try {
+    registerSendMessage(w)
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    const coder = w.scopes.child('c1')
+    await w.created(coder)
+    w.turnStarts(coder, 1)
+    w.says(coder, 1)
+    ;(w.crew().records as unknown as { setReport: () => Promise<undefined> }).setReport = async () => undefined
+    const failed = await w.call(coder, 'report', { status: 'done', summary: 'Added the form.' })
+    assert.equal(failed.isError, true)
+    assert.equal(resultText(failed), NOT_RECORDED)
+    // It does as it was told, and ends its turn with its report as text: that stop isn't sent back.
+    w.says(coder, 1, 2)
+    await w.stop(coder)
+    assert.equal(coder.steers.length, 0)
+    assert.equal(w.crew().reportSteered('c1'), false)
+    // The guard's words are today's: there is no report for it to point to.
+    const long = await w.call(coder, 'send_message', { agent_id: 'main-1', message: 'r'.repeat(5000) })
+    assert.match(resultText(long), /^Error: Not sent: this is your result, and in this crew your closing message is your report\. /)
+    assert.match(resultText(await w.call(coder, 'send_message', { agent_id: 'main-1', message: 'hi' })), /Put everything for the main agent in your closing message, and finish\.$/)
+    // The tool is still there, and still says why it can't record.
+    assert.ok(reportOf(w, coder))
+    assert.deepEqual(w.logs, [])
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('a record that lost the child (its children.json set aside as corrupt): its report fails as above, and a later text stop isn\'t steered', async () => {
+  const w = await reportWorld()
+  try {
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    const coder = w.scopes.child('c1')
+    await w.created(coder)
+    w.turnStarts(coder, 1)
+    w.says(coder, 1)
+    await w.crew().records.flush()
+    await writeFile(sessionPath(w.where, 'main-1', 'children.json'), 'not json\n')
+    const failed = await w.call(coder, 'report', { status: 'done', summary: 'Added the form.' })
+    assert.equal(resultText(failed), NOT_RECORDED)
+    w.says(coder, 1, 2)
+    await w.stop(coder)
+    assert.equal(coder.steers.length, 0)
+    assert.equal(w.logs.length, 1)
+    assert.match(w.logs[0]!, /^\[dish-crew\] warn: the record of session \S+ is not valid; it was moved to /, 'the only warning is the record\'s own')
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('the report guard through the host: a coder that has report reads the words for report; a researcher child reads today\'s', async () => {
+  const w = await reportWorld()
+  try {
+    registerSendMessage(w)
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    await w.crew().records.addChild('main-1', crewChild('x1', { role: 'researcher' }))
+    const coder = w.scopes.child('c1')
+    const researcher = w.scopes.child('x1')
+    await w.created(coder)
+    await w.created(researcher)
+    const long = 'r'.repeat(5000)
+    const fromCoder = await w.call(coder, 'send_message', { agent_id: 'main-1', message: long })
+    assert.equal(fromCoder.isError, true)
+    assert.match(resultText(fromCoder), /^Error: Not sent: this is your result, and in this crew you report with `report`\. /)
+    assert.match(resultText(await w.call(coder, 'send_message', { agent_id: 'main-1', message: 'hi' })), /Put everything for the main agent in your `report`, and finish\.$/)
+    const fromResearcher = await w.call(researcher, 'send_message', { agent_id: 'main-1', message: long })
+    assert.match(resultText(fromResearcher), /^Error: Not sent: this is your result, and in this crew your closing message is your report\. /)
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('the report listeners take odd payloads without a throw, and an odd agent/created doesn\'t fail', async () => {
+  const w = await reportWorld()
+  const serial = (name: string, payload: unknown) => (w.ctx as unknown as { serial(name: string, payload: unknown): Promise<unknown> }).serial(name, payload)
+  const emit = (name: string, ...args: unknown[]) => { (w.ctx as unknown as { emit(name: string, ...args: unknown[]): void }).emit(name, ...args) }
+  try {
+    const odd: unknown[] = [undefined, null, 5, 'text', {}, { agent: null }, { agent: {} }, { agent: { id: 5 } }, { agent: { id: 'x', session: 5 } }]
+    for (const payload of odd) {
+      await serial('agent/created', payload)
+      assert.doesNotThrow(() => { w.ctx.emit('agent/disposed', payload as never) }, JSON.stringify(payload))
+      assert.doesNotThrow(() => { emit('session/event', payload, payload) }, JSON.stringify(payload))
+      assert.doesNotThrow(() => { emit('tools/result', payload, payload) }, JSON.stringify(payload))
+      await serial('agent/turn-stopping', payload)
+    }
+    assert.deepEqual(w.logs, [])
+  } finally {
+    await w.dispose()
   }
 })
