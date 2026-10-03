@@ -1,17 +1,44 @@
 {
+  "skills/changing-infrastructure/SKILL.md": [
+    "43597f3e5356b8147e53eb2e29dfe616afb76d92618d71c2c7558b9a5b111675"
+  ],
+  "skills/executing-plans/SKILL.md": [
+    "7284ef8130dde1d4a88affe39afae3f836b3e2157fb7a59551a5c47c9103496d"
+  ],
   "skills/finishing-a-development-branch/SKILL.md": [
-    "822cd488d8a611d87cd6b4b15ad9e296edcc7a1938bff8280e0eae0110933f19"
+    "822cd488d8a611d87cd6b4b15ad9e296edcc7a1938bff8280e0eae0110933f19",
+    "a83d603e1ea2e078dd10e10a134963369a50ad6a1685952bc31578133e7951ad"
+  ],
+  "skills/receiving-code-review/SKILL.md": [
+    "85234539d24a040de50f4c252e8e6793f12161c9f37e6f4f5ac0fd416153effa"
+  ],
+  "skills/requesting-code-review/SKILL.md": [
+    "2ca810c2089e010d4ac279cb81152285780ea79c1e3d351e494b542cfbdb37ab"
+  ],
+  "skills/reviewing-work/SKILL.md": [
+    "b56979b6b81efadc620bf9d212bca88cdbf54f7c31861730a3f79ec20d9658bb"
   ],
   "skills/subagent-driven-development/SKILL.md": [
+    "86fd62bed6dffadc268d940b6c5677022a9ef68ad25d4140f53d8d075147e0e8",
     "9773520056f569849239b3a40d493302f988f3d79b582c304821dcfa3e5c516c",
     "a8b994806f58bff7ce21c2f61cb5e3cd4380579c5bb3d81f0bde37cfd9086981",
     "ae8838c6cf5e83d81591b8b175aced91d1c362c1a0ef52318562c5efbcfeefcd",
     "fde2f05d8606ffed1bac1c75765dd8b4df94a4c0d9121fd1e842a1c61db9420e"
   ],
+  "skills/systematic-debugging/SKILL.md": [
+    "a156e380b0dbdfd3cd4e98aff28585ebabf19c83175d3ebda4f2b461fe075a51"
+  ],
+  "skills/test-driven-development/SKILL.md": [
+    "0878f727ae6b57c3a969ff85d8347aff37da16d79ef1ec9affd53b6e5e9c8155"
+  ],
   "skills/using-git-worktrees/SKILL.md": [
     "1ab5cf495419c6becd3d785096f75f3ccbd4fd38a20bbef86f9f69df9e787675",
     "4c89b52e3f2318bd05a22332e2988d6c2f8ac2414b0cffba1b2186fad8a5fb92",
     "61987da52ec2179010366cff1287a05dfdd209bb8e842078f20d9d72af4b81ec",
-    "9966b45e36c3c2dbd67813fc2a2359ed221c3df79d7aaa434111231781452551"
+    "9966b45e36c3c2dbd67813fc2a2359ed221c3df79d7aaa434111231781452551",
+    "dc523a7d31834f9ebb007f85dc2c83147ba558dd5b12c8f1876a0a99be8c92dd"
+  ],
+  "skills/verification-before-completion/SKILL.md": [
+    "f72f18b41d815a93c436c4a2721321f71c34c5e2b12726247bba68c84b4553a5"
   ]
 }

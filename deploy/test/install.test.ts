@@ -34,7 +34,7 @@ const SKIP = INTEGRATION ? false : 'set DISH_INSTALL_TEST=1 to run the install a
 const REMOTE = 'git@github-dish-config.invalid:example/store.git'
 const USER_NAME = 'Dish Test'
 const USER_EMAIL = 'dish-test@example.invalid'
-const BUNDLES = ['dish-copilot', 'dish-config', 'dish-prompts', 'dish-skills', 'dish-crew', 'dish-judge', 'dish-web', 'dish-projects', 'dish-workspaces', 'dish-gates']
+const BUNDLES = ['dish-copilot', 'dish-config', 'dish-prompts', 'dish-skills', 'dish-crew', 'dish-judge', 'dish-web', 'dish-projects', 'dish-workspaces', 'dish-gates', 'dish-orchestrator']
 
 const execFileAsync = promisify(execFile)
 
@@ -241,7 +241,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(first.code, 0, first.stderr)
   assert.match(first.stdout, /install: profile web at .*: created/)
   assert.match(first.stdout, /install: dish rows \(.*\): updated/)
-  assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge web projects workspaces gates; already linked: none/)
+  assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge web projects workspaces gates orchestrator; already linked: none/)
   assert.match(first.stdout, /^install: sandbox home: off$/m)
   assert.match(first.stdout, /^install: the profile's pnpm installs copy: updated$/m)
   assert.match(first.stdout, /^install: links into pnpm's store replaced by copies: \d+$/m)
@@ -266,7 +266,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(second.code, 0, second.stderr)
   assert.match(second.stdout, /install: profile web at .*: existing/)
   assert.match(second.stdout, /install: dish rows \(.*\): unchanged/)
-  assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge web projects workspaces gates/)
+  assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge web projects workspaces gates orchestrator/)
   assert.match(second.stdout, /install: no changes to the profile/)
   assert.match(second.stdout, /^install: the profile's pnpm installs copy: unchanged$/m)
   assert.match(second.stdout, /^install: links into pnpm's store replaced by copies: 0$/m)
@@ -301,7 +301,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(removal.code, 0, removal.stderr)
   const repair = await run(INSTALL, [], scratch)
   assert.equal(repair.code, 0, repair.stderr)
-  assert.match(repair.stdout, /bundles added: judge; already linked: copilot config prompts skills crew web projects workspaces gates\n/)
+  assert.match(repair.stdout, /bundles added: judge; already linked: copilot config prompts skills crew web projects workspaces gates orchestrator\n/)
   assert.match(repair.stdout, /install: dish rows \(.*\): unchanged/)
   const repairCalls = dshCalls(scratch).slice(1 + BUNDLES.length)
   assert.equal(repairCalls.length, 2, 'the removal, and one `plugin add`')

@@ -28,12 +28,16 @@
  *   has gone, or after a grace if it hasn't. Modelled on dish-config's `runNetworkGit` (`store/push.ts`).
  * - output is capped, and a failure's message is git's first stderr line with credentials masked (`maskSecrets`) and
  *   cut short.
+ * - a `secret` (step 7: the push's write token) goes to git on fd 3 only: a socket git and its children inherit, written
+ *   once and closed at this end, which `bin/git-credential-dish-push` reads. Never an argument, the environment, a file
+ *   or a message. Without one, git gets no fd 3.
  *
  * @module dish-workspaces/git
  */
 
 import { spawn } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
+import type { ChildProcess, StdioOptions } from 'node:child_process'
+import type { Writable } from 'node:stream'
 import { realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { maskSecrets } from 'dish-kit'
@@ -73,6 +77,8 @@ const MAX_TIMER_MS = 2 ** 31 - 1
 const LOOKS_INSIDE_SUBMODULES: ReadonlySet<string> = new Set(['status', 'diff', 'diff-index', 'diff-files'])
 /** The values of `--ignore-submodules` that keep them from it. */
 const SUBMODULES_LEFT_ALONE: ReadonlySet<string> = new Set(['--ignore-submodules=dirty', '--ignore-submodules=all'])
+/** What a `secret` may be: one line of printable ASCII, as a token is. */
+const SECRET = /^[\x21-\x7e]{1,4096}$/
 
 export interface GitOptions {
   /** The working directory. Default: this process's. */
@@ -85,6 +91,13 @@ export interface GitOptions {
   env?: Record<string, string>
   /** Written to git's stdin, which is then closed. Without it, stdin is closed from the start. */
   input?: string
+  /**
+   * Written to git's fd 3, a socket its children inherit, then that end is closed. pushBranch's write token, for
+   * bin/git-credential-dish-push to read with `read <&3`. Never in an argument, the environment, a file or a message.
+   * One line of printable ASCII (/^[\x21-\x7e]{1,4096}$/), else git() rejects before starting anything and doesn't quote it.
+   * Without it, git gets no fd 3.
+   */
+  secret?: string
 }
 
 export interface GitResult {
@@ -193,6 +206,11 @@ function ceilingFor(dir: string): string {
  * `status` or `diff*` call that `submoduleProblem` refuses.
  */
 export function git(args: readonly string[], options: GitOptions = {}): Promise<GitResult> {
+  const { secret } = options
+  // First, and never quoted: whatever it is, it may be a token.
+  if (secret !== undefined && !(typeof secret === 'string' && SECRET.test(secret))) {
+    return Promise.reject(new Error('git: the secret must be one line of printable ASCII'))
+  }
   const refused = submoduleProblem(args)
   if (refused !== undefined) return Promise.reject(new Error(refused))
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
@@ -210,6 +228,9 @@ export function git(args: readonly string[], options: GitOptions = {}): Promise<
     return Promise.reject(error)
   }
 
+  const stdio: StdioOptions = [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe']
+  // A fourth pipe (a socket in the child) only for a secret: without one, git has no fd 3.
+  if (secret !== undefined) stdio.push('pipe')
   return new Promise((resolve, reject) => {
     const child: ChildProcess = spawn('git', [...SAFE_FLAGS, ...args], {
       cwd: options.cwd,
@@ -218,8 +239,12 @@ export function git(args: readonly string[], options: GitOptions = {}): Promise<
       // switches grafts off.
       env: { ...childEnvironment(), ...options.env, GIT_CEILING_DIRECTORIES: ceiling, GIT_GRAFT_FILE: '/dev/null' },
       detached: true,
-      stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+      stdio,
     })
+    // The secret, once, then EOF: a second read of fd 3 (another helper call) finds nothing.
+    const channel = secret === undefined ? undefined : child.stdio[3] as Writable | null | undefined
+    channel?.on('error', () => {})
+    channel?.end(`${secret}\n`)
     const stdout = new Capture()
     const stderr = new Capture()
     let exited = false
@@ -262,6 +287,7 @@ export function git(args: readonly string[], options: GitOptions = {}): Promise<
       signal?.removeEventListener('abort', onAbort)
       child.stdout?.destroy()
       child.stderr?.destroy()
+      channel?.destroy()
       if (failure !== undefined) reject(failure)
       else resolve({ code: code ?? -1, stdout: stdout.text(), stderr: stderr.text(), timedOut, aborted })
     }

@@ -3,7 +3,7 @@
 The repos dish works on. You register each one as a **project** in `projects.yaml`, in the config store, and dish gets it ready to work on.
 - **The registry.** `projects.yaml`, edited on **Settings → Projects**. Agents may only propose changes to it.
 - **Onboarding.** Each project is cloned, configured, set up and registered as a dsh workspace, one project at a time, in the background. [`dish-workspaces`](../workspaces/) does the work; this plugin decides when, and keeps each project's status.
-- **The service.** `dishProjects` gives the rest of dish the projects and their status. [dish-gates](../gates/) reads `gate`, `gateTimeout` and `gateEnv` from it.
+- **The service.** `dishProjects` gives the rest of dish the projects and their status. [dish-gates](../gates/) reads `gate`, `gateTimeout` and `gateEnv` from it, for a coder's gate and for `open_pr`'s check of a run's head.
 
 The design is in the [spec](../../docs/specs/projects-workspaces.md) and the [plan](../../docs/plans/2026-10-02-projects.md). Its "Notes from the build" say what changed on the way.
 
@@ -42,7 +42,7 @@ projects:
 | the key | required | `owner/repo`, as GitHub spells it. The clone goes to `<work root>/<owner>/<repo>`. |
 | `family` | required | Free text for now (step 8 gives families their own documents). |
 | `role` | required | One line on what the repo is. |
-| `gate` | required | The command [dish-gates](../gates/) runs in a bound coder's worktree when the coder finishes. |
+| `gate` | required | The command [dish-gates](../gates/) runs in a bound coder's worktree when the coder finishes, and that `open_pr` runs on a run's head before it opens a pull request. |
 | `gateTimeout` | required | `<n>s`, `<n>m` or `<n>h`, from 10s to 10m (dsh's shell caps a run at 10 minutes). |
 | `setup` | optional | A command run once, in dish's own fresh clone, outside the sandbox (see [dish-workspaces](../workspaces/README.md#setup)). It gets dish's own Node and pnpm (the unit's `PATH`), so a repo whose tools come from mise needs it to go through mise, such as `mise trust && mise exec -- pnpm install --frozen-lockfile`. |
 | `setupTimeout` | optional | From 10s to 1h; 15m when absent. |

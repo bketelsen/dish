@@ -30,7 +30,7 @@ test('the form has the settings as text: numbers as they read, the tool lists on
     warn: '0.5',
     chunkChars: '24000',
     gated: 'bash\npwsh',
-    screened: 'web_search\nweb_fetch\nread_mcp_resource\nmcp__*',
+    screened: 'web_search\nweb_fetch\nread_mcp_resource\nmcp__*\npr_feedback',
   })
 })
 

@@ -19,12 +19,18 @@
  * 6. **The route** resolves (the model on its family's provider, else the file's, which is what the child starts on), and
  *    7. **the tools** the child may have (`allowList`) are not none.
  * 8. **The start or the send.** A new child's prompt is the task, and, if it has `send_message`, a note that its closing message
- *    is its report (`closingNote`). Each of crew's blocks ends with a blank line (`BLOCK_END`): dsh's adapters join a
- *    message's text blocks with nothing between them.
+ *    is its report (`closingNote`), or, for a coder or a reviewer, that it finishes with `report` (`reportNote`). Each of
+ *    crew's blocks ends with a blank line (`BLOCK_END`): dsh's adapters join a message's text blocks with nothing between them.
  *
  * From 4 to the end, a call holds its session's lock, so two calls in one step can't both pass the same check. A start
  * writes the child's record before `startContinuable`, which is given the id the record has: a child that is quick finds
  * its record when it ends. A child that dsh then refuses is ended in the record as failed, and counts as a delegation.
+ *
+ * **Events (step 7; see `events.ts`).** A start publishes `dish-crew/delegated` right after its child is recorded, before
+ * the prompt is built and dsh starts it; a follow-up publishes it after the follow-up is sent and counted, with the child as
+ * the record has it then. A start dsh refused publishes `dish-crew/settled` for the run `markFailed` filed. Each is awaited
+ * inside the locks the call holds, so a listener that queues its work before it returns (dish-orchestrator's ledger) has it
+ * queued before the next delegation of the session, or on the worktree, is checked. A refusal publishes nothing.
  *
  * **Binding a worktree** (`worktree`, a worktree dish-workspaces made, as `<project>/<slug>` or its path). After step 2 (and
  * 3, for a follow-up), before the lock, a start checks that the role writes, that dish-workspaces is running
@@ -35,7 +41,7 @@
  * it takes a second lock keyed by the worktree (always after the session's, so two calls can't deadlock) and refuses a
  * worktree a running crew child is bound to (`dishCrew.worktreeBindings`), of any session; it holds that lock until the
  * child has started, as the session's lock is held, so two chats can't bind one worktree at once. The child is recorded with
- * the worktree (`ChildRecord.worktree`), and its prompt is the task, `worktreeBrief`, and `closingNote` last. A follow-up
+ * the worktree (`ChildRecord.worktree`), and its prompt is the task, `worktreeBrief`, and the closing note last. A follow-up
  * keeps its child's binding: a `worktree` that resolves elsewhere is refused, a bound child's worktree must still resolve,
  * the same worktree lock and check apply (less the child itself), and nothing is added to its text.
  *
@@ -43,18 +49,41 @@
  * on it), it gates a bound coder's work when the coder finishes and records the result in crew's record. Two things here
  * read that:
  *
- * - **The brief.** A bound coder's `worktreeBrief` gains the gate sentence, with the gate `dishGates.gateFor(project)`
- *   gives. No service, no gate for the project, or a `gateFor` that throws (logged) is no sentence: 6b's block.
+ * - **The brief.** A bound child's `worktreeBrief` gains the gate sentence, with the gate `dishGates.gateFor(project)`
+ *   gives: a coder's speaks of `report` (it is gated when it reports done), any other role's is 6c's. No service, no gate for
+ *   the project, or a `gateFor` that throws (logged) is no sentence: 6b's block.
  * - **The review check.** A review of a bound child's work (a start with `reviews: <child>`, or a follow-up to a reviewer,
  *   which is how the skills re-review) is refused while that child's gate hasn't passed (`gateStanding`): it is still
  *   running, or the latest result of its latest run isn't a pass, or that run has none. It reads the child's record through
  *   `lookup`, inside the session's lock, as the reviewer rule does. The refusal says where the gate stands and how to go
- *   on: wait for the notice, send a fix round, or give `gateOverride` with a ruling. A ruling (folded onto one line; one
- *   with nothing past a leading `Ruling:`, or the placeholder itself, is refused) is recorded on the reviewer
- *   (`ChildRecord.gateOverride`, with its time) and told to it in a block after its task (`gateOverrideBrief`). A re-review
- *   keeps the reviewer's ruling while the reviewed child hasn't run since the ruling was given. When nothing is refused (the
- *   gate passed, the child is unbound, `reviews: "main"`, or dish-gates isn't running), `gateOverride` is ignored and not
- *   recorded.
+ *   on: wait for the notice, send a fix round, or give `ruling` (step 7; `gateOverride`, 6c's name, is still accepted) with a
+ *   ruling. A ruling (folded onto one line and masked; one with nothing past a leading `Ruling:`, or the placeholder itself,
+ *   is refused) is recorded on the reviewer (`ChildRecord.gateOverride`, with its time) and told to it in a block after its
+ *   task (`gateOverrideBrief`). A re-review keeps the reviewer's ruling while the reviewed child hasn't run since the ruling
+ *   was given. When nothing is refused (the gate passed, the child is unbound, `reviews: "main"`, or dish-gates isn't
+ *   running), the ruling is ignored and not recorded.
+ *
+ * **Runs (step 7).** While dish-orchestrator runs (`dishRuns`, read with `ctx.get` and through `RunsReader`: crew doesn't
+ * depend on it), a call is placed in a run (`placeCall`), inside the locks, after every check that refuses without writing
+ * anything (the limits, a busy worktree, the reviewer rule, the gate check, the route and the tools) and before anything is
+ * recorded or sent:
+ *
+ * - **The tags.** A start is recorded with the run and the task `dishRuns.place` gives (`ChildRecord.run`, `.task`); a
+ *   follow-up keeps its child's, whatever `place` says now. A `place` that throws, or gives a malformed answer, is logged;
+ *   either is no run, and a delegation is never refused for it.
+ * - **`final`** (the reviewer role only; refused for any other, before anything is read) asks `place` for the run's final
+ *   review, and is recorded on the reviewer (`ChildRecord.final`, sticky) only when `place` gives it, and, for a follow-up,
+ *   only in the run the reviewer is tagged with: one started outside that run can't give its final review. Otherwise the
+ *   answer's note says it had no effect, and why: the chat drives no run, the reviewer is another run's, or dish couldn't
+ *   place it (`place` failed, or gave no run while `dishRuns.driving` says the chat drives one); nothing is refused.
+ * - **The escalation ladder.** A coder start or follow-up on a run's task is a round, which `place` counts from the run's
+ *   ledger. Rounds 1 to 4 get a note in the answer (`ladderNote`). From `LADDER_RULING_ROUND` the call is refused, unless
+ *   `ruling` holds a ruling; either way `dishRuns.ladder` records it, and a refusal there is the only one that writes (to the
+ *   ledger). Reviewers, other roles, children outside a run, and a follow-up whose child the run no longer places where its
+ *   tags say aren't counted.
+ *
+ * `dish-crew/delegated` is published and awaited inside the same locks, so the next `place` on the task counts this round.
+ * Without dish-orchestrator nothing is asked or tagged, and there is no ladder.
  *
  * What counts as running: the child's agent is stepping, or the record says running and the agent exists (accepted, not
  * stepping yet). A record that says running with no agent is a crash's, and isn't running. A follow-up's own target is left
@@ -68,8 +97,8 @@
  * only the agents under it.
  *
  * This module is the row and little else: everything it loads of the plugin is plain code (`models`, `allow`, `text`,
- * `record`'s running rule, and `notice`, which reads the crew's report files and nothing else outside the process), and the
- * services come in by `import type`.
+ * `record`'s running rule, `events`' publisher, and `notice`, which reads the crew's report files and nothing else outside
+ * the process), and the services come in by `import type`.
  *
  * @module dish-crew/delegate
  */
@@ -84,11 +113,13 @@ import Schema from '@deepseek-ai/schemastery'
 import { isTopLevelAgent, maskSecrets, RETURN_NOTE_LEAD } from 'dish-kit'
 import type { DishPrompts, Persona } from 'dish-prompts'
 import { allowList, visibleTools } from './allow.ts'
+import { publisher } from './events.ts'
+import { within } from './guard.ts'
 import type { DishCrew, WorktreeBinding } from './index.ts'
 import { chooseRoute, offeredModels } from './models.ts'
 import type { ReviewedWork, Route } from './models.ts'
 import { noticeListener } from './notice.ts'
-import { isRunning, latestGate } from './record.ts'
+import { isRunning, latestGate, reportRole } from './record.ts'
 import type { ChildRecord } from './record.ts'
 import type { CrewSettings, RoleSettings } from './settings.ts'
 import { BLOCK_END, gateOverrideBrief, listed, truncate, worktreeBrief } from './text.ts'
@@ -120,13 +151,48 @@ const LISTED_CHILDREN = 6
  * parent's id in its place. A preset edited in Settings → Agent presets can still load dsh's row; then dsh's note follows this
  * one, and `marked` has this one say so. It begins as dsh's does (`RETURN_NOTE_LEAD`), which is where dish-judge ends a child's
  * brief. A follow-up (`to`) gets nothing added: dsh appends nothing to it either. Both are recorded under "What dsh gives us"
- * in the spec, so that a dsh upgrade re-checks them.
+ * in the spec, so that a dsh upgrade re-checks them. Coders and reviewers get `reportNote` instead (step 7), which differs
+ * only in its first sentence after the id: they finish with crew's `report` tool.
  */
 export function closingNote(parentId: string, marked: boolean): string {
   const id = JSON.stringify(parentId)
   return `${RETURN_NOTE_LEAD}${id}. Your closing message is your report: when you finish, the main agent receives it in full, automatically. `
     + `So don't send your result with send_message, not even a summary or part of it${marked ? ', even though the note after this one says to' : ''}. `
     + `Use send_message({ agent_id: ${id}, message: "…" }) only for a short question you're blocked on while you work.`
+}
+
+/**
+ * The closing note for a coder or a reviewer (`reportRole` names one), in place of `closingNote`: it begins with
+ * `RETURN_NOTE_LEAD` and the parent's id, as `closingNote` does (dish-judge ends a child's brief there), says to finish with
+ * `report`, and keeps `send_message` for a short question the child is blocked on. `marked` as for `closingNote`.
+ */
+export function reportNote(parentId: string, marked: boolean): string {
+  const id = JSON.stringify(parentId)
+  return `${RETURN_NOTE_LEAD}${id}. Finish by calling \`report\`: it is your report, and the main agent receives it in full, automatically. `
+    + `So don't send your result with send_message, not even a summary or part of it${marked ? ', even though the note after this one says to' : ''}. `
+    + `Use send_message({ agent_id: ${id}, message: "…" }) only for a short question you're blocked on while you work.`
+}
+
+/**
+ * From this round on, a coder start or follow-up on a run's task needs a ruling. The texts (`ladderNote`, the refusal) name
+ * the rungs: rounds 1–3 to the same coder, round 4 a fresh coder on the strong tier, round 5 a ruling.
+ */
+export const LADDER_RULING_ROUND = 5
+
+/**
+ * The note in `delegate`'s answer for a coder's round on a run's task: what the escalation ladder suggests. `undefined` for
+ * round 0 (the first start), and from `LADDER_RULING_ROUND`, whose words are the caller's (a refusal, or a ruling's note).
+ */
+export function ladderNote(task: string, round: number): string | undefined {
+  if (round >= 1 && round <= 3) {
+    return `Round ${round} of task \`${task}\`. The ladder: rounds 1–3 go to the same coder with \`to\`; round 4 is a fresh coder on the strong tier (\`model\`), `
+      + 'with the open findings and the previous coder\'s report; from round 5, delegate needs your ruling.'
+  }
+  if (round === 4) {
+    return `Round 4 of task \`${task}\`: the ladder starts a fresh coder on the strong tier (\`model\`), with the open findings and the previous coder's report. `
+      + 'From round 5, delegate needs your ruling.'
+  }
+  return undefined
 }
 
 /** dsh's mark on its own `send_message` (`markAdjacentAgentSendMessageTool` in `dsh-subagent/internal`): a process-wide symbol. */
@@ -175,6 +241,46 @@ interface GatesReader {
   gateFor(project: string): Promise<string | undefined>
 }
 
+/** Where `dishRuns.place` puts a delegation: a run's ref (`<owner>/<repo>/<id>`), and for a task its round. */
+interface Placement {
+  run: string
+  task?: string
+  /** Given with `task`: the index of this coder start or follow-up among the task's (the first start is 0). */
+  round?: number
+  /** A reviewer placed in a run, asked for with `final`. */
+  final?: true
+}
+
+/** What `dishRuns.place` is asked: a bound child's worktree (its canonical path), a reviewer's `reviews`, and `final`. */
+interface PlaceTarget {
+  worktree?: string
+  reviews?: string
+  final?: boolean
+}
+
+/** What `dishRuns.ladder` records: a round the ladder refused, or let through on a ruling. */
+interface LadderEntry {
+  sessionId: string
+  run: string
+  task: string
+  round: number
+  outcome: 'refused' | 'ruled'
+  ruling?: string
+  /** A follow-up's target. */
+  child?: string
+}
+
+/**
+ * What the row reads of dish-orchestrator with `ctx.get('dishRuns')`, structurally: crew doesn't depend on it. No method
+ * rejects there; a throw here is a broken service, logged and gone past. `driving` (the open run a chat drives) is asked
+ * only to word `final`'s note when `place` placed nothing.
+ */
+interface RunsReader {
+  place(sessionId: string, where: PlaceTarget): Promise<Placement | undefined>
+  ladder(entry: LadderEntry): Promise<void>
+  driving?(sessionId: string): Promise<unknown>
+}
+
 /** What a ruling says, as the refusals and the parameter put it. */
 const RULING_BODY = 'what — why — cost if wrong'
 /** How a ruling is written, as the refusals and the parameter say it. */
@@ -182,8 +288,33 @@ const RULING_FORM = `Ruling: ${RULING_BODY}`
 /** The placeholder, with or without `Ruling:`, compared without case: a model that copies it back has given no ruling. */
 const PLACEHOLDERS: readonly string[] = [RULING_FORM.toLowerCase(), RULING_BODY.toLowerCase()]
 
+/** What `placement` gives for a `place` that threw, or answered with no run in it. */
+const UNPLACED: unique symbol = Symbol('not placed')
+
 /** Where a reviewed coder's gate stands while the coder is still running. */
 const STILL_RUNNING = 'it is still running'
+
+/** The note for `final` that placed nothing because this chat drives no run. */
+const FINAL_NO_RUN = '`final` had no effect: this chat drives no run, so there is no final review for `open_pr` to read.'
+/**
+ * The note for `final` that placed nothing although dish couldn't tell there is no run: `place` failed (thrown, a malformed
+ * answer, or dish-orchestrator's own failure or time limit, which gives no run while the chat drives one). A reviewer bound
+ * to a closed run's worktree (state `pr` or abandoned) gets it too, while the chat drives another run, and so would a retry.
+ */
+const FINAL_UNPLACED = '`final` had no effect: dish couldn\'t place this reviewer in a run, so `final` wasn\'t recorded; try again with a fresh reviewer and `final: true`; '
+  + 'if it is bound to a closed run\'s worktree, `run` `resume` that run first.'
+/** How long `final`'s note waits for `dishRuns.driving`: it reads the run records in memory. */
+const DRIVING_BUDGET_MS = 2000
+/** The note for `final` on a follow-up to a reviewer whose tags don't name the run `place` gives now (another run, or none). */
+const FINAL_OTHER_RUN = '`final` had no effect: this reviewer was started outside the run this chat drives now, so start a fresh reviewer with `final: true` for that run\'s final review.'
+/** The note for `final` without dish-orchestrator. */
+const FINAL_NO_RUNS = '`final` had no effect: dish keeps no runs here (dish-orchestrator isn\'t loaded).'
+
+/** The ladder's refusal of more coder work on `task` at `round` (from `LADDER_RULING_ROUND`). */
+function ladderRefusal(task: string, round: number): string {
+  return `round ${round} of task \`${task}\`: the escalation ladder ends at round 4, so delegate won't send more coder work on this task without your ruling. `
+    + `Rule with \`ruling: "${RULING_FORM}"\` (it is recorded), or stop and tell the user (\`run\` action \`abandon\`, with a reason, only if they drop the change).`
+}
 
 /** `text` on one line: runs of whitespace, line breaks among them, folded into one space. */
 function oneLine(text: string): string {
@@ -191,20 +322,28 @@ function oneLine(text: string): string {
 }
 
 /**
- * Whether a `gateOverride` (on one line) holds a ruling: something past a leading `Ruling:`, with a letter or a digit in
- * it, that isn't the placeholder the refusal shows.
+ * Whether a `ruling` (on one line) holds a ruling: something past a leading `Ruling:`, with a letter or a digit in it, that
+ * isn't the placeholder the refusals show.
  */
-function hasRuling(override: string): boolean {
-  if (PLACEHOLDERS.includes(oneLine(override).toLowerCase())) return false
-  return /[\p{L}\p{N}]/u.test(override.replace(/^[\s#>*_`]*ruling[*_`]*\s*:[*_`]*/iu, ''))
+function hasRuling(ruling: string): boolean {
+  if (PLACEHOLDERS.includes(oneLine(ruling).toLowerCase())) return false
+  return /[\p{L}\p{N}]/u.test(ruling.replace(/^[\s#>*_`]*ruling[*_`]*\s*:[*_`]*/iu, ''))
 }
 
-/** What the tool returns: the child, and how it shows. */
+/** What the tool returns: the child, how it shows, and for a coder on a run's task (or a `final` that did nothing) a note. */
 interface Delegated {
   child: string
   role: string
   model: string
   label: string
+  note?: string
+}
+
+/** What `placeCall` gives: the tags a start is recorded with, `final` when the placement gave it, and the answer's note. */
+interface Placed {
+  tags: { run?: string, task?: string }
+  final?: true
+  note?: string
 }
 
 /** `value` trimmed, if it is a string with something in it. Models fill every optional parameter, often with `''`. */
@@ -353,8 +492,15 @@ interface Call {
   worktree: string | undefined
   /** dish-gates' service, if it is running: the review check and the brief's gate sentence apply only then. */
   gates: GatesReader | undefined
-  /** The main agent's ruling to review work whose gate hasn't passed, on one line; `undefined` for none. */
-  gateOverride: string | undefined
+  /**
+   * The main agent's ruling past a check (a review of work whose gate hasn't passed, or a coder past the ladder): `ruling`,
+   * else `gateOverride`, folded onto one line and masked; `undefined` for none.
+   */
+  ruling: string | undefined
+  /** `final === true`: a reviewer for the run's final review. */
+  final: boolean
+  /** dish-orchestrator's service, if it is running: runs, tags and the ladder apply only then. */
+  runs: RunsReader | undefined
 }
 
 /** What the review check lets through with a ruling: the ruling, and the block the reviewer gets after its task. */
@@ -403,6 +549,12 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
   // The finish notices of this agent's crew children. A row's listener is the preset's: dsh-scope delivers it the steps of
   // the agents under the preset, and `noticeListener` leaves a message that isn't this agent's own child's alone.
   ctx.on('agent/pre-step', noticeListener(ctx, warn))
+
+  // `dish-crew/delegated`, and `dish-crew/settled` for a start dsh refused. Never rejects.
+  const publish = publisher(ctx, warn)
+
+  // Services of plugins crew doesn't depend on, whose `Context` declarations it may not see, read by name as `index.ts` does.
+  const lookup = ctx as unknown as { get(name: string): unknown }
 
   /** The child `id` if this session started it. @throws a refusal that names the session's children, if not. */
   async function ownChild(call: Call, id: string, what: string, hint: string): Promise<ChildRecord> {
@@ -469,10 +621,10 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
 
   /**
    * The review check (6c), for a review of `child`'s work, on the record `reviewedWork` read inside the session's lock.
-   * `undefined` when there is nothing to override (see `gateStanding`): a `gateOverride` given is then ignored. Otherwise
-   * the ruling, and the block the reviewer gets.
+   * `undefined` when there is nothing to override (see `gateStanding`): a ruling given is then ignored. Otherwise the
+   * ruling, and the block the reviewer gets.
    *
-   * A re-review with no `gateOverride` keeps the reviewer's ruling when the reviewed child hasn't run since the ruling was
+   * A re-review with no ruling keeps the reviewer's ruling when the reviewed child hasn't run since the ruling was
    * given (`gateOverrideAt`, at the reviewer's start or on a follow-up; `startedAt` for a ruling recorded before its time
    * was kept): its latest run ended before then, and none is in progress or running. The ruling was given on exactly the
    * standing it has now; any fix round, crash or resume of that child ends it.
@@ -487,16 +639,16 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       ? `Wait for its finish notice, which says how its gate ended, and ${followUp === undefined ? 'delegate the review' : 'send the follow-up'} then`
       : `Send ${followUp === undefined ? 'it' : `that ${child.role}`} a fix round with \`to: "${child.id}"\``
     const anyway = followUp === undefined ? 'start the review anyway' : 'send this follow-up anyway'
-    const refused = `${followUp === undefined ? '' : `${followUp.lead} `}${who(child)}'s gate hasn't passed (${standing}). ${next}, or ${anyway} with \`gateOverride: "${RULING_FORM}"\`.`
-    if (call.gateOverride === undefined) {
+    const refused = `${followUp === undefined ? '' : `${followUp.lead} `}${who(child)}'s gate hasn't passed (${standing}). ${next}, or ${anyway} with \`ruling: "${RULING_FORM}"\`.`
+    if (call.ruling === undefined) {
       const reviewer = followUp?.reviewer
       const lastEnded = child.runs.at(-1)?.endedAt
       if (reviewer?.gateOverride !== undefined && standing !== STILL_RUNNING && child.last !== 'running'
         && lastEnded !== undefined && lastEnded < (reviewer.gateOverrideAt ?? reviewer.startedAt)) return block(reviewer.gateOverride)
       throw new Error(refused)
     }
-    if (!hasRuling(call.gateOverride)) throw new Error(`gateOverride needs the ruling itself: ${RULING_BODY}. ${refused}`)
-    return block(call.gateOverride)
+    if (!hasRuling(call.ruling)) throw new Error(`ruling needs the ruling itself: ${RULING_BODY}. ${refused}`)
+    return block(call.ruling)
   }
 
   /** Step 5 for a start: the route of the new child, `reviews` as it is recorded, and the record of a crew child it reviews. */
@@ -665,13 +817,125 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     }
   }
 
-  /** Record `childId` as failed, for a start dsh refused. A record that can't be written is logged: the refusal still comes. */
-  async function markFailed(call: Call, childId: string, message: string): Promise<void> {
+  /**
+   * `dishRuns.place`'s answer, checked: `undefined` for no run, and `UNPLACED` for a throw or an answer with no run in it,
+   * which is logged (either is no run for the tags). A `task` is kept when it is a non-empty string, a `round` only with a
+   * task and when it is a whole number, and `final` only when it is `true`. Never throws: a delegation is never refused for
+   * a run it couldn't be placed in.
+   */
+  async function placement(call: Call, runs: RunsReader, where: PlaceTarget): Promise<Placement | typeof UNPLACED | undefined> {
+    let answer: unknown
     try {
-      await call.crew.records.endRun(childId, { stopReason: 'error', error: message, closing: '' })
+      answer = await runs.place(call.sessionId, where)
+    } catch (error) {
+      warn('could not place a delegation in a run: %s', describe(error))
+      return UNPLACED
+    }
+    if (answer === undefined) return undefined
+    const found = (typeof answer === 'object' && answer !== null ? answer : {}) as Record<string, unknown>
+    const { run, task, round } = found
+    if (typeof run !== 'string' || run === '') {
+      let shown: string
+      try {
+        shown = JSON.stringify(answer) ?? String(answer)
+      } catch {
+        shown = typeof answer
+      }
+      warn('could not place a delegation in a run: dishRuns.place gave no run (%s)', truncate(maskSecrets(shown), 200))
+      return UNPLACED
+    }
+    const placed: Placement = { run }
+    if (typeof task === 'string' && task !== '') {
+      placed.task = task
+      if (typeof round === 'number' && Number.isSafeInteger(round) && round >= 0) placed.round = round
+    }
+    if (found.final === true) placed.final = true
+    return placed
+  }
+
+  /**
+   * For `final`'s note, when `place` gave no run: whether that was dish's failure rather than no run, that is, the chat
+   * drives an open run (dish-orchestrator's `place` gives no run past its time limit or on a failure, which it logs), or
+   * `driving` can't say (thrown, or no answer within DRIVING_BUDGET_MS; logged). Without `driving`, no run.
+   */
+  async function placeFailed(call: Call, runs: RunsReader): Promise<boolean> {
+    if (typeof runs.driving !== 'function') return false
+    try {
+      const driven = await within(Promise.resolve().then(() => runs.driving!(call.sessionId)), DRIVING_BUDGET_MS)
+      return driven !== undefined && driven !== null
+    } catch (error) {
+      warn('could not ask dish-orchestrator which run this chat drives: %s', describe(error))
+      return true
+    }
+  }
+
+  /** `dishRuns.ladder`, whose failure is logged and gone past: the refusal, or the ruled call, stands either way. */
+  async function recordLadder(runs: RunsReader, entry: LadderEntry): Promise<void> {
+    try {
+      await runs.ladder(entry)
+    } catch (error) {
+      warn('could not record the escalation ladder\'s %s at round %d of task %s in run %s: %s', entry.outcome, entry.round, entry.task, entry.run, describe(error))
+    }
+  }
+
+  /**
+   * Inside the locks, after every check that refuses without writing anything and before anything is recorded or sent: the
+   * tags for a start, `final`, and the escalation ladder for a coder on a run's task. `target` is a follow-up's child, whose
+   * tags are its own, whatever `place` says now.
+   *
+   * Without dish-orchestrator there are no tags and no ladder, and the only note is `final`'s. A follow-up is counted only
+   * when `place` still puts it where its child's tags say (the same run and task), and made final only in its child's run.
+   * @throws the ladder's refusal, from `LADDER_RULING_ROUND`, when `ruling` holds no ruling; it is recorded first.
+   */
+  async function placeCall(call: Call, where: { worktree?: string | undefined, reviews?: string | undefined }, target?: ChildRecord): Promise<Placed> {
+    const { runs } = call
+    if (runs === undefined) return { tags: {}, ...call.final ? { note: FINAL_NO_RUNS } : {} }
+    const answer = await placement(call, runs, {
+      ...where.worktree === undefined ? {} : { worktree: where.worktree },
+      ...where.reviews === undefined ? {} : { reviews: where.reviews },
+      ...call.final ? { final: true } : {},
+    })
+    const placed = answer === UNPLACED ? undefined : answer
+    // `final` placed nothing: say why, never "no run" for a chat that drives one.
+    const unplaced = call.final && placed === undefined && (answer === UNPLACED || await placeFailed(call, runs))
+    // A follow-up's reviewer gives the final review of its own run only: tagged with another run, or none, the ledger would
+    // put the verdict where `open_pr` doesn't read it.
+    const elsewhere = target !== undefined && placed !== undefined && (target.run === undefined || placed.run !== target.run)
+    const final = call.final && placed?.final === true && !elsewhere
+    const own = target ?? placed
+    const tags = { ...own?.run === undefined ? {} : { run: own.run }, ...own?.task === undefined ? {} : { task: own.task } }
+    const finish = (note?: string): Placed => {
+      const notes = [note, call.final && !final ? (elsewhere ? FINAL_OTHER_RUN : unplaced ? FINAL_UNPLACED : FINAL_NO_RUN) : undefined].filter(text => text !== undefined)
+      return { tags, ...final ? { final: true } : {}, ...notes.length === 0 ? {} : { note: notes.join(' ') } }
+    }
+    const { task } = tags
+    const round = placed?.round
+    if (call.role !== 'coder' || task === undefined || placed === undefined || round === undefined) return finish()
+    if (target !== undefined && (placed.run !== target.run || placed.task !== target.task)) return finish()
+    if (round < LADDER_RULING_ROUND) return finish(ladderNote(task, round))
+    const entry = { sessionId: call.sessionId, run: placed.run, task, round, ...target === undefined ? {} : { child: target.id } }
+    if (call.ruling === undefined || !hasRuling(call.ruling)) {
+      await recordLadder(runs, { ...entry, outcome: 'refused' })
+      const refused = ladderRefusal(task, round)
+      throw new Error(call.ruling === undefined ? refused : `ruling needs the ruling itself: ${RULING_BODY}. ${refused}`)
+    }
+    await recordLadder(runs, { ...entry, outcome: 'ruled', ruling: call.ruling })
+    return finish(`Round ${round} of task \`${task}\`, past the ladder, on your ruling (recorded).`)
+  }
+
+  /**
+   * Record `childId` as failed, for a start dsh refused, and publish `dish-crew/settled` for the run it filed, so a start that
+   * was published as delegated also ends. A record that can't be written is logged: the refusal still comes.
+   */
+  async function markFailed(call: Call, childId: string, message: string): Promise<void> {
+    let ended: Awaited<ReturnType<DishCrew['records']['endRun']>>
+    try {
+      ended = await call.crew.records.endRun(childId, { stopReason: 'error', error: message, closing: '' })
     } catch (error) {
       warn('could not record the failed start of child %s as failed: %s', childId, describe(error))
+      return
     }
+    if (ended !== undefined) await publish('dish-crew/settled', { sessionId: ended.sessionId, child: ended.child, run: ended.run })
   }
 
   /** Steps 5 to 8 for a new child, bound to `bound` if it is given. Inside the session's lock, and the worktree's. */
@@ -681,26 +945,36 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     await checkRoute(call, route)
     const allowed = allowList(call.roleSettings.tools, visibleTools(call.agent), call.role)
     if (!allowed.ok) throw new Error(allowed.problem)
+    // After every check that refuses without writing, before anything is recorded: the ladder's refusal writes to the ledger.
+    const placed = await placeCall(call, { worktree: bound?.path, reviews })
     const label = `${call.role} · ${route.model} · ${title}`
     // The id is ours, and the record is written first: a child that is quick ends before `startContinuable` returns, and
     // its `subagent/end` has to find a record.
     const childId = randomUUID()
     const gate = bound === undefined ? undefined : await gateOf(call, bound.project)
+    let child: ChildRecord
     try {
-      await call.crew.records.addChild(call.sessionId, {
+      child = await call.crew.records.addChild(call.sessionId, {
         id: childId, role: call.role, title, model: route.model, family: route.family, ...reviews === undefined ? {} : { reviews },
         ...bound === undefined ? {} : { worktree: bound.path }, ...override === undefined ? {} : { gateOverride: override.ruling },
+        ...placed.tags, ...placed.final === true ? { final: true } : {},
       })
     } catch (error) {
       throw new Error(`could not record the delegation, so nothing was started: ${describe(error)}. Try again, or tell the user.`, { cause: error })
     }
+    // Before dsh starts the child, so that its start comes before anything it ends with; inside the locks (see the header).
+    await publish('dish-crew/delegated', { sessionId: call.sessionId, child, followUp: false })
     // The closing note stays last: dish-judge ends a child's brief at it, and on a preset that loads dsh's own `send_message` it
     // refers to the note dsh adds after it. Each block ends with a blank line (`BLOCK_END`): dsh's adapters join text blocks
-    // with nothing between them.
+    // with nothing between them. A coder or a reviewer finishes with `report`, and is told so (`reportNote`); every other
+    // role's closing message is its report (`closingNote`).
     const prompt = [{ type: 'text' as const, text: `${call.task}${BLOCK_END}` }]
-    if (bound !== undefined) prompt.push({ type: 'text', text: `${worktreeBrief(bound, gate)}${BLOCK_END}` })
+    if (bound !== undefined) prompt.push({ type: 'text', text: `${worktreeBrief(bound, gate, call.role === 'coder')}${BLOCK_END}` })
     if (override !== undefined) prompt.push({ type: 'text', text: `${override.block}${BLOCK_END}` })
-    if (allowed.allow.includes('send_message')) prompt.push({ type: 'text', text: `${closingNote(call.sessionId, dshSendMessage(call.agent))}${BLOCK_END}` })
+    if (allowed.allow.includes('send_message')) {
+      const note = reportRole({ role: call.role, reviews }) === undefined ? closingNote : reportNote
+      prompt.push({ type: 'text', text: `${note(call.sessionId, dshSendMessage(call.agent))}${BLOCK_END}` })
+    }
     try {
       await ctx.subagents.startContinuable({
         provider: call.crew.subagentProvider,
@@ -726,7 +1000,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
           + `remove ${tools.length === 1 ? 'it' : 'them'} from roles.${call.role}.tools in crew.yaml. Nothing was started; the start failed and counts as a delegation.`,
       { cause: error })
     }
-    return { child: childId, role: call.role, model: route.model, label }
+    return { child: childId, role: call.role, model: route.model, label, ...placed.note === undefined ? {} : { note: placed.note } }
   }
 
   /**
@@ -769,6 +1043,8 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
       const reviewer = reviewerName(call.settings)
       throw new Error(`reviews is for the reviewer role (${reviewer}), and ${call.role} doesn't review. Leave reviews out, or delegate to ${reviewer}.`)
     }
+    // As for a start: after every check that refuses without writing, before anything is sent. The child keeps its tags.
+    const placed = await placeCall(call, { worktree: target.worktree, reviews: target.reviews }, target)
     // A blank line between the task and the ruling's block, as for a start; nothing follows the last block.
     const content = [{ type: 'text' as const, text: override === undefined ? call.task : `${call.task}${BLOCK_END}` }]
     if (override !== undefined) content.push({ type: 'text', text: override.block })
@@ -777,17 +1053,32 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     } catch (error) {
       throw new Error(`could not send the follow-up to child ${target.id}: ${describe(error)}. Try again, or start a new ${call.role} (leave to out): a child that never started can't be resumed.`, { cause: error })
     }
-    // Sent. A record that can't be updated is logged, not thrown: an error would have the model send it again.
+    // Sent. A record that can't be updated is logged, not thrown: an error would have the model send it again. `final` is set
+    // when the placement gave it, and never cleared: a reviewer already final stays final.
+    const extra = { ...override === undefined ? {} : { gateOverride: override.ruling }, ...placed.final === true ? { final: true as const } : {} }
     try {
-      await (override === undefined ? call.crew.records.addFollowUp(target.id) : call.crew.records.addFollowUp(target.id, { gateOverride: override.ruling }))
+      await (Object.keys(extra).length === 0 ? call.crew.records.addFollowUp(target.id) : call.crew.records.addFollowUp(target.id, extra))
     } catch (error) {
       warn('could not record the follow-up to child %s: %s', target.id, describe(error))
     }
-    return { child: target.id, role: target.role, model: target.model, label: `${target.role} · ${target.model} · ${target.title}` }
+    // Published whether or not it was counted: it was sent. The child as the record has it now, else as it would be.
+    let found: { record: ChildRecord } | undefined
+    try {
+      found = await call.crew.records.lookup(target.id)
+    } catch {
+      found = undefined
+    }
+    await publish('dish-crew/delegated', {
+      sessionId: call.sessionId, child: found?.record ?? { ...target, followUps: target.followUps + 1, last: 'running' }, followUp: true,
+    })
+    return {
+      child: target.id, role: target.role, model: target.model, label: `${target.role} · ${target.model} · ${target.title}`,
+      ...placed.note === undefined ? {} : { note: placed.note },
+    }
   }
 
   /** The `call` for the arguments, after the checks that need no one's state: who is calling, the services, the role, the task. */
-  async function prepare(args: { role: string, title?: string, task: string, to?: string, reviews?: string, model?: string, worktree?: string, gateOverride?: string }, agent: Agent | undefined, signal: AbortSignal): Promise<Call> {
+  async function prepare(args: { role: string, title?: string, task: string, to?: string, reviews?: string, model?: string, worktree?: string, ruling?: string, gateOverride?: string, final?: boolean }, agent: Agent | undefined, signal: AbortSignal): Promise<Call> {
     if (agent === undefined || !isTopLevelAgent(agent)) {
       throw new Error('delegate is for the main agent only: a crew child can\'t delegate. Do the work yourself, or send_message the main agent if you need something done.')
     }
@@ -812,12 +1103,19 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     }
     const task = given(args.task)
     if (task === undefined) throw new Error('task is empty: give the child the complete, self-contained brief.')
+    // A cheap check, before the prompt or a follow-up's target is read.
+    const final = args.final === true
+    if (final && !settings.roles[role]!.reviews) {
+      throw new Error(`final is for the reviewer role (${reviewerName(settings)}): it marks the run's final review. Leave final out for ${article(role)}.`)
+    }
     const gates: GatesReader | undefined = ctx.get('dishGates')
-    const gateOverride = given(args.gateOverride)
+    const runs = lookup.get('dishRuns') as RunsReader | undefined
+    // `ruling`, else 6c's `gateOverride`: one line, masked, before anything records it or puts it in a message.
+    const ruling = given(args.ruling) ?? given(args.gateOverride)
     return {
       agent, signal, crew, prompts, agents, settings, role, roleSettings: settings.roles[role]!, task: args.task,
       sessionId: String(agent.id), title: titleOf(args.title), to: given(args.to), reviews: given(args.reviews), model: given(args.model),
-      worktree: given(args.worktree), gates, gateOverride: gateOverride === undefined ? undefined : oneLine(gateOverride),
+      worktree: given(args.worktree), gates, ruling: ruling === undefined ? undefined : maskSecrets(oneLine(ruling)), final, runs,
     }
   }
 
@@ -844,10 +1142,12 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
         + 'To have work reviewed, delegate to the reviewer role with `reviews` set to the id of the child whose work it reviews, or "main" for your own work; '
         + 'the harness picks a model from a different family than the work was done on, and refuses one that is not. '
         + 'To have a coder (a role that writes) work in a worktree you made with the `worktree` tool, pass it as `worktree`: its brief names it, and its follow-ups stay bound to it. '
-        + 'While gates are on, a bound coder\'s work is gated when it finishes, and its finish notice says how the gate ended; '
-        + 'a review of that work is refused until the gate passes, unless `gateOverride` carries your ruling. '
+        + 'While gates are on, a bound coder\'s work is gated when it reports done, and its finish notice says how the gate ended; '
+        + 'a review of that work is refused until the gate passes, unless `ruling` carries your ruling. '
+        + 'In a run, each coder start or follow-up on a task is a round: from round 5, delegate refuses more coder work on that task unless `ruling` carries your ruling. '
+        + 'Set `final: true` on the reviewer of a run\'s final review. '
         + 'crew.yaml limits how many children run at once, how many write files at once (one by default; read-only roles run in parallel) and how many delegations a session makes; '
-        + 'a refusal says who is running and what to do. Returns the child\'s id, role, model and label.',
+        + 'a refusal says who is running and what to do. Returns the child\'s id, role, model and label, and for a coder on a run\'s task the ladder\'s note.',
       parameters: {
         role: { type: 'string', required: true, description: `A role in crew.yaml: ${roleList(settings)}.` },
         // Not required in the schema: a follow-up has no use for one, and dsh refused a follow-up without it before
@@ -858,7 +1158,11 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
         reviews: { type: 'string', description: 'Reviewer role only, and required for it: the id of the crew child whose work is reviewed, or "main" for your own work. Leave empty for any other role.' },
         model: { type: 'string', description: 'An override of the role\'s default model: a model id from the families in crew.yaml. A reviewer\'s must be in a different family from the work reviewed. Not for a follow-up. Leave empty for the default.' },
         worktree: { type: 'string', description: 'A worktree from the `worktree` tool, as `<project>/<slug>` or the path it returned, to bind a coder to: its brief names it, and the harness checks its work there. Only for roles that write. Leave empty otherwise.' },
-        gateOverride: { type: 'string', description: `Only after \`delegate\` refused a review because the reviewed coder's gate hasn't passed: your ruling, on one line, as \`${RULING_FORM}\`. It is recorded, and the reviewer is told. Leave empty otherwise.` },
+        ruling: { type: 'string', description: 'Only after delegate refused for want of one (a review of work whose gate hasn\'t passed, or a coder past round 4 of its task): '
+          + `your ruling, on one line, as \`${RULING_FORM}\`. It is recorded. Leave empty otherwise.` },
+        gateOverride: { type: 'string', description: 'The old name of `ruling`, still accepted. Use `ruling`. Leave empty.' },
+        final: { type: 'boolean', description: 'Reviewer role only: true makes this the run\'s final review, the one `open_pr` checks (its verdict must approve the head that is pushed). '
+          + 'It stays final for its follow-ups, and a follow-up with true makes that reviewer final. Leave false otherwise.' },
       },
       output: {
         schema: {
@@ -869,14 +1173,16 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
             role: { type: 'string', required: true },
             model: { type: 'string', required: true },
             label: { type: 'string', required: true, description: 'How the child shows in the session header: role, model and title.' },
+            note: { type: 'string', description: 'For a coder working on a run\'s task: its round, and what the escalation ladder suggests.' },
           },
         },
         render: (args, value) => {
           const prefix = `${value.role} · ${value.model} · `
           const title = value.label.startsWith(prefix) ? value.label.slice(prefix.length) : value.label
-          return text(given(args.to) === undefined
+          const line = given(args.to) === undefined
             ? `started ${value.role} «${title}» on ${value.model} (child ${value.child})`
-            : `sent a follow-up to ${value.role} «${title}» (child ${value.child})`)
+            : `sent a follow-up to ${value.role} «${title}» (child ${value.child})`
+          return text(value.note === undefined ? line : `${line}\n${value.note}`)
         },
       },
       async execute(args, exec) {

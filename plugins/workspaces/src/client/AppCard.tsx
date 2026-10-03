@@ -31,9 +31,15 @@ export function AppCard(props: Props) {
     <div className="dish-workspaces">
       <h2 className="dish-workspaces-title">GitHub App</h2>
       <p className="dish-workspaces-intro">
-        dish reaches your repositories as a GitHub App: it clones and fetches with a read-only token, and reads pull requests to
-        see which branches were merged. Create the App on GitHub with read access to Contents, Pull requests and Metadata (no
-        webhook), install it on the owners and repositories dish should work in, then give dish its ID and private key here.
+        dish reaches your repositories as a GitHub App. Agents' git clones and fetches with a read-only token, and dish reads
+        pull requests to see which branches were merged. Only the main agent's open_pr pushes a run's branch and opens its pull
+        request (or comments on it), with a write token dish mints in memory for that one push or request. Create the App on
+        GitHub with read and write access to Contents and Pull requests, and read access to Metadata, Checks and Commit
+        statuses (no webhook; the main agent's pr_feedback reads a pull request's reviews, comments and checks), install it on
+        the owners and repositories dish should work in, then give dish its ID and private key here. If the App was read-only
+        before, each installation's owner accepts the new permissions on GitHub. Protect each repository's default branch with
+        a ruleset (require a pull request with an approval, block force pushes and deletions, and never put the App on its
+        bypass list), so nothing reaches it without your merge.
       </p>
       <CredentialsCard state={state} actions={props} />
       <StatusCard state={state} actions={props} />

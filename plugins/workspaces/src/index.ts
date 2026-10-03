@@ -9,7 +9,10 @@
  *   has no workspace registry. It never reads `dishConfig`.
  * - **The App's credentials** are two references in dsh's credential store, named by the rows `appIdName` and
  *   `privateKeyName` (environment-variable names, checked at load), read on every use and never kept.
- * - **The `worktree` tool** registers whenever a `tools` service is there (see `tool.ts`).
+ * - **The `worktree` tool** registers whenever a `tools` service is there (see `tool.ts`). It reads dish-orchestrator's
+ *   `dishRuns` with `ctx.get` on each call, for the run hooks, and works as before without it.
+ * - **Step 7's methods** (`headOf`, `isClean`, `compareBranch`, `pushBranch`, `openPull`, `updatePull`, `commentPull`,
+ *   `readPull`) are for dish-orchestrator's `run`, `open_pr` and `pr_feedback` (see `service.ts`).
  * - **Settings → GitHub App's server half** is the `dishWorkspacesRemote` Typert remote (see `remote.ts`), served by the
  *   gateway for as long as `dishWorkspaces` is. It tells the card what GitHub says of the App (`appStatus`) and takes
  *   nothing from it: the ID and the key go from the browser to dsh's own credential store.
@@ -27,12 +30,15 @@ import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs } from 'dish-kit'
 import { WorkspacesRemote } from './remote.ts'
 import { createDishWorkspaces } from './service.ts'
-import type { DishWorkspaces, WorkspacesInternals, WorkspacesService } from './service.ts'
+import type { DishWorkspaces, RunsHooks, WorkspacesInternals, WorkspacesService } from './service.ts'
 import { worktreeTool } from './tool.ts'
 
 export type { AppStatus, InstallationInfo } from './protocol.ts'
-export type { CloneInfo, DishWorkspaces, WorkspacesInternals, WorkspacesService } from './service.ts'
-export type { CreatedWorktree, Worktree, WorktreeInfo } from './worktrees.ts'
+export type {
+  CleanOptions, Cleanliness, CloneInfo, CreatedForRun, DishWorkspaces, OpenedPull, PullFeedback, RunsHooks, WorkspacesInternals,
+  WorkspacesService,
+} from './service.ts'
+export type { BranchComparison, CreatedWorktree, Worktree, WorktreeInfo } from './worktrees.ts'
 export type { SweepResult } from './sweep.ts'
 
 export const name = 'dish-workspaces'
@@ -101,15 +107,28 @@ export function start(ctx: Context, config: Config, internals: WorkspacesInterna
     resolveProblem: pathOrRef => service.resolveProblem(pathOrRef),
     sweep: project => service.sweep(project),
     appStatus: test => service.appStatus(test),
+    headOf: pathOrRef => service.headOf(pathOrRef),
+    isClean: (pathOrRef, options) => service.isClean(pathOrRef, options),
+    compareBranch: (project, slug) => service.compareBranch(project, slug),
+    pushBranch: (project, slug, options) => service.pushBranch(project, slug, options),
+    openPull: (project, pull) => service.openPull(project, pull),
+    updatePull: (project, number, fields) => service.updatePull(project, number, fields),
+    commentPull: (project, number, body) => service.commentPull(project, number, body),
+    readPull: (project, number) => service.readPull(project, number),
   }
   ctx.provide('dishWorkspaces', dishWorkspaces)
   // Settings → GitHub App's server half: a child plugin that needs `dishWorkspaces`, so it goes when the service does.
   ctx.plugin(WorkspacesRemote, { appIdName, privateKeyName })
 
-  // A global tool, registered through the child context, so it goes when `tools` does, or this plugin. The service is
-  // read with `ctx.get` on each call.
+  // A global tool, registered through the child context, so it goes when `tools` does, or this plugin. The service and
+  // dish-orchestrator's hooks are read with `ctx.get` on each call.
+  const logger = ctx.logger(name)
   ctx.inject(['tools'], (inner) => {
-    inner.tools.register(worktreeTool(() => ctx.get('dishWorkspaces')))
+    inner.tools.register(worktreeTool(
+      () => ctx.get('dishWorkspaces'),
+      () => (ctx as unknown as { get(name: string): unknown }).get('dishRuns') as RunsHooks | undefined,
+      { warn: (format, ...args) => { logger.warn(format, ...args) } },
+    ))
   })
 
   // dsh's registry has an asynchronous start, and only dsh-web-app mounts it: used for as long as it is there.

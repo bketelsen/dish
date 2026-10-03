@@ -34,7 +34,7 @@ import { internals as sweepInternals } from '../src/sweep.ts'
 import { internals as worktreeInternals } from '../src/worktrees.ts'
 import { startFakeGit } from './fake-git-http.ts'
 import type { FakeGitServer } from './fake-git-http.ts'
-import { startFakeGitHub, testKeys } from './fake-github-api.ts'
+import { WRITE_APP_PERMISSIONS, startFakeGitHub, testKeys } from './fake-github-api.ts'
 import type { FakeGitHub } from './fake-github-api.ts'
 import { NOSYSTEM, makeBare, scratchGitEnv, tempDir } from './helpers.ts'
 import { HELPER } from './onboard-helpers.ts'
@@ -157,9 +157,11 @@ export interface ServiceWorld {
 
 /**
  * A fresh fake GitHub holding `acme/widget` and `acme/gadget` (one commit on `main` each), with the App installed on
- * `acme` (id 77, both repos). `files` replaces widget's first commit.
+ * `acme` (id 77, both repos). `files` replaces widget's first commit. With `write`, the App is step 7's
+ * (`WRITE_APP_PERMISSIONS`: Contents and Pull requests write); else read-only. The git server takes each token the API
+ * mints at the level of its `contents`: `write` pushes, anything else only reads.
  */
-export async function startServiceWorld(options: { files?: Record<string, string> } = {}): Promise<ServiceWorld> {
+export async function startServiceWorld(options: { files?: Record<string, string>, write?: boolean } = {}): Promise<ServiceWorld> {
   const dir = await tempDir()
   const root = join(dir, 'srv')
   await makeBare(join(root, 'acme', 'widget.git'), options.files ?? { 'README.md': '# widget\n' })
@@ -167,9 +169,9 @@ export async function startServiceWorld(options: { files?: Record<string, string
   const git = await startFakeGit(root)
   after(() => git.close())
   const keys = testKeys()
-  const github = await startFakeGitHub({ publicKey: keys.publicKey })
+  const github = await startFakeGitHub({ publicKey: keys.publicKey, ...(options.write === true ? { permissions: WRITE_APP_PERMISSIONS } : {}) })
   github.installations.set('acme', { id: 77, account: 'Acme', repos: new Set(['widget', 'gadget']) })
-  github.onToken(token => { git.tokens.set(token, 'read') })
+  github.onToken((token, permissions) => { git.tokens.set(token, permissions.contents === 'write' ? 'write' : 'read') })
   const credentials = new Map([[APP_ID_NAME, String(github.app.id)], [PRIVATE_KEY_NAME, keys.privateKeyPem]])
   const workRoot = join(dir, 'work')
   const state = join(dir, 'state')

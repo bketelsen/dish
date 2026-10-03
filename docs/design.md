@@ -29,9 +29,9 @@ Status: draft, from the brainstorm on 2026-09-30. It records what we decided and
 | Kind | Default | Holds | Versioned |
 |---|---|---|---|
 | Config | `$XDG_CONFIG_HOME/dish/` | `crew.yaml` (roles, model tiers, tools), `prompts/<role>.md`, `skills/<name>/SKILL.md`, `projects.yaml` (the repo registry: family, role, gate, setup), `families/<family>/` (direction, approved initiatives) | git repo; every UI save is a commit; history, diff and revert in the UI |
-| Data | `$XDG_DATA_HOME/dish/` | `vault/` (memory, its own git repo pushed to a private GitHub repo), `ledgers/` (until `orchestrator` (step 7) owns the ledger, the shipped skills keep a plan's ledger at `.worktrees/<plan>-ledger.md` in the repo, git-ignored), initiative status, crew's records | the vault via git; ledgers append-only |
+| Data | `$XDG_DATA_HOME/dish/` | `vault/` (memory, its own git repo pushed to a private GitHub repo), `ledgers/<owner>/<repo>/<run>.jsonl` (each run's ledger, written by `orchestrator`, kept forever; outside a registered project, the skills keep a plan's ledger in `.worktrees/<plan>-ledger.md`), initiative status, crew's records | the vault via git; ledgers append-only |
 | Work | the work root: `~/work` (the service's working directory) | the projects' clones, `<owner>/<repo>`, each with its task worktrees in `.worktrees/<slug>`, and the `scratch` workspace for general chats. Not under `$XDG_DATA_HOME`: these are dsh workspaces, where agents write | each clone is its repo's git |
-| State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs; the projects' onboarding status, each clone's and worktree's record, setup logs, and the read-token files (`workspaces/`); gate logs (`gates/<owner>/<repo>/<slug>/<child>-<turn>-<round>.log`, pruned after 30 days) | no |
+| State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs; the projects' onboarding status, each clone's and worktree's record, setup logs, and the read-token files (`workspaces/`); gate logs (`gates/<owner>/<repo>/<slug>/<child>-<turn>-<round>.log`, pruned after 30 days); run records (`orchestrator/<owner>/<repo>/runs/`) | no |
 | Cache | `$XDG_CACHE_HOME/dish/` | Copilot model catalog cache (`copilot-models.json`), fetched pages | no |
 
 One instance's dish directories move together: when `DSH_DISH_HOME` is set to an absolute path, dish-kit's `xdgPaths` puts all four at `$DSH_DISH_HOME/{config,state,data,cache}/dish`, ahead of the XDG variables, and `workRoot()` puts the work root at `$DSH_DISH_HOME/work`. Dev, the default for everything but the VM's service, sets it to `<checkout>/.dev`; prod uses the defaults above. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands. See the [ops spec](specs/ops.md).
@@ -42,7 +42,7 @@ dsh keeps its own home, `~/.dsh` (dev's is `<checkout>/.dev/dsh`), for sessions,
 
 | Role | Default tier | Does |
 |---|---|---|
-| **main** | strong | Talks with you, plans, delegates, verifies, keeps the ledger, makes rulings. Delegates about 90% of the work. |
+| **main** | strong | Talks with you, plans, delegates, verifies, makes rulings and records them in the run's ledger. Delegates about 90% of the work. |
 | **architect** | strong | Brainstorm → spec → plan, as small tasks that each state exact files, interfaces and tests (the superpowers `writing-plans` shape). |
 | **coder** | mid | Implements one task in its own worktree. A fresh coder for each task, with no inherited chat history. |
 | **reviewer** | mid | Reviews each task for spec compliance and quality, plus a final whole-branch review. Always a **different model family from the coder** (Claude ↔ GPT by default; Gemini and Grok are allowed), enforced by the harness. |
@@ -57,10 +57,10 @@ The main agent may choose a different model for any delegation, except that it c
 Modeled on [obra/superpowers](https://github.com/obra/superpowers) (`writing-plans`, `subagent-driven-development`):
 
 1. **Architect** writes the spec and plan.
-2. **Main agent**, as the controller, runs the tasks without pausing to check in. It records every judgment call as a ruling (`Ruling: what — why — cost if wrong`) and stops only for irreversible or security-sensitive actions, pushes and merges, or a plan too broken to continue.
+2. **Main agent**, as the controller, runs the tasks without pausing to check in. It records every judgment call as a ruling (`Ruling: what — why — cost if wrong`) and stops only for irreversible or security-sensitive actions, merges, or a plan too broken to continue.
 3. **Per task:** worktree → fresh **coder** → **gate** → cross-family **reviewer**.
-4. **Escalation ladder**, the same for gate failures and review findings: rounds 1–3 resume the same coder; round 4 starts a fresh coder on a stronger model; at round 5 the main agent adjudicates what's left and either rules or stops.
-5. **Final whole-branch review**, then a PR. A human merges.
+4. **Escalation ladder**, the same for gate failures and review findings: rounds 1–3 resume the same coder; round 4 starts a fresh coder on a stronger model; at round 5 the main agent adjudicates what's left and either rules or stops. From round 5, `delegate` refuses more coder work on the task unless the main agent rules (step 7).
+5. **Final whole-branch review, then `open_pr`:** dish pushes the run's branch and opens the PR when the gate passes on its head and the final review approved that head. A human merges.
 
 ### Gates (structural)
 
@@ -130,16 +130,16 @@ Each is its own bundle. "Provides" names its Cordis service; plugins depend only
 | `config-store` | `dishConfig` | — | the config git repo: namespaced documents, history, diff, revert, change events |
 | `prompts` | `dishPrompts` | `dishConfig` | role prompts plus the editor page (edit, history, diff, revert) |
 | `skills` | `dishSkills` | `dishConfig` (optional); reads `dishCrew` and `agentPresets` when present | dish's own skills (the pipeline's brainstorm, plan, test-first and review procedures, and others), stored and versioned in the config store; offering each agent its role's skills through dsh's skill registry; Settings → Skills. See the [skills spec](specs/skills.md) |
-| `crew` | `crew` | `prompts`, `dishConfig` | roles, model tiers, the model-family rule, giving each delegated child its role's identity and tools, the `delegate` tool. On dsh-subagent, not dsh's agent teams: see [the research note](research/2026-10-01-dsh-agent-team.md) |
+| `crew` | `crew` | `prompts`, `dishConfig` | roles, model tiers, the model-family rule, giving each delegated child its role's identity and tools, the `delegate` tool (with `ruling` and `final`), coders' and reviewers' structured `report`, and the `dish-crew/delegated` and `dish-crew/settled` events. On dsh-subagent, not dsh's agent teams: see [the research note](research/2026-10-01-dsh-agent-team.md) |
 | `projects` | `dishProjects` | `dishConfig` (optional); drives `dishWorkspaces`, read with `ctx.get` | the repo registry `projects.yaml` (family, role, gate and its timeout and environment, setup), each project's onboarding status and the queue that drives it, Settings → Projects. See the [projects and workspaces spec](specs/projects-workspaces.md) |
-| `workspaces` | `dishWorkspaces` | nothing at load; reads `dishProjects`, `dishCrew` and `credentials` with `ctx.get`, waits for `workspaceRegistry` and `tools` | clones in the work root, the GitHub App (read tokens and the credential helper), setup on its own fresh clone, workspace registration and the scratch workspace, task worktrees with the `worktree` tool, the sweep of merged ones, Settings → GitHub App |
-| `gates` | `dishGates` | nothing at load; reads `dishCrew`, `dishWorkspaces`, `dishProjects` and dsh's `shell` with `ctx.get` | running a project's gate in a bound coder's worktree at turn-stop, through dsh's sandboxed shell; steering a failure back, up to 3 gate runs a turn; the gate logs. Results go in crew's record, which owns the finish notice's gate line and the review check. See the [gates spec](specs/gates.md) |
-| `orchestrator` | — | `crew`, `skills`, `workspaces`, `families` | the main-agent preset and the pipeline as prompts, skills and ledger tools |
+| `workspaces` | `dishWorkspaces` | nothing at load; reads `dishProjects`, `dishCrew` and `credentials` with `ctx.get`, waits for `workspaceRegistry` and `tools` | clones in the work root, the GitHub App (read tokens and the credential helper), setup on its own fresh clone, workspace registration and the scratch workspace, task worktrees with the `worktree` tool, the sweep of merged ones, Settings → GitHub App; and, for `orchestrator`, `headOf`, `isClean`, `compareBranch`, `pushBranch`, `openPull`, `updatePull`, `commentPull` and `readPull` |
+| `gates` | `dishGates` | nothing at load; reads `dishCrew`, `dishWorkspaces`, `dishProjects` and dsh's `shell` with `ctx.get` | running a project's gate in a bound coder's worktree at turn-stop, through dsh's sandboxed shell; steering a failure back, up to 3 gate runs a turn; gating after a coder's `report`; `runAt` for `open_pr`; the gate logs; the `dish-gates/result` event. Results go in crew's record, which owns the finish notice's gate line and the review check. See the [gates spec](specs/gates.md) |
+| `orchestrator` | `dishRuns` | nothing at load; reads `dishCrew`, `dishGates`, `dishWorkspaces`, `dishProjects` and dsh's `agents` with `ctx.get` | runs, their ledgers, the `run`, `open_pr` and `pr_feedback` tools, and Settings → Runs. The dish preset stays in `crew`. See the [orchestrator spec](specs/orchestrator.md) |
 | `families` | `families` | `dishConfig`, `projects` | direction, initiatives, ledger, the Families page |
 | `inbox` | `inbox` | — | items (proposal, approval, result) and the mobile-friendly page |
 | `triggers` | — | `families`, `inbox` | schedules and GitHub events → main-agent wake-ups |
 | `memory` | `memory` | — | the vault: notes, search and agent tools |
-| `judge` | `judge` | `dishConfig` (thresholds) | the TypeSafe Jev client, the key settings card, guardrails (approval answerer and result screen), `ask_judge` |
+| `judge` | `judge` | `dishConfig` (thresholds) | the TypeSafe Jev client, the key settings card, guardrails (approval answerer and result screen, whose `tools.screened` names `pr_feedback`), `ask_judge` |
 | `web` | — | dsh's `webRuntime` | settings over the tailnet: pages on the trusted host count as the operator's own machine. See the [ops spec](specs/ops.md#settings-over-the-tailnet-dish-web) |
 | `copilot` (done) | `copilotCatalog` | — | Copilot sign-in and the live model catalog |
 | later: `copilot-usage`, `infra` (with a tiered approval answerer), `web-research` | | | |
@@ -194,7 +194,7 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
   - GPT-5 mini passed an invented route (`openai/gpt-4o-mini`). The child failed after starting and the notice said only "left no closing message", so the main agent retried 67 times.
   - Fix: `delegate` now checks the route synchronously (errors name the valid models), treats empty strings as absent, and caps children per agent.
   - Generalization: anything a model can get wrong that costs quota gets a structural check.
-- **Don't trust the main agent's account of events.** When `delegate` failed to load, the main agent fabricated a plausible results table. The ledger and the inbox must record harness events (delegations, settlements, gate runs), not model claims.
+- **Don't trust the main agent's account of events.** When `delegate` failed to load, the main agent fabricated a plausible results table. The ledger and the inbox must record harness events (delegations, settlements, gate runs), not model claims (step 7: the run's ledger does, from listeners; the main agent's own entries are marked `by: main`).
 - **Child failure notices hide the cause.** `crew` should attach the child's error to the notice it sends the parent.
 - **The main agent's prompt must say "end your turn, you'll be notified".** In headless mode, without that instruction, it busy-polled `list_agents`. With it, in the web UI, it ended its turn properly.
 - **Children inherit the parent's other delegation tools** (`subagent`, `subagent_fork`, `workflow`). Depth limits make them fail, but they should be filtered out for children.
@@ -207,7 +207,7 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
 2. **dsh's own home.** `~/.dsh` mixes dsh's config and data. Leave it, or point `DSH_HOME` somewhere XDG-shaped?
 3. ~~**The VM.**~~ Settled 2026-10-01: a Debian 13 VM on Minideb, provisioned by fleet with OpenTofu and Ansible, running `dsh web` as a systemd user unit (see the [deploy spec](specs/deploy.md) and the [ops spec](specs/ops.md)).
 4. ~~**Gate environment.**~~ Settled 2026-10-03 (the [gates spec](specs/gates.md)): a gate runs in the sandbox the coder's own commands run in (on the VM, the clone, `/tmp` and the home directory less a protected list), with the network open, the coder's environment plus the project's `gateEnv` (no secret-looking names), and the project's `gateTimeout`, at most 10 minutes.
-5. ~~**Main-agent preset vs global `delegate`.**~~ Settled 2026-10-01: `delegate` is a row in the dish preset, which `crew` owns until `orchestrator` (see the [crew spec](specs/crew.md)).
+5. ~~**Main-agent preset vs global `delegate`.**~~ Settled 2026-10-01: `delegate` is a row in the dish preset, which `crew` owns (step 7 left it there; see the [crew spec](specs/crew.md)).
 6. **Public access with GitHub sign-in, instead of Tailscale only** (raised 2026-09-30, to settle at deployment). You may make dish publicly reachable, signing in with GitHub and allowing only your account and members of the `frostyard` org, so others can use it. This would reopen several decisions:
    - **Access** (currently Tailscale only, Funnel only for webhooks): dsh's own token-in-URL auth would sit behind an OAuth front, either a proxy or a dsh plugin.
    - **Multi-user:**

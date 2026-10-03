@@ -11,10 +11,18 @@
  *   `worktreeBindings(path)` is the children bound to a worktree, with whether each is running (for `delegate`, and for
  *   dish-workspaces' `list`, `remove` and sweep);
  * - captures every crew child's runs: the error an `agent/error` reports is held for the child, `subagent/end` files the
- *   run, with that error and the closing message, in the record, and `subagent/start` marks the child running again (dsh
- *   starts a run each time it brings a child up, not only the first). A child's starts and ends are recorded in the order
- *   they were published. The listeners are the host's, so they hear every agent, and they act only on children the
- *   record knows. They never throw;
+ *   run, with that error, the closing message and the id of its finish notice, in the record, and `subagent/start` marks
+ *   the child running again (dsh starts a run each time it brings a child up, not only the first). A child's starts and
+ *   ends are recorded in the order they were published. The listeners are the host's, so they hear every agent, and they
+ *   act only on children the record knows. They never throw;
+ * - publishes `dish-crew/settled` (see `events.ts`) once `subagent/end` has filed a crew child's run, with the session, the
+ *   child as filed and the run (its structured report included), and awaits its listeners, up to their budget, before
+ *   `whenRecorded` resolves: a child's next start or end waits as well. `delegate` publishes `dish-crew/delegated`, and the
+ *   `settled` of a start dsh refused;
+ * - keeps the id of each finish notice: an `agent/inbox/inserted` listener notes a `subagent-settled` message's id for its
+ *   child, and that child's `subagent/end`, which dsh emits in the same synchronous run, just after it delivers the notice
+ *   (`notifySettlement`, then `observer.settle`, in dsh-subagent), takes it for the run (`RunRecord.notice`). An id whose end
+ *   doesn't come in that run is dropped at the next microtask, so it can't land on a later run;
  * - at start, before it provides the service, removes the sessions' records not written to for 180 days;
  * - guards its children's approvals (see `guard.ts`): an `approval/request` listener that refuses a crew child's request when
  *   dish-judge, whose answerer is the only one a child has, is not loaded. It is registered before anything is awaited, so there is
@@ -22,7 +30,14 @@
  * - guards its children's reports (see `report-guard.ts`): a prepended `tools/pre-execute` listener that refuses a crew child's
  *   `send_message` longer than `messageLimit` characters and then closes `send_message` to that child until its run ends
  *   (`subagent/end` opens it), so that a child reports once, in its closing message, and the main agent gets one delivery.
- *   Registered with the approval guard, before anything is awaited;
+ *   Registered with the approval guard, before anything is awaited. A coder or a reviewer that has `report` is told to report
+ *   with it instead (the guard's `reports`);
+ * - gives each crew coder and reviewer the `report` tool (see `report.ts`), on its own scope at `agent/created` (and, when crew
+ *   loads, each child already in dsh's agent registry), and takes it back at `agent/disposed`: it records the child's
+ *   structured report (`setReport`) and ends its turn. A prepended `agent/turn-stopping` listener sends a coder or reviewer
+ *   whose turn ends without a successful `report` back to call it, at most `reportSteers` times a turn (0 turns it off; the
+ *   tool stays), and `reportSteered(childId)` says it did, for dish-gates at the same stop. What it needs of each session
+ *   comes from `session/event` and `tools/result`. All of it is registered before anything is awaited;
  * - claims `crew.yaml` in the store and seeds it when `dishConfig` is there, moving an unedited earlier default to the
  *   current one. `dishConfig` is optional, so there is no order to keep: with no store, every answer is the shipped
  *   default;
@@ -37,16 +52,25 @@ import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
+import { publisher } from './events.ts'
 import { approvalGuard } from './guard.ts'
 import { CrewRecords, closingOf, isRunning } from './record.ts'
 import type { EndedRun, LiveAgents } from './record.ts'
 import { DEFAULT_MESSAGE_LIMIT, reportGuard } from './report-guard.ts'
+import { DEFAULT_REPORT_STEERS, ReportRegistrar, ReportTracker, reportSteerListener } from './report.ts'
+import type { RegisteringAgent } from './report.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, PREVIOUS_HASHES, parseSettings } from './settings.ts'
 import type { CrewSettings } from './settings.ts'
 
 export type { CrewSettings, FamilySettings, Limits, ParseResult, RoleSettings, Tier } from './settings.ts'
 export type { ChildRecord, ChildStatus, EndedRun, GateOutcome, GateResult, LiveAgents, NewChild, RunEnd, RunRecord } from './record.ts'
 export { CrewRecords, gateProblem, isRunning, latestGate, statusFor } from './record.ts'
+export type {
+  CoderReport, CoderStatus, NotFixed, ReportRole, ReportRuling, ReviewAddressed, ReviewCheck, ReviewerReport, ReviewFinding, Severity,
+  StructuredReport, Verdict,
+} from './record.ts'
+export { CODER_STATUSES, SEVERITIES, VERDICTS, maskReport, reportProblem, reportRole } from './record.ts'
+export type { CrewDelegated, CrewSettled } from './events.ts'
 
 export const name = 'dish-crew'
 
@@ -74,8 +98,9 @@ export interface DishCrew {
   readonly records: CrewRecords
   /**
    * The latest `subagent/end` of `childId` that is still being recorded, or `undefined` if none is. It resolves, never
-   * rejects, with where the report went, or `undefined` if the child isn't a crew child or recording failed (which is
-   * logged). Once it has resolved it is gone from here: the run is in `records`.
+   * rejects, with where the report went and what was filed, or `undefined` if the child isn't a crew child or recording
+   * failed (which is logged). It resolves once `dish-crew/settled`'s listeners have, or their budget is spent. Once it has
+   * resolved it is gone from here: the run is in `records`.
    */
   whenRecorded(childId: string): Promise<EndedRun | undefined> | undefined
   /** The `ctx.subagents` provider the crew's children are created on: the `subagentProvider` setting. The preset row can't see the host's config. */
@@ -88,6 +113,11 @@ export interface DishCrew {
    * `last === 'running'`. Rejects only if the record can't be read.
    */
   worktreeBindings(worktree: string): Promise<WorktreeBinding[]>
+  /**
+   * Whether crew sent this child back to call `report` at its current stop: true from that steer until the child's next
+   * assistant message, or its next turn. dish-gates reads it at agent/turn-stopping, after crew's prepended listener.
+   */
+  reportSteered(childId: string): boolean
 }
 
 // Here, with the type, so that whoever imports it also gets `ctx.get('dishCrew')` typed.
@@ -101,6 +131,7 @@ export interface Config {
   dataDirectory: string
   subagentProvider: string
   messageLimit: number
+  reportSteers: number
   terminal: boolean
 }
 
@@ -111,6 +142,8 @@ export const Config: Schema<Config> = Schema.object({
     .description('The ctx.subagents provider that creates the crew\'s children in-process.'),
   messageLimit: Schema.natural().default(DEFAULT_MESSAGE_LIMIT)
     .description('The most characters a crew child\'s send_message may have. A longer one is taken for the child\'s report: it is refused, and send_message stays closed to that child until it finishes, so that its closing message is its report and the main agent gets one delivery, not two. 0 turns this off.'),
+  reportSteers: Schema.natural().default(DEFAULT_REPORT_STEERS)
+    .description('How many times in one turn a coder or reviewer that ends its turn without calling report is sent back to call it. 0 turns this off: the tool is still there, and nothing asks for it.'),
   terminal: Schema.boolean().default(true)
     .description('Print this plugin\'s messages to the terminal.'),
 })
@@ -253,6 +286,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const records = new CrewRecords(directory, (session, path) => {
     warn('the record of session %s is not valid; it was moved to %s and the session starts a new one, so its delegation count starts again from 0', session, path)
   })
+  // `dish-crew/settled`, once a run is filed. Before the first `await`, like the listeners.
+  const publish = publisher(ctx, warn)
 
   // A crew child asks nobody but dish-judge: when dish-judge is not loaded, its approval requests are refused here, not left to the
   // browser, where nobody sees them and nothing times them out. The services are looked up on each request, so the order the two
@@ -271,6 +306,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     },
   }), { prepend: true })
 
+  // Who crew gave `report` (see `report.ts`): made before the guard, whose refusals name `report` for those children.
+  const tracker = new ReportTracker()
+  const registrar = new ReportRegistrar({ records, tracker, effect: execute => ctx.effect(execute), warn })
+
   // A crew child reports once, in its closing message: a `send_message` longer than `messageLimit` is refused, and the child may not
   // send another until its run ends (see `report-guard.ts`; `subagent/end` below opens it). Prepended, like the guard above, so
   // that a call it refuses reaches nothing after it: no PreToolUse hook, no auto-review classifier (an LLM call) and no
@@ -283,8 +322,35 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     messageLimit: config.messageLimit,
     isCrewChild,
     tell: (message) => { warn('%s', message) },
+    reports: (agent) => {
+      try {
+        return registrar.roleOf(agent as object) !== undefined
+      } catch {
+        return false
+      }
+    },
   })
   ctx.on('tools/pre-execute', report, { prepend: true })
+
+  // The `report` tool and its steer (see `report.ts`). Before the first `await`, like the guards: a child created while crew
+  // loads gets its `report`, and a stop is never heard without the steer. What crew needs of each session comes from
+  // `session/event` (the turn, and each assistant message, which clears a report and a steer) and `tools/result` (a successful
+  // `report` that concluded the turn). The steer is prepended, so dish-gates' listener, whatever the load order, runs after it
+  // and reads `reportSteered` at the same stop.
+  ctx.on('session/event', (session, event) => { tracker.observe(session, event) })
+  ctx.on('tools/result', (exec, result) => { tracker.result(exec, result) })
+  ctx.on('agent/created', async (payload): Promise<undefined> => {
+    await registrar.attach((payload as { agent?: unknown } | null | undefined)?.agent as RegisteringAgent)
+    return undefined
+  })
+  ctx.on('agent/disposed', (payload) => {
+    const agent: unknown = (payload as { agent?: unknown } | null | undefined)?.agent
+    if (typeof agent !== 'object' || agent === null) return
+    registrar.detach(agent)
+    const id = idOf(agent)
+    if (id !== undefined) tracker.forget(id)
+  })
+  ctx.on('agent/turn-stopping', reportSteerListener({ limit: config.reportSteers, tracker, roleOf: agent => registrar.roleOf(agent), warn }), { prepend: true })
 
   // The error each crew child's agent last reported, until its `subagent/end`. The promise answers whether the agent is a
   // crew child (the record has to be asked), and an agent that isn't takes its entry out, so what is kept is the
@@ -296,6 +362,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const chain = new Map<string, Promise<void>>()
   // The end of each child that is being recorded now, until it is. For `whenRecorded`: starts are not in it. Never rejects.
   const pending = new Map<string, Promise<EndedRun | undefined>>()
+  // The id of the finish notice dsh just delivered for each child, until that child's `subagent/end` takes it, or the
+  // microtask after it was delivered drops it: dsh delivers the notice and emits the end in one synchronous run.
+  const settling = new Map<string, string>()
 
   /** Do `job` for child `id` after whatever is being recorded for it. A failure is logged as `failed` says and gives `undefined`. */
   const inOrder = <T>(id: string, failed: string, job: () => Promise<T>): Promise<T | undefined> => {
@@ -360,6 +429,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   })
 
+  // dsh delivers a child's finish notice to its parent's inbox (`notifySettlement` in dsh-subagent) and then, in the same
+  // synchronous run, emits the child's `subagent/end` (`observer.settle`): the id is noted here and taken there.
+  ctx.on('agent/inbox/inserted', (payload) => {
+    try {
+      const message: unknown = (payload as { message?: unknown } | null | undefined)?.message
+      if (!isObject(message)) return
+      const { source, id } = message as { source?: unknown, id?: unknown }
+      if (!isObject(source) || source.kind !== 'subagent-settled') return
+      const sender = source.senderSessionId
+      if (typeof sender !== 'string' || sender === '' || typeof id !== 'string') return
+      const noticeId = String(id)
+      settling.set(sender, noticeId)
+      queueMicrotask(() => {
+        if (settling.get(sender) === noticeId) settling.delete(sender)
+      })
+    } catch (cause) {
+      warn('could not note the finish notice of a child: %s', describe(cause))
+    }
+  })
+
   ctx.on('subagent/end', (info) => {
     try {
       const event: unknown = info
@@ -370,9 +459,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const { stopReason, lastAssistantMessage } = event as { stopReason?: unknown, lastAssistantMessage?: unknown }
       const error = remembered.get(id)
       remembered.delete(id)
+      const notice = settling.get(id)
+      settling.delete(id)
       const closing = closingOf(lastAssistantMessage)
-      const run = inOrder(id, 'could not record the end of child %s: %s',
-        async () => records.endRun(id, { stopReason: stopReason as string, error: await error, closing }))
+      const run = inOrder(id, 'could not record the end of child %s: %s', async () => {
+        const ended = await records.endRun(id, { stopReason: stopReason as string, error: await error, closing, ...notice === undefined ? {} : { notice } })
+        // Awaited here, so `whenRecorded`, and this child's next start or end, wait for the listeners (up to their budget).
+        if (ended !== undefined) await publish('dish-crew/settled', { sessionId: ended.sessionId, child: ended.child, run: ended.run })
+        return ended
+      })
       pending.set(id, run)
       void run.then(() => {
         if (pending.get(id) === run) pending.delete(id)
@@ -428,10 +523,20 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   try {
     ctx.provide('dishCrew', {
       settings, records, whenRecorded: (childId: string) => pending.get(childId), subagentProvider: text(config.subagentProvider) ?? 'spawn', worktreeBindings,
+      reportSteered: (childId: string) => tracker.steered(childId),
     })
   } catch (error) {
     // Unloaded while it was pruning: the plugin is going away, and didn't fail.
     if (unloaded(error)) return
     throw error
+  }
+
+  // Children already running when crew loads (crew reloaded, or loaded after them) were created before its `agent/created`
+  // listener was there: they get their `report` now. `attach` never rejects, and leaves alone what isn't a crew coder or reviewer.
+  try {
+    const agents = (lookup.get('agents') as { list?(): unknown[] } | undefined)?.list?.() ?? []
+    for (const agent of agents) void registrar.attach(agent as RegisteringAgent)
+  } catch (error) {
+    warn('could not give the crew children already running the report tool: %s', describe(error))
   }
 }

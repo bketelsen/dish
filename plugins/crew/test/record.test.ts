@@ -4,10 +4,16 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { CrewRecords, GATE_OUTCOMES, STOP_REASON_STATUS, TEMP_GRACE_MS, closingOf, gateProblem, isRunning, latestGate, reportContent, statusFor } from '../src/record.ts'
-import type { ChildRecord, GateResult, NewChild } from '../src/record.ts'
+import {
+  CODER_STATUSES, CrewRecords, GATE_OUTCOMES, SEVERITIES, STOP_REASON_STATUS, TEMP_GRACE_MS, VERDICTS, closingOf, gateProblem, isRunning, latestGate,
+  maskReport, reportContent, reportProblem, reportRole, statusFor,
+} from '../src/record.ts'
+import type { ChildRecord, CoderReport, GateResult, NewChild, ReviewerReport, StructuredReport } from '../src/record.ts'
 import * as crewIndex from '../src/index.ts'
-import type { GateOutcome as IndexGateOutcome, GateResult as IndexGateResult } from '../src/index.ts'
+import type {
+  CoderReport as IndexCoderReport, GateOutcome as IndexGateOutcome, GateResult as IndexGateResult, ReviewerReport as IndexReviewerReport,
+  StructuredReport as IndexStructuredReport,
+} from '../src/index.ts'
 import { tempDir } from './helpers.ts'
 
 const HOUR = 60 * 60 * 1000
@@ -356,7 +362,7 @@ test('endRun writes the closing message as a report named for the child\'s order
   const before = Date.now()
   const ended = await records.endRun('c1', { stopReason: 'completed', closing: 'I added the login.\n\nTests pass.' })
   const file = join(sessionDir(directory, 's1'), '2-coder-1.md')
-  assert.deepEqual(ended, { report: file })
+  assert.equal(ended?.report, file)
   assert.equal(await readFile(file, 'utf8'), 'I added the login.\n\nTests pass.\n')
   const [, child] = await records.children('s1')
   assert.equal(child!.last, 'finished')
@@ -374,8 +380,8 @@ test('a second run is another report and another run, and the last status is the
   await records.addFollowUp('c1')
   const second = await records.endRun('c1', { stopReason: 'completed', closing: 'all done' })
   const dir = sessionDir(directory, 's1')
-  assert.deepEqual(first, { report: join(dir, '1-coder-1.md') })
-  assert.deepEqual(second, { report: join(dir, '1-coder-2.md') })
+  assert.equal(first?.report, join(dir, '1-coder-1.md'))
+  assert.equal(second?.report, join(dir, '1-coder-2.md'))
   assert.equal(await readFile(join(dir, '1-coder-1.md'), 'utf8'), 'half done\n')
   assert.equal(await readFile(join(dir, '1-coder-2.md'), 'utf8'), 'all done\n')
   const [child] = await records.children('s1')
@@ -427,7 +433,7 @@ test('a new CrewRecords on the same directory still has the children, and can fi
   assert.deepEqual((await restarted.lookup('c2'))?.sessionId, 's1')
   // The pointer is what finds c2's session: this instance has never seen c2.
   const ended = await restarted.endRun('c2', { stopReason: 'completed', closing: 'second' })
-  assert.deepEqual(ended, { report: join(sessionDir(directory, 's1'), '2-researcher-1.md') })
+  assert.equal(ended?.report, join(sessionDir(directory, 's1'), '2-researcher-1.md'))
   await restarted.addFollowUp('c1')
   await restarted.endRun('c1', { stopReason: 'completed', closing: 'again' })
   const [c1, c2] = await restarted.children('s1')
@@ -643,6 +649,16 @@ const BAD_FILES: Array<[string, string | ((good: any) => unknown)]> = [
   ['a gateOverride that is not a string', (good) => { good.children[0].gateOverride = 5; return good }],
   ['a gateOverride that is null', (good) => { good.children[0].gateOverride = null; return good }],
   ['a gateOverrideAt that is not finite', (good) => { good.children[0].gateOverrideAt = 'today'; return good }],
+  ['a gate head that is not a commit id', (good) => { good.children[0].gates = [{ ...gate(), head: 'xyz' }]; return good }],
+  ['a run ref that is not a string', (good) => { good.children[0].run = 7; return good }],
+  ['a task that is not a string', (good) => { good.children[0].task = ['fix-1']; return good }],
+  ['a final that is false', (good) => { good.children[0].final = false; return good }],
+  ['a final that is the string true', (good) => { good.children[0].final = 'true'; return good }],
+  ['a report on the child that is malformed', (good) => { good.children[0].report = { ...coderReport(), status: 'maybe' }; return good }],
+  ['a report on the child that is not an object', (good) => { good.children[0].report = 'done'; return good }],
+  ['a structured report on a run that is malformed', (good) => { good.children[0].runs[0].structured = reviewerReport({ verdict: 'lgtm' as never }); return good }],
+  ['a structuredFile that is not a string', (good) => { good.children[0].runs[0].structuredFile = 5; return good }],
+  ['a notice that is not a string', (good) => { good.children[0].runs[0].notice = 5; return good }],
 ]
 
 for (const [what, make] of BAD_FILES) {
@@ -1318,4 +1334,413 @@ test('the package exports the gate types and helpers', () => {
   const outcome: IndexGateOutcome = 'skipped'
   const result: IndexGateResult = gate({ outcome })
   assert.equal(crewIndex.gateProblem(result), undefined)
+})
+
+// --- structured reports (step 7) ------------------------------------------------------------------
+
+const SHA = '3d412b9e0c85d50cce297dbd2bd3d3e44720aaaa'
+const TOKEN = `ghp_${'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8'}`
+
+/** A coder's report with every field, unless `overrides` says otherwise. */
+function coderReport(overrides: Partial<CoderReport> = {}): CoderReport {
+  return {
+    role: 'coder', turn: 2, at: STARTED + 5000, status: 'done', summary: 'Added the login form; the tests pass.', commits: [SHA],
+    rulings: [{ what: 'kept the old route', why: 'callers use it', costIfWrong: 'one more redirect' }], concerns: ['the session store is in memory'],
+    notFixed: [{ finding: 'rename x', why: 'out of scope' }], ...overrides,
+  }
+}
+
+/** A reviewer's report with every field, unless `overrides` says otherwise. */
+function reviewerReport(overrides: Partial<ReviewerReport> = {}): ReviewerReport {
+  return {
+    role: 'reviewer', turn: 1, at: STARTED + 6000, verdict: 'changes_requested', head: SHA, summary: 'One bug, one nit.',
+    findings: [
+      { severity: 'blocking', file: 'src/login.ts', line: 12, summary: 'off by one', fix: 'use <=' },
+      { severity: 'nit', file: 'README.md', summary: 'a typo', fix: 'spell it out' },
+    ],
+    checks: [{ command: 'pnpm test', exitCode: 0, summary: 'all pass' }],
+    addressed: [{ finding: 'the earlier race', addressed: true, evidence: 'login.ts:40 takes the lock' }],
+    ...overrides,
+  }
+}
+
+/** Reports that are not one, each with the field path its problem names. */
+const BAD_REPORTS: Array<[string, unknown]> = [
+  ['an object', null],
+  ['an object', 'done'],
+  ['an object', [coderReport()]],
+  ['role', { ...coderReport(), role: 'architect' }],
+  ['role', (({ role: _role, ...rest }) => rest)(coderReport())],
+  ['turn', coderReport({ turn: -1 })],
+  ['turn', coderReport({ turn: 1.5 })],
+  ['at', { ...coderReport(), at: 'now' }],
+  ['at', coderReport({ at: Number.NaN })],
+  ['status', { ...coderReport(), status: 'maybe' }],
+  ['summary', (({ summary: _summary, ...rest }) => rest)(coderReport())],
+  ['commits', { ...coderReport(), commits: SHA }],
+  ['commits[1]', { ...coderReport(), commits: [SHA, 5] }],
+  ['blockedOn', { ...coderReport(), blockedOn: 5 }],
+  ['rulings', { ...coderReport(), rulings: {} }],
+  ['rulings[0]', { ...coderReport(), rulings: ['a ruling'] }],
+  ['rulings[0].costIfWrong', { ...coderReport(), rulings: [{ what: 'a', why: 'b' }] }],
+  ['concerns[0]', { ...coderReport(), concerns: [null] }],
+  ['notFixed[0].why', { ...coderReport(), notFixed: [{ finding: 'x', why: 3 }] }],
+  ['verdict', { ...reviewerReport(), verdict: 'lgtm' }],
+  ['head', { ...reviewerReport(), head: 5 }],
+  ['summary', { ...reviewerReport(), summary: null }],
+  ['findings', (({ findings: _findings, ...rest }) => rest)(reviewerReport())],
+  ['findings[0].severity', reviewerReport({ findings: [{ severity: 'major' as never, file: 'a', summary: 'b', fix: 'c' }] })],
+  ['findings[1].line', reviewerReport({ findings: [reviewerReport().findings[0]!, { severity: 'nit', file: 'a', line: 1.5, summary: 'b', fix: 'c' }] })],
+  ['findings[0].file', reviewerReport({ findings: [{ severity: 'nit', summary: 'b', fix: 'c' } as never] })],
+  ['findings[0].fix', reviewerReport({ findings: [{ severity: 'nit', file: 'a', summary: 'b' } as never] })],
+  ['checks', { ...reviewerReport(), checks: 'pnpm test' }],
+  ['checks[0].exitCode', reviewerReport({ checks: [{ command: 'pnpm test', exitCode: 'x' as never, summary: 's' }] })],
+  ['addressed', { ...reviewerReport(), addressed: 'yes' }],
+  ['addressed[0].addressed', reviewerReport({ addressed: [{ finding: 'f', addressed: 'yes' as never, evidence: 'e' }] })],
+]
+
+test('the report enums are frozen, in their order', () => {
+  assert.deepEqual([...CODER_STATUSES], ['done', 'blocked', 'needs_context'])
+  assert.deepEqual([...VERDICTS], ['approved', 'changes_requested'])
+  assert.deepEqual([...SEVERITIES], ['blocking', 'should_fix', 'nit'])
+  for (const list of [CODER_STATUSES, VERDICTS, SEVERITIES]) assert.ok(Object.isFrozen(list))
+})
+
+test('reportProblem names each wrong field, and nothing for full and minimal reports', () => {
+  assert.equal(reportProblem(coderReport()), undefined)
+  assert.equal(reportProblem(reviewerReport()), undefined)
+  assert.equal(reportProblem({ role: 'coder', turn: 0, at: 1, status: 'blocked', summary: '' }), undefined)
+  assert.equal(reportProblem({ role: 'reviewer', turn: 0, at: 1, verdict: 'approved', head: 'HEAD', summary: ' ', findings: [] }), undefined)
+  // A reviewer of work outside git gives no head.
+  assert.equal(reportProblem({ role: 'reviewer', turn: 0, at: 1, verdict: 'approved', summary: 'Fine.', findings: [] }), undefined)
+  // What the tool checks, the record doesn't: a blank blockedOn, the form of head, blank strings.
+  assert.equal(reportProblem(coderReport({ status: 'needs_context', summary: '   ' })), undefined)
+  for (const [path, value] of BAD_REPORTS) {
+    const problem = reportProblem(value)
+    assert.equal(typeof problem, 'string', JSON.stringify(value))
+    assert.ok(problem!.startsWith(path) || path === 'an object', `${problem} should start with ${path}`)
+    if (path === 'an object') assert.match(problem!, /object/)
+  }
+  assert.equal(reportProblem(BAD_REPORTS.find(([path]) => path === 'findings[0].severity')![1]), 'findings[0].severity must be one of blocking, should_fix, nit')
+})
+
+test('maskReport masks every string, nested ones included, and keeps the rest', () => {
+  const masked = maskReport(reviewerReport({
+    summary: `uses ${TOKEN}`,
+    findings: [{ severity: 'blocking', file: 'src/a.ts', line: 3, summary: 'a token', fix: `remove ${TOKEN}` }],
+    checks: [{ command: `curl -H "Authorization: token ${TOKEN}"`, exitCode: 0, summary: 'ok' }],
+  }))
+  const text = JSON.stringify(masked)
+  assert.ok(!text.includes(TOKEN), text)
+  assert.match((masked as ReviewerReport).summary, /^uses ‹secret/)
+  assert.equal((masked as ReviewerReport).findings[0]!.line, 3)
+  assert.equal((masked as ReviewerReport).checks![0]!.exitCode, 0)
+  assert.equal(masked.role, 'reviewer')
+  const coder = maskReport({ ...coderReport({ concerns: [TOKEN] }), extra: TOKEN } as CoderReport)
+  assert.ok(!JSON.stringify(coder).includes(TOKEN))
+  assert.ok(!('extra' in coder))
+})
+
+test('reportRole: a coder by its role, a reviewer by reviews, and nothing for the other roles', () => {
+  assert.equal(reportRole({ role: 'coder' }), 'coder')
+  assert.equal(reportRole({ role: 'reviewer', reviews: 'c1' }), 'reviewer')
+  assert.equal(reportRole({ role: 'reviewer', reviews: 'main' }), 'reviewer')
+  assert.equal(reportRole({ role: 'ops' }), undefined)
+  assert.equal(reportRole({ role: 'writer' }), undefined)
+  assert.equal(reportRole({ role: 'researcher' }), undefined)
+})
+
+test('setReport keeps a masked copy on the run in progress and gives it back; a second replaces the first; it survives a restart', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('r1', { role: 'reviewer', reviews: 'c1' }))
+  const given = reviewerReport({ summary: `found ${TOKEN}`, findings: [{ severity: 'should_fix', file: 'a.ts', summary: 'leak', fix: `revoke ${TOKEN}` }] })
+  const stored = await records.setReport('r1', given)
+  assert.ok(stored !== undefined)
+  assert.ok(!JSON.stringify(stored).includes(TOKEN))
+  assert.deepEqual(stored, maskReport(given))
+  assert.deepEqual((await records.lookup('r1'))!.record.report, stored)
+  assert.ok(!(await readFile(join(sessionDir(directory, 's1'), 'children.json'), 'utf8')).includes(TOKEN))
+  // What it gives back is a copy.
+  ;(stored as ReviewerReport).summary = 'changed'
+  assert.notEqual((await records.lookup('r1'))!.record.report!.summary, 'changed')
+
+  const second = reviewerReport({ verdict: 'approved', findings: [], summary: 'fixed' })
+  await records.setReport('r1', second)
+  assert.deepEqual((await records.lookup('r1'))!.record.report, second)
+  const { records: restarted, corrupt } = reopen(directory)
+  assert.deepEqual((await restarted.lookup('r1'))!.record.report, second)
+  assert.deepEqual(corrupt, [])
+})
+
+test('setReport drops unknown fields, and the caller\'s object can\'t change what is stored', async () => {
+  const { records } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  const given = { ...coderReport(), extra: 'dropped', rulings: [{ what: 'a', why: 'b', costIfWrong: 'c', more: 1 }] } as unknown as CoderReport
+  const setting = records.setReport('c1', given)
+  given.summary = 'changed afterwards'
+  given.rulings![0]!.what = 'changed afterwards'
+  const stored = await setting
+  assert.ok(!('extra' in stored!))
+  assert.deepEqual((stored as CoderReport).rulings, [{ what: 'a', why: 'b', costIfWrong: 'c' }])
+  assert.equal(stored!.summary, coderReport().summary)
+  // A minimal report has none of the optional fields.
+  const minimal = await records.setReport('c1', { role: 'coder', turn: 0, at: 1, status: 'done', summary: 'done' })
+  assert.deepEqual(minimal, { role: 'coder', turn: 0, at: 1, status: 'done', summary: 'done' })
+})
+
+test('setReport for a child that is not recorded is undefined, and writes nothing', async () => {
+  const { records, directory } = await fixture()
+  assert.equal(await records.setReport('nobody', coderReport()), undefined)
+  assert.equal(await records.setReport('', coderReport()), undefined)
+  assert.equal(await exists(join(directory, 'sessions')), false)
+})
+
+test('a malformed report is a TypeError, and the record is left byte for byte', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  await records.setReport('c1', coderReport())
+  const file = join(sessionDir(directory, 's1'), 'children.json')
+  const before = await readFile(file)
+  const { mtimeMs } = await stat(file)
+  const named: Array<[string, unknown]> = [
+    ['role', { ...coderReport(), role: 'architect' }],
+    ['status', { ...coderReport(), status: 'maybe' }],
+    ['summary', (({ summary: _summary, ...rest }) => rest)(coderReport())],
+    ['severity', reviewerReport({ findings: [{ severity: 'major' as never, file: 'a', summary: 'b', fix: 'c' }] })],
+    ['line', reviewerReport({ findings: [{ severity: 'nit', file: 'a', line: 1.5, summary: 'b', fix: 'c' }] })],
+    ['exitCode', reviewerReport({ checks: [{ command: 'x', exitCode: 'x' as never, summary: 's' }] })],
+    ['addressed', reviewerReport({ addressed: [{ finding: 'f', addressed: 'yes' as never, evidence: 'e' }] })],
+    ['turn', coderReport({ turn: -1 })],
+  ]
+  for (const [field, value] of named) {
+    await assert.rejects(records.setReport('c1', value as StructuredReport), (error: unknown) => {
+      assert.ok(error instanceof TypeError, String(error))
+      assert.match(error.message, /^setReport needs a report: /)
+      assert.ok(error.message.includes(field), error.message)
+      return true
+    })
+  }
+  await assert.rejects(records.setReport('nobody', { role: 'architect' } as never), TypeError)
+  assert.deepEqual(await readFile(file), before)
+  assert.equal((await stat(file)).mtimeMs, mtimeMs)
+})
+
+test('endRun writes the run\'s report as <n>-<role>-<run>.json beside the .md, and moves it onto the run', { skip: process.platform === 'win32' }, async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  const given = coderReport({ summary: `done with ${TOKEN}` })
+  const stored = await records.setReport('c1', given)
+  const ended = await records.endRun('c1', { stopReason: 'completed', closing: '' })
+  const dir = sessionDir(directory, 's1')
+  const json = join(dir, '1-coder-1.json')
+  assert.equal(ended!.report, join(dir, '1-coder-1.md'))
+  assert.equal(await readFile(json, 'utf8'), `${JSON.stringify(stored, null, 2)}\n`)
+  assert.ok(!(await readFile(json, 'utf8')).includes(TOKEN))
+  assert.equal((await stat(json)).mode & 0o777, 0o600)
+  assert.equal(await readFile(ended!.report, 'utf8'), '(no closing message)\n')
+  let record = (await records.lookup('c1'))!.record
+  assert.ok(!('report' in record), JSON.stringify(record))
+  assert.deepEqual(record.runs[0]!.structured, stored)
+  assert.equal(record.runs[0]!.structuredFile, json)
+  assert.equal(record.runs[0]!.report, ended!.report)
+
+  // The next run starts with none, and ends with none.
+  await records.addFollowUp('c1')
+  await records.endRun('c1', { stopReason: 'completed', closing: 'text only' })
+  record = (await records.lookup('c1'))!.record
+  assert.ok(!('structured' in record.runs[1]!))
+  assert.ok(!('structuredFile' in record.runs[1]!))
+  assert.equal(await exists(join(dir, '1-coder-2.json')), false)
+  assert.equal(await exists(join(dir, '1-coder-2.md')), true)
+  // And after a restart.
+  const { records: restarted, corrupt } = reopen(directory)
+  assert.deepEqual((await restarted.lookup('c1'))!.record.runs[0]!.structured, stored)
+  assert.deepEqual(corrupt, [])
+})
+
+test('an orphan .json takes the name: both files of the run go to the next free base', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  const dir = sessionDir(directory, 's1')
+  await writeFile(join(dir, '1-coder-1.json'), '{}\n')
+  const ended = await records.endRun('c1', { stopReason: 'completed', closing: 'x' })
+  assert.equal(ended!.report, join(dir, '1-coder-1.2.md'))
+  assert.equal(await exists(join(dir, '1-coder-1.md')), false)
+  // With a report as well: the next run's base is free, and the one after an orphan .md moves both.
+  await writeFile(join(dir, '1-coder-2.md'), 'an orphan\n')
+  await records.setReport('c1', coderReport())
+  const second = await records.endRun('c1', { stopReason: 'completed', closing: 'y' })
+  assert.equal(second!.report, join(dir, '1-coder-2.2.md'))
+  assert.equal(second!.run.structuredFile, join(dir, '1-coder-2.2.json'))
+  assert.equal(await readFile(join(dir, '1-coder-2.md'), 'utf8'), 'an orphan\n')
+  assert.equal(await readFile(join(dir, '1-coder-1.json'), 'utf8'), '{}\n')
+})
+
+test('endRun keeps the notice\'s id when it is a non-empty string, and leaves out anything else', async () => {
+  const { records } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  await records.endRun('c1', { stopReason: 'completed', closing: 'x', notice: 'msg-1' })
+  await records.endRun('c1', { stopReason: 'completed', closing: 'x', notice: '' })
+  await records.endRun('c1', { stopReason: 'completed', closing: 'x', notice: 5 as never })
+  await records.endRun('c1', { stopReason: 'completed', closing: 'x' })
+  const { runs } = (await records.lookup('c1'))!.record
+  assert.equal(runs[0]!.notice, 'msg-1')
+  for (const run of runs.slice(1)) assert.ok(!('notice' in run), JSON.stringify(run))
+})
+
+test('EndedRun has the session, the filed child and the run, as copies', async () => {
+  const { records } = await fixture()
+  await records.addChild('s1', newChild('c0'))
+  await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
+  await records.addGate('c1', gate())
+  await records.setReport('c1', coderReport())
+  const ended = await records.endRun('c1', { stopReason: 'completed', closing: 'done', notice: 'm1' })
+  const record = (await records.lookup('c1'))!.record
+  assert.equal(ended!.sessionId, 's1')
+  assert.deepEqual(ended!.child, record)
+  assert.deepEqual(ended!.run, record.runs.at(-1))
+  assert.deepEqual(ended!.run, ended!.child.runs.at(-1))
+  assert.notEqual(ended!.run, ended!.child.runs.at(-1))
+  assert.deepEqual(ended!.run.gates, [gate()])
+  assert.equal(ended!.run.notice, 'm1')
+  assert.deepEqual(ended!.run.structured, coderReport())
+  ended!.child.title = 'changed'
+  ended!.run.stopReason = 'changed'
+  const again = (await records.lookup('c1'))!.record
+  assert.equal(again.title, 'add login')
+  assert.equal(again.runs[0]!.stopReason, 'completed')
+})
+
+test('setReport and endRun called at once: the report is on the run that ends', async () => {
+  const { records } = await fixture()
+  for (let round = 0; round < 50; round++) {
+    const id = `c${round}`
+    await records.addChild('s1', newChild(id))
+    const [, ended] = await Promise.all([records.setReport(id, coderReport({ turn: round })), records.endRun(id, { stopReason: 'completed', closing: 'x' })])
+    assert.equal(ended!.run.structured?.turn, round, `round ${round}`)
+    assert.ok(!('report' in (await records.lookup(id))!.record))
+  }
+})
+
+test('addChild keeps run, task and final when they are given; refuses them malformed and writes nothing', async () => {
+  const { records, directory } = await fixture()
+  const tagged = await records.addChild('s1', newChild('r1', { role: 'reviewer', reviews: 'c1', run: 'frostyard/snosi/20261003-fix-1', task: 'fix-1', final: true }))
+  assert.equal(tagged.run, 'frostyard/snosi/20261003-fix-1')
+  assert.equal(tagged.task, 'fix-1')
+  assert.equal(tagged.final, true)
+  const plain = await records.addChild('s1', newChild('c2'))
+  for (const field of ['run', 'task', 'final', 'report'] as const) assert.ok(!(field in plain), field)
+  const { records: restarted } = reopen(directory)
+  assert.deepEqual((await restarted.lookup('r1'))!.record, tagged)
+  for (const [field, extra] of [['final', { final: false }], ['run', { run: 7 }], ['task', { task: null }], ['final', { final: 'true' }]] as const) {
+    await assert.rejects(records.addChild('s1', { ...newChild('c3'), ...extra } as unknown as NewChild), (error: unknown) => {
+      assert.ok(error instanceof TypeError)
+      assert.ok(error.message.includes(field), error.message)
+      return true
+    })
+  }
+  assert.match(await records.addChild('s1', { ...newChild('c3'), final: false } as unknown as NewChild).then(() => '', (error: Error) => error.message), /final must be true when it is given/)
+  assert.equal(await records.lookup('c3'), undefined)
+})
+
+test('addFollowUp with final: true marks the child final; without it, final stays; final: false is a TypeError', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('r1', { role: 'reviewer', reviews: 'c1' }))
+  await records.addFollowUp('r1')
+  assert.ok(!('final' in (await records.lookup('r1'))!.record))
+  await records.addFollowUp('r1', { final: true })
+  assert.equal((await records.lookup('r1'))!.record.final, true)
+  await records.addFollowUp('r1')
+  await records.addFollowUp('r1', { gateOverride: 'Ruling: a — b — c' })
+  const record = (await records.lookup('r1'))!.record
+  assert.equal(record.final, true)
+  assert.equal(record.followUps, 4)
+  const file = join(sessionDir(directory, 's1'), 'children.json')
+  const before = await readFile(file)
+  await assert.rejects(records.addFollowUp('r1', { final: false as never }), TypeError)
+  await assert.rejects(records.addFollowUp('r1', { final: 'yes' as never }), /final must be true/)
+  assert.deepEqual(await readFile(file), before)
+})
+
+test('an old children.json, from before reports, run tags and gate heads, still parses', async () => {
+  const { records, directory, corrupt } = await fixture()
+  const dir = sessionDir(directory, 's1')
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'children.json'), JSON.stringify({
+    sessionId: 's1',
+    children: [{
+      id: 'c1', n: 1, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', worktree: TREE_GATED, startedAt: STARTED,
+      followUps: 0, runs: [{ endedAt: STARTED + 1, stopReason: 'completed', report: '/r/1-coder-1.md', gates: [gate()] }], gates: [gate({ turn: 2 })], last: 'running',
+    }],
+  }))
+  const [child] = await records.children('s1')
+  assert.deepEqual(corrupt, [])
+  for (const field of ['run', 'task', 'final', 'report'] as const) assert.ok(!(field in child!), field)
+  for (const field of ['structured', 'structuredFile', 'notice'] as const) assert.ok(!(field in child!.runs[0]!), field)
+  assert.ok(!('head' in child!.runs[0]!.gates![0]!))
+  assert.deepEqual(child!.gates, [gate({ turn: 2 })])
+})
+
+test('a reviewer\'s report without a head (work outside git) is kept, and read back, without one', async () => {
+  const { records, directory, corrupt } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  const { head: _head, ...headless } = reviewerReport()
+  assert.deepEqual(await records.setReport('c1', headless), headless)
+  const again = reopen(directory)
+  assert.deepEqual((await again.records.lookup('c1'))!.record.report, headless)
+  assert.deepEqual([...corrupt, ...again.corrupt], [])
+})
+
+test('a report\'s unknown fields, and a run\'s, are dropped when the record is read', async () => {
+  const { records, directory, corrupt } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  await records.setReport('c1', coderReport())
+  await records.endRun('c1', { stopReason: 'completed', closing: 'x' })
+  await records.setReport('c1', reviewerReport())
+  const file = join(sessionDir(directory, 's1'), 'children.json')
+  const good = JSON.parse(await readFile(file, 'utf8'))
+  good.children[0].runs[0].structured.later = 1
+  good.children[0].runs[0].structured.rulings[0].later = 2
+  good.children[0].report.findings[0].later = 3
+  good.children[0].runs[0].later = 4
+  await writeFile(file, JSON.stringify(good))
+  const record = (await records.lookup('c1'))!.record
+  assert.deepEqual(corrupt, [])
+  assert.deepEqual(record.runs[0]!.structured, coderReport())
+  assert.deepEqual(record.report, reviewerReport())
+  assert.ok(!('later' in record.runs[0]!))
+})
+
+test('addGate keeps head, a sha or null, through a restart; a head that is not a commit id is a TypeError', async () => {
+  const { records, directory } = await fixture()
+  await records.addChild('s1', newChild('c1', { worktree: TREE_GATED }))
+  const withSha = gate({ head: SHA })
+  const withNull = gate({ round: 2, head: null })
+  const long = gate({ round: 3, head: 'f'.repeat(64) })
+  assert.equal(await records.addGate('c1', withSha), true)
+  assert.equal(await records.addGate('c1', withNull), true)
+  assert.equal(await records.addGate('c1', long), true)
+  const { records: restarted } = reopen(directory)
+  assert.deepEqual((await restarted.lookup('c1'))!.record.gates, [withSha, withNull, long])
+  assert.equal(gateProblem(gate()), undefined, 'a gate without a head is still one')
+  const file = join(sessionDir(directory, 's1'), 'children.json')
+  const before = await readFile(file)
+  for (const head of ['xyz', SHA.slice(0, 12), SHA.toUpperCase(), 5, ` ${SHA}`]) {
+    assert.equal(gateProblem(gate({ head: head as never })), 'head must be a commit id or null', String(head))
+    await assert.rejects(records.addGate('c1', gate({ head: head as never })), /^TypeError: addGate needs a gate result: head must be a commit id or null/)
+  }
+  assert.deepEqual(await readFile(file), before)
+})
+
+test('the package exports the report types and helpers', () => {
+  assert.equal(crewIndex.reportProblem, reportProblem)
+  assert.equal(crewIndex.maskReport, maskReport)
+  assert.equal(crewIndex.reportRole, reportRole)
+  assert.equal(crewIndex.CODER_STATUSES, CODER_STATUSES)
+  assert.equal(crewIndex.VERDICTS, VERDICTS)
+  assert.equal(crewIndex.SEVERITIES, SEVERITIES)
+  const coder: IndexCoderReport = coderReport()
+  const reviewer: IndexReviewerReport = reviewerReport()
+  const either: IndexStructuredReport[] = [coder, reviewer]
+  assert.ok(either.every(report => crewIndex.reportProblem(report) === undefined))
 })

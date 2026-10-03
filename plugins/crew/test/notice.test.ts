@@ -12,15 +12,21 @@ import { maskSecrets } from 'dish-kit'
 import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
 import * as row from '../src/delegate.ts'
 import type { DishCrew } from '../src/index.ts'
-import { COMPARE_BYTES, gateLine, noticeSummary, noticeText, rewriteNotices } from '../src/notice.ts'
+import { COMPARE_BYTES, NO_STRUCTURED_REPORT, gateLine, noticeSummary, noticeText, reportBlock, rewriteNotices } from '../src/notice.ts'
 import { CrewRecords } from '../src/record.ts'
 import { BLOCK_END } from '../src/text.ts'
-import type { ChildRecord, EndedRun, GateResult, NewChild, RunRecord } from '../src/record.ts'
+import type { ChildRecord, CoderReport, EndedRun, GateResult, NewChild, ReviewerReport, RunRecord } from '../src/record.ts'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
 import { dirs, mountCrew, provideStub, tempDir, watchLogs } from './helpers.ts'
 
 const SESSION = 'session-main'
 const WHO = 'coder «add login» (claude-sonnet-5.5)'
+/**
+ * What a coder's or a reviewer's notice says of a run that ended without a structured report (step 7). The children of most
+ * tests below are coders whose runs end with text, so their notices say it, between the report (and the gate line) and dsh's
+ * label.
+ */
+const NONE = NO_STRUCTURED_REPORT
 
 const disposables: Array<{ dispose(): Promise<void> | void }> = []
 after(async () => {
@@ -118,7 +124,7 @@ test('a finished child\'s notice names its role, title and model, its report, an
   const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Login works.\n\nTests pass.' })
   const message = settlement('child-1', 'completed', ['Login works.', 'Tests pass.'])
   const [out] = await world.rewrite([message])
-  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. Its closing message:${BLOCK_END}`, 'Login works.', 'Tests pass.'])
+  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Login works.', 'Tests pass.'])
   assert.deepEqual(world.warnings, [])
   // What dsh made stays: the message's identity, the source's kind, form and sender, and the closing blocks are the very objects.
   assert.equal(out!.id, message.id)
@@ -139,7 +145,7 @@ test('a failed child\'s notice says it failed, with the error it reported', asyn
   await world.child()
   const ended = await world.records.endRun('child-1', { stopReason: 'error', error: 'rate limited by the provider', closing: 'Got partway.' })
   const [out] = await world.rewrite([settlement('child-1', 'error', ['Got partway.'])])
-  assert.deepEqual(texts(out), [`${WHO} failed: rate limited by the provider. Report: \`${ended!.report}\`. Its closing message:${BLOCK_END}`, 'Got partway.'])
+  assert.deepEqual(texts(out), [`${WHO} failed: rate limited by the provider. Report: \`${ended!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Got partway.'])
 })
 
 test('a failure with no error recorded is just the verb', async () => {
@@ -147,7 +153,7 @@ test('a failure with no error recorded is just the verb', async () => {
   await world.child()
   const ended = await world.records.endRun('child-1', { stopReason: 'error', closing: '' })
   const [out] = await world.rewrite([settlement('child-1', 'error')])
-  assert.deepEqual(texts(out), [`${WHO} failed. Report: \`${ended!.report}\`. It left no closing message.`])
+  assert.deepEqual(texts(out), [`${WHO} failed. Report: \`${ended!.report}\`. ${NONE} It left no closing message.`])
 })
 
 test('a stopped child\'s notice says it was stopped', async () => {
@@ -155,7 +161,7 @@ test('a stopped child\'s notice says it was stopped', async () => {
   await world.child()
   const ended = await world.records.endRun('child-1', { stopReason: 'aborted', closing: 'Halfway.' })
   const [out] = await world.rewrite([settlement('child-1', 'aborted', ['Halfway.'])])
-  assert.deepEqual(texts(out), [`${WHO} was stopped. Report: \`${ended!.report}\`. Its closing message:${BLOCK_END}`, 'Halfway.'])
+  assert.deepEqual(texts(out), [`${WHO} was stopped. Report: \`${ended!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Halfway.'])
 })
 
 test('each stop reason has its verb, and one dsh adds later is stopped with the reason in brackets', async () => {
@@ -171,7 +177,7 @@ test('each stop reason has its verb, and one dsh adds later is stopped with the 
     await world.child()
     const ended = await world.records.endRun('child-1', { stopReason, closing: 'x' })
     const [out] = await world.rewrite([settlement('child-1', stopReason, ['x'])])
-    assert.equal(texts(out)[0], `${WHO} ${said}. Report: \`${ended!.report}\`. Its closing message:${BLOCK_END}`, stopReason)
+    assert.equal(texts(out)[0], `${WHO} ${said}. Report: \`${ended!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, stopReason)
   }
 })
 
@@ -180,7 +186,7 @@ test('an unknown stop reason with an error says both', async () => {
   await world.child()
   const ended = await world.records.endRun('child-1', { stopReason: 'weird', error: 'it broke', closing: 'x' })
   const [out] = await world.rewrite([settlement('child-1', 'weird', ['x'])])
-  assert.equal(texts(out)[0], `${WHO} stopped (weird): it broke. Report: \`${ended!.report}\`. Its closing message:${BLOCK_END}`)
+  assert.equal(texts(out)[0], `${WHO} stopped (weird): it broke. Report: \`${ended!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
 })
 
 test('an error is one line, and its own full stop is not doubled', async () => {
@@ -188,7 +194,7 @@ test('an error is one line, and its own full stop is not doubled', async () => {
   await world.child()
   const ended = await world.records.endRun('child-1', { stopReason: 'error', error: 'connection reset.\n  retries exhausted. ', closing: 'x' })
   const [out] = await world.rewrite([settlement('child-1', 'error', ['x'])])
-  assert.equal(texts(out)[0], `${WHO} failed: connection reset. retries exhausted. Report: \`${ended!.report}\`. Its closing message:${BLOCK_END}`)
+  assert.equal(texts(out)[0], `${WHO} failed: connection reset. retries exhausted. Report: \`${ended!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
 })
 
 test('a child that left no closing message gets dsh\'s own words for that, after the report', async () => {
@@ -197,7 +203,7 @@ test('a child that left no closing message gets dsh\'s own words for that, after
   const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: '' })
   const message = settlement('child-1', 'completed')
   const [out] = await world.rewrite([message])
-  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. It left no closing message.`])
+  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. ${NONE} It left no closing message.`])
   assert.deepEqual(out!.source, { ...message.source, summary: `${WHO} finished.` })
 })
 
@@ -209,7 +215,7 @@ test('a child with several runs gets the notice of its latest', async () => {
   const second = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'two' })
   assert.notEqual(first!.report, second!.report)
   const [out] = await world.rewrite([settlement('child-1', 'completed', ['two'])])
-  assert.equal(texts(out)[0], `${WHO} finished. Report: \`${second!.report}\`. Its closing message:${BLOCK_END}`)
+  assert.equal(texts(out)[0], `${WHO} finished. Report: \`${second!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
 })
 
 test('a title with the marks in it is shown as it is', async () => {
@@ -231,7 +237,7 @@ test('several notices in one step are each rewritten for their own child, in ord
   const out = await world.rewrite([before, settlement('child-1', 'completed', ['A']), after, settlement('child-2', 'aborted', ['B'])])
   assert.equal(out.length, 4)
   assert.equal(out[0], before)
-  assert.equal(texts(out[1])[0], `coder «one» (claude-sonnet-5.5) finished. Report: \`${a!.report}\`. Its closing message:${BLOCK_END}`)
+  assert.equal(texts(out[1])[0], `coder «one» (claude-sonnet-5.5) finished. Report: \`${a!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
   assert.equal(out[2], after)
   assert.equal(texts(out[3])[0], `architect «two» (claude-opus-5.5) was stopped. Report: \`${b!.report}\`. Its closing message:${BLOCK_END}`)
 })
@@ -323,7 +329,7 @@ test('a notice that arrives before its run is recorded waits for it, then report
   release()
   const [out] = await result
   const run = (await world.records.lookup('child-1'))!.record.runs[0]!
-  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${run.report}\`. Its closing message:${BLOCK_END}`, 'Done.'])
+  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${run.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Done.'])
 })
 
 test('a run that is never recorded: after the wait, the notice is rewritten without the report', async () => {
@@ -357,7 +363,8 @@ test('a recording that rejects is as good as one that finished', async () => {
   await world.records.endRun('child-1', { stopReason: 'completed', closing: 'x' })
   const crew = { records: world.records, whenRecorded: () => Promise.reject(new Error('never happens')) }
   const [out] = await rewriteNotices([settlement('child-1', 'completed', ['x'])], { crew, sessionId: SESSION, warn: (text, ...args) => { world.warnings.push(format(text, ...args)) } })
-  assert.match(texts(out)[0]!, /Report: `.*1-coder-1\.md`\. Its closing message:\n\n$/)
+  assert.match(texts(out)[0]!, /Report: `.*1-coder-1\.md`\. /)
+  assert.ok(texts(out)[0]!.endsWith(`.md\`. ${NONE} Its closing message:${BLOCK_END}`))
   assert.deepEqual(world.warnings, [])
 })
 
@@ -408,8 +415,8 @@ test('two notices from one child in one step each cite their own round: an error
   const n1 = settlement('child-1', 'error', ['It broke.'])
   const n2 = settlement('child-1', 'completed', ['Fixed.'])
   const out = await world.rewrite([n1, n2])
-  assert.deepEqual(texts(out[0]), [`${WHO} failed: rate limited. Report: \`${one!.report}\`. Its closing message:${BLOCK_END}`, 'It broke.'])
-  assert.deepEqual(texts(out[1]), [`${WHO} finished. Report: \`${two!.report}\`. Its closing message:${BLOCK_END}`, 'Fixed.'])
+  assert.deepEqual(texts(out[0]), [`${WHO} failed: rate limited. Report: \`${one!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'It broke.'])
+  assert.deepEqual(texts(out[1]), [`${WHO} finished. Report: \`${two!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Fixed.'])
   assert.equal((out[0]!.source as { summary: string }).summary, `${WHO} failed: rate limited.`)
   assert.equal((out[1]!.source as { summary: string }).summary, `${WHO} finished.`)
   assert.equal(await reportText(one!.report), 'It broke.\n')
@@ -437,7 +444,7 @@ test('a notice whose round ended is not given the report of a round that ended a
   // And a third round is under way, so the record says running.
   await world.records.addFollowUp('child-1')
   const [out] = await world.rewrite([settlement('child-1', 'error', ['Too slow.'])])
-  assert.deepEqual(texts(out), [`${WHO} failed: timed out. Report: \`${one!.report}\`. Its closing message:${BLOCK_END}`, 'Too slow.'])
+  assert.deepEqual(texts(out), [`${WHO} failed: timed out. Report: \`${one!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Too slow.'])
 })
 
 test('rounds with the same closing text and different stop reasons are told apart by the reason', async () => {
@@ -449,11 +456,11 @@ test('rounds with the same closing text and different stop reasons are told apar
   const n1 = settlement('child-1', 'error', ['Stopped here.'])
   const n2 = settlement('child-1', 'completed', ['Stopped here.'])
   const both = await world.rewrite([n1, n2])
-  assert.equal(texts(both[0])[0], `${WHO} failed: boom. Report: \`${one!.report}\`. Its closing message:${BLOCK_END}`)
-  assert.equal(texts(both[1])[0], `${WHO} finished. Report: \`${two!.report}\`. Its closing message:${BLOCK_END}`)
+  assert.equal(texts(both[0])[0], `${WHO} failed: boom. Report: \`${one!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
+  assert.equal(texts(both[1])[0], `${WHO} finished. Report: \`${two!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
   // The older round alone: the newer run has the same text, and still isn't its.
   const [alone] = await world.rewrite([n1])
-  assert.equal(texts(alone)[0], `${WHO} failed: boom. Report: \`${one!.report}\`. Its closing message:${BLOCK_END}`)
+  assert.equal(texts(alone)[0], `${WHO} failed: boom. Report: \`${one!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
 })
 
 test('rounds with the same closing text and the same stop reason: the newest unclaimed run, the last notice first', async () => {
@@ -467,11 +474,11 @@ test('rounds with the same closing text and the same stop reason: the newest unc
   // Both in one step: the reports say the same, so which is whose is decided by order. The last notice is the newest, so it
   // takes the newest run, and the one before it the next.
   const both = await world.rewrite([n1, n2])
-  assert.equal(texts(both[0])[0], `${WHO} finished. Report: \`${one!.report}\`. Its closing message:${BLOCK_END}`)
-  assert.equal(texts(both[1])[0], `${WHO} finished. Report: \`${two!.report}\`. Its closing message:${BLOCK_END}`)
+  assert.equal(texts(both[0])[0], `${WHO} finished. Report: \`${one!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
+  assert.equal(texts(both[1])[0], `${WHO} finished. Report: \`${two!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
   // One alone: the earlier notices went in earlier steps, so this one is the newest round's.
   const [alone] = await world.rewrite([n2])
-  assert.equal(texts(alone)[0], `${WHO} finished. Report: \`${two!.report}\`. Its closing message:${BLOCK_END}`)
+  assert.equal(texts(alone)[0], `${WHO} finished. Report: \`${two!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
 })
 
 test('a child with no closing message in either round: the reports say "(no closing message)", and the reasons tell them apart', async () => {
@@ -480,8 +487,8 @@ test('a child with no closing message in either round: the reports say "(no clos
   const one = await world.records.endRun('child-1', { stopReason: 'aborted', closing: '' })
   const two = await world.records.endRun('child-1', { stopReason: 'completed', closing: '' })
   const out = await world.rewrite([settlement('child-1', 'aborted'), settlement('child-1', 'completed')])
-  assert.equal(texts(out[0])[0], `${WHO} was stopped. Report: \`${one!.report}\`. It left no closing message.`)
-  assert.equal(texts(out[1])[0], `${WHO} finished. Report: \`${two!.report}\`. It left no closing message.`)
+  assert.equal(texts(out[0])[0], `${WHO} was stopped. Report: \`${one!.report}\`. ${NONE} It left no closing message.`)
+  assert.equal(texts(out[1])[0], `${WHO} finished. Report: \`${two!.report}\`. ${NONE} It left no closing message.`)
   assert.equal(await reportText(one!.report), '(no closing message)\n')
 })
 
@@ -542,8 +549,8 @@ test('a notice whose opening line dsh worded in a way this does not know is matc
     source: { kind: 'subagent-settled', form: 'notice', summary: 's', senderSessionId: 'child-1' as never },
   })
   const out = await world.rewrite([odd('One.'), odd('Two.')])
-  assert.deepEqual(texts(out[0]), [`${WHO} failed. Report: \`${one!.report}\`. Its closing message:${BLOCK_END}`, 'One.'])
-  assert.deepEqual(texts(out[1]), [`${WHO} finished. Report: \`${two!.report}\`. Its closing message:${BLOCK_END}`, 'Two.'])
+  assert.deepEqual(texts(out[0]), [`${WHO} failed. Report: \`${one!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'One.'])
+  assert.deepEqual(texts(out[1]), [`${WHO} finished. Report: \`${two!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Two.'])
 })
 
 test('a notice for a round that matches no run gets the fallback, and the others in the step are rewritten', async () => {
@@ -551,7 +558,7 @@ test('a notice for a round that matches no run gets the fallback, and the others
   await world.child()
   const one = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Known.' })
   const out = await world.rewrite([settlement('child-1', 'completed', ['Known.']), settlement('child-1', 'completed', ['Unrecorded.'])])
-  assert.equal(texts(out[0])[0], `${WHO} finished. Report: \`${one!.report}\`. Its closing message:${BLOCK_END}`)
+  assert.equal(texts(out[0])[0], `${WHO} finished. Report: \`${one!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
   assert.deepEqual(texts(out[1]), [`${WHO} finished and will do no further work unless you send it more. Its closing message:${BLOCK_END}`, 'Unrecorded.'])
 })
 
@@ -582,7 +589,7 @@ test('a run the host plugin records from subagent/end is the report the notice f
     })
     const report = (await ctx.dishCrew.records.lookup('child-1'))!.record.runs[0]!.report
     assert.equal(await readFile(report, 'utf8'), 'I got as far as the router.\n\nThen the API stopped answering.\n')
-    assert.deepEqual(texts(out).slice(0, 1), [`${WHO} finished. Report: \`${report}\`. Its closing message:${BLOCK_END}`])
+    assert.deepEqual(texts(out).slice(0, 1), [`${WHO} finished. Report: \`${report}\`. ${NONE} Its closing message:${BLOCK_END}`])
     assert.deepEqual(warnings, [])
     // And a child that left nothing says the same on both sides.
     await ctx.dishCrew.records.addChild(SESSION, { id: 'child-2', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic' })
@@ -591,7 +598,8 @@ test('a run the host plugin records from subagent/end is the report the notice f
       lastAssistantMessage: [{ type: 'text', text: '  \n' }],
     } as unknown as SubagentRunEndInfo)
     const [none] = await rewriteNotices([settlement('child-2', 'completed', ['  \n'])], { crew: ctx.dishCrew, sessionId: SESSION, warn: () => {} })
-    assert.match(texts(none)[0]!, /finished\. Report: `.*2-coder-1\.md`\. Its closing message:\n\n$/)
+    assert.match(texts(none)[0]!, /finished\. Report: `.*2-coder-1\.md`\. /)
+    assert.ok(texts(none)[0]!.endsWith(`.md\`. ${NONE} Its closing message:${BLOCK_END}`))
   } finally {
     await handle.dispose()
   }
@@ -606,7 +614,7 @@ test('a report that can\'t be read is not the run, and the search goes on, with 
   await chmod(two!.report, 0o000)
   try {
     const [out] = await world.rewrite([settlement('child-1', 'completed', ['Done.'])])
-    assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${one!.report}\`. Its closing message:${BLOCK_END}`, 'Done.'])
+    assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${one!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Done.'])
     assert.equal(world.warnings.length, 1)
     assert.match(world.warnings[0]!, /child-1.*EACCES/)
     // Two notices that both meet it are told once. The last takes the one report that can be read, and the other has none.
@@ -614,7 +622,7 @@ test('a report that can\'t be read is not the run, and the search goes on, with 
     const both = await world.rewrite([settlement('child-1', 'completed', ['Done.']), settlement('child-1', 'completed', ['Done.'])])
     assert.equal(world.warnings.length, 1)
     assert.ok(!texts(both[0])[0]!.includes('Report'))
-    assert.equal(texts(both[1])[0], `${WHO} finished. Report: \`${one!.report}\`. Its closing message:${BLOCK_END}`)
+    assert.equal(texts(both[1])[0], `${WHO} finished. Report: \`${one!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
     // With nothing else that matches, it is the form without a report.
     await chmod(one!.report, 0o000)
     world.warnings.length = 0
@@ -754,9 +762,9 @@ test('a logger that throws is not worth a failed step', async () => {
 test('noticeText is the plan\'s wording for a finished run and for a failed one', () => {
   const child = { id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5' }
   const run = (stopReason: string, error?: string) => ({ endedAt: 1, stopReason, report: '/data/1-coder-1.md', ...error === undefined ? {} : { error } })
-  assert.equal(noticeText(child, run('completed'), 'dsh lead', 'Its closing message:'), 'coder «add login» (claude-sonnet-5.5) finished. Report: `/data/1-coder-1.md`. Its closing message:')
-  assert.equal(noticeText(child, run('error', 'boom'), 'dsh lead', 'Its closing message:'), 'coder «add login» (claude-sonnet-5.5) failed: boom. Report: `/data/1-coder-1.md`. Its closing message:')
-  assert.equal(noticeText(child, run('aborted'), 'dsh lead', 'It left no closing message.'), 'coder «add login» (claude-sonnet-5.5) was stopped. Report: `/data/1-coder-1.md`. It left no closing message.')
+  assert.equal(noticeText(child, run('completed'), 'dsh lead', 'Its closing message:'), `coder «add login» (claude-sonnet-5.5) finished. Report: \`/data/1-coder-1.md\`. ${NONE} Its closing message:`)
+  assert.equal(noticeText(child, run('error', 'boom'), 'dsh lead', 'Its closing message:'), `coder «add login» (claude-sonnet-5.5) failed: boom. Report: \`/data/1-coder-1.md\`. ${NONE} Its closing message:`)
+  assert.equal(noticeText(child, run('aborted'), 'dsh lead', 'It left no closing message.'), `coder «add login» (claude-sonnet-5.5) was stopped. Report: \`/data/1-coder-1.md\`. ${NONE} It left no closing message.`)
   assert.equal(noticeSummary(child, run('error', 'boom'), 'dsh lead'), 'coder «add login» (claude-sonnet-5.5) failed: boom.')
   assert.equal(noticeSummary(child, undefined, 'Background subagent c finished and will do no further work unless you send it more.'), 'coder «add login» (claude-sonnet-5.5) finished and will do no further work unless you send it more.')
 })
@@ -805,7 +813,7 @@ test('a pass in a run that then ended another way than completed says so: the wo
   // In the notice, after the report.
   const child = { id: 'c1', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', worktree: BOUND.worktree }
   assert.equal(noticeText(child, { ...runWith([gate()]), stopReason: 'aborted' }, 'dsh lead', 'It left no closing message.'),
-    'coder «add login» (claude-sonnet-5.5) was stopped. Report: `/data/1-coder-1.md`. Gate passed earlier in this run (round 1), but the run ended (aborted) after it, so any work after the gate wasn\'t gated. It left no closing message.')
+    `coder «add login» (claude-sonnet-5.5) was stopped. Report: \`/data/1-coder-1.md\`. Gate passed earlier in this run (round 1), but the run ended (aborted) after it, so any work after the gate wasn't gated. ${NONE} It left no closing message.`)
 })
 
 test('rounds that ran out: the command, the exit code, the last lines in a fence, the log, and what to do next', () => {
@@ -907,7 +915,7 @@ test('a bound child\'s notice carries the gate line after the report and before 
   await world.records.addGate('child-1', gate({ round: 2 }))
   const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Login works.' })
   const [out] = await world.rewrite([settlement('child-1', 'completed', ['Login works.'])])
-  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. Gate passed (round 2). Its closing message:${BLOCK_END}`, 'Login works.'])
+  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. Gate passed (round 2). ${NONE} Its closing message:${BLOCK_END}`, 'Login works.'])
   // The collapsed row's sentence is the same as for any child.
   assert.equal((out!.source as { summary: string }).summary, `${WHO} finished.`)
   assert.deepEqual(world.warnings, [])
@@ -921,7 +929,7 @@ test('a failed gate\'s notice puts the fence, the log and the label in order', a
   const [out] = await world.rewrite([settlement('child-1', 'completed', ['I tried.'])])
   assert.deepEqual(texts(out), [
     `${WHO} finished. Report: \`${ended!.report}\`. Gate FAILED after 3 rounds (\`make test\`, exit 2); last lines:\n\`\`\`\nFAIL one\nFAIL two\n\`\`\`\n`
-    + `Full log: \`${LOG}\`. Start a fix round with \`to\` or a fresh coder (escalation ladder). Its closing message:${BLOCK_END}`,
+    + `Full log: \`${LOG}\`. Start a fix round with \`to\` or a fresh coder (escalation ladder). ${NONE} Its closing message:${BLOCK_END}`,
     'I tried.',
   ])
 })
@@ -931,12 +939,12 @@ test('a bound child\'s run with no gate result is told "Gate not run."', async (
   await world.child('child-1', BOUND)
   const ended = await world.records.endRun('child-1', { stopReason: 'error', error: 'rate limited', closing: 'Got partway.' })
   const [out] = await world.rewrite([settlement('child-1', 'error', ['Got partway.'])])
-  assert.deepEqual(texts(out), [`${WHO} failed: rate limited. Report: \`${ended!.report}\`. Gate not run. Its closing message:${BLOCK_END}`, 'Got partway.'])
+  assert.deepEqual(texts(out), [`${WHO} failed: rate limited. Report: \`${ended!.report}\`. Gate not run. ${NONE} Its closing message:${BLOCK_END}`, 'Got partway.'])
   // And the same for a child that left no closing message.
   await world.child('child-2', BOUND)
   const second = await world.records.endRun('child-2', { stopReason: 'completed', closing: '' })
   const [none] = await world.rewrite([settlement('child-2', 'completed')])
-  assert.deepEqual(texts(none), [`${WHO} finished. Report: \`${second!.report}\`. Gate not run. It left no closing message.`])
+  assert.deepEqual(texts(none), [`${WHO} finished. Report: \`${second!.report}\`. Gate not run. ${NONE} It left no closing message.`])
 })
 
 test('an unbound child\'s notice is as it was', async () => {
@@ -944,7 +952,7 @@ test('an unbound child\'s notice is as it was', async () => {
   await world.child()
   const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Login works.' })
   const [out] = await world.rewrite([settlement('child-1', 'completed', ['Login works.'])])
-  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. Its closing message:${BLOCK_END}`, 'Login works.'])
+  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Login works.'])
 })
 
 test('each round\'s notice has the gate line of its own run', async () => {
@@ -957,7 +965,7 @@ test('each round\'s notice has the gate line of its own run', async () => {
   const second = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Second try.' })
   const [one, two] = await world.rewrite([settlement('child-1', 'completed', ['First try.']), settlement('child-1', 'completed', ['Second try.'])])
   assert.ok(texts(one)[0]!.startsWith(`${WHO} finished. Report: \`${first!.report}\`. Gate FAILED after 3 rounds (\`make test\`, exit 1); last lines:\n`))
-  assert.deepEqual(texts(two), [`${WHO} finished. Report: \`${second!.report}\`. Gate passed (round 1). Its closing message:${BLOCK_END}`, 'Second try.'])
+  assert.deepEqual(texts(two), [`${WHO} finished. Report: \`${second!.report}\`. Gate passed (round 1). ${NONE} Its closing message:${BLOCK_END}`, 'Second try.'])
 })
 
 test('a notice that matches no run has no gate line, as it has no report', async () => {
@@ -973,20 +981,356 @@ test('noticeText puts the gate line between the report and the label, for a boun
   const run = runWith([gate({ round: 2 })])
   assert.equal(
     noticeText({ id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', ...BOUND }, run, 'dsh lead', 'Its closing message:'),
-    'coder «add login» (claude-sonnet-5.5) finished. Report: `/data/1-coder-1.md`. Gate passed (round 2). Its closing message:',
+    `coder «add login» (claude-sonnet-5.5) finished. Report: \`/data/1-coder-1.md\`. Gate passed (round 2). ${NONE} Its closing message:`,
   )
   assert.equal(
     noticeText({ id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', ...BOUND }, run, 'dsh lead'),
-    'coder «add login» (claude-sonnet-5.5) finished. Report: `/data/1-coder-1.md`. Gate passed (round 2).',
+    `coder «add login» (claude-sonnet-5.5) finished. Report: \`/data/1-coder-1.md\`. Gate passed (round 2). ${NONE}`,
   )
   assert.equal(
     noticeText({ id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5' }, run, 'dsh lead', 'Its closing message:'),
-    'coder «add login» (claude-sonnet-5.5) finished. Report: `/data/1-coder-1.md`. Its closing message:',
+    `coder «add login» (claude-sonnet-5.5) finished. Report: \`/data/1-coder-1.md\`. ${NONE} Its closing message:`,
   )
   assert.equal(
     noticeSummary({ id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', ...BOUND }, run, 'dsh lead'),
     'coder «add login» (claude-sonnet-5.5) finished.',
   )
+})
+
+// --- structured reports, and a notice matched by its id (step 7) ------------------------------------
+
+const SHA = 'a'.repeat(40)
+const SHA2 = 'b'.repeat(40)
+const TOKEN = `ghp_${'A1b2C3d4E5'.repeat(4)}`
+
+/** A coder's report as the record keeps it, with what a test names changed. */
+function coderReport(extra: Partial<CoderReport> = {}): CoderReport {
+  return { role: 'coder', turn: 1, at: 1_700_000_000_000, status: 'done', summary: 'Added the login form.', ...extra }
+}
+
+/** A reviewer's report as the record keeps it, with what a test names changed. */
+function reviewerReport(extra: Partial<ReviewerReport> = {}): ReviewerReport {
+  return { role: 'reviewer', turn: 1, at: 1_700_000_000_000, verdict: 'approved', head: SHA, summary: 'Looks right.', findings: [], ...extra }
+}
+
+const FULL_CODER = coderReport({
+  summary: '  Added the login form.\nAnd its tests.\n',
+  commits: [SHA, SHA2],
+  blockedOn: 'nothing, in the end',
+  rulings: [{ what: 'kept the old API', why: 'two callers\nuse it', costIfWrong: 'a rename later' }],
+  concerns: ['the session store is slow', 'no rate limit'],
+  notFixed: [{ finding: 'rename the module', why: 'out of this task\'s scope' }],
+})
+
+const FULL_CODER_BLOCK = [
+  'Status: done',
+  'Summary: Added the login form.\nAnd its tests.',
+  `Commits: \`${SHA}\`, \`${SHA2}\``,
+  'Blocked on: nothing, in the end',
+  'Rulings:',
+  '- kept the old API — two callers use it — a rename later',
+  'Concerns:',
+  '- the session store is slow',
+  '- no rate limit',
+  'Not fixed:',
+  '- rename the module — out of this task\'s scope',
+].join('\n')
+
+const FULL_REVIEW = reviewerReport({
+  verdict: 'changes_requested',
+  summary: 'A bug and two nits.',
+  findings: [
+    { severity: 'blocking', file: 'src/login.ts', line: 42, summary: 'The password is logged.', fix: 'Drop the log line.' },
+    { severity: 'nit', file: 'src/form.tsx', summary: 'A stray\nconsole.log.', fix: 'Remove it.' },
+    { severity: 'nit', file: 'README.md', line: 3, summary: 'A typo.', fix: 'Spell it right.' },
+  ],
+  checks: [{ command: 'pnpm test', exitCode: 1, summary: '1 failed:\nlogin.test.ts' }],
+  addressed: [
+    { finding: 'the empty password', addressed: true, evidence: 'login.test.ts:12 covers it.' },
+    { finding: 'the error text', addressed: false, evidence: 'It still says "oops".' },
+  ],
+})
+
+const FULL_REVIEW_BLOCK = [
+  `Verdict: changes requested, at \`${SHA}\``,
+  'Summary: A bug and two nits.',
+  'Findings (3): 1 blocking, 2 nit',
+  '- [blocking] `src/login.ts:42`: The password is logged. Fix: Drop the log line.',
+  '- [nit] `src/form.tsx`: A stray console.log. Fix: Remove it.',
+  '- [nit] `README.md:3`: A typo. Fix: Spell it right.',
+  'Checks:',
+  '- `pnpm test` exit 1: 1 failed: login.test.ts',
+  'Addressed:',
+  '- the empty password: addressed. login.test.ts:12 covers it.',
+  '- the error text: NOT addressed. It still says "oops".',
+].join('\n')
+
+/** A run that ended with `structured`, as the record files it. */
+function reported(structured: CoderReport | ReviewerReport, extra: Partial<RunRecord> = {}): RunRecord {
+  return { endedAt: 1, stopReason: 'completed', report: '/data/1-coder-1.md', structured, structuredFile: '/data/1-coder-1.json', ...extra }
+}
+
+test('reportBlock: a coder\'s every line, in order, the summary trimmed with its line breaks kept and list items on one line each', () => {
+  assert.equal(reportBlock(FULL_CODER), FULL_CODER_BLOCK)
+  // A line for a field that isn't there is left out; so is an empty list's.
+  assert.equal(reportBlock(coderReport()), 'Status: done\nSummary: Added the login form.')
+  assert.equal(reportBlock(coderReport({ commits: [], rulings: [], concerns: [], notFixed: [] })), 'Status: done\nSummary: Added the login form.')
+  assert.equal(reportBlock(coderReport({ status: 'blocked', blockedOn: 'the API key' })), 'Status: blocked\nSummary: Added the login form.\nBlocked on: the API key')
+  assert.equal(reportBlock(coderReport({ status: 'needs_context', blockedOn: 'which store?' })).split('\n')[0], 'Status: needs context')
+})
+
+test('reportBlock: a reviewer\'s verdict and head, the counts, each finding with and without a line, the checks and what was addressed', () => {
+  assert.equal(reportBlock(FULL_REVIEW), FULL_REVIEW_BLOCK)
+  // A clean review: no findings, and nothing else.
+  assert.equal(reportBlock(reviewerReport()), `Verdict: approved, at \`${SHA}\`\nSummary: Looks right.\nFindings: none`)
+  // A review of work outside git gives no head: the verdict says none.
+  const { head: _head, ...headless } = reviewerReport({ verdict: 'changes_requested' })
+  assert.equal(reportBlock(headless), 'Verdict: changes requested\nSummary: Looks right.\nFindings: none')
+  // Only the counts above 0, in the order of the severities.
+  const counts = (severities: Array<'blocking' | 'should_fix' | 'nit'>): string => reportBlock(reviewerReport({
+    findings: severities.map(severity => ({ severity, file: 'a.ts', summary: 's', fix: 'f' })),
+  })).split('\n')[2]!
+  assert.equal(counts(['nit', 'should_fix', 'nit']), 'Findings (3): 1 should_fix, 2 nit')
+  assert.equal(counts(['should_fix']), 'Findings (1): 1 should_fix')
+  assert.equal(counts(['nit', 'blocking', 'should_fix']), 'Findings (3): 1 blocking, 1 should_fix, 1 nit')
+})
+
+test('reportBlock: code spans are quoted whole, on one line, past any backticks in them', () => {
+  const block = reportBlock(reviewerReport({
+    findings: [{ severity: 'nit', file: 'odd `name`.ts', line: 7, summary: 's', fix: 'f' }],
+    checks: [{ command: 'make\n  test', exitCode: 0, summary: 'ok' }],
+  }))
+  assert.ok(block.includes('- [nit] `` odd `name`.ts:7 ``: s Fix: f'), block)
+  assert.ok(block.includes('- `make test` exit 0: ok'), block)
+})
+
+test('reportBlock masks every string again, a finding\'s included', () => {
+  const masked = maskSecrets(TOKEN)
+  const review = reportBlock(reviewerReport({
+    summary: `Found ${TOKEN}.`,
+    findings: [{ severity: 'blocking', file: `src/${TOKEN}.ts`, summary: `It prints ${TOKEN}.`, fix: `Revoke ${TOKEN}.` }],
+    checks: [{ command: `GH_TOKEN=${TOKEN} make test`, exitCode: 0, summary: TOKEN }],
+    addressed: [{ finding: TOKEN, addressed: false, evidence: TOKEN }],
+  }))
+  assert.ok(!review.includes(TOKEN), review)
+  assert.ok(review.includes(`It prints ${masked}. Fix: Revoke ${masked}.`), review)
+  const coder = reportBlock(coderReport({
+    summary: TOKEN, commits: [TOKEN], blockedOn: TOKEN, rulings: [{ what: TOKEN, why: TOKEN, costIfWrong: TOKEN }], concerns: [TOKEN], notFixed: [{ finding: TOKEN, why: TOKEN }],
+  }))
+  assert.ok(!coder.includes(TOKEN), coder)
+  assert.ok(coder.includes(`Summary: ${masked}`), coder)
+})
+
+test('noticeText of a run with a structured report: the .json, the gate line, then "Its report:", and no label', () => {
+  const coder = { id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5' }
+  assert.equal(noticeText(coder, reported(coderReport()), 'dsh lead', 'Its closing message:'),
+    'coder «add login» (claude-sonnet-5.5) finished: done. Report: `/data/1-coder-1.json`. Its report:')
+  assert.equal(noticeText(coder, reported(coderReport()), 'dsh lead', 'It left no closing message.'),
+    'coder «add login» (claude-sonnet-5.5) finished: done. Report: `/data/1-coder-1.json`. Its report:')
+  assert.equal(noticeText({ ...coder, ...BOUND }, reported(coderReport(), { gates: [gate({ round: 2 })] }), 'dsh lead'),
+    'coder «add login» (claude-sonnet-5.5) finished: done. Report: `/data/1-coder-1.json`. Gate passed (round 2). Its report:')
+  // A run whose report has no file of its own cites the .md.
+  const noFile = reported(coderReport())
+  delete noFile.structuredFile
+  assert.equal(noticeText(coder, noFile, 'dsh lead'), 'coder «add login» (claude-sonnet-5.5) finished: done. Report: `/data/1-coder-1.md`. Its report:')
+})
+
+test('the summary of a run with a report says what it reported; a run that didn\'t complete keeps its verb and error', () => {
+  const coder = { id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5' }
+  const reviewer = { id: 'r', role: 'reviewer', title: 'review login', model: 'gpt-6', reviews: 'c' }
+  assert.equal(noticeSummary(coder, reported(coderReport()), 'dsh lead'), 'coder «add login» (claude-sonnet-5.5) finished: done.')
+  assert.equal(noticeSummary(coder, reported(coderReport({ status: 'blocked' })), 'dsh lead'), 'coder «add login» (claude-sonnet-5.5) finished: blocked.')
+  assert.equal(noticeSummary(coder, reported(coderReport({ status: 'needs_context' })), 'dsh lead'), 'coder «add login» (claude-sonnet-5.5) finished: needs context.')
+  assert.equal(noticeSummary(reviewer, reported(reviewerReport()), 'dsh lead'), 'reviewer «review login» (gpt-6) finished: approved.')
+  assert.equal(noticeSummary(reviewer, reported(reviewerReport({ verdict: 'changes_requested' })), 'dsh lead'), 'reviewer «review login» (gpt-6) finished: changes requested.')
+  assert.equal(noticeSummary(coder, reported(coderReport(), { stopReason: 'error', error: 'rate limited' }), 'dsh lead'), 'coder «add login» (claude-sonnet-5.5) failed: rate limited.')
+  assert.equal(noticeSummary(coder, reported(coderReport(), { stopReason: 'aborted' }), 'dsh lead'), 'coder «add login» (claude-sonnet-5.5) was stopped.')
+})
+
+test('a coder\'s notice for a run that ended with `report`: the .json, every line of the block, and no "It left no closing message."', async () => {
+  const world = await setup()
+  await world.child()
+  const message = settlement('child-1', 'completed')
+  await world.records.setReport('child-1', FULL_CODER)
+  const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: '', notice: message.id })
+  assert.ok(ended!.run.structuredFile?.endsWith('1-coder-1.json'))
+  const [out] = await world.rewrite([message])
+  assert.deepEqual(texts(out), [`${WHO} finished: done. Report: \`${ended!.run.structuredFile}\`. Its report:${BLOCK_END}`, FULL_CODER_BLOCK])
+  assert.ok(!texts(out).join('').includes('It left no closing message.'))
+  assert.equal(out!.id, message.id)
+  assert.deepEqual(out!.source, { ...message.source, summary: `${WHO} finished: done.` })
+  assert.ok(Object.isFrozen(out) && Object.isFrozen(out!.content) && Object.isFrozen(out!.content[0]) && Object.isFrozen(out!.content[1]) && Object.isFrozen(out!.source))
+  assert.deepEqual(world.warnings, [])
+})
+
+test('a run with a report and a closing message: the block, then "Its closing message:", then dsh\'s blocks as the very objects', async () => {
+  const world = await setup()
+  await world.child()
+  const message = settlement('child-1', 'completed', ['All done.', 'See the report.'])
+  await world.records.setReport('child-1', coderReport())
+  const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'All done.\n\nSee the report.', notice: message.id })
+  const [out] = await world.rewrite([message])
+  assert.deepEqual(texts(out), [
+    `${WHO} finished: done. Report: \`${ended!.run.structuredFile}\`. Its report:${BLOCK_END}`,
+    `Status: done\nSummary: Added the login form.${BLOCK_END}Its closing message:${BLOCK_END}`,
+    'All done.',
+    'See the report.',
+  ])
+  assert.equal(out!.content[2], message.content[2])
+  assert.equal(out!.content[3], message.content[3])
+})
+
+test('a bound coder\'s notice with a report has its gate line between the report\'s path and "Its report:"', async () => {
+  const world = await setup()
+  await world.child('child-1', BOUND)
+  await world.records.addGate('child-1', gate({ outcome: 'failed', exitCode: 1, round: 1 }))
+  await world.records.addGate('child-1', gate({ round: 2 }))
+  await world.records.setReport('child-1', coderReport())
+  const message = settlement('child-1', 'completed')
+  const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: '', notice: message.id })
+  const [out] = await world.rewrite([message])
+  assert.deepEqual(texts(out), [
+    `${WHO} finished: done. Report: \`${ended!.run.structuredFile}\`. Gate passed (round 2). Its report:${BLOCK_END}`,
+    'Status: done\nSummary: Added the login form.',
+  ])
+})
+
+test('a reviewer\'s notice renders its verdict, head, findings, checks and what was addressed', async () => {
+  const world = await setup()
+  await world.child('child-2', { role: 'reviewer', title: 'review login', model: 'gpt-6', reviews: 'child-1' })
+  const message = settlement('child-2', 'completed')
+  await world.records.setReport('child-2', FULL_REVIEW)
+  const ended = await world.records.endRun('child-2', { stopReason: 'completed', closing: '', notice: message.id })
+  const [out] = await world.rewrite([message])
+  assert.deepEqual(texts(out), [`reviewer «review login» (gpt-6) finished: changes requested. Report: \`${ended!.run.structuredFile}\`. Its report:${BLOCK_END}`, FULL_REVIEW_BLOCK])
+  assert.equal((out!.source as { summary: string }).summary, 'reviewer «review login» (gpt-6) finished: changes requested.')
+})
+
+test('by id: two runs that both ended with `report`, and so say the same, each get their own notice, in either order', async () => {
+  const world = await setup()
+  await world.child()
+  const m1 = settlement('child-1', 'completed')
+  const m2 = settlement('child-1', 'completed')
+  await world.records.setReport('child-1', coderReport({ summary: 'Round one.' }))
+  const one = await world.records.endRun('child-1', { stopReason: 'completed', closing: '', notice: m1.id })
+  await world.records.addFollowUp('child-1')
+  await world.records.setReport('child-1', coderReport({ turn: 2, status: 'blocked', summary: 'Round two.', blockedOn: 'the schema' }))
+  const two = await world.records.endRun('child-1', { stopReason: 'completed', closing: '', notice: m2.id })
+  // Both reports are "(no closing message)" and both ended completed: by their text, only their order would tell them apart.
+  assert.equal(await reportText(one!.report), await reportText(two!.report))
+  const expected = new Map([
+    [m1, [`${WHO} finished: done. Report: \`${one!.run.structuredFile}\`. Its report:${BLOCK_END}`, 'Status: done\nSummary: Round one.']],
+    [m2, [`${WHO} finished: blocked. Report: \`${two!.run.structuredFile}\`. Its report:${BLOCK_END}`, 'Status: blocked\nSummary: Round two.\nBlocked on: the schema']],
+  ])
+  for (const step of [[m1, m2], [m2, m1]]) {
+    const out = await world.rewrite(step)
+    step.forEach((message, index) => assert.deepEqual(texts(out[index]), expected.get(message), `${step.indexOf(m1)}`))
+  }
+  // One alone is its own too, however many runs came after it.
+  assert.deepEqual(texts((await world.rewrite([m1]))[0]), expected.get(m1))
+  assert.deepEqual(world.warnings, [])
+})
+
+test('by id: a notice in a shape this does not know still finds its run, and a second message with the same id finds none', async () => {
+  const world = await setup()
+  await world.child()
+  const odd = createUserMessage({
+    content: [{ type: 'text', text: 'Background subagent child-1 finished.' }, { type: 'text', text: 'Output follows' }],
+    source: { kind: 'subagent-settled', form: 'notice', summary: 's', senderSessionId: 'child-1' as never },
+  })
+  await world.records.setReport('child-1', coderReport())
+  const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Output follows', notice: odd.id })
+  const reportedText = `${WHO} finished: done. Report: \`${ended!.run.structuredFile}\`. Its report:${BLOCK_END}`
+  const [out] = await world.rewrite([odd])
+  assert.deepEqual(texts(out), [reportedText, `Status: done\nSummary: Added the login form.${BLOCK_END}`, 'Output follows'])
+  assert.equal(out!.content[2], odd.content[1])
+  // The same message twice in one step: the last takes the run, and the other gets none, never one found by its text.
+  const both = await world.rewrite([odd, odd])
+  assert.deepEqual(texts(both[0]), [`${WHO} finished.${BLOCK_END}`, 'Output follows'])
+  assert.deepEqual(texts(both[1]), texts(out))
+})
+
+test('the fallback: a notice whose id is on no run, while the runs carry other ids, is matched to none of them', async () => {
+  const world = await setup()
+  await world.child()
+  await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Done.', notice: 'another-notice' })
+  const [out] = await world.rewrite([settlement('child-1', 'completed', ['Done.'])])
+  assert.deepEqual(texts(out), [`${WHO} finished and will do no further work unless you send it more. Its closing message:${BLOCK_END}`, 'Done.'])
+  assert.equal((out!.source as { summary: string }).summary, `${WHO} finished and will do no further work unless you send it more.`)
+})
+
+test('the fallback: the text is compared only with the runs that have no notice id', async () => {
+  const world = await setup()
+  await world.child()
+  // Two rounds that said the same: the newer one's notice was seen, so a notice that isn't it can only be the older's.
+  const older = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Done.' })
+  await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Done.', notice: 'seen-notice' })
+  const [out] = await world.rewrite([settlement('child-1', 'completed', ['Done.'])])
+  assert.equal(texts(out)[0], `${WHO} finished. Report: \`${older!.report}\`. ${NONE} Its closing message:${BLOCK_END}`)
+})
+
+test('without a structured report: a coder\'s and a reviewer\'s notice say so before dsh\'s label, and a researcher\'s is as it was', async () => {
+  const world = await setup()
+  await world.child()
+  const coder = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Done.' })
+  const [c] = await world.rewrite([settlement('child-1', 'completed', ['Done.'])])
+  assert.deepEqual(texts(c), [`${WHO} finished. Report: \`${coder!.report}\`. ${NO_STRUCTURED_REPORT} Its closing message:${BLOCK_END}`, 'Done.'])
+  assert.equal((c!.source as { summary: string }).summary, `${WHO} finished.`)
+  await world.child('child-2', { role: 'reviewer', title: 'review login', model: 'gpt-6', reviews: 'child-1' })
+  const reviewer = await world.records.endRun('child-2', { stopReason: 'completed', closing: '' })
+  const [r] = await world.rewrite([settlement('child-2', 'completed')])
+  assert.deepEqual(texts(r), [`reviewer «review login» (gpt-6) finished. Report: \`${reviewer!.report}\`. ${NO_STRUCTURED_REPORT} It left no closing message.`])
+  await world.child('child-3', { role: 'researcher', title: 'find it' })
+  const researcher = await world.records.endRun('child-3', { stopReason: 'completed', closing: 'Found.' })
+  const [x] = await world.rewrite([settlement('child-3', 'completed', ['Found.'])])
+  assert.deepEqual(texts(x), [`researcher «find it» (claude-sonnet-5.5) finished. Report: \`${researcher!.report}\`. Its closing message:${BLOCK_END}`, 'Found.'])
+  // A notice matched to no run says nothing of a report, either way.
+  const [unmatched] = await world.rewrite([settlement('child-1', 'completed', ['Never recorded.'])])
+  assert.ok(!texts(unmatched)[0]!.includes(NO_STRUCTURED_REPORT))
+})
+
+test('a summary with a report is bounded to 120 characters, and the text is not', async () => {
+  const world = await setup()
+  await world.child('child-1', { title: 'a'.repeat(120) })
+  const message = settlement('child-1', 'completed')
+  await world.records.setReport('child-1', coderReport({ status: 'needs_context', blockedOn: 'x' }))
+  await world.records.endRun('child-1', { stopReason: 'completed', closing: '', notice: message.id })
+  const [out] = await world.rewrite([message])
+  const summary = (out!.source as { summary: string }).summary
+  assert.equal(summary.length, 120)
+  assert.ok(summary.endsWith('…'))
+  assert.ok(texts(out)[0]!.startsWith(`coder «${'a'.repeat(120)}» (claude-sonnet-5.5) finished: needs context. Report: `))
+})
+
+test('through the host plugin: a report, the notice entering the inbox, then an end that is only the report call, gives a notice of the .json and the report', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const handle = mountCrew(ctx, where.data)
+  await handle
+  try {
+    await ctx.dishCrew.records.addChild(SESSION, { id: 'child-1', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic' })
+    await ctx.dishCrew.records.setReport('child-1', coderReport({ summary: `Done; the key ${TOKEN} was in the fixture.` }))
+    // dsh delivers the notice to the parent's inbox and then emits the child's end, in one synchronous run. A turn that a
+    // `report` call ended leaves no text, so dsh's notice says "It left no closing message."
+    const notice = settlement('child-1', 'completed')
+    ctx.emit('agent/inbox/inserted', { agent: { id: SESSION }, message: notice } as never)
+    ctx.emit('subagent/end', {
+      runId: 'run-1', provider: 'spawn', id: 'child-1', local: true, stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'tool_use', id: 't1', name: 'report', input: { status: 'done', summary: 'Done.' } }],
+    } as unknown as SubagentRunEndInfo)
+    const warnings: string[] = []
+    const [out] = await rewriteNotices([notice], { crew: ctx.dishCrew, sessionId: SESSION, warn: (text, ...args) => { warnings.push(format(text, ...args)) } })
+    const run = (await ctx.dishCrew.records.lookup('child-1'))!.record.runs[0]!
+    assert.equal(run.notice, notice.id)
+    assert.ok(run.structuredFile?.endsWith('1-coder-1.json'))
+    assert.deepEqual(texts(out), [
+      `${WHO} finished: done. Report: \`${run.structuredFile}\`. Its report:${BLOCK_END}`,
+      `Status: done\nSummary: Done; the key ${maskSecrets(TOKEN)} was in the fixture.`,
+    ])
+    assert.deepEqual(warnings, [])
+  } finally {
+    await handle.dispose()
+  }
 })
 
 // --- the row ----------------------------------------------------------------------------------------
@@ -1062,7 +1406,7 @@ test('the row rewrites a crew child\'s notice at the main agent\'s pre-step, and
   assert.ok(decision.kind === 'enter')
   assert.equal(decision.startsRequestSeries, true)
   assert.equal(decision.messages.length, 2)
-  assert.deepEqual(texts(decision.messages[0]), [`${WHO} finished. Report: \`${ended!.report}\`. Its closing message:${BLOCK_END}`, 'Done.'])
+  assert.deepEqual(texts(decision.messages[0]), [`${WHO} finished. Report: \`${ended!.report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Done.'])
   assert.equal(decision.messages[0]!.id, note.id)
   assert.equal(decision.messages[1], other)
   assert.deepEqual(world.logs, [])
@@ -1129,7 +1473,7 @@ test('the row waits for a run being recorded, through dishCrew.whenRecorded', as
   const decision = await world.step(world.main, messages)
   assert.ok(decision.kind === 'enter')
   const report = (await world.records.lookup('child-1'))!.record.runs[0]!.report
-  assert.deepEqual(texts(decision.messages[0]), [`${WHO} failed: it fell over. Report: \`${report}\`. Its closing message:${BLOCK_END}`, 'Sorry.'])
+  assert.deepEqual(texts(decision.messages[0]), [`${WHO} failed: it fell over. Report: \`${report}\`. ${NONE} Its closing message:${BLOCK_END}`, 'Sorry.'])
 })
 
 test('the row stops waiting when the turn is cancelled', async () => {

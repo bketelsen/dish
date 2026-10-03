@@ -26,7 +26,7 @@ No production code without a failing test first. If you wrote code before its te
 5. Run the test, then the rest of the suite. If something fails, fix the code, not the test. Warnings count as failures.
 6. **Refactor** with everything green: names, duplication, helpers. No new behavior.
 7. Repeat for the next behavior. A bug fix starts with a test that reproduces the bug.
-8. Before you finish, run the repo's whole gate, not just your file, and check its exit code.
+8. Before you finish, run the repo's whole gate, not just your file, and check its exit code. A coder whose brief says dish runs the gate leaves that run to dish: dish runs it when you `report` `done`, and a failure comes back to you.
 
 ## Good tests
 
@@ -42,4 +42,4 @@ Go back to red if you notice code written before its test, a test that passed on
 
 ## Hand back
 
-For each behavior: the test's file and name, the failure you saw before the fix (one line), and that it passes now. Then the gate command, its exit code and its summary line.
+For each behavior: the test's file and name, the failure you saw before the fix (one line), and that it passes now. Then the gate command, its exit code and its summary line, or that dish runs it.

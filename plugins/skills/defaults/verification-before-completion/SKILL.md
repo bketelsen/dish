@@ -25,9 +25,9 @@ A task is done when each of its requirements is checked, not when the tests pass
 
 ## By role
 
-- **coder:** the repo's gate on your final tree, exit code 0. Done means the gate passed. For a bug fix, the test that reproduced the bug now passes.
+- **coder:** the repo's gate on your final tree, exit code 0: done means the gate passed. When your brief says dish runs the gate, dish runs it when you `report` `done`, and a failure comes back to you; you run the tests your change touches. For a bug fix, the test that reproduced the bug now passes.
 - **reviewer:** you ran the gate yourself. A report that says it passed is not evidence.
-- **main:** a child's report is a claim. Check its commits and diff (`git log`, `git diff BASE..HEAD`), the gate, and the files it says it wrote.
+- **main:** a child's report is a claim. Check its commits and diff (`git log`, `git diff BASE..HEAD`), the gate (a notice's gate line, before `Its report:`, is dish's own run), and the files it says it wrote.
 - **architect:** every file and interface the plan names exists in the repo, or is created by an earlier task. Every command it names exists in the repo's scripts or docs.
 - **researcher:** the source actually says it. Open the link, or the file at the line, and read it again.
 - **writer:** every command, name, path and flag checked against its source: the code, its help text, the config.

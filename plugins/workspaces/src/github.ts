@@ -4,7 +4,12 @@
  * - **The App's credentials** (its id and private key) come from the function the client is given, called for every
  *   request that needs the JWT, and are dropped once the JWT is signed: nothing here keeps them. The service's function
  *   reads them with `ctx.get('credentials')?.resolve(ref)` each time.
- * - **Read only (6b).** `createToken` takes only `read` permissions, and throws before anything is sent otherwise.
+ * - **Read only (6b), for every token but two.** `createToken` takes only `read` permissions, and throws before anything is
+ *   sent otherwise. Step 7's `createWriteToken` mints exactly `PUSH_PERMISSIONS` (Contents write, for `pushBranch`) or
+ *   `PULL_PERMISSIONS` (Pull requests write, for `openPull`, `updatePull` and `commentPull`), for one repository, and
+ *   refuses a token GitHub granted more than asked, or for another repository.
+ * - **Pull requests** (step 7): opened, found, edited, commented on, and read with their reviews, comments and checks,
+ *   each with an installation token. What GitHub answers is untrusted: the service masks and caps it (`readPull`).
  * - **Secrets never travel out.** The JWT and a token go only in the `Authorization` header, never in a URL; an error
  *   names the call and the status, and at most 200 characters of GitHub's `message`, masked (dish-kit's `maskSecrets`);
  *   never a header, a token or the key. Redirects are not followed, so a header never goes anywhere it wasn't sent.
@@ -42,6 +47,19 @@ const PER_PAGE = 100
 const MAX_PAGES = 100
 /** GitHub takes up to 500 repository names in one token request. */
 const MAX_REPOSITORIES = 500
+/** A repository's name, as a token request takes it. */
+const REPOSITORY = /^[A-Za-z0-9._-]{1,100}$/
+/** The largest pull request number dish takes (GitHub's are 32-bit). */
+const MAX_PULL_NUMBER = 2 ** 31 - 1
+
+/** A push's token (`pushBranch`): Contents write, and Metadata read, which every token has. */
+export const PUSH_PERMISSIONS: Readonly<{ contents: 'write', metadata: 'read' }> = Object.freeze({ contents: 'write', metadata: 'read' })
+/** A pull request's token (`openPull`, `updatePull`, `commentPull`): Pull requests write, and Metadata read. */
+export const PULL_PERMISSIONS: Readonly<{ metadata: 'read', pull_requests: 'write' }> = Object.freeze({ metadata: 'read', pull_requests: 'write' })
+/** The only permissions `createWriteToken` takes. */
+export type WritePermissions = typeof PUSH_PERMISSIONS | typeof PULL_PERMISSIONS
+/** A permission level's rank: what a token may do more of. */
+const LEVELS: Readonly<Record<string, number>> = { read: 1, write: 2, admin: 3 }
 
 export interface AppCredentials {
   /** The App's id (or client id): the JWT's `iss`. */
@@ -90,6 +108,38 @@ export interface PullSummary {
   mergedAt: string | null
   headSha: string
   headRef: string
+}
+
+/** A pull request `createPull` opened, or `findOpenPull` found. */
+export interface PullOpened {
+  number: number
+  url: string
+  base: string
+}
+
+/** What `readPull` needs of `GET /repos/{o}/{r}/pulls/{number}`. Unmasked: the service masks it. */
+export interface PullDetails {
+  number: number
+  url: string
+  title: string
+  state: 'open' | 'closed'
+  merged: boolean
+  draft: boolean
+  /** null: GitHub hasn't computed it yet. */
+  mergeable: boolean | null
+  mergeableState: string
+  head: { ref: string, sha: string }
+  base: { ref: string }
+}
+
+/**
+ * GitHub's items, unparsed (readPull reads each field with a type check), and `full`: whether GitHub has items this list
+ * doesn't hold. For the reviews and the comments (the newest 100), those are older ones; for the checks (the first page),
+ * a full page.
+ */
+export interface RawList {
+  items: unknown[]
+  full: boolean
 }
 
 export interface GitHubClientOptions {
@@ -153,6 +203,23 @@ function segment(what: string, value: string): string {
     throw new Error(`${what} must be a name, not ${JSON.stringify(value)}`)
   }
   return encodeURIComponent(value)
+}
+
+/** `number`, if it is a pull request's: a positive whole number below 2³¹. */
+function pullNumber(number: number): number {
+  if (!Number.isSafeInteger(number) || number <= 0 || number > MAX_PULL_NUMBER) throw new Error('a pull request number is a positive whole number')
+  return number
+}
+
+/** `sha`, if it is a full commit id. */
+function commitId(sha: string): string {
+  if (typeof sha !== 'string' || !/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(sha)) throw new Error(`${JSON.stringify(sha)} is not a commit id`)
+  return sha
+}
+
+/** The sorted `[name, level]` entries of a permission set, as one string to compare. */
+function permissionKey(permissions: unknown): string {
+  return isRecord(permissions) ? JSON.stringify(Object.entries(permissions).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : ''
 }
 
 /** A token, if it is one header value: printable ASCII, no spaces. Never quoted. */
@@ -307,6 +374,52 @@ export class GitHubApp {
   }
 
   /**
+   * POST /app/installations/{id}/access_tokens for one repository with exactly PUSH_PERMISSIONS or PULL_PERMISSIONS.
+   * Anything else throws before any request. A token GitHub granted more than asked for (a permission not asked, or a
+   * higher level), or for another repository, is GitHubError('other') and isn't returned.
+   */
+  async createWriteToken(installationId: number, repository: string, permissions: WritePermissions): Promise<InstallationToken> {
+    if (!Number.isSafeInteger(installationId) || installationId <= 0) throw new Error('the installation id must be a positive integer')
+    if (typeof repository !== 'string' || !REPOSITORY.test(repository)) throw new Error(`repository ${JSON.stringify(repository)} is not a repository name`)
+    const key = permissionKey(permissions)
+    if (key !== permissionKey(PUSH_PERMISSIONS) && key !== permissionKey(PULL_PERMISSIONS)) {
+      throw new Error('dish mints write tokens only for a push (contents) or a pull request (pull_requests)')
+    }
+    const asked: Record<string, string> = { ...permissions }
+
+    const path = `/app/installations/${installationId}/access_tokens`
+    const call = `POST ${path}`
+    const { json } = await this.#request('POST', path, { kind: 'jwt' }, call, { repositories: [repository], permissions: asked })
+    if (!isRecord(json) || typeof json.token !== 'string' || typeof json.expires_at !== 'string') throw malformed(call)
+    const expiresAt = Date.parse(json.expires_at)
+    if (!Number.isFinite(expiresAt)) throw malformed(call)
+    const granted: Record<string, string> = {}
+    if (isRecord(json.permissions)) {
+      for (const [name, level] of Object.entries(json.permissions)) granted[name] = String(level)
+    }
+    // A token that can do more than asked, anywhere, is not used (it expires on its own within the hour).
+    for (const [name, level] of Object.entries(granted)) {
+      const wanted = asked[name]
+      if (wanted === undefined || (LEVELS[level] ?? Number.POSITIVE_INFINITY) > LEVELS[wanted]!) {
+        throw new GitHubError('other', `${call}: GitHub granted more than asked; the token is not used`)
+      }
+    }
+    const names = Array.isArray(json.repositories)
+      ? json.repositories.flatMap(item => isRecord(item) && typeof item.name === 'string' ? [item.name] : [])
+      : []
+    if (names.length !== 1 || names[0]!.toLowerCase() !== repository.toLowerCase()) {
+      throw new GitHubError('other', `${call}: the token covers other repositories; it is not used`)
+    }
+    let token: string
+    try {
+      token = checkedToken(json.token)
+    } catch {
+      throw malformed(call)
+    }
+    return { token, expiresAt, permissions: granted, repositories: names }
+  }
+
+  /**
    * `GET /users/<slug>%5Bbot%5D`: the bot's id, for its commit email. With an installation token when one is given;
    * without one, the request carries no credential at all. The endpoint is public, so onboarding asks it that way (Task
    * 7a's review): the in-memory API token needs Pull requests read, which an installation that hasn't accepted it yet
@@ -348,8 +461,142 @@ export class GitHubApp {
     })
   }
 
+  /** POST /repos/{o}/{r}/pulls with an installation token: `{ title, head, base, body }`. */
+  async createPull(owner: string, repo: string, pull: { title: string, head: string, base: string, body: string }, token: string): Promise<PullOpened> {
+    const auth: Auth = { kind: 'token', token: checkedToken(token) }
+    const path = `${repoPath(owner, repo)}/pulls`
+    const call = `POST ${path}`
+    const { json } = await this.#request('POST', path, auth, call, { title: pull.title, head: pull.head, base: pull.base, body: pull.body })
+    if (!isRecord(json) || typeof json.number !== 'number' || typeof json.html_url !== 'string') throw malformed(call)
+    return { number: json.number, url: json.html_url, base: pull.base }
+  }
+
+  /** GET /repos/{o}/{r}/pulls?head=<owner>:<branch>&state=open&per_page=100: the first whose head.ref is `branch`, or undefined. */
+  async findOpenPull(owner: string, repo: string, branch: string, token: string): Promise<PullOpened | undefined> {
+    const auth: Auth = { kind: 'token', token: checkedToken(token) }
+    const path = `${repoPath(owner, repo)}/pulls`
+    const call = `GET ${path}`
+    const { json } = await this.#request('GET', `${path}?head=${encodeURIComponent(`${owner}:${branch}`)}&state=open&per_page=${PER_PAGE}`, auth, call)
+    if (!Array.isArray(json)) throw malformed(call)
+    for (const item of json) {
+      if (!isRecord(item) || !isRecord(item.head) || item.head.ref !== branch) continue
+      if (typeof item.number !== 'number' || typeof item.html_url !== 'string' || !isRecord(item.base) || typeof item.base.ref !== 'string') throw malformed(call)
+      return { number: item.number, url: item.html_url, base: item.base.ref }
+    }
+    return undefined
+  }
+
+  /** POST /repos/{o}/{r}/issues/{number}/comments with an installation token: `{ body }`. A 201 is enough. */
+  async createComment(owner: string, repo: string, number: number, body: string, token: string): Promise<void> {
+    const auth: Auth = { kind: 'token', token: checkedToken(token) }
+    const path = `${repoPath(owner, repo)}/issues/${pullNumber(number)}/comments`
+    await this.#request('POST', path, auth, `POST ${path}`, { body })
+  }
+
+  /** PATCH /repos/{o}/{r}/pulls/{number} with an installation token: only the fields given. A 200 is enough. */
+  async updatePull(owner: string, repo: string, number: number, fields: { title?: string, body?: string }, token: string): Promise<void> {
+    const auth: Auth = { kind: 'token', token: checkedToken(token) }
+    const path = `${repoPath(owner, repo)}/pulls/${pullNumber(number)}`
+    const changed: { title?: string, body?: string } = {}
+    if (fields.title !== undefined) changed.title = fields.title
+    if (fields.body !== undefined) changed.body = fields.body
+    await this.#request('PATCH', path, auth, `PATCH ${path}`, changed)
+  }
+
+  /** GET /repos/{o}/{r}/pulls/{number}: what readPull needs of it. */
+  async pullDetails(owner: string, repo: string, number: number, token: string): Promise<PullDetails> {
+    const auth: Auth = { kind: 'token', token: checkedToken(token) }
+    const path = `${repoPath(owner, repo)}/pulls/${pullNumber(number)}`
+    const call = `GET ${path}`
+    const { json } = await this.#request('GET', path, auth, call)
+    if (!isRecord(json) || typeof json.number !== 'number' || typeof json.html_url !== 'string' || typeof json.title !== 'string'
+      || (json.state !== 'open' && json.state !== 'closed') || !isRecord(json.head) || typeof json.head.ref !== 'string'
+      || typeof json.head.sha !== 'string' || !isRecord(json.base) || typeof json.base.ref !== 'string') {
+      throw malformed(call)
+    }
+    return {
+      number: json.number,
+      url: json.html_url,
+      title: json.title,
+      state: json.state,
+      merged: json.merged === true,
+      draft: json.draft === true,
+      mergeable: typeof json.mergeable === 'boolean' ? json.mergeable : null,
+      mergeableState: typeof json.mergeable_state === 'string' ? json.mergeable_state : 'unknown',
+      head: { ref: json.head.ref, sha: json.head.sha },
+      base: { ref: json.base.ref },
+    }
+  }
+
+  /** GET …/pulls/{number}/reviews: the newest 100 (`#newest`). */
+  async pullReviews(owner: string, repo: string, number: number, token: string): Promise<RawList> {
+    return this.#newest(`${repoPath(owner, repo)}/pulls/${pullNumber(number)}/reviews`, token)
+  }
+
+  /** GET …/pulls/{number}/comments: the newest 100 (`#newest`). */
+  async pullReviewComments(owner: string, repo: string, number: number, token: string): Promise<RawList> {
+    return this.#newest(`${repoPath(owner, repo)}/pulls/${pullNumber(number)}/comments`, token)
+  }
+
+  /** GET /repos/{o}/{r}/issues/{number}/comments: the newest 100 (`#newest`). */
+  async issueComments(owner: string, repo: string, number: number, token: string): Promise<RawList> {
+    return this.#newest(`${repoPath(owner, repo)}/issues/${pullNumber(number)}/comments`, token)
+  }
+
+  /** GET /repos/{o}/{r}/commits/{sha}/check-runs?per_page=100: its `check_runs`. */
+  async checkRuns(owner: string, repo: string, sha: string, token: string): Promise<RawList> {
+    return this.#list(`${repoPath(owner, repo)}/commits/${commitId(sha)}/check-runs`, token, 'check_runs')
+  }
+
+  /** GET /repos/{o}/{r}/commits/{sha}/status?per_page=100 (the combined status): its `statuses`. */
+  async combinedStatus(owner: string, repo: string, sha: string, token: string): Promise<RawList> {
+    return this.#list(`${repoPath(owner, repo)}/commits/${commitId(sha)}/status`, token, 'statuses')
+  }
+
+  /**
+   * The newest 100 items of a list GitHub gives oldest first, a page at a time, in GitHub's order: the first page (which
+   * says how many pages there are), then, when its `Link` header names a last page past it, that page, and the page before
+   * it when the last is short. Only the page number is taken from the header: each request is `path` with `page`, never a
+   * URL GitHub gave. `full` is true when older items weren't read. A `Link` with no last page it can read leaves the first
+   * page, and `full`.
+   */
+  async #newest(path: string, token: string): Promise<RawList> {
+    const auth: Auth = { kind: 'token', token: checkedToken(token) }
+    const call = `GET ${path}`
+    const page = async (number?: number): Promise<{ items: unknown[], headers: Headers }> => {
+      const { json, headers } = await this.#request('GET', `${path}?per_page=${PER_PAGE}${number === undefined ? '' : `&page=${number}`}`, auth, call)
+      if (!Array.isArray(json)) throw malformed(call)
+      return { items: json, headers }
+    }
+    const first = await page()
+    const links = linkRelations(first.headers.get('link'))
+    const last = pageNumber(links.get('last'))
+    if (last === undefined) {
+      // No other page; or one GitHub names only as `next`, which can't be the newest.
+      const more = links.size > 0 || first.items.length > PER_PAGE
+      return { items: first.items.slice(-PER_PAGE), full: more }
+    }
+    if (last <= 1) return { items: first.items.slice(-PER_PAGE), full: first.items.length > PER_PAGE }
+    let items = (await page(last)).items
+    if (items.length < PER_PAGE) {
+      const before = last === 2 ? first.items : (await page(last - 1)).items
+      items = [...before, ...items]
+    }
+    return { items: items.slice(-PER_PAGE), full: true }
+  }
+
+  /** The first page (100) of `path` with an installation token: the answer itself, or its `field`, must be a list. */
+  async #list(path: string, token: string, field?: string): Promise<RawList> {
+    const auth: Auth = { kind: 'token', token: checkedToken(token) }
+    const call = `GET ${path}`
+    const { json } = await this.#request('GET', `${path}?per_page=${PER_PAGE}`, auth, call)
+    const items: unknown = field === undefined ? json : isRecord(json) ? json[field] : undefined
+    if (!Array.isArray(items)) throw malformed(call)
+    return { items, full: items.length >= PER_PAGE }
+  }
+
   /** One request. `call` (method and path, no query) is what an error names. */
-  async #request(method: 'GET' | 'POST', path: string, auth: Auth, call: string, body?: unknown): Promise<Answer> {
+  async #request(method: 'GET' | 'POST' | 'PATCH', path: string, auth: Auth, call: string, body?: unknown): Promise<Answer> {
     let authorization: string | undefined
     if (auth.kind === 'jwt') {
       let credentials: AppCredentials | undefined
@@ -403,13 +650,38 @@ export class GitHubApp {
     let message = ''
     try {
       const parsed: unknown = JSON.parse(text)
-      if (isRecord(parsed) && typeof parsed.message === 'string') message = excerpt(parsed.message)
+      if (isRecord(parsed)) message = excerpt(failureText(parsed))
     } catch {
       // Not JSON: no message.
     }
     const detail = message === '' ? '' : `: ${message}`
     throw new GitHubError(kindOf(status, response.headers), `${call} answered HTTP ${status}${detail}`, status)
   }
+}
+
+/** GitHub's `Link` header as relation → URL (`next`, `last`, `prev`, `first`); empty for none. Nothing in it is fetched. */
+function linkRelations(header: string | null): Map<string, string> {
+  const relations = new Map<string, string>()
+  if (header === null) return relations
+  for (const part of header.slice(0, 8 * 1024).split(',')) {
+    const found = /^\s*<([^>]*)>\s*;\s*rel="([^"]*)"\s*$/.exec(part)
+    if (found === null) continue
+    for (const rel of found[2]!.split(/\s+/)) if (rel !== '') relations.set(rel, found[1]!)
+  }
+  return relations
+}
+
+/** The `page` of a `Link` URL, a whole number from 1; undefined when there is none, or it isn't one. */
+function pageNumber(url: string | undefined): number | undefined {
+  if (url === undefined) return undefined
+  let page: string | null
+  try {
+    page = new URL(url, 'https://api.github.com').searchParams.get('page')
+  } catch {
+    return undefined
+  }
+  if (page === null || !/^[1-9]\d{0,6}$/.test(page)) return undefined
+  return Number(page)
 }
 
 /** The kind of a failed answer. */
@@ -423,6 +695,27 @@ function kindOf(status: number, headers: Headers): GitHubErrorKind {
   if (status === 404) return 'not-found'
   if (status === 422) return 'unprocessable'
   return 'other'
+}
+
+/**
+ * A failure's text: its `message`, and each item of its `errors` (GitHub's 422 says what was wrong there): the item's
+ * own `message`, else `<resource> <field> <code>` from the strings it has. `"<message> (<one>; <two>)"`; unmasked
+ * (the caller masks, then cuts).
+ */
+function failureText(body: Record<string, unknown>): string {
+  const message = typeof body.message === 'string' ? body.message : ''
+  const parts = !Array.isArray(body.errors) ? [] : body.errors.flatMap((item): string[] => {
+    if (!isRecord(item)) return []
+    if (typeof item.message === 'string' && item.message !== '') return [item.message]
+    const words = [item.resource, item.field, item.code].filter((word): word is string => typeof word === 'string' && word !== '')
+    return words.length === 0 ? [] : [words.join(' ')]
+  })
+  return parts.length === 0 ? message : `${message} (${parts.join('; ')})`.trim()
+}
+
+/** `/repos/{owner}/{repo}`, each one segment, encoded. */
+function repoPath(owner: string, repo: string): string {
+  return `/repos/${segment('owner', owner)}/${segment('repo', repo)}`
 }
 
 function malformed(call: string, status?: number): GitHubError {

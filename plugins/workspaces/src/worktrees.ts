@@ -116,6 +116,18 @@ export interface WorktreeInfo extends Worktree {
 
 export interface CreatedWorktree extends Worktree {
   setup: SetupOutcome
+  /** The base as asked for: `origin/<default>`, or the caller's `base` (the record's `baseRef`). */
+  baseRef: string
+}
+
+/** A worktree's branch against GitHub's, as the last fetch left them (`Worktrees.compare`). */
+export interface BranchComparison {
+  /** Commits on origin/<default> the branch lacks. */
+  behindDefault: number
+  /** Commits on the branch origin/<default> lacks. */
+  aheadOfDefault: number
+  /** Commits on origin/dish/<slug> the branch lacks; null when GitHub has no such branch. */
+  remoteAhead: number | null
 }
 
 export interface WorktreeDeps {
@@ -232,7 +244,44 @@ export class Worktrees {
     if (landed !== path || await realpath(path).catch(() => undefined) !== path) {
       await this.#undo(project, clone, record, landed, path)
     }
-    return { project: project.name, slug, branch: record.branch, path, clone, base: commit, setup: worktreeSetup(project, path) }
+    return { project: project.name, slug, branch: record.branch, path, clone, base: commit, setup: worktreeSetup(project, path), baseRef }
+  }
+
+  /**
+   * HEAD's commit in the worktree at `path` (`checkWorktree` first: a refusal throws). Throws "worktree <slug>'s HEAD
+   * isn't a commit" when it isn't one.
+   */
+  async head(clone: string, path: string): Promise<string> {
+    const check = await checkWorktree(clone, path)
+    if (!check.ok) throw new Error(check.problem)
+    const sha = await commitOf(resolve(path), 'HEAD')
+    if (sha === undefined) throw new Error(`worktree ${shown(basename(path), 80)}'s HEAD isn't a commit`)
+    return sha
+  }
+
+  /** `refs/heads/<branch>`'s commit in the clone, or undefined. */
+  tip(clone: string, branch: string): Promise<string | undefined> {
+    return branchTip(clone, branch)
+  }
+
+  /**
+   * The local branch against `refs/remotes/origin/<default>` and `refs/remotes/origin/<branch>`, as the last fetch left
+   * them. Rejects when its branch is gone, or when git can't count (unlike `aheadBehind`, which gives zeros).
+   */
+  async compare(clone: string, branch: string, defaultBranch: string): Promise<BranchComparison> {
+    const tip = await branchTip(clone, branch)
+    if (tip === undefined) throw new Error(`its branch ${branch} is gone`)
+    const counts = await gitOk(['-C', clone, 'rev-list', '--left-right', '--count', `refs/remotes/origin/${defaultBranch}...${tip}`], this.#options())
+    const both = /^(\d+)\s+(\d+)\s*$/.exec(counts)
+    if (both === null) throw new Error(`git couldn't count ${branch} against origin/${defaultBranch}`)
+    const remote = await commitOf(clone, `refs/remotes/origin/${branch}`)
+    let remoteAhead: number | null = null
+    if (remote !== undefined) {
+      const ahead = /^(\d+)\s*$/.exec(await gitOk(['-C', clone, 'rev-list', '--count', `${tip}..${remote}`], this.#options()))
+      if (ahead === null) throw new Error(`git couldn't count origin/${branch} against ${branch}`)
+      remoteAhead = Number(ahead[1])
+    }
+    return { behindDefault: Number(both[1]), aheadOfDefault: Number(both[2]), remoteAhead }
   }
 
   /** Every linked worktree of the clone (not its main checkout), in git's order; `merged` is computed for managed ones only. */
@@ -389,8 +438,13 @@ export class Worktrees {
    * repositories, whose own edits `--ignore-submodules=dirty` hides and whose history removal would delete: a gitlink
    * in its index, or a `.git` in a folder git tracks (one in an untracked folder shows in `status`; one in an ignored
    * folder is an ignored file, a known limit).
+   *
+   * With `options.untracked` (open_pr's: a gate may leave output git doesn't ignore), untracked files don't count: their
+   * paths, as git lists them (relative, an untracked folder once, as `<folder>/`), are added to it, unmasked. A tracked
+   * change (staged or not), another branch and a nested worktree still count, and so does a nested repository in an
+   * untracked folder: `status --untracked-files=all` lists each one as its own `<folder>/`.
    */
-  async dirty(clone: string, path: string, branch?: string): Promise<string | undefined> {
+  async dirty(clone: string, path: string, branch?: string, options?: { untracked?: string[] }): Promise<string | undefined> {
     const check = await checkWorktree(clone, path)
     if (!check.ok) throw new Error(check.problem)
     const dir = resolve(path)
@@ -399,8 +453,26 @@ export class Worktrees {
       const ref = head.code === 0 ? head.stdout.trim() : undefined
       if (ref !== `refs/heads/${branch}`) return ref === undefined ? `a detached HEAD, not ${branch}, is checked out` : `${shown(ref.replace(/^refs\/heads\//, ''), 100)}, not ${branch}, is checked out`
     }
+    const collected = options?.untracked
     const status = await gitOk(['-C', dir, '--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=normal', '--ignore-submodules=dirty'], this.#options())
-    const changed = status.split('\0').filter(entry => entry !== '')
+    let changed = status.split('\0').filter(entry => entry !== '')
+    const untracked: string[] = []
+    if (collected !== undefined) {
+      // A listing this long may have been cut, and a tracked change with it.
+      if (status.length >= GIT_OUTPUT_CAP - 16) return 'too many changes to check'
+      const tracked: string[] = []
+      for (let at = 0; at < changed.length; at += 1) {
+        const entry = changed[at]!
+        if (entry.startsWith('?? ')) {
+          untracked.push(entry.slice(3))
+          continue
+        }
+        tracked.push(entry)
+        // A rename's or a copy's source path follows it, as a field of its own.
+        if (/^(?:[RC].|.[RC]) /.test(entry)) at += 1
+      }
+      changed = tracked
+    }
     if (changed.length > 0) return `${shown(changed[0]!, 120)}${changed.length > 1 ? ` and ${changed.length - 1} more` : ''}`
     const inner = nestedWorktree(await worktreeEntries(clone), dir)
     if (inner !== undefined) return `it holds another worktree (${shown(inner, 200)})`
@@ -412,6 +484,15 @@ export class Worktrees {
     for (const folder of folders.split('\0')) {
       if (folder !== '' && await present(join(dir, folder, '.git'))) return `it has a nested repository (${shown(folder, 100)})`
     }
+    if (collected !== undefined && untracked.some(entry => entry.endsWith('/'))) {
+      // git lists an untracked folder once, whatever is in it; listing every untracked file shows each nested repository
+      // in one (a folder with a `.git`) as its own `<folder>/`, and nothing else ends with `/`.
+      const all = await gitOk(['-C', dir, '--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all', '--ignore-submodules=dirty'], this.#options())
+      if (all.length >= GIT_OUTPUT_CAP - 16) return 'too many untracked files to check for nested repositories'
+      const repository = all.split('\0').find(entry => entry.startsWith('?? ') && entry.endsWith('/'))
+      if (repository !== undefined) return `it has a nested repository (${shown(repository.slice(3), 100)})`
+    }
+    collected?.push(...untracked)
     return undefined
   }
 

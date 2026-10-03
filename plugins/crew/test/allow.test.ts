@@ -12,7 +12,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
 
 /** Every name of the never-list, as the plan's Global Constraints spell it. */
-const NEVER_NAMES = ['delegate', 'subagent', 'subagent_fork', 'subagent_codex', 'subagent_claude_code', 'list_subagent_models', 'workflow', 'ralph', 'interrupt_agent', 'list_agents', 'ask_user_question', 'create_goal', 'update_goal', 'exit_plan_mode', 'present', 'worktree']
+const NEVER_NAMES = ['delegate', 'subagent', 'subagent_fork', 'subagent_codex', 'subagent_claude_code', 'list_subagent_models', 'workflow', 'ralph', 'interrupt_agent', 'list_agents', 'ask_user_question', 'create_goal', 'update_goal', 'exit_plan_mode', 'present', 'worktree', 'run', 'open_pr', 'pr_feedback']
 
 function allowed(roleTools: string[], visible: string[]): string[] {
   const result = allowList(roleTools, new Set(visible))
@@ -30,12 +30,21 @@ function problemOf(roleTools: string[], visible: string[], role?: string): strin
 
 test('NEVER is exactly the never-list: nothing a child must not have is missing, and nothing else is in it', () => {
   assert.deepEqual([...NEVER].sort(), [...NEVER_NAMES].sort())
-  assert.equal(NEVER.size, 16)
+  assert.equal(NEVER.size, 19)
 })
 
 test('worktree, dish-workspaces\' tool for the main agent, is dropped like delegate, and the problem names it among what children never get', () => {
   assert.deepEqual(allowed(['read', 'worktree', 'delegate'], ['read', 'worktree', 'delegate']), ['read'])
   assert.match(problemOf(['worktree'], ['worktree', 'read'], 'coder'), /Children never get [^.]*\bworktree\b/)
+})
+
+test('run, open_pr and pr_feedback, dish-orchestrator\'s tools for the main agent, are dropped from a role that lists them, and the problem names them', () => {
+  const orchestrator = ['run', 'open_pr', 'pr_feedback']
+  assert.deepEqual(allowed(['read', ...orchestrator], ['read', ...orchestrator]), ['read'])
+  for (const name of orchestrator) {
+    assert.ok(NEVER.has(name), name)
+    assert.match(problemOf([name], [name, 'read'], 'coder'), new RegExp(`Children never get [^.]*\\b${name}\\b`), name)
+  }
 })
 
 // --- allowList ------------------------------------------------------------------------------------

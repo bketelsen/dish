@@ -30,7 +30,7 @@ Not for reviewing someone else's work. That's `reviewing-work`.
 6. YAGNI check: before adding anything "proper" (extra options, metrics, an abstraction), check who would use it. If nothing does and the task didn't ask for it, say so instead of building it.
 7. Fix one finding at a time, blocking ones first. For code, write the test that shows the failure first (coder and main: load `test-driven-development`), then fix, then rerun it.
 8. If a finding conflicts with the task, the spec or an earlier ruling, don't pick a side silently. Name the conflict; the main agent decides.
-9. If you have `bash`, run the repo's gate after the last fix and read its exit code. Without it, re-read each changed passage against its source, and say the gate wasn't run.
+9. If you have `bash`, run the repo's gate after the last fix and read its exit code; when your brief says dish runs the gate, dish runs it when you `report` `done`. Without `bash`, re-read each changed passage against its source, and say the gate wasn't run.
 
 ## Rules
 
@@ -46,4 +46,4 @@ One line per finding, in the order you got them:
 - `Fixed: <finding> — <what changed, file:line, the test or check that covers it>`
 - `Not fixed: <finding> — <why, with the evidence>`
 
-Then the gate result, or that you couldn't run it, and anything still open.
+Then the gate result, or that you couldn't run it, and anything still open. A coder puts these in `report`: the fixes in `summary`, and each `Not fixed:` line as an entry of `notFixed`.

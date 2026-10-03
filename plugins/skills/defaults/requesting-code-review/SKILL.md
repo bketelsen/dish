@@ -24,14 +24,14 @@ A review helps only if the reviewer judges the work, not your account of it. In 
    - the worktree or branch, and `BASE..HEAD`;
    - the gate command, which it runs itself, and the Review Focus and Global Constraints, copied in;
    - the coder's report, marked as claims to verify;
-   - for a re-review: the earlier findings, the coder's `Not fixed:` lines with their evidence, and the fix's range, asking ADDRESSED or NOT ADDRESSED for each, and new breakage in the fix only;
-   - the report shape: a verdict, then findings, each with a severity (blocking, should fix or nit), `file:line`, the concrete failure and the fix, plus the gate output and exit code.
+   - for a re-review: the earlier findings, the coder's `notFixed` entries with their evidence, and the fix's range, asking whether each is addressed, and new breakage in the fix only;
+   - that it finishes with `report`: its `verdict`, the `head` it reviewed, and `findings`, each with a severity (`blocking`, `should_fix` or `nit`), the file and line, the concrete failure and the fix, with the gate and its exit code in `checks`.
 
    Don't pre-judge: never tell the reviewer to ignore an issue or cap a severity.
-3. **Delegate to `reviewer`** with `reviews` set to the child whose work it is, or `main` for your own. For a final review, set `model` to the strongest model of the reviewer's family. For a re-review, use `to` with the same reviewer and leave `reviews` and `model` empty. Then end your turn.
+3. **Delegate to `reviewer`** with `reviews` set to the child whose work it is, or `main` for your own. For the final review, set `final: true`, and `model` to the strongest model of the reviewer's family: `open_pr` needs its approval of the head it pushes. For a re-review, use `to` with the same reviewer and leave `reviews` and `model` empty. Then end your turn.
 4. **Sort the findings:**
-   - **Blocking and should fix:** through the fix rounds (`delegate` with `to` the coder), then a re-review. **Nits:** ledgered as deferred.
-   - **One you think is wrong:** check it against the code. If it still looks wrong, push back with evidence (load `receiving-code-review`) and record a ruling.
+   - **Blocking and should fix:** through the fix rounds (`delegate` with `to` the coder), then a re-review. **Nits:** deferred with `run` action `defer`.
+   - **One you think is wrong:** check it against the code. If it still looks wrong, push back with evidence (load `receiving-code-review`) and record a ruling (`run` action `ruling`).
    - **"Can't verify from the diff":** you hold the cross-task context, so check it yourself. A real gap is blocking.
 
 ## Red flags
@@ -43,4 +43,4 @@ A review helps only if the reviewer judges the work, not your account of it. In 
 
 ## Hand back
 
-The verdict, each blocking or should-fix finding with what was done about it, and the deferred findings: to the user if they asked, otherwise in the ledger.
+The verdict, each blocking or should-fix finding with what was done about it, and the deferred findings: to the user if they asked, otherwise in the run's ledger.

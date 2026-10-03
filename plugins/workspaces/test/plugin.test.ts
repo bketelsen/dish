@@ -221,6 +221,9 @@ test('end to end: a project in projects.yaml is onboarded; a restart prepares it
     await commit('dirty-one', made.dirty.path)
     const merged = made.merged
     await writeFile(join(made.dirty.path, 'scratch.txt'), 'not committed\n')
+    // isClean's option reaches the service through dishWorkspaces.
+    assert.deepEqual(await run.service()!.isClean('acme/widget/dirty-one', { untracked: 'ignore' }), { clean: true, untracked: ['scratch.txt'] })
+    assert.equal((await run.service()!.isClean('acme/widget/dirty-one')).clean, false)
     const swept = await run.service()!.sweep()
     assert.deepEqual(swept.removed, [{ project: 'acme/widget', slug: 'merged-one', by: 'pull-request' }])
     assert.deepEqual(swept.kept.map(item => [item.slug, item.reason]).sort(), [['dirty-one', 'dirty'], ['feature', 'not-merged']])
@@ -322,6 +325,40 @@ test('dish-projects recording a project ready registers its workspace when a reg
   } finally {
     await workspaces.dispose()
     await registry?.stop()
+    for (const fiber of fibers.reverse()) await fiber.dispose()
+  }
+})
+
+test('dishWorkspaces exposes headOf, isClean, compareBranch, pushBranch, openPull, updatePull, commentPull and readPull, and they reach the service', async () => {
+  const world = await startServiceWorld()
+  const ctx = new Context()
+  const projects = projectsStub()
+  projects.add(projectOf('acme/widget'))
+  const fibers = [provideStub(ctx, 'dishProjects', projects.service), provideStub(ctx, 'credentials', credentialsStub(world.credentials))]
+  for (const fiber of fibers) await fiber
+  const workspaces = mountWorkspaces(ctx, world)
+  await workspaces
+  try {
+    const service = ctx.get('dishWorkspaces') as DishWorkspaces
+    for (const method of ['headOf', 'isClean', 'compareBranch', 'pushBranch', 'openPull', 'updatePull', 'commentPull', 'readPull'] as const) {
+      assert.equal(typeof service[method], 'function', method)
+    }
+    const head = 'a'.repeat(40)
+    assert.equal(await service.headOf('acme/widget/fix-1'), undefined)
+    await assert.rejects(service.isClean('acme/widget/fix-1'), /^Error: no worktree acme\/widget\/fix-1 that dish made$/)
+    // A project that isn't ready (pending) is refused by each, before anything reaches GitHub.
+    const pending = /^Error: acme\/widget isn't ready \(pending\); see Settings → Projects$/
+    await assert.rejects(service.compareBranch('acme/widget', 'fix-1'), pending)
+    await assert.rejects(service.pushBranch('acme/widget', 'fix-1', { head }), pending)
+    await assert.rejects(service.openPull('acme/widget', { head: 'dish/fix-1', title: 't', body: '' }), pending)
+    await assert.rejects(service.updatePull('acme/widget', 1, { title: 't' }), pending)
+    await assert.rejects(service.commentPull('acme/widget', 1, 'b'), pending)
+    await assert.rejects(service.readPull('acme/widget', 1), pending)
+    await assert.rejects(service.readPull('acme/nothing', 1), /no project acme\/nothing in projects\.yaml/)
+    assert.deepEqual(world.github.minted, [])
+    assert.deepEqual(world.github.requests.filter(request => request.path.startsWith('/repos/acme/widget/pulls')), [])
+  } finally {
+    await workspaces.dispose()
     for (const fiber of fibers.reverse()) await fiber.dispose()
   }
 })

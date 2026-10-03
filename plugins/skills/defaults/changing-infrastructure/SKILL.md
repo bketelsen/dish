@@ -16,7 +16,7 @@ Not for application code in a repo, which is a coder's task, unless that repo is
 ## Steps
 
 1. Look first. Read the config, the status and the recent logs: the service manager's status, the journal, the container or VM list, the health endpoint. Say what you found before proposing anything.
-2. Find where it's defined. If a GitOps repo defines it (the homelab's is `fleet`), change it there: commit on a branch and hand back the diff. Pushing, the pull request and the apply wait for the main agent's go-ahead. Humans merge. Don't hand-edit the machine instead: it drifts from the repo, and the next apply undoes it.
+2. Find where it's defined. If a GitOps repo defines it (the homelab's is `fleet`), change it there: commit on a branch and hand back the diff. Don't push: in a registered project, the main agent opens the pull request with `open_pr`; elsewhere the user pushes. The apply waits for the main agent's go-ahead. Humans merge. Don't hand-edit the machine instead: it drifts from the repo, and the next apply undoes it.
 3. Plan the smallest change that does the job, and how you'd undo it. Use a dry run or a diff when the tool has one.
 4. Back up before you change: copy a file before editing it, export a config, snapshot a VM before a large change.
 5. Before anything irreversible or disruptive, stop. That means deleting data, restarting a shared service, changing access, the firewall or DNS, or rebooting. Report the exact command, what it affects and how to undo it, and don't run it until the main agent tells you to.

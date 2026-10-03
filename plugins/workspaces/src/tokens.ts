@@ -1,13 +1,20 @@
 /**
  * The read tokens: per owner, a file token for the credential helper, and an in-memory token for dish's own API reads.
+ * And (step 7) the write tokens of `pushBranch`, `openPull`, `updatePull` and `commentPull`: minted for one call, kept
+ * nowhere.
  *
  * - **The file token** (`FILE_PERMISSIONS`: contents and metadata, read) covers the repos of that owner's projects (one
  *   installation per owner). It is written atomically to `<tokens dir>/<owner, lower-case>`, mode 0600, as the token and
  *   `\n`, in a directory this manager makes 0700 (and sets to 0700 if it was there already). It is refreshed
  *   `REFRESH_BEFORE_MS` before it expires, by a timer per owner; a failed refresh is logged once per distinct error,
  *   tried again after a minute, and leaves the old file (good until it expires).
- * - **The API token** (`API_PERMISSIONS`: metadata and pull requests, read) is kept in memory only, so the file token
- *   stays as narrow as above.
+ * - **The API token** (`API_PERMISSIONS`: metadata, pull requests, checks and commit statuses, read) is kept in memory
+ *   only, so the file token stays as narrow as above. Pull requests are for the sweep and `readPull`; checks and commit
+ *   statuses for `readPull` (`pr_feedback`). An installation that hasn't accepted the last two yet gets
+ *   `API_BASE_PERMISSIONS` (today's metadata and pull requests) instead, logged once, so the sweep keeps working; the
+ *   wide set is asked for again at each mint.
+ * - **A write token** (`writeToken`: `PUSH_PERMISSIONS` or `PULL_PERMISSIONS`, for one repository of a held owner) is
+ *   minted for each call, returned, and kept nowhere: no state, no file, no timer, no log.
  * - **A repo the installation no longer has** fails the whole token request (422): the repos are looked up one by one
  *   with `installationFor`, the ones it lacks are dropped (and reported), and the token is minted for the rest.
  * - **Nothing logs a token.** A log line or an error names the owner, the repos and GitHub's masked message only.
@@ -23,12 +30,15 @@ import { chmod, lstat, mkdir, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { maskSecrets } from 'dish-kit'
 import { GitHubError } from './github.ts'
-import type { GitHubApp, InstallationToken } from './github.ts'
+import type { GitHubApp, InstallationToken, WritePermissions } from './github.ts'
 import { KeyedLock } from './locks.ts'
 import { writeFileAtomic } from './paths.ts'
 
 export const FILE_PERMISSIONS = { contents: 'read', metadata: 'read' } as const
-export const API_PERMISSIONS = { metadata: 'read', pull_requests: 'read' } as const
+/** The in-memory API token's permissions: the sweep's pull requests, and readPull's checks and commit statuses. */
+export const API_PERMISSIONS = { metadata: 'read', pull_requests: 'read', checks: 'read', statuses: 'read' } as const
+/** Today's API permissions: what an installation that hasn't accepted Checks and Commit statuses read still gets. */
+export const API_BASE_PERMISSIONS = { metadata: 'read', pull_requests: 'read' } as const
 /** A token is minted again this long before it expires (GitHub's last an hour). */
 export const REFRESH_BEFORE_MS = 600_000
 /** A failed refresh is tried again after this long. */
@@ -53,7 +63,7 @@ export interface OwnerRepos {
 export interface TokenManagerOptions {
   /** `tokensDir(state)`. */
   directory: string
-  app: Pick<GitHubApp, 'createToken' | 'installationFor'>
+  app: Pick<GitHubApp, 'createToken' | 'installationFor' | 'createWriteToken'>
   logger: { warn(format: string, ...args: unknown[]): void, info(format: string, ...args: unknown[]): void }
   now?: () => number
   /** Tests; default an unref'd `setTimeout`. */
@@ -70,7 +80,10 @@ interface OwnerState {
   repos: string[]
   /** What the file holds now. */
   file: { repos: string, installation: number, expiresAt: number } | undefined
-  api: { repos: string, installation: number, expiresAt: number, token: string } | undefined
+  /** The API token; `narrow` when it has only API_BASE_PERMISSIONS (the installation hasn't accepted the new two). */
+  api: { repos: string, installation: number, expiresAt: number, token: string, narrow: boolean } | undefined
+  /** Whether the first narrow API token has been logged. */
+  narrowLogged: boolean
   timer: unknown
   /** The last refresh error logged, so the same one isn't logged every minute. */
   lastError: string | undefined
@@ -162,7 +175,7 @@ export class TokenManager {
       // Unchanged, and nothing dropped: nothing to do. A repo dropped after a 422 is tried again at every recompute (the 422
       // path drops it again if the installation still lacks it), so one given back to the App is read again without a restart.
       if (current !== undefined && current.given === given && reposKey(current.repos) === given && current.installation === entry.installation) continue
-      const state: OwnerState = current ?? { owner, installation: entry.installation, given, repos, file: undefined, api: undefined, timer: undefined, lastError: undefined }
+      const state: OwnerState = current ?? { owner, installation: entry.installation, given, repos, file: undefined, api: undefined, narrowLogged: false, timer: undefined, lastError: undefined }
       state.installation = entry.installation
       state.given = given
       state.repos = repos
@@ -179,7 +192,11 @@ export class TokenManager {
     return this.#lock.run(key, () => this.#ensure(key, false))
   }
 
-  /** The in-memory API token for `owner`, minted with API_PERMISSIONS, never written. */
+  /**
+   * The in-memory API token for `owner`, minted with API_PERMISSIONS, never written. When the installation hasn't
+   * accepted Checks and Commit statuses read (a 422 with no repository dropped), with API_BASE_PERMISSIONS instead: kept
+   * the same way, logged the first time, and replaced near its expiry by a mint that asks for the wide set again.
+   */
   async apiToken(owner: string): Promise<string> {
     const key = ownerKey(owner)
     // Its own lock key (an owner has no space in it), so an API read never waits behind a file refresh.
@@ -191,13 +208,49 @@ export class TokenManager {
         return cached.token
       }
       if (state.repos.length === 0) throw new Error(`the dish App can read no repository of ${key} any more`)
-      const { token, repos: covered, installation } = await this.#mint(state, API_PERMISSIONS)
+      let narrow = false
+      let minted: Minted
+      try {
+        minted = await this.#mint(state, API_PERMISSIONS)
+      } catch (error) {
+        // #mint rethrows a 422 only when no repository was dropped: the installation lacks a permission asked for, one
+        // it hasn't accepted yet. Today's narrower token keeps the sweep's reads working.
+        if (!(error instanceof GitHubError && error.kind === 'unprocessable')) throw error
+        minted = await this.#mint(state, API_BASE_PERMISSIONS)
+        narrow = true
+      }
+      const { token, repos: covered, installation } = minted
       if (token === undefined) throw new Error(`the dish App can read no repository of ${key} any more`)
       if (this.#owners.get(key) === state && !this.#closed) {
-        state.api = { repos: reposKey(covered), installation, expiresAt: token.expiresAt, token: token.token }
+        state.api = { repos: reposKey(covered), installation, expiresAt: token.expiresAt, token: token.token, narrow }
+        if (narrow && !state.narrowLogged) {
+          state.narrowLogged = true
+          this.#logger.warn("the dish App's installation for %s hasn't accepted Checks and Commit statuses read; pr_feedback shows no checks until it does (Settings → GitHub App)", key)
+        }
       }
       return token.token
     })
+  }
+
+  /**
+   * A token for `owner/repo` with `permissions`, minted now for one call: never cached on the owner's state, never
+   * written, never logged. The caller drops it when its call ends. Refused, with nothing minted, for an owner this
+   * manager doesn't hold (or once closed) and a repo none of its projects has. GitHub's 422 (the App, or an
+   * installation, without the write permission) says what the App needs.
+   */
+  async writeToken(owner: string, repo: string, permissions: WritePermissions): Promise<string> {
+    const key = ownerKey(owner)
+    const state = this.#held(key)
+    if (typeof repo !== 'string' || !state.repos.some(item => item.toLowerCase() === repo.toLowerCase())) {
+      throw new Error(`the dish App can't reach ${key}/${describe(String(repo))}: no project of dish has it installed`)
+    }
+    try {
+      return (await this.#app.createWriteToken(state.installation, repo, permissions)).token
+    } catch (error) {
+      if (!(error instanceof GitHubError && error.kind === 'unprocessable')) throw error
+      const needs = 'contents' in permissions ? 'Contents' : 'Pull requests'
+      throw new Error(`dish couldn't get a write token for ${key}/${repo}: ${describe(error).replace(/\.$/, '')}. The dish App needs ${needs} read and write, and each installation must accept it (Settings → GitHub App)`)
+    }
   }
 
   /**
