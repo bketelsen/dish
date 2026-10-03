@@ -14,7 +14,10 @@
  * `report` is registered at `agent/created` on the child's own scope (`agent.ctx`), never in the preset, as dsh's own
  * `structured_output` is: a scope's own layer isn't subject to its tool filter, so no allow list names it, and the main agent
  * never sees it. A cold resume makes a new agent object with the same id, and it is given `report` as well. `ReportRegistrar`
- * keeps which agent objects this crew instance gave it to (`roleOf`).
+ * keeps which agent objects this crew instance gave it to (`roleOf`). When the record has lost the child (its `children.json` was
+ * set aside as corrupt after `report` was given), `setReport` gives `undefined` and the tool tells the child to end its turn with
+ * its report as its closing message. From then on that agent counts as one without `report` (`lost`): crew doesn't steer it back
+ * to call it, and the report guard's refusals are the closing message's again. The tool stays, and says the same if called.
  *
  * ### The steer
  *
@@ -215,6 +218,11 @@ export interface ReportToolDeps {
   records: Pick<CrewRecords, 'setReport'>
   tracker: Pick<ReportTracker, 'turnOf'>
   now?: () => number
+  /**
+   * Called when `setReport` gives `undefined`: the record has no such child, and the child is told to report in its closing
+   * message. The registrar stops counting the agent as one that reports with `report`. A throw is ignored.
+   */
+  lost?(): void
 }
 
 /** Record `report` for the child, conclude its turn, and give the stored report; a failure is the error the child reads. */
@@ -225,7 +233,15 @@ async function record(deps: ReportToolDeps, report: StructuredReport, exec: Tool
   } catch (error) {
     throw new Error(`dish couldn't record your report (${maskSecrets(describe(error))}); call report again`)
   }
-  if (stored === undefined) throw new Error(NOT_A_CHILD)
+  if (stored === undefined) {
+    // It is told to report in its closing message: crew mustn't send it back to call `report`, nor the guard name it.
+    try {
+      deps.lost?.()
+    } catch {
+      // The child is told all the same.
+    }
+    throw new Error(NOT_A_CHILD)
+  }
   exec.concludeTurn()
   return stored
 }
@@ -430,7 +446,8 @@ function inactive(error: unknown): boolean {
 /** Gives crew's coders and reviewers their `report`, at `agent/created`, and takes it back at `agent/disposed`. */
 export class ReportRegistrar {
   readonly #deps: RegistrarDeps
-  readonly #attached = new WeakMap<object, { role: ReportRole, detach: () => unknown }>()
+  /** Each agent object given `report`; `lost` once the record had no such child when it called it. */
+  readonly #attached = new WeakMap<object, { role: ReportRole, detach: () => unknown, lost: boolean }>()
   readonly #told = new Set<string>()
 
   constructor(deps: RegistrarDeps) {
@@ -468,9 +485,13 @@ export class ReportRegistrar {
       // A second `agent/created` for the same object can have raced the lookup.
       if (this.#attached.has(agent)) return
       const { records, tracker, now } = this.#deps
-      const tool = reportTool({ role, agent, records, tracker, ...now === undefined ? {} : { now } })
+      const lost = (): void => {
+        const entry = this.#attached.get(agent)
+        if (entry !== undefined) entry.lost = true
+      }
+      const tool = reportTool({ role, agent, records, tracker, lost, ...now === undefined ? {} : { now } })
       const detach = this.#deps.effect(() => agent.ctx.effect(() => agent.ctx.tools.register(tool)))
-      this.#attached.set(agent, { role, detach })
+      this.#attached.set(agent, { role, detach, lost: false })
     } catch (error) {
       if (inactive(error)) return
       this.#tell(id, error)
@@ -490,10 +511,14 @@ export class ReportRegistrar {
     }
   }
 
-  /** The role `report` was registered for on this agent object, by this crew instance; undefined otherwise. */
+  /**
+   * The role `report` was registered for on this agent object, by this crew instance; undefined otherwise, and once its `report`
+   * found the record had lost the child.
+   */
   roleOf(agent: object): ReportRole | undefined {
     try {
-      return this.#attached.get(agent)?.role
+      const entry = this.#attached.get(agent)
+      return entry === undefined || entry.lost ? undefined : entry.role
     } catch {
       return undefined
     }

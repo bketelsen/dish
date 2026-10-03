@@ -54,6 +54,8 @@ interface Fixture {
   tool: ToolDefinition
   /** The calls of `records.setReport`. */
   setReports(): number
+  /** How many times the tool said the record has lost the child (`lost`). */
+  losses(): number
   call(args: Record<string, unknown>): Promise<{ value?: StructuredReport, error?: Error, concluded: number }>
 }
 
@@ -69,10 +71,12 @@ async function fixture(t: TestContext, role: ReportRole, options: { recorded?: b
   const spy = t.mock.method(records, 'setReport')
   const tracker = new ReportTracker()
   const agent = childOf('c1')
-  const tool = reportTool({ role, agent, records: options.records ?? records, tracker, now: () => NOW })
+  let losses = 0
+  const tool = reportTool({ role, agent, records: options.records ?? records, tracker, now: () => NOW, lost: () => { losses += 1 } })
   return {
     records, tracker, agent, tool,
     setReports: () => spy.mock.callCount(),
+    losses: () => losses,
     async call(args) {
       const { exec, concluded } = execOf(agent)
       try {
@@ -273,6 +277,26 @@ test('failures: a setReport that throws, or that gives undefined, is said to the
   assert.equal(missing.error?.message, 'dish-crew has no record of you as a crew child, so the report wasn\'t recorded; end your turn with your report as your closing message')
   assert.equal(missing.concluded, 0)
   assert.equal(unknown.setReports(), 1)
+})
+
+test('a setReport that gives undefined (the record lost the child) calls lost, once per such call; a throw, a refusal and a success don\'t', async (t) => {
+  const unknown = await fixture(t, 'coder', { recorded: false })
+  await unknown.call(CODER)
+  assert.equal(unknown.losses(), 1)
+  await unknown.call(CODER)
+  assert.equal(unknown.losses(), 2)
+
+  const throwing = await fixture(t, 'coder', { records: { setReport: () => Promise.reject(new Error('disk full')) } })
+  await throwing.call(CODER)
+  const known = await fixture(t, 'coder')
+  await known.call({ status: 'blocked', summary: 'Stuck.' })
+  await known.call(CODER)
+  assert.equal(throwing.losses() + known.losses(), 0)
+
+  // Without `lost`, the tool says the same and nothing else happens.
+  const records = new CrewRecords(await tempDir())
+  const bare = reportTool({ role: 'coder', agent: childOf('c1'), records, tracker: new ReportTracker() })
+  await assert.rejects(bare.execute(CODER, execOf().exec), /^Error: dish-crew has no record of you as a crew child/)
 })
 
 // --- the tracker --------------------------------------------------------------------------------------------------------

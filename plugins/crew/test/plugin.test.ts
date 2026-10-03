@@ -1326,6 +1326,22 @@ async function reportWorld(options: { config?: Partial<plugin.Config>, before?(c
 
 const reportOf = (w: ReportWorld, agent: object) => w.ctx.tools.get('report', agent)
 
+/** A `send_message` in dsh's registry that delivers anything, for the report guard to stand in front of. */
+function registerSendMessage(w: ReportWorld): void {
+  w.ctx.tools.register({
+    name: 'send_message', description: 'Send a message to an agent.',
+    parameters: { type: 'object', properties: { agent_id: { type: 'string' }, message: { type: 'string' } }, required: ['agent_id', 'message'] },
+    output: { schema: { type: 'string' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }] },
+    async execute() { return 'delivered' },
+  } as never)
+}
+
+/** A result's text. */
+const resultText = (result: CallResult): string => result.content.map(block => block.text ?? '').join('')
+
+/** What the report tool says when the record has no such child. */
+const NOT_RECORDED = 'Error: dish-crew has no record of you as a crew child, so the report wasn\'t recorded; end your turn with your report as your closing message'
+
 test('report is on a crew coder\'s and a reviewer\'s own scope after agent/created, each with its role\'s schema; not on the main agent, a researcher or an agent crew doesn\'t know', async () => {
   const w = await reportWorld()
   try {
@@ -1498,15 +1514,62 @@ test('through the record: a coder\'s report, then its subagent/end, leaves the r
   }
 })
 
+test('a report the record can\'t file (setReport gives undefined): crew stops sending that child back to call report, and the guard goes back to today\'s words', async () => {
+  const w = await reportWorld()
+  try {
+    registerSendMessage(w)
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    const coder = w.scopes.child('c1')
+    await w.created(coder)
+    w.turnStarts(coder, 1)
+    w.says(coder, 1)
+    ;(w.crew().records as unknown as { setReport: () => Promise<undefined> }).setReport = async () => undefined
+    const failed = await w.call(coder, 'report', { status: 'done', summary: 'Added the form.' })
+    assert.equal(failed.isError, true)
+    assert.equal(resultText(failed), NOT_RECORDED)
+    // It does as it was told, and ends its turn with its report as text: that stop isn't sent back.
+    w.says(coder, 1, 2)
+    await w.stop(coder)
+    assert.equal(coder.steers.length, 0)
+    assert.equal(w.crew().reportSteered('c1'), false)
+    // The guard's words are today's: there is no report for it to point to.
+    const long = await w.call(coder, 'send_message', { agent_id: 'main-1', message: 'r'.repeat(5000) })
+    assert.match(resultText(long), /^Error: Not sent: this is your result, and in this crew your closing message is your report\. /)
+    assert.match(resultText(await w.call(coder, 'send_message', { agent_id: 'main-1', message: 'hi' })), /Put everything for the main agent in your closing message, and finish\.$/)
+    // The tool is still there, and still says why it can't record.
+    assert.ok(reportOf(w, coder))
+    assert.deepEqual(w.logs, [])
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('a record that lost the child (its children.json set aside as corrupt): its report fails as above, and a later text stop isn\'t steered', async () => {
+  const w = await reportWorld()
+  try {
+    await w.crew().records.addChild('main-1', crewChild('c1'))
+    const coder = w.scopes.child('c1')
+    await w.created(coder)
+    w.turnStarts(coder, 1)
+    w.says(coder, 1)
+    await w.crew().records.flush()
+    await writeFile(sessionPath(w.where, 'main-1', 'children.json'), 'not json\n')
+    const failed = await w.call(coder, 'report', { status: 'done', summary: 'Added the form.' })
+    assert.equal(resultText(failed), NOT_RECORDED)
+    w.says(coder, 1, 2)
+    await w.stop(coder)
+    assert.equal(coder.steers.length, 0)
+    assert.equal(w.logs.length, 1)
+    assert.match(w.logs[0]!, /^\[dish-crew\] warn: the record of session \S+ is not valid; it was moved to /, 'the only warning is the record\'s own')
+  } finally {
+    await w.dispose()
+  }
+})
+
 test('the report guard through the host: a coder that has report reads the words for report; a researcher child reads today\'s', async () => {
   const w = await reportWorld()
   try {
-    w.ctx.tools.register({
-      name: 'send_message', description: 'Send a message to an agent.',
-      parameters: { type: 'object', properties: { agent_id: { type: 'string' }, message: { type: 'string' } }, required: ['agent_id', 'message'] },
-      output: { schema: { type: 'string' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }] },
-      async execute() { return 'delivered' },
-    } as never)
+    registerSendMessage(w)
     await w.crew().records.addChild('main-1', crewChild('c1'))
     await w.crew().records.addChild('main-1', crewChild('x1', { role: 'researcher' }))
     const coder = w.scopes.child('c1')
@@ -1514,13 +1577,12 @@ test('the report guard through the host: a coder that has report reads the words
     await w.created(coder)
     await w.created(researcher)
     const long = 'r'.repeat(5000)
-    const text = (result: CallResult) => result.content.map(block => block.text ?? '').join('')
     const fromCoder = await w.call(coder, 'send_message', { agent_id: 'main-1', message: long })
     assert.equal(fromCoder.isError, true)
-    assert.match(text(fromCoder), /^Error: Not sent: this is your result, and in this crew you report with `report`\. /)
-    assert.match(text(await w.call(coder, 'send_message', { agent_id: 'main-1', message: 'hi' })), /Put everything for the main agent in your `report`, and finish\.$/)
+    assert.match(resultText(fromCoder), /^Error: Not sent: this is your result, and in this crew you report with `report`\. /)
+    assert.match(resultText(await w.call(coder, 'send_message', { agent_id: 'main-1', message: 'hi' })), /Put everything for the main agent in your `report`, and finish\.$/)
     const fromResearcher = await w.call(researcher, 'send_message', { agent_id: 'main-1', message: long })
-    assert.match(text(fromResearcher), /^Error: Not sent: this is your result, and in this crew your closing message is your report\. /)
+    assert.match(resultText(fromResearcher), /^Error: Not sent: this is your result, and in this crew your closing message is your report\. /)
   } finally {
     await w.dispose()
   }
