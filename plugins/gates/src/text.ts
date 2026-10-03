@@ -23,6 +23,11 @@ export const EXCERPT_MAX_CHARS = 1000
 export const SUMMARY_MAX_CHARS = 120
 /** Why a gate was skipped when the coder's closing message opted out. */
 export const BLOCKED_REASON = 'the coder reported BLOCKED / NEEDS CONTEXT'
+/** Why a gate was skipped when the coder's `report` said it couldn't finish. */
+export const REPORTED_REASON: Readonly<Record<'blocked' | 'needs_context', string>> = Object.freeze({
+  blocked: 'the coder reported status blocked',
+  needs_context: 'the coder reported status needs_context',
+})
 
 /** The longest a gate command is shown in the first line of a message. */
 const COMMAND_SHOWN = 200
@@ -128,12 +133,18 @@ export interface Failure {
   maxRounds: number
   /** Whether the output has the sandbox's "Read-only file system" refusal in it. */
   denied: boolean
+  /** The stop was concluded by the coder's `report`: the message asks for `report` again. Default false. */
+  reported?: boolean
 }
 
 /**
  * The message steered to the coder. It is only for a failure the coder can fix and finish again on: rounds 1 to
  * `maxRounds - 1`. The failure that uses the last round ends the turn and is not sent back (the user's decision, 2026-10-03),
  * so a message for it would promise a gate run that won't happen: that throws a `RangeError`.
+ *
+ * After a stop the coder's `report` concluded (`reported`), what it is asked to do is `report` again, and its opt-out is
+ * `report`'s `status`; the sandbox's hint asks for the report's `concerns`. Without it the text is the closing message's, as
+ * before step 7.
  */
 export function failureMessage(failure: Failure): string {
   const { round, maxRounds } = failure
@@ -148,18 +159,25 @@ export function failureMessage(failure: Failure): string {
       : `${head} exited ${failure.exitCode} after ${took}.`
   const shown = tailOf(failure.tail, failure.tailLines ?? DEFAULT_TAIL_LINES)
   const lines = [first, shown.trim() === '' ? 'It printed nothing.' : `Last lines of its output:\n${fenced(shown)}`]
+  const reported = failure.reported === true
   if (failure.denied) {
     lines.push('Some of it was refused with "Read-only file system": a gate can write in the clone and `/tmp`, and on dish\'s VM in the home directory, '
-      + 'except dish\'s own files, `~/.ssh`, git\'s config and shell startup files. If it needs another directory, say so in your closing message.')
+      + 'except dish\'s own files, `~/.ssh`, git\'s config and shell startup files. '
+      + (reported ? 'If it needs another directory, say so in your report\'s `concerns`.' : 'If it needs another directory, say so in your closing message.'))
   }
   const problem = oneLine(failure.logProblem ?? '', PROBLEM_SHOWN, ' ').replace(/\.+$/, '')
   const log = failure.log !== null ? `Full log: ${inlineCode(failure.log)}.` : problem === '' ? '(No log.)' : `(No log: ${problem}.)`
-  // dsh's report of a child is its last non-empty message: a short "Fixed it." would replace the report the coder wrote.
-  const fix = 'Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do.'
+  // dsh's report of a child is its last non-empty message: a short "Fixed it." would replace the report the coder wrote. A
+  // coder that reported with `report` calls it again instead: crew keeps the newer report.
+  const fix = reported
+    ? 'Fix it in your worktree, then call `report` again: the new report replaces the one you made. The gate runs again when you do.'
+    : 'Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do.'
   lines.push(round === maxRounds - 1
     ? `${log} ${fix} If it fails once more, your turn ends with the failure, and the main agent decides what's next.`
     : `${log} ${fix}`)
-  lines.push('If you\'re blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.')
+  lines.push(reported
+    ? 'If you\'re blocked, call `report` with `status: "blocked"` or `"needs_context"` and `blockedOn`, and the gate is skipped.'
+    : 'If you\'re blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.')
   return lines.join('\n')
 }
 

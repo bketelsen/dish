@@ -37,16 +37,18 @@ import type { ChildRecord, CrewRecords, DishCrew } from 'dish-crew'
 import type { Project } from 'dish-projects'
 import type { Worktree } from 'dish-workspaces'
 import * as gates from '../src/index.ts'
-import type { Config, GatesInternals } from '../src/index.ts'
+import type { Config, GateResultEvent, GatesInternals } from '../src/index.ts'
 import { LOG_KEEP_MS } from '../src/logs.ts'
 import type { ShellLike } from '../src/run.ts'
-import { BLOCKED_REASON } from '../src/text.ts'
+import { BLOCKED_REASON, REPORTED_REASON } from '../src/text.ts'
 import { tempDir, withEnv } from './helpers.ts'
 
 const SESSION = 'main-1'
 const TOKEN = `ghs_${'A1b2C3d4E5'.repeat(4)}`
 const CLONE = '/w/acme/widget'
 const FIX1 = `${CLONE}/.worktrees/fix-1`
+/** What the stub `headOf` gives for FIX1. */
+const HEAD = '3f1c9a7e5b2d4f6081a3c5e7f9b1d3e5a7c9e1f3'
 
 const PROJECT: Project = {
   name: 'acme/widget', owner: 'acme', repo: 'widget', family: 'anthropic', role: 'coder',
@@ -197,6 +199,10 @@ interface World {
   stop(agent: FakeAgent, turn?: number, signal?: AbortSignal): Promise<void>
   /** dsh's `session/event` for an assistant message with `text`, in `agent`'s session. */
   says(agent: FakeAgent, text: string): void
+  /** dsh's `session/event` for an assistant message of `content`, in `agent`'s session. */
+  message(agent: FakeAgent, content: unknown[]): void
+  /** dsh-tools' `tools/result` for a successful `report` by `agent` with `status` that concluded its turn. */
+  reports(agent: FakeAgent, status: string): void
   child(id: string): Promise<ChildRecord>
   dispose(): Promise<void>
 }
@@ -204,6 +210,10 @@ interface World {
 interface WorldOptions {
   /** Mount dish-crew's host plugin (default true). */
   crew?: boolean
+  /** crew's `reportSteers` (default 0: crew never sends a coder back to call `report`, and a text ending is gated as before). */
+  reportSteers?: number
+  /** dish-gates' wait for `dish-gates/result`'s listeners, when the internals are the default ones (default: the plugin's). */
+  eventBudgetMs?: number
   config?: Partial<Config>
   /** Internals for `start`; `null` mounts the plugin as dsh does, through `apply`, with no internals. */
   internals?: GatesInternals | null
@@ -229,18 +239,24 @@ async function world(options: WorldOptions = {}): Promise<World> {
   const project = { current: PROJECT as Project | undefined }
   const crew = options.crew === false
     ? undefined
-    : ctx.plugin(crewPlugin, { terminal: false, dataDirectory: crewData, reportSteers: 0 } as crewPlugin.Config) as unknown as Handle
+    : ctx.plugin(crewPlugin, { terminal: false, dataDirectory: crewData, reportSteers: options.reportSteers ?? 0 } as crewPlugin.Config) as unknown as Handle
   if (crew !== undefined) await crew
   const workspaces = provideStub(ctx, 'dishWorkspaces', {
     resolve: async (path: string) => path === FIX1 ? worktreeOf(path) : undefined,
     resolveProblem: async () => undefined,
+    headOf: async (path: string) => path === FIX1 ? HEAD : undefined,
   }) as unknown as Handle
   const projects = provideStub(ctx, 'dishProjects', {
     get: async (name: string) => name === 'acme/widget' ? project.current : undefined,
   }) as unknown as Handle
   const shellHandle = provideStub(ctx, 'shell', shell) as unknown as Handle
   // dsh's environment for the gate's PATH: a scratch home with no mise shims, never the runner's.
-  const internals = options.internals === undefined ? { state, environment: () => ({ PATH: '/usr/bin:/bin', HOME: join(dir, 'home') }) } : options.internals
+  const internals = options.internals === undefined
+    ? {
+        state, environment: () => ({ PATH: '/usr/bin:/bin', HOME: join(dir, 'home') }),
+        ...options.eventBudgetMs === undefined ? {} : { eventBudgetMs: options.eventBudgetMs },
+      }
+    : options.internals
   const gatesHandle = mountGates(ctx, options.config ?? {}, internals)
   await Promise.all([workspaces, projects, shellHandle, gatesHandle])
   const handles = { ...crew === undefined ? {} : { crew }, gates: gatesHandle, workspaces, projects, shell: shellHandle }
@@ -258,8 +274,16 @@ async function world(options: WorldOptions = {}): Promise<World> {
       await (ctx as unknown as { serial(name: string, payload: unknown): Promise<void> }).serial('agent/turn-stopping', { agent, turn, signal })
     },
     says(agent, text) {
-      const event = { type: 'assistant/message', seq: 1, time: 0, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text }] } } }
+      w.message(agent, [{ type: 'text', text }])
+    },
+    message(agent, content) {
+      const event = { type: 'assistant/message', seq: 1, time: 0, data: { turn: 1, step: 1, message: { role: 'assistant', content } } }
       ;(ctx as unknown as { emit(name: string, ...args: unknown[]): void }).emit('session/event', agent.session, event)
+    },
+    reports(agent, status) {
+      const exec = { callId: 'call-1', rootCallId: 'call-1', name: 'report', arguments: { status, summary: 'did it' }, agent, signal: new AbortController().signal }
+      const result = { isError: false, value: { role: 'coder', turn: 1, at: 1, status, summary: 'did it' }, content: [], concludesTurn: true }
+      ;(ctx as unknown as { emit(name: string, ...args: unknown[]): void }).emit('tools/result', exec, result)
     },
     async child(id) {
       const found = await w.records().lookup(id)
@@ -447,6 +471,137 @@ test('terminal: false prints nothing; terminal: true prints the plugin\'s own li
   }
 })
 
+// --- step 7: report, the head, the event and runAt, with a fake agent ---------------------------------------------
+
+/** A plugin of its own on `ctx` that hears `dish-gates/result` with `listener`. */
+function onResult(ctx: Context, listener: (event: GateResultEvent) => void | Promise<void>): Handle {
+  return ctx.plugin({
+    name: 'result-listener',
+    apply(own: Context) { own.on('dish-gates/result', listener) },
+  } as never, undefined as never) as unknown as Handle
+}
+
+test('dish-gates hears tools/result: a report that concluded a turn makes a stop with tool calls gated, and an assistant message after it doesn\'t', async () => {
+  const w = await world()
+  try {
+    await w.coder('child-1')
+    const agent = w.agent('child-1')
+    // The message that calls report: tool calls, and no text.
+    w.message(agent, [{ type: 'tool-call', id: 'call-1', name: 'report', arguments: '{}' }])
+    await w.stop(agent)
+    assert.equal(w.shell.requests.length, 0, 'tool calls and no report: not finished')
+    w.reports(agent, 'done')
+    await w.stop(agent)
+    assert.equal(w.shell.requests.length, 1)
+    // The next message (it calls a tool) drops the report: that stop isn't gated.
+    w.message(agent, [{ type: 'tool-call', id: 'call-2', name: 'bash', arguments: '{}' }])
+    await w.stop(agent)
+    assert.equal(w.shell.requests.length, 1)
+    // A report that says blocked is skipped.
+    w.message(agent, [{ type: 'tool-call', id: 'call-3', name: 'report', arguments: '{}' }])
+    w.reports(agent, 'blocked')
+    await w.stop(agent, 2)
+    assert.deepEqual((await w.child('child-1')).gates?.map(result => [result.turn, result.outcome, result.reason, result.head]), [
+      [1, 'passed', undefined, HEAD],
+      [2, 'skipped', REPORTED_REASON.blocked, HEAD],
+    ])
+    assert.equal(agent.steers.length, 0)
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('dishGates.runAt is there, and the fake shell\'s request has sandboxPolicy { mode: \'workspace-write\', workspaceRoot: CLONE, sessionId: \'main-1\' }', async () => {
+  const w = await world()
+  try {
+    const service = w.ctx.get('dishGates')!
+    assert.equal(typeof service.runAt, 'function')
+    w.shell.script.push(FAIL)
+    const result = await service.runAt('acme/widget', FIX1, { sessionId: SESSION, head: HEAD })
+    assert.deepEqual({ ...result, durationMs: 0 }, {
+      outcome: 'failed', command: 'pnpm test', exitCode: 1, timedOut: false, durationMs: 0,
+      log: join(w.state, 'gates', 'acme', 'widget', 'fix-1', 'open_pr.log'), excerpt: 'not ok 1 - adds\n# fail 1', at: result.at, head: HEAD,
+    })
+    assert.equal(w.shell.requests.length, 1)
+    assert.equal(w.shell.requests[0]!.workdir, FIX1)
+    assert.deepEqual(w.shell.requests[0]!.sandboxPolicy, { mode: 'workspace-write', workspaceRoot: CLONE, sessionId: SESSION })
+    // A worktree it can't resolve is an error, and the shell isn't asked.
+    const elsewhere = await service.runAt('acme/widget', `${CLONE}/.worktrees/fix-9`, { sessionId: SESSION })
+    assert.deepEqual([elsewhere.outcome, elsewhere.reason], ['error', `no worktree dish made at ${CLONE}/.worktrees/fix-9 in a registered project`])
+    assert.equal(w.shell.requests.length, 1)
+    assert.ok(w.logs.some(line => /^\[dish-gates\] info: open_pr's gate for acme\/widget\/fix-1 at 3f1c9a7e5b2d: failed in .+ \(exit 1\)$/.test(line)), w.logs.join('\n'))
+    await w.handles.gates.dispose()
+    assert.equal(w.ctx.get('dishGates'), undefined)
+  } finally {
+    await w.dispose()
+  }
+})
+
+test('a dish-gates/result listener gets the result after crew has it (it reads it back with lookup), and one that throws is logged once and changes nothing', async () => {
+  const w = await world()
+  const heard: Array<{ event: GateResultEvent, onRecord: boolean }> = []
+  const reader = onResult(w.ctx, async (event) => {
+    const found = await w.records().lookup(event.childId)
+    heard.push({ event, onRecord: found?.record.gates?.some(result => result.at === event.result.at && result.turn === event.result.turn) === true })
+  })
+  const thrower = onResult(w.ctx, () => { throw new Error(`a listener broke ${TOKEN}`) })
+  try {
+    await Promise.all([reader, thrower])
+    await w.coder('child-1')
+    const agent = w.agent('child-1')
+    w.shell.script.push(FAIL, PASS)
+    w.says(agent, 'done')
+    await w.stop(agent)
+    w.says(agent, 'fixed')
+    await w.stop(agent)
+    const record = await w.child('child-1')
+    assert.deepEqual(record.gates?.map(result => [result.round, result.outcome, result.head]), [[1, 'failed', HEAD], [2, 'passed', HEAD]])
+    assert.deepEqual(heard.map(({ event }) => [event.childId, event.sessionId, event.result.outcome]), [['child-1', SESSION, 'failed'], ['child-1', SESSION, 'passed']])
+    assert.deepEqual(heard.map(({ onRecord }) => onRecord), [true, true])
+    assert.deepEqual(heard.map(({ event }) => event.result), record.gates)
+    assert.equal(agent.steers.length, 1, 'the failure was steered all the same')
+    const failures = w.logs.filter(line => line.includes('dish-gates/result listener failed'))
+    assert.deepEqual(failures, [`[dish-gates] warn: a dish-gates/result listener failed: a listener broke ${maskSecrets(TOKEN)}`])
+  } finally {
+    await reader.dispose()
+    await thrower.dispose()
+    await w.dispose()
+  }
+})
+
+test('a dish-gates/result listener held past the budget: the result is still recorded, the stop goes on, and it is logged once', async () => {
+  assert.equal(gates.EVENT_BUDGET_MS, 10_000)
+  const w = await world({ eventBudgetMs: 50 })
+  const held = deferred()
+  const heard: string[] = []
+  const slow = onResult(w.ctx, async (event) => {
+    heard.push(event.result.outcome)
+    await held.promise
+  })
+  try {
+    await slow
+    await w.coder('child-1')
+    const agent = w.agent('child-1')
+    w.shell.script.push(FAIL, PASS)
+    w.says(agent, 'done')
+    const started = Date.now()
+    await w.stop(agent)
+    w.says(agent, 'fixed')
+    await w.stop(agent)
+    assert.ok(Date.now() - started < 5_000, 'the stops didn\'t wait for the listener')
+    assert.deepEqual(heard, ['failed', 'passed'], 'the listener heard each result')
+    assert.deepEqual((await w.child('child-1')).gates?.map(result => [result.round, result.outcome]), [[1, 'failed'], [2, 'passed']])
+    assert.equal(agent.steers.length, 1, 'the failure was steered all the same')
+    assert.deepEqual(w.logs.filter(line => line.includes('took longer')), [
+      '[dish-gates] warn: dish-gates/result listeners took longer than 0.05 s; dish-gates went on without them',
+    ])
+  } finally {
+    held.resolve()
+    await slow.dispose()
+    await w.dispose()
+  }
+})
+
 // --- logs and their pruning ---------------------------------------------------------------------------------------
 
 /** Write a `.log` under `<state>/gates` whose time is `ageMs` ago; gives its path. */
@@ -559,10 +714,10 @@ async function dshModule(name: string): Promise<any> {
 }
 
 /**
- * What the coder's model answers in one step: text, tool calls (by name, with `{}` for arguments), and whether the answer
- * is cut at `max-tokens`. A string is text alone.
+ * What the coder's model answers in one step: text, tool calls (by name, with `{}` for arguments, or `{ name, args }`, sent as
+ * `JSON.stringify(args)`), and whether the answer is cut at `max-tokens`. A string is text alone.
  */
-type CoderReply = string | { text?: string, calls?: string[], cut?: boolean }
+type CoderReply = string | { text?: string, calls?: Array<string | { name: string, args: unknown }>, cut?: boolean }
 
 /** What the coder's model answers to a request, given every earlier request's text and this one's. */
 type CoderScript = (request: string, count: number) => CoderReply
@@ -615,11 +770,13 @@ async function withDsh(coder: CoderScript, body: (dsh: DshWorld) => Promise<void
           yield { type: 'block-end', index, block: { type: 'text', text } }
           index++
         }
-        for (const name of calls) {
+        for (const call of calls) {
           const id = `call-${coderRequests.length}-${index}`
+          const { name, args } = typeof call === 'string' ? { name: call, args: {} } : call
+          const json = JSON.stringify(args)
           yield { type: 'block-start', index, blockType: 'tool-call' }
-          yield { type: 'tool-call-delta', index, id, name, argumentsDelta: '{}' }
-          yield { type: 'block-end', index, block: { type: 'tool-call', id, name, arguments: '{}' } }
+          yield { type: 'tool-call-delta', index, id, name, argumentsDelta: json }
+          yield { type: 'block-end', index, block: { type: 'tool-call', id, name, arguments: json } }
           index++
         }
         yield { type: 'finish', reason: { kind: cut ? 'max-tokens' : calls.length > 0 ? 'tool-calls' : 'stop' } }
@@ -785,6 +942,125 @@ test('a real crew child whose gate holds a credential: crew files it masked, whi
       assert.ok(!JSON.stringify(record).includes(TOKEN))
       assert.ok(!dsh.coderRequests.some(text => text.includes(TOKEN)))
     } finally {
+      await w.dispose()
+    }
+  })
+})
+
+// --- real crew children that finish with report (step 7) ---------------------------------------------------------
+
+/** A coder's `report` call, as its model makes it. */
+const report = (args: Record<string, unknown>): CoderReply => ({ calls: [{ name: 'report', args }] })
+const DONE = report({ status: 'done', summary: 'Created ok.txt.', commits: [] })
+const REPORT_AGAIN = 'call `report` again'
+/** The start of crew's steer to a coder that ended without `report`. */
+const CREW_STEER = 'Finish by calling `report`'
+
+test('a real crew coder that reports done is gated; a failure steers it to call report again, and that report is gated', async () => {
+  await withDsh((request) => request.includes(REPORT_AGAIN)
+    ? report({ status: 'done', summary: 'Fixed the test, and created ok.txt.' })
+    : DONE, async (dsh) => {
+    const w = await world({ ctx: dsh.ctx, reportSteers: 2 })
+    try {
+      w.shell.script.push(FAIL, PASS)
+      await dsh.delegate('child-5', 'create ok.txt')
+      const record = await settled(w, dsh, 'child-5')
+      assert.equal(dsh.coderRequests.length, 2)
+      assert.ok(!dsh.coderRequests[0]!.includes(GATE_FAILED))
+      assert.ok(dsh.coderRequests[1]!.includes(GATE_FAILED))
+      assert.ok(dsh.coderRequests[1]!.includes(REPORT_AGAIN))
+      assert.ok(!dsh.coderRequests[1]!.includes(CREW_STEER), 'crew didn\'t steer a stop concluded by report')
+      assert.equal(w.shell.requests.length, 2)
+      assert.deepEqual(record.runs[0]!.gates?.map(result => [result.outcome, result.round, result.turn, result.head]), [
+        ['failed', 1, 1, HEAD], ['passed', 2, 1, HEAD],
+      ])
+      const structured = record.runs[0]!.structured
+      assert.equal(structured?.role, 'coder')
+      assert.equal(structured?.role === 'coder' ? structured.status : undefined, 'done')
+      assert.equal(structured?.summary, 'Fixed the test, and created ok.txt.', 'the second report replaced the first')
+    } finally {
+      await w.dispose()
+    }
+  })
+})
+
+test('a real crew coder that reports blocked is skipped with REPORTED_REASON.blocked, and nothing runs', async () => {
+  await withDsh(() => report({ status: 'blocked', summary: 'Stopped before writing.', blockedOn: 'Which directory should ok.txt go in?' }), async (dsh) => {
+    const w = await world({ ctx: dsh.ctx, reportSteers: 2 })
+    try {
+      await dsh.delegate('child-6', 'create ok.txt')
+      const record = await settled(w, dsh, 'child-6')
+      assert.equal(dsh.coderRequests.length, 1)
+      assert.deepEqual(record.runs[0]!.gates?.map(result => [result.outcome, result.reason, result.head]), [['skipped', REPORTED_REASON.blocked, HEAD]])
+      assert.equal(w.shell.requests.length, 0)
+      const structured = record.runs[0]!.structured
+      assert.equal(structured?.role === 'coder' ? structured.status : undefined, 'blocked')
+    } finally {
+      await w.dispose()
+    }
+  })
+})
+
+test('a real crew coder that ends with text is steered by crew, not gated, until crew\'s steers run out; then its stop is gated', async () => {
+  await withDsh(() => 'done', async (dsh) => {
+    const w = await world({ ctx: dsh.ctx, reportSteers: 2 })
+    try {
+      await dsh.delegate('child-7', 'create ok.txt')
+      const record = await settled(w, dsh, 'child-7')
+      assert.equal(dsh.coderRequests.length, 3)
+      for (const request of dsh.coderRequests.slice(1)) {
+        assert.ok(request.includes(CREW_STEER))
+        assert.ok(!request.includes('The gate failed'))
+      }
+      assert.equal(w.shell.requests.length, 1)
+      assert.deepEqual(record.runs[0]!.gates?.map(result => [result.outcome, result.round, result.turn]), [['passed', 1, 1]])
+      assert.equal(record.runs[0]!.structured, undefined)
+    } finally {
+      await w.dispose()
+    }
+  })
+})
+
+test('a real crew coder that reports, is steered by a failure, calls a tool and ends with text: crew steers it, and its next report is gated', async () => {
+  const steps: CoderReply[] = [
+    DONE,
+    // The gate's steer: a tool call (an unknown tool: an error result, and the step goes on), then text.
+    { calls: ['no_such_tool'] },
+    'Fixed it.',
+    // Crew's steer: the report, gated.
+    report({ status: 'done', summary: 'Fixed the test.' }),
+  ]
+  await withDsh((_, count) => steps[count - 1] ?? 'done', async (dsh) => {
+    const w = await world({ ctx: dsh.ctx, reportSteers: 2 })
+    try {
+      w.shell.script.push(FAIL, PASS)
+      await dsh.delegate('child-8', 'create ok.txt')
+      const record = await settled(w, dsh, 'child-8')
+      assert.equal(dsh.coderRequests.length, 4)
+      assert.ok(dsh.coderRequests[1]!.includes(REPORT_AGAIN), 'the gate\'s steer')
+      assert.ok(!dsh.coderRequests[2]!.includes(CREW_STEER))
+      assert.ok(dsh.coderRequests[3]!.includes(CREW_STEER), 'crew\'s steer after the text stop')
+      assert.equal(w.shell.requests.length, 2, 'the text stop wasn\'t gated')
+      assert.deepEqual(record.runs[0]!.gates?.map(result => [result.outcome, result.round, result.turn]), [['failed', 1, 1], ['passed', 2, 1]])
+    } finally {
+      await w.dispose()
+    }
+  })
+})
+
+test('the gate\'s result reaches a dish-gates/result listener with the child\'s session, and the head the stub headOf gives', async () => {
+  await withDsh(() => DONE, async (dsh) => {
+    const w = await world({ ctx: dsh.ctx, reportSteers: 2 })
+    const heard: GateResultEvent[] = []
+    const listener = onResult(dsh.ctx, (event) => { heard.push(event) })
+    try {
+      await listener
+      await dsh.delegate('child-9', 'create ok.txt')
+      const record = await settled(w, dsh, 'child-9')
+      assert.deepEqual(heard.map(event => [event.childId, event.sessionId, event.result.outcome, event.result.head]), [['child-9', SESSION, 'passed', HEAD]])
+      assert.deepEqual(heard.map(event => event.result), record.runs[0]!.gates)
+    } finally {
+      await listener.dispose()
       await w.dispose()
     }
   })
