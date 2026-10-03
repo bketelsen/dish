@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { stat } from 'node:fs/promises'
+import { mkdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
@@ -165,6 +165,8 @@ async function world(options: WorldOptions = {}): Promise<World> {
       warn: (format, ...args) => { w.warns.push(format.replace(/%[sd]/g, () => String(args.shift()))) },
       info: (format, ...args) => { w.infos.push(format.replace(/%[sd]/g, () => String(args.shift()))) },
     },
+    // dsh's own environment, as the gate's PATH reads it: a home with no mise shims unless a test makes them.
+    environment: () => ({ PATH: '/usr/bin:/bin', HOME: join(directory, 'home') }),
     now: () => 1_700_000_000_000,
     run: async (run) => {
       w.runs.push(run)
@@ -449,6 +451,21 @@ test('a credential in projects.yaml\'s gate is masked in the record and the stee
   }
   assert.ok(!JSON.stringify(gates).includes(TOKEN))
   assert.ok(![...w.infos, ...w.warns].some(line => line.includes(TOKEN)))
+})
+
+test('the gate\'s PATH: dsh\'s, then mise\'s shims when they exist; a gateEnv PATH wins as given', async () => {
+  const w = await world()
+  await w.coder('c1')
+  const c1 = w.agent('c1')
+  await w.stop(c1, 1)
+  assert.equal(Object.hasOwn(w.runs[0]!.env, 'PATH'), false, 'no shims: the PATH is dsh\'s, untouched')
+  const shims = join(w.directory, 'home', '.local', 'share', 'mise', 'shims')
+  await mkdir(shims, { recursive: true })
+  await w.stop(c1, 2)
+  assert.deepEqual(w.runs[1]!.env, { GOCACHE: `${CLONE}/.worktrees/.cache/go-build`, WHERE: FIX1, PATH: `/usr/bin:/bin:${shims}` })
+  w.project = { ...PROJECT, gateEnv: { PATH: '/opt/tools/bin:/usr/bin' } }
+  await w.stop(c1, 3)
+  assert.deepEqual(w.runs[2]!.env, { PATH: '/opt/tools/bin:/usr/bin' })
 })
 
 test('the message keeps the settings\' tailLines', async () => {

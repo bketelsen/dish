@@ -14,8 +14,18 @@
  * `gateEnv`'s names and values are validated by dish-projects' registry (6b): no `DSH_*`, nothing secret-looking, one
  * line, no NUL. Its values are never logged.
  *
+ * **mise's shims.** One more thing is added (the controller's decision, 2026-10-03): when `gateEnv` doesn't set `PATH`,
+ * the gate's `PATH` is dsh's own followed by mise's shims directory (`${XDG_DATA_HOME:-$HOME/.local/share}/mise/shims`),
+ * when that directory exists (`withMiseShims`). The VM's unit has a `PATH` with no `go` or `cargo` on it
+ * (`/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin`), so a gate such as `go test ./...` would exit 127, while the coder's
+ * tools are installed with mise. The shims come after the system's directories, so dish's own node still comes first. A
+ * shim runs `mise`, which runs the tool: inside the gate's sandbox, as everything the gate starts does.
+ *
  * @module dish-gates/env
  */
+
+import { stat } from 'node:fs/promises'
+import { isAbsolute, join } from 'node:path'
 
 /** `<clone>` or `<worktree>`, as written in a `gateEnv` value. */
 const TOKEN = /<(clone|worktree)>/g
@@ -31,4 +41,46 @@ export function gateEnvironment(gateEnv: Readonly<Record<string, string>>, where
     name,
     value.replace(TOKEN, (_match, token: string) => token === 'clone' ? where.clone : where.worktree),
   ]))
+}
+
+/** What `withMiseShims` reads of dsh's own environment. */
+export interface BaseEnvironment {
+  PATH?: string | undefined
+  HOME?: string | undefined
+  XDG_DATA_HOME?: string | undefined
+}
+
+/**
+ * Where mise keeps its shims for dsh's environment `base`: `$XDG_DATA_HOME/mise/shims` when that is absolute (as for
+ * dish-kit's xdgPaths), else `$HOME/.local/share/mise/shims`; `undefined` without an absolute `HOME` for the second.
+ */
+export function miseShims(base: Readonly<BaseEnvironment>): string | undefined {
+  const data = base.XDG_DATA_HOME
+  if (data !== undefined && isAbsolute(data)) return join(data, 'mise', 'shims')
+  const home = base.HOME
+  return home !== undefined && isAbsolute(home) ? join(home, '.local', 'share', 'mise', 'shims') : undefined
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * `env` (a gate's, from `gateEnvironment`) with `PATH` set to dsh's own `PATH` (`base.PATH`) and then mise's shims
+ * directory (`miseShims(base)`), when that directory exists. Left as it is (a copy) when `env` sets `PATH` (a project's
+ * `gateEnv` wins as given), when dsh has no `PATH` (the shell's default stays), when there is no shims directory, or when
+ * it is on dsh's `PATH` already. A new object; never throws.
+ */
+export async function withMiseShims(env: Readonly<Record<string, string>>, base: Readonly<BaseEnvironment>): Promise<Record<string, string>> {
+  const copy = { ...env }
+  if (Object.hasOwn(env, 'PATH')) return copy
+  const path = base.PATH
+  const shims = miseShims(base)
+  if (path === undefined || path === '' || shims === undefined) return copy
+  if (path.split(':').includes(shims) || !await isDirectory(shims)) return copy
+  return { ...copy, PATH: `${path}:${shims}` }
 }

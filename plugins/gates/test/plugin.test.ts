@@ -239,7 +239,8 @@ async function world(options: WorldOptions = {}): Promise<World> {
     get: async (name: string) => name === 'acme/widget' ? project.current : undefined,
   }) as unknown as Handle
   const shellHandle = provideStub(ctx, 'shell', shell) as unknown as Handle
-  const internals = options.internals === undefined ? { state } : options.internals
+  // dsh's environment for the gate's PATH: a scratch home with no mise shims, never the runner's.
+  const internals = options.internals === undefined ? { state, environment: () => ({ PATH: '/usr/bin:/bin', HOME: join(dir, 'home') }) } : options.internals
   const gatesHandle = mountGates(ctx, options.config ?? {}, internals)
   await Promise.all([workspaces, projects, shellHandle, gatesHandle])
   const handles = { ...crew === undefined ? {} : { crew }, gates: gatesHandle, workspaces, projects, shell: shellHandle }

@@ -30,6 +30,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { maskSecrets, printOwnLogs, xdgPaths } from 'dish-kit'
 import { ClosingHeads } from './closing.ts'
+import type { BaseEnvironment } from './env.ts'
 import { DEFAULT_MAX_ROUNDS, gateListener } from './listener.ts'
 import { pruneLogs } from './logs.ts'
 import type { runGate } from './run.ts'
@@ -75,6 +76,8 @@ export interface GatesInternals {
   state?: string
   now?: () => number
   run?: typeof runGate
+  /** dsh's own environment, for the gate's `PATH`. Default: `process.env`. */
+  environment?: () => Readonly<BaseEnvironment>
 }
 
 /** How often the logs are pruned while the plugin runs, besides at start. */
@@ -124,6 +127,7 @@ export function start(ctx: Context, config: Config, internals: GatesInternals): 
     logger,
     ...internals.now === undefined ? {} : { now: internals.now },
     ...internals.run === undefined ? {} : { run: internals.run },
+    ...internals.environment === undefined ? {} : { environment: internals.environment },
   }))
 
   // Pruning: at start, in the background, and every day while the plugin runs. A failure is logged once per distinct

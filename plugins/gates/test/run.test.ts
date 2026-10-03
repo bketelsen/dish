@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
-import { chmod, readFile, stat, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type { ShellExecRequest, ShellExecSpec, ShellExecution, ShellRunResult } from '@deepseek-ai/dsh-shell'
 import { maskSecrets } from 'dish-kit'
-import { gateEnvironment } from '../src/env.ts'
+import { gateEnvironment, withMiseShims } from '../src/env.ts'
 import { gateLogFile } from '../src/logs.ts'
 import { gateCommand, GATE_MAX_TIMEOUT_MS, OUTPUT_MAX_BYTES, runGate } from '../src/run.ts'
 import type { GateRun, GateRunResult, ShellLike } from '../src/run.ts'
@@ -448,6 +449,27 @@ test('real: gateEnv reaches the gate expanded, and HOME and the cache variables 
       assert.equal(seen[name], world.vars[name], name)
       assert.ok(!seen[name]!.startsWith(world.clone), `${name} is in the clone`)
     }
+  })
+})
+
+const SYSTEM_GO = ['/usr/bin/go', '/bin/go'].find(path => existsSync(path))
+
+test('real, with dish-sandbox as the runner: a bare `go` resolves through mise\'s shims, after the system\'s directories', { skip: SKIP || (SYSTEM_GO === undefined ? false : `${SYSTEM_GO} comes first`) }, async () => {
+  await withRealShell({ runner: true }, async world => {
+    // A stub go in the scratch home's shims directory, as mise reshim makes them.
+    const shims = join(world.vars.XDG_DATA_HOME!, 'mise', 'shims')
+    await mkdir(shims, { recursive: true })
+    await writeFile(join(shims, 'go'), '#!/bin/sh\necho "go version stub (from mise\'s shims)"\n')
+    await chmod(join(shims, 'go'), 0o755)
+    // dsh's PATH as the VM's unit has it, less dish's own node: no go on it.
+    const env = await withMiseShims({}, { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' })
+    assert.equal(env.PATH, `/usr/local/bin:/usr/bin:/bin:${shims}`)
+    const r = ran(await realGate(world, 'command -v go && go version', { env }))
+    assert.equal(r.exitCode, 0, r.output)
+    assert.equal(r.output, `${shims}/go\ngo version stub (from mise's shims)\n`)
+    // Without the shims on PATH there is no go.
+    const bare = ran(await realGate(world, 'go version', { env: { PATH: '/usr/local/bin:/usr/bin:/bin' } }))
+    assert.equal(bare.exitCode, 127, bare.output)
   })
 })
 

@@ -21,7 +21,7 @@
  * 6. **Rounds used up:** with `maxRounds` failures in this turn already, nothing runs and nothing is recorded. Only another
  *    listener's steer can bring a turn here.
  * 7. **The run** (`runGate`): projects.yaml's gate as it is now, never the coder's; the turn's signal joined with the
- *    plugin's.
+ *    plugin's; the project's `gateEnv`, and, unless it sets `PATH`, dsh's `PATH` with mise's shims after it (`env.ts`).
  * 8. **The outcome:** `cancelled` records nothing; `error`, `passed` and `failed` are recorded.
  * 9. **The steer**, only for a recorded `failed` with `round < maxRounds`. The failure in the last round is recorded and not
  *    steered: the turn ends with it (the user's decision A, 2026-10-03). So a turn has at most `maxRounds` gate runs and
@@ -52,7 +52,8 @@ import type { DishProjects } from 'dish-projects'
 import type { DishWorkspaces } from 'dish-workspaces'
 import { optsOut } from './closing.ts'
 import type { Closing } from './closing.ts'
-import { gateEnvironment } from './env.ts'
+import { gateEnvironment, withMiseShims } from './env.ts'
+import type { BaseEnvironment } from './env.ts'
 import { gateLogFile } from './logs.ts'
 import { runGate } from './run.ts'
 import type { GateRunResult, ShellLike } from './run.ts'
@@ -113,6 +114,11 @@ export interface GateDeps {
   state: string
   /** The plugin's: aborted when dish-gates stops. */
   signal: AbortSignal
+  /**
+   * dsh's own process environment, read on each stop, for the gate's `PATH` (`withMiseShims`). Default: `process.env`.
+   * Tests give their own.
+   */
+  environment?: () => Readonly<BaseEnvironment>
   logger: { warn(format: string, ...args: unknown[]): void, info(format: string, ...args: unknown[]): void }
   now?: () => number
   /** Tests. */
@@ -201,6 +207,7 @@ export function gateListener(deps: GateDeps): (payload: StoppingPayload) => Prom
   const told = new Set<string>()
   const now = deps.now ?? Date.now
   const run = deps.run ?? runGate
+  const environment = deps.environment ?? ((): Readonly<BaseEnvironment> => process.env)
 
   /** Log `message` at warn, once: a broken record or service would otherwise say the same at every stop. */
   const warnOnce = (message: string): void => {
@@ -302,7 +309,7 @@ export function gateListener(deps: GateDeps): (payload: StoppingPayload) => Prom
         command: project.gate,
         worktree: { path: worktree.path, clone: worktree.clone },
         timeoutMs: project.gateTimeoutMs,
-        env: gateEnvironment(project.gateEnv, { clone: worktree.clone, worktree: worktree.path }),
+        env: await withMiseShims(gateEnvironment(project.gateEnv, { clone: worktree.clone, worktree: worktree.path }), environment()),
         log: gateLogFile(deps.state, worktree.project, worktree.slug, id, turn, round),
         signal,
         sessionId: id,

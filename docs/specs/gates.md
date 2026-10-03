@@ -94,6 +94,7 @@ Through `ctx.shell` (the executor dsh's bash tool uses), and only when it sandbo
 
 A gate runs in the sandbox the coder's own commands run in, with dsh's environment and the scrub dsh gives every agent shell.
 - **On dish's VM,** that sandbox writes the home directory, less sandbox-home's protected list. So Go's build cache, pnpm's store and mise's installs are where the coder's commands put them, and a gate runs a command the way the coder's own run of it did.
+- **Tools from mise** (the controller's decision, 2026-10-03). The service's `PATH` on the VM (`/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin`) has no `go`, so `bketelsen/clippy`'s `go build` gate would exit 127 every time. Unless the project's `gateEnv` sets `PATH` (which wins as given), the gate's `PATH` is dsh's own followed by `${XDG_DATA_HOME:-$HOME/.local/share}/mise/shims`, when that directory exists. So bare tool names (`go test ./...`, `cargo test`, `pytest`) resolve through mise's shims, and `mise exec -- …` works too. The shims come after the system's directories, so dish's own node still comes first. The gate runs sandboxed, so a shim does too.
 - **dish sets no cache variables.** Pointing `XDG_*`, `GOPATH`, `npm_config_cache` or `CARGO_HOME` into the clone would:
   - hide mise's installs and its trust records;
   - move pnpm's store, which then refuses an existing `node_modules` without a terminal;

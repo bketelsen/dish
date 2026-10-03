@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { test } from 'node:test'
-import { gateEnvironment } from '../src/env.ts'
+import { gateEnvironment, miseShims, withMiseShims } from '../src/env.ts'
+import { tempDir } from './helpers.ts'
 
 const WHERE = { clone: '/w/acme/widget', worktree: '/w/acme/widget/.worktrees/fix-1' }
 
@@ -51,4 +54,64 @@ test('a variable called __proto__ is kept as a variable', () => {
   const env = gateEnvironment(given, WHERE)
   assert.equal(Object.hasOwn(env, '__proto__'), true)
   assert.equal(Object.getOwnPropertyDescriptor(env, '__proto__')?.value, WHERE.worktree)
+})
+
+// --- mise's shims on PATH ---------------------------------------------------------------------------------------
+
+const SYSTEM = '/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin'
+
+/** A scratch home, with mise's shims directory under its default data home when `shims` is true. */
+async function home(shims: boolean): Promise<string> {
+  const dir = join(await tempDir(), 'home')
+  await mkdir(shims ? join(dir, '.local', 'share', 'mise', 'shims') : dir, { recursive: true })
+  return dir
+}
+
+test('miseShims: $XDG_DATA_HOME/mise/shims when it is absolute, else ~/.local/share/mise/shims; none without an absolute HOME', () => {
+  assert.equal(miseShims({ HOME: '/home/dish' }), '/home/dish/.local/share/mise/shims')
+  assert.equal(miseShims({ HOME: '/home/dish', XDG_DATA_HOME: '/data' }), '/data/mise/shims')
+  assert.equal(miseShims({ HOME: '/home/dish', XDG_DATA_HOME: 'relative' }), '/home/dish/.local/share/mise/shims')
+  assert.equal(miseShims({ HOME: '/home/dish', XDG_DATA_HOME: '' }), '/home/dish/.local/share/mise/shims')
+  assert.equal(miseShims({ XDG_DATA_HOME: '/data' }), '/data/mise/shims')
+  assert.equal(miseShims({}), undefined)
+  assert.equal(miseShims({ HOME: 'relative' }), undefined)
+})
+
+test('withMiseShims: dsh\'s PATH, then mise\'s shims, when the directory exists; the system\'s directories stay first', async () => {
+  const at = await home(true)
+  const env = await withMiseShims({ GOFLAGS: '-mod=mod' }, { PATH: SYSTEM, HOME: at })
+  assert.deepEqual(env, { GOFLAGS: '-mod=mod', PATH: `${SYSTEM}:${at}/.local/share/mise/shims` })
+  // Where XDG_DATA_HOME points, when it is absolute.
+  const data = join(await tempDir(), 'data')
+  await mkdir(join(data, 'mise', 'shims'), { recursive: true })
+  assert.equal((await withMiseShims({}, { PATH: SYSTEM, HOME: at, XDG_DATA_HOME: data })).PATH, `${SYSTEM}:${data}/mise/shims`)
+})
+
+test('withMiseShims leaves the environment as it is: no shims directory, a gateEnv PATH, shims on PATH already, no PATH or HOME', async () => {
+  const without = await home(false)
+  assert.deepEqual(await withMiseShims({ A: '1' }, { PATH: SYSTEM, HOME: without }), { A: '1' })
+  // A file where the directory would be isn't one.
+  await mkdir(join(without, '.local', 'share', 'mise'), { recursive: true })
+  await writeFile(join(without, '.local', 'share', 'mise', 'shims'), '')
+  assert.deepEqual(await withMiseShims({}, { PATH: SYSTEM, HOME: without }), {})
+
+  const at = await home(true)
+  const shims = `${at}/.local/share/mise/shims`
+  // A project's gateEnv PATH wins, as given.
+  assert.deepEqual(await withMiseShims({ PATH: '/opt/tools/bin' }, { PATH: SYSTEM, HOME: at }), { PATH: '/opt/tools/bin' })
+  assert.deepEqual(await withMiseShims({}, { PATH: `${shims}:${SYSTEM}`, HOME: at }), {}, 'on PATH already')
+  assert.deepEqual(await withMiseShims({}, { HOME: at }), {}, 'dsh has no PATH: the shell\'s default stays')
+  assert.deepEqual(await withMiseShims({}, { PATH: '', HOME: at }), {})
+  assert.deepEqual(await withMiseShims({}, { PATH: SYSTEM }), {}, 'no HOME')
+})
+
+test('withMiseShims gives a new object, and never changes the one it is given', async () => {
+  const at = await home(true)
+  const given = Object.freeze({ A: '1' })
+  const env = await withMiseShims(given, { PATH: SYSTEM, HOME: at })
+  assert.notEqual(env, given)
+  assert.deepEqual(given, { A: '1' })
+  const untouched = await withMiseShims(given, { PATH: SYSTEM, HOME: '/nowhere' })
+  assert.notEqual(untouched, given)
+  assert.deepEqual(untouched, { A: '1' })
 })
