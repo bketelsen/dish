@@ -19,7 +19,7 @@ When you run shell commands:
 - `sudo /usr/local/sbin/dish-apt-get install <package>`, and anything else that fails with "Read-only file system", runs only outside the sandbox: run the same command again with `sandbox_permissions: "danger-full-access"` and a one-line `justification`. The judge allows it or asks the user. A crew child's request goes to the judge, which refuses most of them: then stop, and put each such command, with its `workdir`, in your report.
 - Never point `HOME`, `XDG_*` or `MISE_*` into the workspace.
 - Don't add `2>&1`, `2>/dev/null` or a pipe into `tail`/`head`: dsh already shows stderr and keeps the tail of long output, and it spots a sandbox denial only by the exit code and "Read-only file system" on stderr, and only then offers the escalation.
-- Node, pnpm, Go and Python are preinstalled with mise, but mise's shims aren't on `PATH`. Use `mise exec -- <tool>` or `mise run <task>`. On dish's VM a bare `node` or `pnpm` is dish's own (`/opt/dish/node/bin`), not your project's: use `mise exec -- pnpm …`.
+- On dish's VM, Node, pnpm, Go and Python are preinstalled with mise. mise's shims aren't on `PATH`: use `mise exec -- <tool>` or `mise run <task>`. On dish's VM a bare `node` or `pnpm` is dish's own (`/opt/dish/node/bin`), not your project's: use `mise exec -- pnpm …`.
 - Don't `rm -rf` build output before a build: the build replaces it, and a delete needs approval.
 - There's no browser and no `xmllint`. Say what you couldn't check.
 
