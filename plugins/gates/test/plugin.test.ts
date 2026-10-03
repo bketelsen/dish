@@ -510,12 +510,13 @@ test('pruning runs again every day while the plugin runs, and stops with it', as
 })
 
 test('a pruning that fails is logged once, and the gate still runs', { skip: process.getuid?.() === 0 ? 'root reads a directory of mode 000' : false }, async () => {
-  mock.timers.enable({ apis: ['setInterval'] })
   const dir = await tempDir()
   const gatesDir = join(dir, 'state', 'gates')
-  await mkdir(join(gatesDir, 'acme'), { recursive: true })
-  await chmod(gatesDir, 0o000)
   try {
+    // Inside the try, so a setup that throws still has the timers reset below.
+    mock.timers.enable({ apis: ['setInterval'] })
+    await mkdir(join(gatesDir, 'acme'), { recursive: true })
+    await chmod(gatesDir, 0o000)
     const w = await world({ internals: { state: join(dir, 'state') } })
     try {
       const failed = (): string[] => w.logs.filter(line => /^\[dish-gates\] warn: .*prune/.test(line))
