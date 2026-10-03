@@ -278,7 +278,7 @@ test('failureMessage: the log, or why there is none', () => {
 
 test('failureMessage: what to do', () => {
   const message = failureMessage(failure())
-  assert.ok(message.includes('Fix it in your worktree and finish again; the gate runs again when you do.'))
+  assert.ok(message.includes('Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do.'))
 })
 
 test('failureMessage: the next-to-last round says the next failure ends the turn', () => {
@@ -290,7 +290,7 @@ test('failureMessage: the next-to-last round says the next failure ends the turn
   assert.ok(failureMessage(failure({ round: 4, maxRounds: 5 })).includes(sentence), 'round 4 of 5')
   assert.ok(failureMessage(failure({ round: 1, maxRounds: 2 })).includes(sentence), 'round 1 of 2')
   const full = failureMessage(failure({ round: 2 }))
-  assert.ok(full.includes('the gate runs again when you do. If it fails once more'), 'it follows the fix sentence on its line')
+  assert.ok(full.includes('The gate runs again when you do. If it fails once more'), 'it follows the fix sentence on its line')
 })
 
 test('failureMessage: the opt-out sentence ends the message', () => {
@@ -309,7 +309,7 @@ test('failureMessage: the whole message, as the spec lays it out', () => {
     'FAIL src/a.test.ts',
     '  expected 1, got 2',
     '```',
-    'Full log: `/state/dish/gates/acme/widget/fix-1/c1-1-1.log`. Fix it in your worktree and finish again; the gate runs again when you do. '
+    'Full log: `/state/dish/gates/acme/widget/fix-1/c1-1-1.log`. Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do. '
       + 'If it fails once more, your turn ends with the failure, and the main agent decides what\'s next.',
     'If you\'re blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.',
   ].join('\n'))

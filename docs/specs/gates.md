@@ -126,9 +126,10 @@ A gate runs in the sandbox the coder's own commands run in, with dsh's environme
 > <tail: last 200 lines, at most 16 KB>
 > ```
 > <a hint, if the sandbox refused a write: where a gate can write>
-> Full log: `<path>`. Fix it in your worktree and finish again; the gate runs again when you do. <in round 2: "If it fails once more, your turn ends with the failure, and the main agent decides what's next.">
+> Full log: `<path>`. Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do. <in round 2: "If it fails once more, your turn ends with the failure, and the main agent decides what's next.">
 > If you're blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.
 
+- **The whole report again.** dsh's report of a child is its last non-empty assistant message, so a coder that answers a steer with "Fixed the test." would replace the full report it wrote before. The message asks for the whole report as the new closing message (from the final review).
 - **When it's sent.** Only after rounds 1 and 2. The steer's source is `dish-gates`, a notice, with a one-line summary.
 - **No screening.** The output is the coder's own, from its own code, so it isn't screened. dish-judge's result screen is for web and MCP content. Secrets in it are masked, as above.
 - **The judge's task.** The message is never part of it: the judge reads a child's brief and its latest instruction from its parent or a person.

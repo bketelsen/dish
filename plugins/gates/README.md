@@ -73,7 +73,7 @@ Sent after a failure with rounds left (round 1 and 2 of 3), as a message in the 
 > ```
 > …the last `tailLines` lines, at most 16 KiB…
 > ```
-> Full log: `<path>`. Fix it in your worktree and finish again; the gate runs again when you do.
+> Full log: `<path>`. Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do.
 > If you're blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.
 
 On a timeout the first line says the gate "was stopped at its time limit (<limit>)", and with no exit code that it "was killed". A gate that printed nothing says so. A sandbox refusal adds where a gate can write. In the next-to-last round the message adds "If it fails once more, your turn ends with the failure, and the main agent decides what's next." The output isn't screened (it is the coder's own), but secrets in it are masked (dish-kit's `maskSecrets`) before it reaches the message, the log or the record.

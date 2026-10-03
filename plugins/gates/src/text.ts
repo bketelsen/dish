@@ -154,7 +154,8 @@ export function failureMessage(failure: Failure): string {
   }
   const problem = oneLine(failure.logProblem ?? '', PROBLEM_SHOWN, ' ').replace(/\.+$/, '')
   const log = failure.log !== null ? `Full log: ${inlineCode(failure.log)}.` : problem === '' ? '(No log.)' : `(No log: ${problem}.)`
-  const fix = 'Fix it in your worktree and finish again; the gate runs again when you do.'
+  // dsh's report of a child is its last non-empty message: a short "Fixed it." would replace the report the coder wrote.
+  const fix = 'Fix it in your worktree, then finish again with your whole report as your closing message: it replaces the one above. The gate runs again when you do.'
   lines.push(round === maxRounds - 1
     ? `${log} ${fix} If it fails once more, your turn ends with the failure, and the main agent decides what's next.`
     : `${log} ${fix}`)
