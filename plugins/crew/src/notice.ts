@@ -27,16 +27,23 @@
  *   from a child crew didn't start, or from one of another session, goes through untouched, as the same object.
  * - **Which round.** A child that is sent a follow-up settles again, and dsh steers a notice into the parent's next step
  *   for each settlement, which that step claims all at once. A step can hold the notices of several rounds, and a notice
- *   can be read after later rounds were recorded, so "the child's latest run" can be another round's. A notice is matched
- *   to a run by what it says: the run's report file must hold the notice's closing text (`closingOf` its blocks, and
- *   `reportContent` of that, the rules `record.ts` records a run by and this reads one back by), and the run's stop
- *   reason must be the one dsh's opening line says (see `IMPLIED`). A report that can't be read is not the run, and is
- *   told of once. Of the runs that match, the newest not claimed by another notice of the
- *   step is the one, taking the step's notices from the last: if two rounds said the same and ended the same way, the
- *   last notice gets the newest run and the one before it the next. A notice that matches no run is rewritten without a
- *   report path (dsh's own account of how the child ended, with the child named), and so is a notice in a shape that
- *   isn't known, which has no closing text to compare. A report is compared by its size and its first `COMPARE_BYTES`,
- *   never read whole.
+ *   can be read after later rounds were recorded, so "the child's latest run" can be another round's. The step's notices
+ *   are matched from the last, and a run one of them took is not another's (`runOf`):
+ *   - **By the notice's id,** first. The host plugin notes the id of each finish notice it sees enter the parent's inbox,
+ *     and files it on the run whose `subagent/end` follows in the same synchronous run (`RunRecord.notice`). A notice whose
+ *     id is on a run is that run's, whatever its shape; if a notice of the step took that run already, it has none. No file
+ *     is read.
+ *   - **Otherwise by what it says,** over the runs that have no notice id: a run another notice was filed for is never
+ *     taken by text (two runs a `report` call ended both say "(no closing message)", and would match each other). This is
+ *     what is left for a run crew filed without seeing its notice (crew loaded late) and for records from before step 7.
+ *     The run's report file must hold the notice's closing text (`closingOf` its blocks, and `reportContent` of that, the
+ *     rules `record.ts` records a run by and this reads one back by), and the run's stop reason must be the one dsh's
+ *     opening line says (see `IMPLIED`). A report that can't be read is not the run, and is told of once. Of the runs that
+ *     match, the newest not claimed by another notice of the step is the one: if two rounds said the same and ended the
+ *     same way, the last notice gets the newest run and the one before it the next. A notice in a shape that isn't known
+ *     has no closing text to compare. A report is compared by its size and its first `COMPARE_BYTES`, never read whole.
+ *   - A notice that matches no run is rewritten without a report path: dsh's own account of how the child ended, with the
+ *     child named.
  * - **The wait.** dsh queues the notice and publishes `subagent/end` in the same synchronous run, so by the time a step
  *   claims the notice the host plugin has heard the end. What may still be going on is writing it down: the report file
  *   and the record. `dishCrew.whenRecorded(child)` is that, if it is; it is awaited, up to `WAIT_MS` and no longer than
@@ -47,8 +54,24 @@
  * A child bound to a worktree (`ChildRecord.worktree`) has its gate's ending said after the report, from the last gate result
  * of the run the notice is of (`gateLine`; the results are dish-gates', recorded by `addGate`, and filed on the run by
  * `endRun`): a pass, a failure that used the last round, a failure that didn't (the run ended some other way), a skip, an
- * error, or no result. A notice with no run matched to it says nothing of a gate, as it names no report. The collapsed
- * row's sentence (`noticeSummary`) doesn't change.
+ * error, or no result. A notice with no run matched to it says nothing of a gate, as it names no report. The gate line
+ * doesn't change the collapsed row's sentence (`noticeSummary`).
+ *
+ * **Structured reports** (step 7). A coder or a reviewer (`reportRole`) finishes with crew's `report` tool, and dsh's notice of
+ * a turn that call ended says only "It left no closing message.": dsh keeps the text blocks of the last message, and the
+ * report is a tool call. The record has it (`RunRecord.structured`, and its `.json` as `structuredFile`), so a run with one
+ * is told as the report:
+ *
+ * > coder «add login» (claude-sonnet-5.5) finished: done. Report: `/…/3-coder-1.json`. Its report:
+ * >
+ * > Status: done
+ * > Summary: …
+ *
+ * The first block is that sentence (with the gate line before `Its report:`), the second the report (`reportBlock`), every
+ * string of it masked again; dsh's "It left no closing message." is dropped, and a closing message the child did write
+ * follows the report, after `Its closing message:`, as dsh's own blocks. The collapsed row's sentence says what was
+ * reported: `finished: done.`, `blocked`, `needs context`, `approved` or `changes requested`. A coder's or a reviewer's run
+ * without one says so (`NO_STRUCTURED_REPORT`), before dsh's label; other roles' notices are as they were.
  *
  * Messages are deep-frozen, so what is replaced is a new message with the same id (`agent/pre-step` replaces the messages
  * that enter the step by returning them; see `@deepseek-ai/dsh-tmux-context`, which does the same to add one).
@@ -61,12 +84,18 @@ import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import { maskSecrets } from 'dish-kit'
 import type { DishCrew } from './index.ts'
-import { closingOf, reportContent } from './record.ts'
+import { SEVERITIES, closingOf, reportContent, reportRole } from './record.ts'
 import { BLOCK_END } from './text.ts'
-import type { ChildRecord, RunRecord } from './record.ts'
+import type { ChildRecord, RunRecord, StructuredReport } from './record.ts'
 
 /** The longest a notice waits for a run that is being recorded, in ms. */
 export const WAIT_MS = 2000
+
+/** What a coder's or reviewer's notice says when its run has no structured report (`noticeText`). */
+export const NO_STRUCTURED_REPORT = 'It ended without a successful `report`, so there is no structured report.'
+
+/** What leads the report in the notice of a run that has one. */
+const REPORT_LABEL = 'Its report:'
 
 /** The most of a report that is read to compare it with a notice, in bytes. */
 export const COMPARE_BYTES = 1024 * 1024
@@ -102,8 +131,8 @@ const ABNORMAL = /^ ended abnormally \((.*)\) before it finished\.$/s
 /** A log line that can't throw: what the row logs through. */
 type Warn = (format: string, ...args: unknown[]) => void
 
-/** What a notice says of a child. */
-type Child = Pick<ChildRecord, 'id' | 'role' | 'title' | 'model' | 'worktree'>
+/** What a notice says of a child. `reviews` is for `reportRole`. */
+type Child = Pick<ChildRecord, 'id' | 'role' | 'title' | 'model' | 'worktree' | 'reviews'>
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -144,6 +173,78 @@ function codeSpan(text: string): string {
 function fenced(text: string): string {
   const fence = '`'.repeat(Math.max(3, longestBackticks(text) + 1))
   return `${fence}\n${text}\n${fence}`
+}
+
+// --- the report -----------------------------------------------------------------------------------------------------
+
+/** A word of the report's own (a status, a verdict, a severity) as it is said: masked, like every string, `_` a space. */
+function said(word: string): string {
+  return maskSecrets(word).replaceAll('_', ' ')
+}
+
+/** `text` masked and trimmed, its own line breaks kept: a summary. */
+function kept(text: string): string {
+  return maskSecrets(text).trim()
+}
+
+/** `text` masked, on one line: a field of a list item. */
+function folded(text: string): string {
+  return maskSecrets(text).replace(/\s+/g, ' ').trim()
+}
+
+/** `text` masked, as an inline code span (`codeSpan`). */
+function code(text: string): string {
+  return codeSpan(maskSecrets(text))
+}
+
+/** What a report says of how the work ended, for the notice's first sentence: `done`, …, `changes requested`. */
+function outcomeOf(report: StructuredReport): string {
+  return said(report.role === 'coder' ? report.status : report.verdict)
+}
+
+/**
+ * The report as the notice shows it: a line for each field there is (an absent field, or an empty list, has none), joined by
+ * `\n`, with each list item folded onto a line of its own. Every string goes through `maskSecrets` again: the record masked it
+ * (`setReport`), and this is where it is written into a message.
+ *
+ * - A coder's: `Status: done` (or `blocked`, `needs context`); `Summary: …`, trimmed, its own line breaks kept; `Commits:`
+ *   and the shas as code spans, joined by `, `; `Blocked on: …`; `Rulings:` and `- <what> — <why> — <cost if wrong>` for
+ *   each; `Concerns:` and `- <concern>`; `Not fixed:` and `- <finding> — <why>`.
+ * - A reviewer's: `Verdict: approved` (or `changes requested`) and `, at ` the head as a code span; `Summary: …`;
+ *   `Findings (<n>): <k> blocking, <k> should_fix, <k> nit`, the counts above 0 only, or `Findings: none`; for each finding
+ *   `- [<severity>] ` its file (and `:<line>`) as a code span, then `: <summary> Fix: <fix>`; `Checks:` and, for each, the
+ *   command as a code span, then ` exit <code>: <summary>`; `Addressed:` and `- <finding>: addressed. <evidence>`, or
+ *   `NOT addressed`.
+ *
+ * Code spans are `codeSpan`'s: one line, with marks longer than any run of backticks inside.
+ */
+export function reportBlock(report: StructuredReport): string {
+  const lines: string[] = []
+  const list = <T>(title: string, items: readonly T[] | undefined, line: (item: T) => string): void => {
+    if (items !== undefined && items.length > 0) lines.push(title, ...items.map(item => `- ${line(item)}`))
+  }
+  if (report.role === 'coder') {
+    lines.push(`Status: ${outcomeOf(report)}`, `Summary: ${kept(report.summary)}`)
+    if (report.commits !== undefined && report.commits.length > 0) lines.push(`Commits: ${report.commits.map(code).join(', ')}`)
+    if (report.blockedOn !== undefined && report.blockedOn.trim() !== '') lines.push(`Blocked on: ${kept(report.blockedOn)}`)
+    list('Rulings:', report.rulings, ruling => [ruling.what, ruling.why, ruling.costIfWrong].map(folded).join(' — '))
+    list('Concerns:', report.concerns, folded)
+    list('Not fixed:', report.notFixed, item => `${folded(item.finding)} — ${folded(item.why)}`)
+  } else {
+    lines.push(`Verdict: ${outcomeOf(report)}, at ${code(report.head)}`, `Summary: ${kept(report.summary)}`)
+    const { findings } = report
+    const counts = SEVERITIES.map(severity => [severity, findings.filter(finding => finding.severity === severity).length] as const)
+      .filter(([, count]) => count > 0).map(([severity, count]) => `${count} ${severity}`)
+    lines.push(findings.length === 0 ? 'Findings: none' : `Findings (${findings.length}): ${counts.join(', ')}`)
+    for (const finding of findings) {
+      const where = finding.line === undefined ? finding.file : `${finding.file}:${finding.line}`
+      lines.push(`- [${maskSecrets(finding.severity)}] ${code(where)}: ${folded(finding.summary)} Fix: ${folded(finding.fix)}`)
+    }
+    list('Checks:', report.checks, check => `${code(check.command)} exit ${check.exitCode}: ${folded(check.summary)}`)
+    list('Addressed:', report.addressed, item => `${folded(item.finding)}: ${item.addressed ? 'addressed' : 'NOT addressed'}. ${folded(item.evidence)}`)
+  }
+  // A blank field leaves no space at the end of its line.
+  return lines.map(line => line.trimEnd()).join('\n')
 }
 
 /**
@@ -202,7 +303,8 @@ export function gateLine(child: Pick<ChildRecord, 'worktree'>, run: RunRecord, g
 }
 
 /**
- * The first sentence of a notice: who, and how it ended, without the report.
+ * The first sentence of a notice: who, and how it ended, without the report. A run with a structured report that ended
+ * `completed` says what it reported: `finished: done.` (or `blocked`, `needs context`, `approved`, `changes requested`).
  * @param child - the child the notice is of.
  * @param run - the run that ended, or `undefined` if the record has none for this notice.
  * @param lead - dsh's own opening line, which says how the child ended when `run` doesn't.
@@ -214,7 +316,7 @@ export function noticeSummary(child: Child, run: RunRecord | undefined, lead: st
     const subject = `Background subagent ${child.id}`
     return lead.startsWith(subject) ? `${who}${lead.slice(subject.length)}` : `${who}: ${lead}`
   }
-  if (run.stopReason === 'completed') return `${who} finished.`
+  if (run.stopReason === 'completed') return run.structured === undefined ? `${who} finished.` : `${who} finished: ${outcomeOf(run.structured)}.`
   const verb = Object.hasOwn(VERBS, run.stopReason) ? VERBS[run.stopReason]! : `stopped (${run.stopReason})`
   const error = oneLine(run.error)
   return `${who} ${verb}${error === undefined ? '' : `: ${error}`}.`
@@ -223,6 +325,11 @@ export function noticeSummary(child: Child, run: RunRecord | undefined, lead: st
 /**
  * The text that leads a notice: its first sentence, the report, the gate line of a bound child (`gateLine`), and what dsh put
  * before the closing message.
+ *
+ * - A run with a structured report cites its `.json` (`structuredFile`, else the `.md`), and ends `Its report:`: the report
+ *   follows (`reportBlock`), and `label` isn't used.
+ * - A coder's or a reviewer's run without one (`reportRole`) says `NO_STRUCTURED_REPORT` before `label`.
+ * - Any other run names its report and then `label`; a notice with no run, only `label`.
  * @param child - the child the notice is of.
  * @param run - the run that ended, or `undefined` if the record has none for this notice (no report is named then).
  * @param lead - dsh's own opening line.
@@ -232,9 +339,14 @@ export function noticeSummary(child: Child, run: RunRecord | undefined, lead: st
  */
 export function noticeText(child: Child, run: RunRecord | undefined, lead: string, label?: string, gatesOn = true): string {
   const head = noticeSummary(child, run, lead)
-  const gate = run === undefined ? undefined : gateLine(child, run, gatesOn)
-  const reported = run === undefined ? head : `${head} Report: \`${run.report}\`.${gate === undefined ? '' : ` ${gate}`}`
-  return label === undefined ? reported : `${reported} ${label}`
+  if (run === undefined) return label === undefined ? head : `${head} ${label}`
+  const gate = gateLine(child, run, gatesOn)
+  const gated = gate === undefined ? '' : ` ${gate}`
+  if (run.structured !== undefined) return `${head} Report: \`${run.structuredFile ?? run.report}\`.${gated} ${REPORT_LABEL}`
+  const parts = [`${head} Report: \`${run.report}\`.${gated}`]
+  if (reportRole(child) !== undefined) parts.push(NO_STRUCTURED_REPORT)
+  if (label !== undefined) parts.push(label)
+  return parts.join(' ')
 }
 
 /** The id of the child `message` is dsh's account of, if it is one. */
@@ -295,14 +407,27 @@ async function reportIs(path: string, expected: Buffer): Promise<boolean> {
 }
 
 /**
- * The newest run of `runs` that `parts` is the notice of and that isn't in `claimed`, which it is added to. A report that
- * can't be read isn't the run: `unreadable` is told, and the search goes on with the runs before it.
+ * The run of `runs` that `message` (taken apart as `parts`) is the notice of, if it isn't in `claimed`, which it is added to:
+ *
+ * 1. the newest run filed with the message's id as its `notice`. Claimed already (the same message twice in a step), there is
+ *    none, and no other is looked for. No file is read, so this holds for a message of any shape;
+ * 2. else, of the runs that have no `notice`, the newest that says what the notice says (see the module's header). A report
+ *    that can't be read isn't the run: `unreadable` is told, and the search goes on with the runs before it.
  */
-async function runOf(parts: Parts, runs: readonly RunRecord[], claimed: Set<RunRecord>, unreadable: (run: RunRecord, error: unknown) => void): Promise<RunRecord | undefined> {
+async function runOf(message: UserMessage, parts: Parts, runs: readonly RunRecord[], claimed: Set<RunRecord>, unreadable: (run: RunRecord, error: unknown) => void): Promise<RunRecord | undefined> {
+  // The host plugin files an id only when it is a non-empty string, so no other is looked for.
+  const id: unknown = message.id
+  const noticed = typeof id === 'string' && id !== '' ? runs.findLast(run => run.notice === id) : undefined
+  if (noticed !== undefined) {
+    if (claimed.has(noticed)) return undefined
+    claimed.add(noticed)
+    return noticed
+  }
   if (parts.report === undefined) return undefined
   for (let index = runs.length - 1; index >= 0; index--) {
     const run = runs[index]!
-    if (claimed.has(run) || (parts.implied !== undefined && run.stopReason !== parts.implied)) continue
+    // A run another notice was filed for is that notice's: two runs a `report` call ended both say "(no closing message)".
+    if (run.notice !== undefined || claimed.has(run) || (parts.implied !== undefined && run.stopReason !== parts.implied)) continue
     let same: boolean
     try {
       same = await reportIs(run.report, parts.report)
@@ -318,16 +443,28 @@ async function runOf(parts: Parts, runs: readonly RunRecord[], claimed: Set<RunR
   return undefined
 }
 
+/** A text block, frozen as dsh's are. */
+function textBlock(text: string): ContentBlock {
+  return Object.freeze({ type: 'text', text })
+}
+
 /**
  * `message` with the text that leads it and its source's summary replaced. When dsh's blocks follow it (the closing
  * message), crew's text ends with a blank line (`BLOCK_END`): dsh's adapters join text blocks with nothing between them.
+ *
+ * A run with a structured report has two blocks of crew's: the first sentence, ending `Its report:`, and the report
+ * (`reportBlock`), followed by `Its closing message:` when dsh's label was that. dsh's `It left no closing message.` goes:
+ * the report is the message.
  */
 function rewritten(message: UserMessage, child: ChildRecord, parts: Parts, run: RunRecord | undefined, gatesOn: boolean): UserMessage {
   // The blocks that stay are dsh's own, frozen already.
   const rest = message.content.slice(parts.label === undefined ? 1 : 2)
   const lead = noticeText(child, run, parts.lead, parts.label, gatesOn)
-  const text: ContentBlock = Object.freeze({ type: 'text', text: rest.length === 0 ? lead : `${lead}${BLOCK_END}` })
-  const content = Object.freeze([text, ...rest])
+  const after = rest.length === 0 ? '' : BLOCK_END
+  const ours = run?.structured === undefined
+    ? [textBlock(`${lead}${after}`)]
+    : [textBlock(`${lead}${BLOCK_END}`), textBlock(`${reportBlock(run.structured)}${parts.label === CLOSING_LABEL ? `${BLOCK_END}${CLOSING_LABEL}` : ''}${after}`)]
+  const content = Object.freeze([...ours, ...rest])
   const source = Object.freeze({ ...message.source, summary: bounded(noticeSummary(child, run, parts.lead)) })
   return Object.freeze({ ...message, content, source })
 }
@@ -404,7 +541,7 @@ async function rewriteChild(id: string, indexes: readonly number[], messages: re
       try {
         const parts = partsOf(message, id)
         if (parts === undefined) continue
-        out[index] = rewritten(message, record, parts, await runOf(parts, record.runs, claimed, unreadable), context.gatesOn ?? true)
+        out[index] = rewritten(message, record, parts, await runOf(message, parts, record.runs, claimed, unreadable), context.gatesOn ?? true)
       } catch (error) {
         tell(context, 'could not rewrite a finish notice of child %s, which is left as dsh wrote it: %s', id, describe(error))
       }
