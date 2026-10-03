@@ -31,7 +31,7 @@ Status: draft, from the brainstorm on 2026-09-30. It records what we decided and
 | Config | `$XDG_CONFIG_HOME/dish/` | `crew.yaml` (roles, model tiers, tools), `prompts/<role>.md`, `skills/<name>/SKILL.md`, `projects.yaml` (the repo registry: family, role, gate, setup), `families/<family>/` (direction, approved initiatives) | git repo; every UI save is a commit; history, diff and revert in the UI |
 | Data | `$XDG_DATA_HOME/dish/` | `vault/` (memory, its own git repo pushed to a private GitHub repo), `ledgers/` (until `orchestrator` (step 7) owns the ledger, the shipped skills keep a plan's ledger at `.worktrees/<plan>-ledger.md` in the repo, git-ignored), initiative status, crew's records | the vault via git; ledgers append-only |
 | Work | the work root: `~/work` (the service's working directory) | the projects' clones, `<owner>/<repo>`, each with its task worktrees in `.worktrees/<slug>`, and the `scratch` workspace for general chats. Not under `$XDG_DATA_HOME`: these are dsh workspaces, where agents write | each clone is its repo's git |
-| State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs; the projects' onboarding status, each clone's and worktree's record, setup logs, and the read-token files (`workspaces/`) | no |
+| State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs; the projects' onboarding status, each clone's and worktree's record, setup logs, and the read-token files (`workspaces/`); gate logs (`gates/<owner>/<repo>/<slug>/<child>-<turn>-<round>.log`, pruned after 30 days) | no |
 | Cache | `$XDG_CACHE_HOME/dish/` | Copilot model catalog cache (`copilot-models.json`), fetched pages | no |
 
 One instance's dish directories move together: when `DSH_DISH_HOME` is set to an absolute path, dish-kit's `xdgPaths` puts all four at `$DSH_DISH_HOME/{config,state,data,cache}/dish`, ahead of the XDG variables, and `workRoot()` puts the work root at `$DSH_DISH_HOME/work`. Dev, the default for everything but the VM's service, sets it to `<checkout>/.dev`; prod uses the defaults above. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands. See the [ops spec](specs/ops.md).
@@ -68,6 +68,7 @@ Modeled on [obra/superpowers](https://github.com/obra/superpowers) (`writing-pla
 - When a coder agent working in a registered repo is about to finish its turn, the gates plugin runs the gate itself in that worktree. dsh's `agent/turn-stopping` hook is the interception point.
 - If the gate fails, its output is sent back to the coder (`agent.steer`) and the turn continues. "Done" means the gate actually passed, not that the coder says it ran.
 - The gates plugin counts rounds and hands off to the ladder. dsh's own hook bridges have no loop cap, so this one must have its own.
+- As built in step 6c ([gates spec](specs/gates.md)): at most 3 gate runs per turn, the third failure ending the turn, and a review of work whose gate didn't pass refused unless the main agent records a ruling.
 
 ## Project families
 
@@ -132,7 +133,7 @@ Each is its own bundle. "Provides" names its Cordis service; plugins depend only
 | `crew` | `crew` | `prompts`, `dishConfig` | roles, model tiers, the model-family rule, giving each delegated child its role's identity and tools, the `delegate` tool. On dsh-subagent, not dsh's agent teams: see [the research note](research/2026-10-01-dsh-agent-team.md) |
 | `projects` | `dishProjects` | `dishConfig` (optional); drives `dishWorkspaces`, read with `ctx.get` | the repo registry `projects.yaml` (family, role, gate and its timeout and environment, setup), each project's onboarding status and the queue that drives it, Settings → Projects. See the [projects and workspaces spec](specs/projects-workspaces.md) |
 | `workspaces` | `dishWorkspaces` | nothing at load; reads `dishProjects`, `dishCrew` and `credentials` with `ctx.get`, waits for `workspaceRegistry` and `tools` | clones in the work root, the GitHub App (read tokens and the credential helper), setup on its own fresh clone, workspace registration and the scratch workspace, task worktrees with the `worktree` tool, the sweep of merged ones, Settings → GitHub App |
-| `gates` | — | `projects` | gate execution at turn-stop, retry rounds |
+| `gates` | `dishGates` | nothing at load; reads `dishCrew`, `dishWorkspaces`, `dishProjects` and dsh's `shell` with `ctx.get` | running a project's gate in a bound coder's worktree at turn-stop, through dsh's sandboxed shell; steering a failure back, up to 3 gate runs a turn; the gate logs. Results go in crew's record, which owns the finish notice's gate line and the review check. See the [gates spec](specs/gates.md) |
 | `orchestrator` | — | `crew`, `skills`, `workspaces`, `families` | the main-agent preset and the pipeline as prompts, skills and ledger tools |
 | `families` | `families` | `dishConfig`, `projects` | direction, initiatives, ledger, the Families page |
 | `inbox` | `inbox` | — | items (proposal, approval, result) and the mobile-friendly page |
@@ -205,7 +206,7 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
 1. ~~**Config backup.**~~ Settled 2026-10-01: the store pushes `main` to the private `bketelsen/dish-config` after every commit, from one machine at a time.
 2. **dsh's own home.** `~/.dsh` mixes dsh's config and data. Leave it, or point `DSH_HOME` somewhere XDG-shaped?
 3. ~~**The VM.**~~ Settled 2026-10-01: a Debian 13 VM on Minideb, provisioned by fleet with OpenTofu and Ansible, running `dsh web` as a systemd user unit (see the [deploy spec](specs/deploy.md) and the [ops spec](specs/ops.md)).
-4. **Gate environment.** Sandbox, timeouts, and whether gates need network or secrets.
+4. ~~**Gate environment.**~~ Settled 2026-10-03 (the [gates spec](specs/gates.md)): a gate runs in the sandbox the coder's own commands run in (on the VM, the clone, `/tmp` and the home directory less a protected list), with the network open, the coder's environment plus the project's `gateEnv` (no secret-looking names), and the project's `gateTimeout`, at most 10 minutes.
 5. ~~**Main-agent preset vs global `delegate`.**~~ Settled 2026-10-01: `delegate` is a row in the dish preset, which `crew` owns until `orchestrator` (see the [crew spec](specs/crew.md)).
 6. **Public access with GitHub sign-in, instead of Tailscale only** (raised 2026-09-30, to settle at deployment). You may make dish publicly reachable, signing in with GitHub and allowing only your account and members of the `frostyard` org, so others can use it. This would reopen several decisions:
    - **Access** (currently Tailscale only, Funnel only for webhooks): dsh's own token-in-URL auth would sit behind an OAuth front, either a proxy or a dsh plugin.

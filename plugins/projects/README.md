@@ -3,7 +3,7 @@
 The repos dish works on. You register each one as a **project** in `projects.yaml`, in the config store, and dish gets it ready to work on.
 - **The registry.** `projects.yaml`, edited on **Settings → Projects**. Agents may only propose changes to it.
 - **Onboarding.** Each project is cloned, configured, set up and registered as a dsh workspace, one project at a time, in the background. [`dish-workspaces`](../workspaces/) does the work; this plugin decides when, and keeps each project's status.
-- **The service.** `dishProjects` gives the rest of dish the projects and their status. 6c's gates read `gate`, `gateTimeout` and `gateEnv` from it.
+- **The service.** `dishProjects` gives the rest of dish the projects and their status. [dish-gates](../gates/) reads `gate`, `gateTimeout` and `gateEnv` from it.
 
 The design is in the [spec](../../docs/specs/projects-workspaces.md) and the [plan](../../docs/plans/2026-10-02-projects.md). Its "Notes from the build" say what changed on the way.
 
@@ -42,11 +42,11 @@ projects:
 | the key | required | `owner/repo`, as GitHub spells it. The clone goes to `<work root>/<owner>/<repo>`. |
 | `family` | required | Free text for now (step 8 gives families their own documents). |
 | `role` | required | One line on what the repo is. |
-| `gate` | required | The command 6c's gates run. |
+| `gate` | required | The command [dish-gates](../gates/) runs in a bound coder's worktree when the coder finishes. |
 | `gateTimeout` | required | `<n>s`, `<n>m` or `<n>h`, from 10s to 10m (dsh's shell caps a run at 10 minutes). |
 | `setup` | optional | A command run once, in dish's own fresh clone, outside the sandbox (see [dish-workspaces](../workspaces/README.md#setup)). It gets dish's own Node and pnpm (the unit's `PATH`), so a repo whose tools come from mise needs it to go through mise, such as `mise trust && mise exec -- pnpm install --frozen-lockfile`. |
 | `setupTimeout` | optional | From 10s to 1h; 15m when absent. |
-| `gateEnv` | optional | Variables for the gate: names like `FOO_BAR`, never `DSH_*` or a name with `KEY`, `TOKEN`, `SECRET` or `PASSWORD` in it. Values are one line, and may use `<clone>` and `<worktree>`, which 6c expands. |
+| `gateEnv` | optional | Variables for the gate: names like `FOO_BAR`, never `DSH_*`, `HOME`, `LD_*` (they reach dish's sandbox runner, outside the sandbox) or a name with `KEY`, `TOKEN`, `SECRET` or `PASSWORD` in it. Values are one line, and may use `<clone>` and `<worktree>`, which dish-gates expands. A gate otherwise has the coder's own environment; where the sandbox can't write the home directory (dev without `DISH_SANDBOX_HOME=on`), point a cache into the clone here, such as `GOCACHE: <clone>/.worktrees/.cache/go-build`. |
 
 The store refuses a document with any other field or top-level key, two keys that differ only in case, a blank required field, a multi-line one, or an owner of `scratch` or `tokens`. `scratch` is the scratch workspace's folder in the work root, and `tokens` would share its state directory with dish-workspaces' token files. A refusal names the project and the field, never the value.
 
@@ -83,7 +83,7 @@ Between Skills and the GitHub App card, in Settings' nav.
 ```ts
 interface DishProjects {
   list(): Promise<Project[]>                      // projects.yaml at main, parsed and sorted; [] without a store or when it doesn't parse
-  get(name: string): Promise<Project | undefined> // any case; what 6c reads: gate, gateTimeout, gateTimeoutMs, gateEnv
+  get(name: string): Promise<Project | undefined> // any case; what dish-gates reads: gate, gateTimeout, gateTimeoutMs, gateEnv
   status(name: string): ProjectStatus             // synchronous; pending at 0 when unknown
   retry(name: string): Promise<void>              // throws only while its onboarding is queued or running
   problem(): Promise<string | undefined>          // why the stored projects.yaml doesn't parse
@@ -119,5 +119,5 @@ The clones, their state and the token files are dish-workspaces'.
 - **Comments in `projects.yaml`** are lost when the page saves it.
 - **A changed `setup`** doesn't run on a ready project: setup runs only in dish's own fresh clone. Run it yourself in the clone, or remove the clone (dish never does) and press Retry.
 - **A failed setup isn't run again** by Retry, a restart or an edit, since each adopts dish's own clone and the project goes ready with setup skipped. Remove the clone and press Retry, or run the command yourself.
-- **`gateTimeout` stops at 10 minutes,** dsh's cap on a shell run. A long build isn't a gate until 6c finds a way past it; use its lint or validate step.
+- **`gateTimeout` stops at 10 minutes,** dsh's cap on a shell run. dish could wait longer with a deadline of its own, and 6c chose not to: a turn stays running for as long as its gate does ([gates spec](../../docs/specs/gates.md), open item 1). A long build isn't a gate; use its lint or validate step.
 - **An aborted onboarding that never stops** (a setup that ignores its signals and escapes its process group) is left behind after 30 seconds. The project's lock in dish-workspaces still keeps anything else out of its clone.

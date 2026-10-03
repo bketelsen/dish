@@ -15,7 +15,7 @@ The design is in the [deploy spec](../docs/specs/deploy.md) and the [ops spec](.
 - **The state.** It lives in `dish`'s home:
   - `~/.dsh`: dsh's sessions and its credential file;
   - `~/.config/dish/config.git`: the config store, pushed to `bketelsen/dish-config`. The VM is its only pusher;
-  - `~/.local/state/dish`: the judge's decision log; `deploy/`, `update.sh`'s lock and record of the last start; `projects/status.json`, each project's onboarding status; and `workspaces/`, each clone's and worktree's record, setup logs, and the GitHub App's read tokens (`workspaces/tokens/<owner>`, 0600, removed when dsh stops);
+  - `~/.local/state/dish`: the judge's decision log; `deploy/`, `update.sh`'s lock and record of the last start; `projects/status.json`, each project's onboarding status; `workspaces/`, each clone's and worktree's record, setup logs, and the GitHub App's read tokens (`workspaces/tokens/<owner>`, 0600, removed when dsh stops); and `gates/<owner>/<repo>/<slug>/`, the gate logs of [`dish-gates`](../plugins/gates/) (one per gate run, `<child>-<turn>-<round>.log`, 0600 in 0700 directories, pruned after 30 days);
   - `~/.local/share/dish`: crew's records.
 
 ## What the files here do
@@ -51,7 +51,7 @@ Its steps, in order:
    - **The `agent-preset-registry` row** makes the `dish` preset the default for new tasks, when no default is chosen yet.
    - **The `sandbox` row**, with `DISH_SANDBOX_HOME=on`: `runnerCommand: [<checkout>/deploy/dish-sandbox]` and `runnerFailureSignatures: ['bwrap: ', 'dish-sandbox: ']`. With it off, those two keys go, and the row with them unless it holds something else.
    - Other rows, comments and key order stay as they are. A file that is already right is not rewritten.
-4. **The bundles.** For copilot, config, prompts, skills, crew, judge, web, projects and workspaces, in that order (projects after config, whose store it uses, and workspaces after projects, whose types it imports), `pnpm exec dsh plugin --profile <profile> add ./plugins/<name>`, only when the profile doesn't link it yet. That is dsh's own binary, not the launcher, so the profile is the one `DSH_HOME` names.
+4. **The bundles.** For copilot, config, prompts, skills, crew, judge, web, projects, workspaces and gates, in that order (projects after config, whose store it uses, workspaces after projects, whose types it imports, and gates last, since it reads crew, projects and workspaces), `pnpm exec dsh plugin --profile <profile> add ./plugins/<name>`, only when the profile doesn't link it yet. That is dsh's own binary, not the launcher, so the profile is the one `DSH_HOME` names.
 5. **Copies, not links.** pnpm hard-links its store's files into `node_modules` where it can (the VM's ext4), so dish's files would share their inodes with every agent's project and with the store, which a sandboxed command can write on the VM. Step 1 installs with `--package-import-method=clone-or-copy` (a reflink on btrfs, else a copy), `install.sh` writes `packageImportMethod: clone-or-copy` into the profile's `pnpm-workspace.yaml` before step 4, and here it replaces every file in the checkout's and the profile's `node_modules` that is still a link by a copy of its own (`pnpm-copies.ts`), since pnpm never imports a package again for a changed setting. When there is nothing to copy, it is a scan. Agents' own installs still link, in clones and worktrees of dish too, since the flag isn't in the checkout's `pnpm-workspace.yaml`.
 
 It prints what it did, `install: sandbox home: on` or `off`, `install: the profile's pnpm installs copy: updated` (or `unchanged`) and `install: links into pnpm's store replaced by copies: <n>` among it, and its last line is `install: no changes to the profile` or `install: profile changed`. A changed `sandbox` row is a changed profile. On a failure it stops and names the step on stderr, as `install: FAILED at step: …`. It prints nothing secret.
@@ -98,6 +98,14 @@ incus exec minideb:dish --project dish -- su - dish -c 'cd ~/dish && env -i HOME
 ```
 
 Then roll back with `dish-update --apply <ref>`. The clones under `~/work` and dish's records stay, and a later update to a commit with the two plugins links them again. Until then, the clones' credential helper (`~/dish/plugins/workspaces/bin/git-credential-dish`) is gone, so agents' git can't fetch a private repo in them.
+
+**Rolling back past 6c,** to a commit without `plugins/gates`, is the same step for its one bundle, first:
+
+```sh
+incus exec minideb:dish --project dish -- su - dish -c 'cd ~/dish && env -i HOME="$HOME" PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin pnpm exec dsh plugin --profile web remove dish-gates'
+```
+
+Crew's record keeps the gate results it holds, and an older crew drops them when it next writes a child's record. The gate logs under `~/.local/state/dish/gates` stay until you remove them.
 
 `minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh <you>@<minideb-host> incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`. The scripts' own hints, such as `run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)`, give that form for Minideb itself; from the desktop, add the `minideb:` remote.
 
@@ -323,7 +331,7 @@ dsh runs each agent shell command in bwrap: `/` read-only, a fresh `/dev` and `/
 
 - **What a command can write.** The workspace, its `/tmp`, and the home directory less the protected list. So `pnpm install`, `go mod download`, `cargo build`, `pip install --user`, `mise install` and caches work without an escalation. The network is open, as before. `danger-full-access` (an escalated command) never goes through `dish-sandbox`.
 - **The protected list,** read-only whether it exists yet or not:
-  - dish and dsh themselves: `$DSH_HOME` and `~/.dsh`, dish's four XDG directories (`~/.config/dish`, `~/.local/share/dish`, `~/.local/state/dish`, `~/.cache/dish`, or where `XDG_*` puts them), `$DSH_DISH_HOME`, and the checkout, `~/dish`, so no agent can change `dish-sandbox`;
+  - dish and dsh themselves: `$DSH_HOME` and `~/.dsh`, dish's four XDG directories (`~/.config/dish`, `~/.local/share/dish`, `~/.local/state/dish`, `~/.cache/dish` always, since a gate's `gateEnv` can move `XDG_*`, and also where `XDG_*` puts them), `$DSH_DISH_HOME`, and the checkout, `~/dish`, so no agent can change `dish-sandbox`;
   - credentials and git: `~/.ssh`, `~/.gnupg`, `~/.gitconfig`, `~/.config/git` and `~/.git-credentials`, since dish's own git reads the account's global config outside the sandbox;
   - files that run later outside the sandbox without anyone acting: `~/.config/systemd` and `~/.local/share/systemd`, `~/.config/environment.d`, `~/.config/autostart`, `~/.pam_environment`; the shell's startup files `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.bash_logout` and `~/.profile`, and `~/.bash_aliases`, `~/.bash_completion` and `~/.local/share/bash-completion`, which Debian's `.bashrc` and bash-completion read; `~/.config/mise`, fleet's global mise config; `~/.config/pnpm` and `~/.npmrc`, which pnpm reads when `install.sh` and dsh's plugin manager run it; and `~/node_modules`, `~/.node_modules` and `~/.node_libraries`, where node looks for a module dish's own `node_modules` doesn't have;
   - each `--protect <path>` (absolute, or `~/…`) added by hand after the path in the row's `runnerCommand`. A later install keeps them.

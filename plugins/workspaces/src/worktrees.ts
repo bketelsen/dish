@@ -1,10 +1,10 @@
 /**
  * Task worktrees: `<clone>/.worktrees/<slug>` on a new branch `dish/<slug>`, made by the main agent with the `worktree`
- * tool, bound to coders by crew's `delegate`, gated by 6c, and removed once merged (sweep.ts).
+ * tool, bound to coders by crew's `delegate`, gated by dish-gates, and removed once merged (sweep.ts).
  *
  * - **Managed** means dish made it: dish records each one it makes (`<state>/workspaces/<owner>/<repo>/worktrees/
  *   <slug>.json`, with the commit it was cut from) in its state directory, which agents can't write. Only a managed
- *   worktree is resolved, removed or swept. Anything else under `.worktrees/` (6c's `.cache`, a worktree made by hand)
+ *   worktree is resolved, removed or swept. Anything else under `.worktrees/` (a `.cache`, a worktree made by hand)
  *   is listed at most, and never changed.
  * - **Paths are canonical:** the clone is `realpath`'d and `.worktrees` must be a real directory, so
  *   `<clone>/.worktrees/<slug>` is the path crew records and compares, the one `bindings` is asked about, and the one
@@ -48,7 +48,7 @@ import type { CloneExpectations } from './safety.ts'
 import type { GitHubDefault, SetupOutcome } from './setup.ts'
 import { checkMerged, defaultBranchOf, githubWord } from './sweep.ts'
 
-/** A worktree's name: its folder under `.worktrees/` and its branch `dish/<slug>`. (`.cache`, 6c's, can't be one.) */
+/** A worktree's name: its folder under `.worktrees/` and its branch `dish/<slug>`. (`.cache` can't be one.) */
 export const SLUG = /^[a-z0-9][a-z0-9-]{0,39}$/
 /** How long after a `resolve` the sweep leaves a worktree alone: a coder about to start in it. */
 export const RECENT_RESOLVE_MS = 300_000

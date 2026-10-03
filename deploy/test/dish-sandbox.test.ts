@@ -273,6 +273,26 @@ test('workspace-write: the protected list follows DSH_HOME, the XDG variables an
   assert.ok(!existsSync(join(relative.home, 'xdg')) && !existsSync(join(relative.workspace, 'instance')))
 })
 
+test('workspace-write: the default dish directories stay protected wherever the XDG variables point, as a gateEnv may move them', { skip: SKIP }, async () => {
+  const box = await makeBox()
+  const at = (path: string): string => join(box.home, path)
+  // A gate's environment can move XDG_* (dish-projects' gateEnv): dish's own directories on the VM are the defaults.
+  const env = {
+    ...box.env,
+    XDG_CONFIG_HOME: at('moved/config'),
+    XDG_DATA_HOME: at('moved/data'),
+    XDG_STATE_HOME: at('moved/state'),
+    XDG_CACHE_HOME: at('moved/cache'),
+  }
+  const defaults = ['.config/dish', '.local/share/dish', '.local/state/dish', '.cache/dish'].map(at)
+  const moved = ['moved/config/dish', 'moved/data/dish', 'moved/state/dish', 'moved/cache/dish'].map(at)
+  const result = await bash(box, `${tryWrites([...defaults, ...moved], [])}\nmkdir -p ~/moved/cache/go-build && touch ~/moved/cache/go-build/x ~/.cache/y && echo free`, { env })
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(result.stdout, 'free\n', 'the defaults and the moved ones are protected; a cache beside them is not')
+  for (const path of [...defaults, ...moved]) assert.equal(mode(path), 0o700, path)
+  assert.ok(existsSync(at('moved/cache/go-build/x')))
+})
+
 test('workspace-write: missing protected paths are made first: directories 0700, files 0600, and ~/.bash_profile reads what bash read before', { skip: SKIP }, async () => {
   const box = await makeBox()
   const result = await bash(box, 'true')

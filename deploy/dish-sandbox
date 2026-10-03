@@ -26,9 +26,11 @@
 # - dish and dsh themselves: $DSH_HOME (dsh gives every shell call its own), and ~/.dsh, dsh's default home, wherever
 #   $DSH_HOME points; dish's four XDG directories, ${XDG_CONFIG_HOME:-~/.config}/dish,
 #   ${XDG_DATA_HOME:-~/.local/share}/dish, ${XDG_STATE_HOME:-~/.local/state}/dish and ${XDG_CACHE_HOME:-~/.cache}/dish
-#   (an XDG variable counts when it is absolute, as for dish-kit's xdgPaths); $DSH_DISH_HOME when it is absolute (dsh
-#   passes a runner no DSH_* name but its own, so under dsh it is never set here, and dev's sits inside the checkout
-#   anyway); and dish's checkout, this file's ../, so that no agent can change this file.
+#   (an XDG variable counts when it is absolute, as for dish-kit's xdgPaths), and the four defaults, ~/.config/dish,
+#   ~/.local/share/dish, ~/.local/state/dish and ~/.cache/dish, wherever the XDG variables point: a gate's environment
+#   (dish-projects' gateEnv) can move them, and dish on the VM keeps its files in the defaults; $DSH_DISH_HOME when it
+#   is absolute (dsh passes a runner no DSH_* name but its own, so under dsh it is never set here, and dev's sits inside
+#   the checkout anyway); and dish's checkout, this file's ../, so that no agent can change this file.
 # - credentials and git: ~/.ssh, ~/.gnupg, ~/.gitconfig, ~/.config/git and ~/.git-credentials. dish's own git reads the
 #   account's global config outside the sandbox, where a credential.helper or url.*.insteadOf would run or redirect.
 # - files that run later outside the sandbox without anyone acting: ~/.config/systemd and ~/.local/share/systemd (user
@@ -177,8 +179,9 @@ want dir "$home/.dsh"
 for pair in CONFIG:.config DATA:.local/share STATE:.local/state CACHE:.cache; do
   name=XDG_${pair%%:*}_HOME
   base=${!name-}
-  if [[ $base != /* ]]; then base=$home/${pair#*:}; fi
-  want dir "$base/dish"
+  # The default always, and where the variable points too: a gate's environment can move it.
+  want dir "$home/${pair#*:}/dish"
+  if [[ $base == /* ]]; then want dir "$base/dish"; fi
 done
 if [[ ${DSH_DISH_HOME-} == /* ]]; then want dir "$DSH_DISH_HOME"; fi
 want dir "$checkout"

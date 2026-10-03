@@ -220,7 +220,7 @@ function EnvEditor({ rows, readOnly, edit }: { rows: EnvRow[], readOnly: boolean
       </div>
       <span className="dish-projects-muted">
         Variables the gate runs with. A name starting DSH_ or containing KEY, PASSWORD, SECRET or TOKEN is refused: the registry is
-        stored in plain text.
+        stored in plain text. HOME and names starting LD_ are refused too: they reach dish's sandbox runner.
       </span>
     </fieldset>
   )
