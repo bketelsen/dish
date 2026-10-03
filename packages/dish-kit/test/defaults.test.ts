@@ -19,7 +19,8 @@ after(() => { for (const root of roots) rmSync(root, { recursive: true, force: t
 // A developer's own git config (core.autocrlf, signing, hooks, attributes) must not change what these tests see, so the
 // test process, and every git it starts, runs with neither the global nor the system config. Settings passed in the
 // environment as GIT_CONFIG_COUNT/KEY/VALUE survive that, which is why the helper below also pins the ones that matter.
-const ISOLATE = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }
+// Every process it starts (git, and node running the script) gets a scratch HOME too, never the runner's.
+const ISOLATE = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', HOME: scratch() }
 const saved = new Map<string, string | undefined>()
 before(() => {
   for (const [name, value] of Object.entries(ISOLATE)) {

@@ -103,10 +103,12 @@ test('a person\'s edit survives a restart: the defaults are only seeded where no
 // --- earlier defaults ---------------------------------------------------------------------------
 
 const DEFAULTS_DIRECTORY = fileURLToPath(new URL('../defaults/', import.meta.url))
+/** The environment of the git `earlierText` runs: a scratch HOME, never the runner's, and no global git config. */
+const GIT_ENV: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: await tempDir(), GIT_CONFIG_GLOBAL: '/dev/null' }
 
 /** The text of `file` (under `defaults/`) in git history whose sha256 is `hash`. */
 function earlierText(file: string, hash: string): string {
-  const git = (...args: string[]): string => execFileSync('git', ['-C', DEFAULTS_DIRECTORY, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  const git = (...args: string[]): string => execFileSync('git', ['-C', DEFAULTS_DIRECTORY, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: GIT_ENV })
   // `--full-history`, as `computePrevious` reads it: a version that only a side branch had is listed too.
   for (const commit of git('log', '--full-history', '--format=%H', '--', file).split('\n').filter(Boolean)) {
     let text: string

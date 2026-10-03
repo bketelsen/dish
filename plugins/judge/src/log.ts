@@ -17,8 +17,9 @@
  *   one buffer at a time, however long the files are.
  * - **Private.** Directories are `0o700`, files `0o600`.
  * - **Whole lines.** Appends to a day's file go through that file's queue, one `appendFile` for each line. A line that
- *   can't be read back (torn by a crash, or not ours) is skipped on read and counted in `skipped`. The first append to a
- *   file in a process starts a new line if the file's last line has no newline, so a torn line doesn't take the next one with it.
+ *   can't be read back (torn by a crash or a failed append, or not ours) is skipped on read and counted in `skipped`. The
+ *   first append to a file in a process, and the first after an append to it failed, starts a new line if the file's last
+ *   line has no newline, so a torn line doesn't take the next one with it.
  *
  * `write` rejects when the disk does. A caller on the way to a decision must catch that and decide anyway: a log that
  * can't be written is no reason to fail a gate.
@@ -394,7 +395,10 @@ export class JudgeLog {
   readonly #now: () => number
   /** The tail of each day file's queue, until it's done. */
   readonly #queues = new Map<string, Promise<void>>()
-  /** The day files that this process has appended to, and so has checked for a torn last line. */
+  /**
+   * The day files that this process has appended to, and so has checked for a torn last line. A file leaves the set when
+   * an append to it fails, since that append may have written part of its line.
+   */
   readonly #tidy = new Set<string>()
 
   /**
@@ -460,19 +464,24 @@ export class JudgeLog {
     const text = `${fitLine(masked)}\n`
     const file = join(this.#directory, `${day}.jsonl`)
     await this.#serial(file, async () => {
-      // The first append to a file in this process: if the file's last line was torn off (a crash in the middle of an
-      // append), this line would be glued on to it and both would be lost. A newline first leaves the torn one on its own.
+      // The first append to a file in this process, or the first after one that failed: if the file's last line was torn
+      // off (a crash in the middle of an append, or an append that wrote part of its line and then failed), this line
+      // would be glued on to it and both would be lost. A newline first leaves the torn one on its own.
       const first = !this.#tidy.has(file)
       const written = first && await endsMidLine(file) ? `\n${text}` : text
       if (first) this.#tidy.add(file)
       // O_NOFOLLOW: a link in the place of a day file is not ours to write through.
       const options = { mode: 0o600, flag: constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | NO_FOLLOW }
       try {
-        await appendFile(file, written, options)
+        await appendFile(file, written, options).catch(async (error: unknown) => {
+          if (errorCode(error) !== 'ENOENT') throw error
+          await mkdir(this.#directory, { recursive: true, mode: 0o700 })
+          await appendFile(file, written, options)
+        })
       } catch (error) {
-        if (errorCode(error) !== 'ENOENT') throw error
-        await mkdir(this.#directory, { recursive: true, mode: 0o700 })
-        await appendFile(file, written, options)
+        // A short write and then ENOSPC, say: what was written of the line is left, so the next append checks again.
+        this.#tidy.delete(file)
+        throw error
       }
     })
   }

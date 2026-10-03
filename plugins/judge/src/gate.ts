@@ -22,6 +22,11 @@
  *   cancels wins, and the gate never lets a human approve over it. Its own `deny` is final and `next()` is not called, as in
  *   dsh's auto-review: a call that will not run should not start the `PreToolUse` hooks or recorders after it.
  * - **A verdict cache** (`VerdictCache`, below) is written before `next()` is called and read by the approval answerer.
+ * - **Its ask shows you the escalation.** When the gate asks you about a call whose tool will then ask to escalate the
+ *   sandbox (`sandbox_permissions` with a `justification` that isn't blank, for a mode other than the session's, which the
+ *   sandbox policy gives as it gives dsh's `bash`), the ask says so, with the mode and the whole justification
+ *   (`showingEscalation`), and the cache keeps the ask's reason (`askReason`). Your yes to that ask is then also your yes to
+ *   the escalation's request, which the answerer allows once instead of asking you a second time about the same call.
  *
  * ### What was found in dsh 0.2.0-rc.2, and where the state comes from
  *
@@ -43,20 +48,39 @@
  *   canonical (symlinks resolved), or the service's configured root when the session has none. It is what the sandbox
  *   enforces, and what `bash` itself uses. With no such service, or if it throws, the workspace is `cwd`.
  * - **The task.** `exec.agent.session.snapshotEvents(fromSeq?)` returns the session's frozen events; a `user/message` event's
- *   `data` is a `UserMessage` `{ id, role: 'user', content: ContentBlock[], source }`, and `source.kind === 'user'` marks a
- *   prompt that a human (or, for a child, its parent's brief) wrote, as against context dsh injected (`goal`, `schedule`,
- *   `user-approval`, tool results and so on). For a top-level agent the task is the last such message; for a child it is the
- *   first one among its own events, which `session.inheritedEventCount` says where they start (a forked child's log begins
- *   with its parent's). Text blocks only, joined, cut to 4000 characters. `snapshotEvents` is marked deprecated in dsh ("new
- *   calls are prohibited", for dsh's own code, which should read projections), because it assumes the whole log is in
- *   memory; in 0.2.0-rc.2 it is, there is no other synchronous way to the prompt, and the turn-outline's prompt is a
- *   one-line preview. If it is missing or throws, the task is `''`: the judge then reads every command as not serving a task
- *   it can't see, and the gate asks you more often. A crew child's brief carries a trailing guidance block ("Your parent
- *   agent id is …"), and a compacted-away or image-only first message leaves nothing to read; both are accepted.
+ *   `data` is a `UserMessage` `{ id, role: 'user', content: ContentBlock[], source }`. `source.kind === 'user'` marks a prompt
+ *   that a human wrote (or, for a child, the brief its parent queued), and `source.kind === 'agent-message'` a message from
+ *   another agent, with the live sender's id in `senderSessionId` and dsh's `Agent <id> sent a message: ` as its first block
+ *   (`createAgentMessage` in `dsh-subagent`). Everything else is context dsh injected (`goal`, `runtime-context`,
+ *   `subagent-settled`, `tool-jobs`, tool results and so on), and never counts. Text blocks only; each message is cut by
+ *   taking out its middle (`clipMiddle`), so its head and its tail, where a brief's commit and report instructions tend to
+ *   be, both stay. Its secrets are masked **before** the cut, each as a plain `[<kind>, left out]` (`taskPart`): a cut that
+ *   took out a private key's header, or went through a token, would leave the rest of it for the client's mask to miss.
+ *   - **A top-level agent's** task is its prompts, oldest first, a resend (one equal to the one before it) counted once: the
+ *     first, then the newest that fit in `MAX_TASK_CHARS`, with `[… N earlier messages left out]` for the rest. The first and
+ *     the newest are always in, cut to `MAX_PART_CHARS`. The first is often the request, and the newest what was said since
+ *     ("site URL will be …"). The ones between are cut to `MAX_MIDDLE_CHARS`, so that more of them fit: in the friction
+ *     session the first prompt was "hello!" and the request came second, where two long pastes after it would otherwise
+ *     have pushed it out.
+ *   - **A child's** task comes from its own events, which `session.inheritedEventCount` says where they start (a forked
+ *     child's log begins with its parent's). The brief is the first non-empty text block of its first prompt: crew's closing
+ *     note and dsh's return note ("Your parent agent id is …") are the blocks after it. Then the latest instruction after the
+ *     brief, if there is one, each cut to `MAX_PART_CHARS`. An instruction is a prompt a person typed into the child (a
+ *     `user` message with a string `rpcId`, which dsh's `subagent.prompt` gives it; dsh's auto-review, `isHumanInstruction`,
+ *     tells one the same way), or an `agent-message` whose `senderSessionId` is the header's `parentSession` (a `delegate`
+ *     with `to`, or the parent's `send_message`), without dsh's first block. dsh lets only the parent send to a child
+ *     (`authorizeLineage`), and its auto-review tells a parent's instruction the same way. A `user` message with no `rpcId`,
+ *     a message from any other agent, and, for a child whose header names no parent, any `agent-message`, add nothing.
+ *
+ *   `snapshotEvents` is marked deprecated in dsh ("new calls are prohibited", for dsh's own code, which should read
+ *   projections), because it assumes the whole log is in memory; in 0.2.0-rc.2 it is, there is no other synchronous way to
+ *   the prompt, and the turn-outline's prompt is a one-line preview. If it is missing or throws, the task is `''`: the judge
+ *   then reads every command as not serving a task it can't see, and the gate asks you more often. A prompt with no text is
+ *   passed over, and a compacted-away brief leaves nothing to read, which is accepted.
  *   The route dsh prefers, for a later follow-up: a `session/event` listener (emit mode, one per session) that keeps
- *   `WeakMap<Session, { brief, latest }>`, filled from each `user/message` event with `source.kind === 'user'` (the brief is
- *   the first one after `inheritedEventCount`). It needs no read of the log, but it also misses what was said before the
- *   plugin loaded or the session was resumed, which a projection registered with `ctx.sessionProjections` would not.
+ *   `WeakMap<Session, …>` of the messages above (the prompts, or the brief and the latest instruction), filled from each
+ *   `user/message` event as it comes. It needs no read of the log, but it also misses what was said before the plugin
+ *   loaded or the session was resumed, which a projection registered with `ctx.sessionProjections` would not.
  *
  * @module dish-judge/gate
  */
@@ -65,7 +89,7 @@ import { createHash } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
-import { isTopLevelAgent } from 'dish-kit'
+import { isTopLevelAgent, maskSecrets } from 'dish-kit'
 import type { Decision, Judge, JudgeAgent, JudgeResult, JsonValue, Question } from './client.ts'
 import { ASK_JUDGE_TOOL } from './ask.ts'
 import { DEFAULT_SETTINGS } from './settings.ts'
@@ -101,8 +125,19 @@ export const SERVES_TASK_QUESTION: Question = {
   instructions: 'Is running `command` a reasonable step toward `task`?',
 }
 
-/** The task is cut to this many characters. */
-export const MAX_TASK_CHARS = 4000
+/** One message is cut to this many characters, by taking out its middle. */
+export const MAX_PART_CHARS = 4000
+/**
+ * A main agent's message between its first and its newest is cut to this many characters, so that more of them fit, and a
+ * long paste can't push the request out of the task.
+ */
+export const MAX_MIDDLE_CHARS = 1000
+/**
+ * The task is kept within this many characters; the first and the newest message are always in. What it bounds is the
+ * messages between those two: the two alone can come to `2 * MAX_PART_CHARS`, plus a separator, and a gap line and its
+ * separator when some were left out.
+ */
+export const MAX_TASK_CHARS = 8000
 /** A justification is cut to this many characters. */
 const MAX_JUSTIFICATION_CHARS = 1000
 
@@ -148,8 +183,9 @@ export interface VerdictEntry {
   readonly verdict: VerdictKind
   /**
    * `true` when the call carried a sandbox escalation (`sandbox_permissions`), the judge was shown it, and the verdict is
-   * `allow`: the verdict covers the escalation, so the approval request it leads to may be answered `allowed-once`. Always
-   * `false` for an `ask` or a `deny`, and for a call with no escalation.
+   * `allow`: the verdict covers the escalation, so the approval request it leads to may be answered `allowed-once`, once (the
+   * answerer writes it back `false` when it uses it, through `replace`). Always `false` for an `ask` or a `deny`, and for a
+   * call with no escalation.
    */
   readonly escalationCovered: boolean
   /**
@@ -162,9 +198,22 @@ export interface VerdictEntry {
    * The `reason` dsh's tool gives when it asks to escalate this call, as it will arrive in the approval request:
    * `escalate sandbox to <sandbox_permissions>: <justification>` (`approveEscalation` in `dsh-sandbox`, which `bash` and `pwsh`
    * both call). Set when the call asked for an escalation. Only a request with exactly this reason is the escalation the judge
-   * was shown; an entry with none covers nothing.
+   * was shown, or the one your yes covers; an entry with none covers nothing.
    */
   readonly escalationReason?: string
+  /**
+   * The reason of the gate's own ask about this call, when that ask showed you the escalation the call will ask for (the mode
+   * and the justification, whole: `showingEscalation`). The approval request with this tool and exactly this reason is that
+   * ask, and your yes to it covers the escalation (`coveredByYou`). Set only when the gate itself asks you and `escalationReason`
+   * is set: never for an allow, a deny, a child, or another listener's ask.
+   */
+  readonly askReason?: string
+  /**
+   * `true` from when you said yes to the ask in `askReason` until the escalation's request (this tool, `escalationReason`) is
+   * answered with it: that request is `allowed-once`, once, and then this is gone. Written by the approval answerer, through
+   * `replace`; the gate never writes it.
+   */
+  readonly coveredByYou?: boolean
   /** When it was written, on the cache's monotonic clock, in ms. */
   readonly at: number
   /** The gate's own: lets it see that it has already decided this call. The answerer ignores it. */
@@ -172,7 +221,7 @@ export interface VerdictEntry {
 }
 
 /** What `set` takes: the entry, and the clock supplies `at`. */
-export type VerdictInput = Pick<VerdictEntry, 'verdict' | 'escalationCovered' | 'tool' | 'escalationReason' | 'memo'>
+export type VerdictInput = Pick<VerdictEntry, 'verdict' | 'escalationCovered' | 'tool' | 'escalationReason' | 'askReason' | 'coveredByYou' | 'memo'>
 
 export interface VerdictCacheOptions {
   /** A monotonic clock, in ms. Defaults to `performance.now()`. For tests. */
@@ -234,6 +283,8 @@ export class VerdictCache {
       escalationCovered: input.escalationCovered,
       ...input.tool === undefined ? {} : { tool: input.tool },
       ...input.escalationReason === undefined ? {} : { escalationReason: input.escalationReason },
+      ...input.askReason === undefined ? {} : { askReason: input.askReason },
+      ...input.coveredByYou === true ? { coveredByYou: true } : {},
       at: this.#now(),
       ...input.memo === undefined ? {} : { memo: input.memo },
     })
@@ -247,6 +298,18 @@ export class VerdictCache {
       if (oldest.done === true) break
       this.#entries.delete(oldest.value)
     }
+  }
+
+  /**
+   * Write `input` for this agent's call `callId`, as `set` does, only if the entry there is still `entry`: the very object the
+   * caller read, so that nothing has been written for the call since, and it has not been deleted (its call settled) or
+   * evicted. One that has expired since it was read, and is still there, is still that entry, and is written fresh. This is
+   * the approval answerer's: it reads an entry, waits for you, and then writes your yes on it. Returns whether it wrote.
+   */
+  replace(owner: string, callId: string, entry: VerdictEntry, input: VerdictInput): boolean {
+    if (this.#entries.get(keyOf(owner, callId)) !== entry) return false
+    this.set(owner, callId, input)
+    return true
   }
 
   /** Forget this agent's call `callId`; the same call id of another agent stays. */
@@ -275,7 +338,8 @@ function keyOf(owner: string, callId: string): string {
 export type GateAgent = JudgeAgent & {
   readonly session?: {
     readonly id?: unknown
-    readonly header?: { readonly cwd?: unknown }
+    /** `parentSession` is a child's parent's session id, as dsh-subagent writes it; a top-level session has none. */
+    readonly header?: { readonly cwd?: unknown, readonly parentSession?: unknown }
     readonly inheritedEventCount?: unknown
     snapshotEvents?(fromSeq?: number): readonly unknown[]
   }
@@ -307,6 +371,31 @@ function clip(text: string, max: number): string {
   const last = text.charCodeAt(end - 1)
   if (last >= 0xd800 && last <= 0xdbff) end -= 1
   return `${text.slice(0, end)}…`
+}
+
+/** What stands where `clipMiddle` took text out. */
+const CUT = '\n[…]\n'
+
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff
+
+/**
+ * `text` if it is within `max` characters, else its first and last halves joined by `\n[…]\n`, within `max`, with no half of a
+ * surrogate pair left at either cut. The head gets the odd character. A `max` too small for the mark gives the head alone.
+ */
+export function clipMiddle(text: string, max: number): string {
+  if (text.length <= max) return text
+  if (max <= CUT.length) {
+    let end = Math.max(0, max)
+    if (end > 0 && isHighSurrogate(text.charCodeAt(end - 1))) end -= 1
+    return text.slice(0, end)
+  }
+  const room = max - CUT.length
+  let headEnd = Math.ceil(room / 2)
+  let tailStart = text.length - (room - headEnd)
+  if (isHighSurrogate(text.charCodeAt(headEnd - 1))) headEnd -= 1
+  if (tailStart < text.length && isLowSurrogate(text.charCodeAt(tailStart))) tailStart += 1
+  return `${text.slice(0, headEnd)}${CUT}${text.slice(tailStart)}`
 }
 
 /** The tools whose `command` is the whole of what they run: the two shells. */
@@ -344,16 +433,42 @@ function escalationOf(args: unknown): string | undefined {
     : `sandbox_permissions: ${permissions}; justification: ${clip(justification, MAX_JUSTIFICATION_CHARS)}`
 }
 
+/** The escalation dsh's tool will ask the approval service for: the mode and the justification, as the model gave them. */
+interface EscalationAsked {
+  readonly mode: string
+  readonly justification: string
+}
+
 /**
- * The `reason` dsh's tools put on the approval request for this call's escalation, or `undefined` if the call would not make one
- * (no `sandbox_permissions`, or no `justification` to send with it: `bash` and `pwsh` ask only when they have both). It is the
- * wording of `approveEscalation` in `dsh-sandbox`, with the arguments as the model gave them, not as they are shown to the judge.
+ * The escalation this call names, or `undefined` if its tool would not ask for one: no `sandbox_permissions`, or no
+ * `justification` with something in it (`bash` and `pwsh` ask only when they have both, and refuse a blank justification
+ * before they ask: `validateEscalationArgs` in `dsh-sandbox`). The arguments as the model gave them, not as they are shown to
+ * the judge. A mode the session already has is not asked for either; the gate reads that from the sandbox policy.
  */
-function escalationReasonOf(args: unknown): string | undefined {
+function escalationAskedOf(args: unknown): EscalationAsked | undefined {
   if (!isRecord(args)) return undefined
-  const permissions = given(args.sandbox_permissions)
-  if (permissions === undefined || typeof args.justification !== 'string') return undefined
-  return `escalate sandbox to ${permissions}: ${args.justification}`
+  const mode = given(args.sandbox_permissions)
+  if (mode === undefined || typeof args.justification !== 'string' || args.justification.trim() === '') return undefined
+  return { mode, justification: args.justification }
+}
+
+/** The `reason` dsh's tool puts on the approval request for the escalation: the wording of `approveEscalation` in `dsh-sandbox`. */
+function escalationReasonOf(asked: EscalationAsked): string {
+  return `escalate sandbox to ${asked.mode}: ${asked.justification}`
+}
+
+/** The gate's own ask, as dsh-tools puts it to the approval service: its reason, and the same words to show you. */
+type GateAsk = { kind: 'ask', reason: string, displayReason: { en: string } }
+
+/**
+ * The gate's own `ask` for a call that will ask to escalate, with the escalation in it: the mode, and the justification whole
+ * and as the model gave it, which is what dsh's own request for it would show you. Your yes to this ask also answers that
+ * request (the approval answerer), so the ask must show you all of it.
+ */
+function showingEscalation(ask: Extract<PreToolDecision, { kind: 'ask' }>, asked: EscalationAsked): GateAsk {
+  const before = ask.reason === undefined ? '' : `${ask.reason} `
+  const reason = `${before}The command also asks for ${asked.mode} permissions: "${asked.justification}". Allowing it allows that too.`
+  return { kind: 'ask', reason, displayReason: { en: reason } }
 }
 
 /** Where the command runs: `workdir` if the call names one (as `bash` and `pwsh` resolve it), else the session's cwd. */
@@ -364,43 +479,143 @@ function directoryOf(args: unknown, sessionCwd: string | undefined): string | un
   return resolve(sessionCwd, workdir)
 }
 
-/** The text of a message a human wrote (`source.kind === 'user'`), or `undefined` for any other. */
-function promptText(data: unknown): string | undefined {
-  if (!isRecord(data) || data.role !== 'user') return undefined
-  const source = data.source
-  if (!isRecord(source) || source.kind !== 'user') return undefined
-  const content = data.content
-  if (!Array.isArray(content)) return undefined
-  const parts: string[] = []
-  for (const block of content) {
-    if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+/** What goes between the messages of a task. */
+const SEPARATOR = '\n\n'
+
+/** dsh's first block of a message from another agent (`createAgentMessage` in `dsh-subagent`): `Agent <id> sent a message: `. */
+const AGENT_MESSAGE_LEAD = /^Agent \S+ sent a message:\s*$/
+
+/** The line that stands for the messages a task leaves out. */
+function gapLine(count: number): string {
+  return count === 1 ? '[… 1 earlier message left out]' : `[… ${count} earlier messages left out]`
+}
+
+/** A user message (`role: 'user'`) with its source and the text of its text blocks, or `undefined` for anything else. */
+function userMessage(event: unknown): { source: Record<string, unknown>, texts: string[] } | undefined {
+  if (!isRecord(event) || event.type !== 'user/message') return undefined
+  const data = event.data
+  if (!isRecord(data) || data.role !== 'user' || !isRecord(data.source) || !Array.isArray(data.content)) return undefined
+  const texts: string[] = []
+  for (const block of data.content) {
+    if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') texts.push(block.text)
   }
-  const text = parts.join('\n').trim()
+  return { source: data.source, texts }
+}
+
+/** Text blocks joined by `\n` and trimmed, or `undefined` when nothing is left. */
+function joined(texts: readonly string[]): string | undefined {
+  const text = texts.join('\n').trim()
   return text === '' ? undefined : text
 }
 
+/** The text of a message a human wrote (`source.kind === 'user'`), or `undefined` for any other, or for one with no text. */
+function promptText(event: unknown): string | undefined {
+  const message = userMessage(event)
+  return message?.source.kind === 'user' ? joined(message.texts) : undefined
+}
+
 /**
- * The agent's task: a top-level agent's latest prompt, or a child's brief (its first). `''` when it can't be read, which
- * every way of failing comes to (see the file's notes). Never throws.
+ * A mask `maskSecrets` puts where a secret was: `‹secret: <kind>›`. The kind is bounded (dish-kit's longest is 27
+ * characters): unbounded, every `‹secret: ` with no `›` after it scanned to the end, quadratic in a message's length.
+ */
+const SECRET_MASK = /‹secret: ([^›]{0,64})›/g
+
+/**
+ * One message of the task, as it is sent: its secrets masked, and then cut in the middle to `max`.
+ *
+ * - **Masked first.** `maskSecrets` finds a private key by its `-----BEGIN … PRIVATE KEY-----` header and a token by its
+ *   prefix. A cut that took out the header, or went through a token, would leave the key's base64 and END line, or the
+ *   token's other half, for the client's own mask to miss.
+ * - **Each mask becomes a plain marker,** `[<kind>, left out]`. The client refuses a request that holds a private key's mask
+ *   (or a scan's that failed) as opaque, because a key's mask can take in what is written around it. That is right for a
+ *   command, whose text is what runs. The task is context, and its first prompt is always in it: one key there would make
+ *   every later command in the session opaque. The marker says what was there, and it holds nothing the client masks.
+ */
+function taskPart(text: string, max: number): string {
+  return clipMiddle(maskSecrets(text).replace(SECRET_MASK, '[$1, left out]'), max)
+}
+
+/**
+ * A top-level agent's task: its prompts, oldest first, a resend (one equal to the one before it) once. The first and the newest
+ * are always in, each cut to `MAX_PART_CHARS`; the ones between are cut to `MAX_MIDDLE_CHARS` and added newest first while
+ * the whole stays within `MAX_TASK_CHARS`, and a gap line stands for those left out. Only the messages it looks at are
+ * masked (`taskPart`): those it keeps, and the one that didn't fit, not the whole of a long chat on every command.
+ */
+function topLevelTask(events: Iterable<unknown>): string {
+  const texts: string[] = []
+  let previous: string | undefined
+  for (const event of events) {
+    const text = promptText(event)
+    if (text === undefined || text === previous) continue
+    previous = text
+    texts.push(text)
+  }
+  if (texts.length === 0) return ''
+  const newest = texts.length - 1
+  const first = taskPart(texts[0]!, MAX_PART_CHARS)
+  if (newest === 0) return first
+  const last = taskPart(texts[newest]!, MAX_PART_CHARS)
+  // The ones kept between the first and the newest, newest first; `from` is the oldest of them (or the newest, with none), and
+  // `kept` the length of those from it to the newest, joined.
+  const between: string[] = []
+  let from = newest
+  let kept = last.length
+  for (let index = newest - 1; index >= 1; index--) {
+    const part = taskPart(texts[index]!, MAX_MIDDLE_CHARS)
+    const withIt = part.length + SEPARATOR.length + kept
+    const gap = index > 1 ? gapLine(index - 1).length + SEPARATOR.length : 0
+    if (first.length + SEPARATOR.length + gap + withIt > MAX_TASK_CHARS) break
+    between.push(part)
+    from = index
+    kept = withIt
+  }
+  return [first, ...from > 1 ? [gapLine(from - 1)] : [], ...between.reverse(), last].join(SEPARATOR)
+}
+
+/**
+ * A child's task: its brief, and the latest instruction after it, each clipped. The brief is the first text block with
+ * something in it of its first prompt (`source.kind === 'user'`): crew's closing note and dsh's return note are the blocks
+ * after it. An instruction is a later prompt a person typed into the child (`source.kind === 'user'` with a string `rpcId`,
+ * which dsh's `subagent.prompt` gives it, and dsh's auto-review reads as a human instruction), or a message from its parent
+ * (`agent-message` whose `senderSessionId` is `parent`), without dsh's leading block. With no `parent`, no `agent-message`
+ * counts; nothing else ever does.
+ */
+function childTask(events: Iterable<unknown>, parent: string | undefined): string {
+  let brief: string | undefined
+  let latest: string | undefined
+  for (const event of events) {
+    const message = userMessage(event)
+    if (message === undefined) continue
+    const { source, texts } = message
+    if (brief === undefined) {
+      if (source.kind === 'user') brief = texts.map(text => text.trim()).find(text => text !== '')
+      continue
+    }
+    if (source.kind === 'user' && typeof source.rpcId === 'string') {
+      latest = joined(texts) ?? latest
+    } else if (source.kind === 'agent-message' && parent !== undefined && source.senderSessionId === parent) {
+      const lead = texts[0]
+      latest = joined(lead !== undefined && AGENT_MESSAGE_LEAD.test(lead) ? texts.slice(1) : texts) ?? latest
+    }
+  }
+  if (brief === undefined) return ''
+  const task = taskPart(brief, MAX_PART_CHARS)
+  return latest === undefined ? task : `${task}${SEPARATOR}${taskPart(latest, MAX_PART_CHARS)}`
+}
+
+/**
+ * The agent's task: a top-level agent's first and latest prompts, or a child's brief and its latest instruction (see the
+ * file's notes, and `topLevelTask` and `childTask`). `''` when it can't be read, which every way of failing comes to. Never
+ * throws.
  */
 export function taskOf(agent: GateAgent, topLevel: boolean): string {
   try {
     const session = agent.session
     if (typeof session?.snapshotEvents !== 'function') return ''
-    if (topLevel) {
-      const events = session.snapshotEvents()
-      for (let index = events.length - 1; index >= 0; index--) {
-        const event = events[index]
-        const text = isRecord(event) && event.type === 'user/message' ? promptText(event.data) : undefined
-        if (text !== undefined) return clip(text, MAX_TASK_CHARS)
-      }
-      return ''
-    }
+    if (topLevel) return topLevelTask(session.snapshotEvents())
     const inherited = typeof session.inheritedEventCount === 'number' && session.inheritedEventCount > 0 ? session.inheritedEventCount : 0
-    for (const event of session.snapshotEvents(inherited)) {
-      const text = isRecord(event) && event.type === 'user/message' ? promptText(event.data) : undefined
-      if (text !== undefined) return clip(text, MAX_TASK_CHARS)
-    }
+    const parent = session.header?.parentSession
+    return childTask(session.snapshotEvents(inherited), typeof parent === 'string' && parent !== '' ? parent : undefined)
   } catch {
     // Not a session we can read.
   }
@@ -410,18 +625,32 @@ export function taskOf(agent: GateAgent, topLevel: boolean): string {
 /** The sandbox policy's view of the workspace for an agent: its resolved `workspaceRoot`, or `undefined` if there is none. */
 export type WorkspaceRoot = (agent: GateAgent) => string | undefined
 
-/** `WorkspaceRoot` over `ctx.get('sandboxPolicy')`, looked up on every call (the service is a sibling's, and may come and go). */
-export function workspaceRootFrom(ctx: Context): WorkspaceRoot {
-  return (agent) => {
-    try {
-      const policy = (ctx as unknown as { get(name: string): unknown }).get('sandboxPolicy')
-      if (!isRecord(policy) || typeof policy.resolve !== 'function') return undefined
-      const resolved: unknown = policy.resolve({ session: agent.session })
-      return isRecord(resolved) ? given(resolved.workspaceRoot) : undefined
-    } catch {
-      return undefined
-    }
+/**
+ * The sandbox policy's mode for an agent's session (`read-only`, `workspace-write`, …), or `undefined` if there is none. It is
+ * what dsh's `bash` and `pwsh` read (`resolve({ session }).mode`), and a call that asks for that mode is run with no request.
+ */
+export type SandboxMode = (agent: GateAgent) => string | undefined
+
+/** What `ctx.get('sandboxPolicy')` resolves for an agent's session, looked up on every call (the service is a sibling's, and may come and go). */
+function resolvedPolicy(ctx: Context, agent: GateAgent): Record<string, unknown> | undefined {
+  try {
+    const policy = (ctx as unknown as { get(name: string): unknown }).get('sandboxPolicy')
+    if (!isRecord(policy) || typeof policy.resolve !== 'function') return undefined
+    const resolved: unknown = policy.resolve({ session: agent.session })
+    return isRecord(resolved) ? resolved : undefined
+  } catch {
+    return undefined
   }
+}
+
+/** `WorkspaceRoot` over `ctx.get('sandboxPolicy')`. */
+export function workspaceRootFrom(ctx: Context): WorkspaceRoot {
+  return agent => given(resolvedPolicy(ctx, agent)?.workspaceRoot)
+}
+
+/** `SandboxMode` over `ctx.get('sandboxPolicy')`. */
+export function sandboxModeFrom(ctx: Context): SandboxMode {
+  return agent => given(resolvedPolicy(ctx, agent)?.mode)
 }
 
 /** Whether `name` is one of `patterns`: a plain entry must match exactly, an entry ending in `*` is a prefix. */
@@ -511,6 +740,11 @@ export interface CommandGateDeps {
   settings(): Promise<JudgeSettings>
   /** The sandbox policy's workspace root for an agent. Without it, or when it says nothing, the workspace is `cwd`. */
   workspaceRoot?: WorkspaceRoot
+  /**
+   * The sandbox policy's mode for an agent: an escalation to it is not asked for, so the gate's ask doesn't show it. Without it,
+   * or when it says nothing, every escalation the call names is taken to be asked for.
+   */
+  sandboxMode?: SandboxMode
   /** Where verdicts are kept. */
   cache: VerdictCache
 }
@@ -540,7 +774,16 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     const args = exec.arguments
     const command = commandOf(exec.name, args)
     const escalation = shell ? escalationOf(args) : undefined
-    const escalationReason = shell ? escalationReasonOf(args) : undefined
+    // The escalation dsh's tool will ask for: none for the mode the session already has.
+    const named = shell ? escalationAskedOf(args) : undefined
+    let mode: string | undefined
+    try {
+      if (named !== undefined) mode = deps.sandboxMode?.(agent)
+    } catch {
+      // Not known: the escalation is taken to be asked for.
+    }
+    const asked = named !== undefined && named.mode !== mode ? named : undefined
+    const escalationReason = asked === undefined ? undefined : escalationReasonOf(asked)
     const sessionCwd = given(agent.session?.header?.cwd)
     const cwd = shell ? directoryOf(args, sessionCwd) : sessionCwd
     let workspace: string | undefined
@@ -551,14 +794,17 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
     }
     workspace ??= cwd
 
-    // Once per call: a call of this agent that comes through again, as it was, is not put to the judge again.
+    // Once per call: a call of this agent that comes through again, as it was, is not put to the judge again. The escalation
+    // dsh's tool will ask for is part of it, whole, since the gate's ask shows it.
     const key = createHash('sha256')
-      .update(JSON.stringify([exec.name, command, cwd ?? null, escalation ?? null]))
+      .update(JSON.stringify([exec.name, command, cwd ?? null, escalation ?? null, escalationReason ?? null]))
       .digest('hex')
     const known = deps.cache.get(owner, callId)
 
     let ours: PreToolDecision
     if (known?.memo?.key === key) {
+      // Gated again, as it was: the same decision, and the entry is written afresh below. A yes you gave its earlier ask covers
+      // nothing of this one, and the judge's cover is back, as it was the first time.
       ours = known.memo.decision
     } else {
       const state: { [key: string]: JsonValue } = { command }
@@ -571,7 +817,7 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
       try {
         const judge = deps.judge()
         if (judge !== undefined) {
-          const asked = await judge.ask<Outcome>({
+          const answered = await judge.ask<Outcome>({
             state,
             // The spec's question, or, when a wider sandbox is asked for, the same with the escalation named in it.
             questions: { effect: escalation === undefined ? EFFECT_QUESTION : EFFECT_WITH_ESCALATION_QUESTION, serves_task: SERVES_TASK_QUESTION },
@@ -584,7 +830,7 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
             // A call that was cancelled has no one to ask, so the line says it was cancelled, not asked or denied.
             decide: result => exec.signal.aborted ? { decision: 'cancel', pre: { kind: 'cancel' } } : decideCommand(result, settings, topLevel),
           })
-          outcome = asked.decided
+          outcome = answered.decided
         }
       } catch {
         // The client never throws for a Jev failure; this is anything else, and is no reason to let a command run.
@@ -592,14 +838,19 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
       // A call that was cancelled must not leave an approval prompt behind.
       if (exec.signal.aborted) return { kind: 'cancel' }
       ours = (outcome ?? unavailable(topLevel)).pre
-      deps.cache.set(owner, callId, {
-        verdict: verdictOf(ours),
-        escalationCovered: ours.kind === 'allow' && escalation !== undefined,
-        tool: exec.name,
-        ...escalationReason === undefined ? {} : { escalationReason },
-        memo: { key, decision: ours },
-      })
+      // The gate's own ask shows you the escalation the tool will ask for, so that your yes to it can cover that request too.
+      if (ours.kind === 'ask' && asked !== undefined) ours = showingEscalation(ours, asked)
     }
+    // The ask's reason is kept when it showed you the escalation: a memo's decision did too, since the key holds the escalation.
+    const askReason = ours.kind === 'ask' && asked !== undefined ? ours.reason : undefined
+    deps.cache.set(owner, callId, {
+      verdict: verdictOf(ours),
+      escalationCovered: ours.kind === 'allow' && escalation !== undefined,
+      tool: exec.name,
+      ...escalationReason === undefined ? {} : { escalationReason },
+      ...askReason === undefined ? {} : { askReason },
+      memo: { key, decision: ours },
+    })
 
     // The gate's own deny is final, as dsh's auto-review's is: a call that will not run has no use for the hooks and
     // recorders that listen after this one, and must not trigger them.
@@ -628,6 +879,7 @@ export function registerCommandGate(ctx: Context): VerdictCache {
     judge: () => ctx.get('judge'),
     settings: () => ctx.get('dishJudge')?.settings() ?? Promise.resolve(DEFAULT_SETTINGS),
     workspaceRoot: workspaceRootFrom(ctx),
+    sandboxMode: sandboxModeFrom(ctx),
     cache,
   })
   ctx.on('tools/pre-execute', gate, { prepend: true })

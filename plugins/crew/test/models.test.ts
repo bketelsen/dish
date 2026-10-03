@@ -53,8 +53,24 @@ test('familyOf falls back to prefixes for a model no family lists', () => {
   for (const model of ['grok-4', 'grok-code-fast-1']) assert.equal(familyOf(model, SETTINGS), 'xai', model)
 })
 
+test('familyOf tells the vendors beyond the four: Qwen, DeepSeek, Kimi, GLM, Llama and Mistral', () => {
+  const told: Array<[string, string[]]> = [
+    ['alibaba', ['qwen3-coder', 'halogen-qwen3.8-flash-next', 'selfie/halogen-qwen3.8-flash-next', 'qwq-32b']],
+    ['deepseek', ['deepseek-v4', 'deepseek-ai/DeepSeek-V3']],
+    ['moonshot', ['kimi-k2', 'moonshot-v1']],
+    ['zhipu', ['glm-4.6', 'chatglm3']],
+    ['meta', ['llama-3.3', 'meta-llama/llama-3']],
+    ['mistral', ['mistral-large', 'mixtral-8x7b', 'codestral-2501', 'devstral']],
+  ]
+  for (const [family, models] of told) for (const model of models) assert.equal(familyOf(model, SETTINGS), family, model)
+  // A host in front of the model is not the model's vendor, and a model's own name is not another vendor's.
+  assert.deepEqual([...vendorsOf('ollama/qwen3')], ['alibaba'])
+  assert.deepEqual([...vendorsOf('codestral')], ['mistral'])
+  assert.equal(vendorsOf('codestral').has('openai'), false)
+})
+
 test('familyOf is undefined for a model it can\'t tell', () => {
-  for (const model of ['llama-3.3', 'mistral-large', 'omega', 'o', 'oss-120b', 'sonnet', 'sonnet-x', '', ' ']) {
+  for (const model of ['omega', 'o', 'oss-120b', 'sonnet', 'sonnet-x', '', ' ']) {
     assert.equal(familyOf(model, SETTINGS), undefined, JSON.stringify(model))
   }
 })
@@ -340,7 +356,12 @@ test('vendorsOf tells the vendor of a model id by the prefix table, whatever is 
   assert.deepEqual([...vendorsOf('grok-4')], ['xai'])
   // A vendor name on its own is as good as a model prefix.
   assert.deepEqual([...vendorsOf('anthropic.something-new')], ['anthropic'])
-  for (const id of ['llama-3.3', 'mistral-large', 'omega', 'o', 'sonnet-x', 'deepseek-v4', '', ' ', 'meta-llama/llama-3', 'constructor', '__proto__']) {
+  // The vendors beyond the four are found the same way.
+  assert.deepEqual([...vendorsOf('llama-3.3')], ['meta'])
+  assert.deepEqual([...vendorsOf('mistral-large')], ['mistral'])
+  assert.deepEqual([...vendorsOf('deepseek-v4')], ['deepseek'])
+  assert.deepEqual([...vendorsOf('meta-llama/llama-3')], ['meta'])
+  for (const id of ['omega', 'o', 'sonnet-x', '', ' ', 'constructor', '__proto__']) {
     assert.equal(vendorsOf(id).size, 0, JSON.stringify(id))
   }
 })
@@ -358,12 +379,14 @@ test('vendorsOf finds a vendor in any token of the id: an alias, a hosting prefi
     ['team o3 mini', 'openai'],
     ['vertex_ai/gemini-2.5-pro', 'google'],
     ['xai:grok-4', 'xai'],
+    ['llama-3', 'meta'],
+    ['hf.co/Qwen/Qwen3-Coder', 'alibaba'],
   ]
   for (const [id, vendor] of found) assert.deepEqual([...vendorsOf(id)], [vendor], id)
   // Two vendors in one id are both found, so neither can be got past the rule through it.
   assert.deepEqual([...vendorsOf('claude-gpt-bridge')].sort(), ['anthropic', 'openai'])
   // A token has to be a vendor's word: a letter-and-digit that merely contains an o, or a model's own name, isn't.
-  for (const id of ['4o-mini', 'sonnet-x', 'opus', 'haiku-3', 'llama-3', 'o', 'ob1']) assert.equal(vendorsOf(id).size, 0, id)
+  for (const id of ['4o-mini', 'sonnet-x', 'opus', 'haiku-3', 'o', 'ob1']) assert.equal(vendorsOf(id).size, 0, id)
 })
 
 test('familyOf gives a family only when exactly one vendor matches', () => {
@@ -502,17 +525,62 @@ test('model and family together: the reviewer differs from both', () => {
   assert.match(problemOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model: 'gpt-4.1', family: 'claude' } })), /^no reviewer family differs from claude/)
 })
 
-test('a reviewed model whose family can\'t be told is refused, and the problem names it', () => {
-  for (const model of ['llama-3.3', 'deepseek-v4', 'meta-llama/llama-3', 'mistral-large']) {
-    const problem = problemOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model } }))
-    assert.ok(problem.includes(`can't tell the family of model ${JSON.stringify(model)}`), problem)
-    assert.match(problem, /add it to a family in crew\.yaml/)
+test('a reviewed model whose family can\'t be told is its own family: it excludes nothing, and the first reviewer family reviews it', () => {
+  // No known vendor and no listing: the first reviewerFamilies entry, at the reviewer's tier.
+  for (const model of ['omega-1', 'sonnet-x', 'mystery-1']) {
+    assert.deepEqual(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model } })),
+      { provider: 'github-copilot', model: 'claude-sonnet-5.5', family: 'claude' }, model)
+    assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { model } })),
+      { provider: 'github-copilot', model: 'gpt-5.6-sol', family: 'openai' }, model)
+  }
+  // An override in any family is accepted: nothing is excluded.
+  for (const override of ['claude-opus-5.5', 'gpt-6.1-sol', 'gpt-5.6-sol', 'claude-sonnet-5.5']) {
+    assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { model: 'mystery-1' }, override })).model, override, override)
+  }
+  // deepseek-v4 and llama-3.3 are told by their vendor now, which no shipped family holds: the first entry again.
+  for (const model of ['deepseek-v4', 'llama-3.3', 'meta-llama/llama-3', 'mistral-large']) {
+    assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model } })).family, 'claude', model)
+    assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { model } })).family, 'openai', model)
   }
   // With a family given as well, the family is what tells.
   assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model: 'llama-3.3', family: 'meta' } })).family, 'claude')
+  assert.equal(routeOf(chooseRoute({ settings: RENAMED, role: 'reviewer', reviewed: { model: 'mystery-1', family: 'claude' } })).family, 'gpt')
   // A model the file lists is told by the list, whatever it is called.
   const settings = settingsOf((document) => { document.families.inhouse = { strong: 'llama-3.3', mid: 'llama-3.1' } })
   assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: 'llama-3.3' } })).family, 'openai')
+})
+
+test('qwen as the work: the reviewer is a GPT, and an override in Claude or GPT is accepted', () => {
+  const reviewed = { model: 'halogen-qwen3.8-flash-next' }
+  assert.deepEqual(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed })),
+    { provider: 'github-copilot', model: 'gpt-5.6-sol', family: 'openai' })
+  // The strong tier, as the skill's final review uses.
+  const strong = settingsOf((document) => { document.roles.reviewer.tier = 'strong' })
+  assert.equal(routeOf(chooseRoute({ settings: strong, role: 'reviewer', reviewed })).model, 'gpt-6.1-sol')
+  // The provider prefix a model of the user's own provider carries changes nothing.
+  assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { model: 'selfie/halogen-qwen3.8-flash-next' } })).model, 'gpt-5.6-sol')
+  for (const override of ['gpt-6.1-sol', 'claude-opus-5.5']) {
+    assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed, override })).model, override, override)
+  }
+  // Reviewed by label alone, the vendor's name is the family and excludes only what lists its models.
+  assert.equal(routeOf(chooseRoute({ settings: SETTINGS, role: 'reviewer', reviewed: { family: 'alibaba' } })).family, 'openai')
+})
+
+test('a family of the file that holds a model of the new vendor is kept away from the reviewer of that vendor\'s work', () => {
+  const settings = settingsOf((document) => {
+    document.families = {
+      local: { strong: 'qwen3-coder', mid: 'qwen3-coder' },
+      openai: { strong: 'gpt-6.1-sol', mid: 'gpt-5.6-sol' },
+    }
+    document.reviewerFamilies = ['local', 'openai']
+    for (const role of Object.values(document.roles) as any[]) if (role.family !== undefined) role.family = 'openai'
+  })
+  const reviewed = { model: 'halogen-qwen3.8-flash-next' }
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed })).family, 'openai')
+  // An override in the vendor's own family is refused.
+  assert.match(problemOf(chooseRoute({ settings, role: 'reviewer', reviewed, override: 'qwen3-coder' })), /different family/)
+  // Work on a model of another vendor still takes the first family.
+  assert.equal(routeOf(chooseRoute({ settings, role: 'reviewer', reviewed: { model: 'gpt-4.1' } })).family, 'local')
 })
 
 test('no reviewer family differs when every candidate is the reviewed vendor, and the problem says what to change', () => {

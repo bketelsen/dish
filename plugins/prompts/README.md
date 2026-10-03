@@ -34,7 +34,7 @@ Sandbox and approval policy, delegation info and a repo's `AGENTS.md` reach the 
 
 **Variables.** `{{model}}`, `{{cwd}}`, `{{provider}}` and any variable a plugin registers can be used. dsh itself fails a step on an unknown variable. This plugin fills in its own sections leniently instead: a name with no value is left as written and logged once per agent. The editor warns about unknown names but never refuses them.
 
-**Snapshots.** The first time an agent's prompt is built, the plugin records the store commit it read, in `$XDG_STATE_HOME/dish/prompts/agents/`. Every later step, and a resume after a restart, reads the texts at that commit, so the model never sees its instructions change mid-conversation. Snapshot files not read for 180 days are pruned at startup.
+**Snapshots.** The first time an agent's prompt is built, the plugin records the store commit it read, in `$XDG_STATE_HOME/dish/prompts/agents/`. Every later step, and a resume after a restart, reads the texts at that commit, so the model never sees its instructions change mid-conversation (except `{{model}}` and `{{provider}}`, which follow a model you switch to in the chat). Snapshot files not read for 180 days are pruned at startup.
 
 **When the store isn't running** (for example, another dsh process holds its lock), agents get the shipped defaults, and the plugin logs it. Once the store answers, an agent resumed from a snapshot switches back to its recorded text, and that's logged too.
 

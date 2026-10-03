@@ -14,7 +14,7 @@ import * as plugin from '../src/index.ts'
 import type { DishConfigService } from '../src/index.ts'
 import { Git } from '../src/store/git.ts'
 import type { RemoteStatus } from '../src/store/push.ts'
-import { AGENTA, USERA, isStoreError, ns, repoPath, tempDir } from './helpers.ts'
+import { AGENTA, USERA, isStoreError, ns, ownEnv, repoPath, tempDir } from './helpers.ts'
 
 const run = promisify(execFile)
 const SHORT = /^[0-9a-f]{7}$/
@@ -111,7 +111,7 @@ async function withEnv<T>(env: Record<string, string>, body: () => Promise<T>): 
 
 /** Who git recorded as the author of `rev`'s commit: `name <email>`. */
 async function authorOf(repository: string, rev = 'main'): Promise<string> {
-  return (await run('git', [`--git-dir=${repository}`, 'log', '-1', '--format=%an <%ae>', rev])).stdout.trim()
+  return (await run('git', [`--git-dir=${repository}`, 'log', '-1', '--format=%an <%ae>', rev], { env: ownEnv() })).stdout.trim()
 }
 
 const LOCK_MODULE = pathToFileURL(join(import.meta.dirname, '../src/store/lock.ts')).href
@@ -126,7 +126,7 @@ setInterval(() => {}, 1000)
 async function holdLock(dir: string): Promise<ChildProcess> {
   const child = spawn(process.execPath, ['--input-type=module', '-e', HOLDER], {
     stdio: ['ignore', 'pipe', 'inherit'],
-    env: { ...process.env, LOCK_DIR: dir, LOCK_MODULE },
+    env: ownEnv({ LOCK_DIR: dir, LOCK_MODULE }),
   })
   await new Promise<void>((resolve, reject) => {
     child.stdout!.setEncoding('utf8').on('data', (chunk: string) => { if (chunk.includes('acquired')) resolve() })

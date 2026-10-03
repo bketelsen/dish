@@ -7,7 +7,17 @@
  * the `dishPrompts` service, an `agent/created` listener, which forgets a snapshot on `/clear`, and an `agent/disposed`
  * listener, which forgets what the row has told about the agent.
  *
- * Two rules decide what the row may do:
+ * Three rules decide what the row may do:
+ *
+ * - **The persona is applied after `next()`, and the row is prepended.** A prompt's `{{model}}` and `{{provider}}` are
+ *   the model the session has selected, and dsh sets those on the assembly late: dsh-agent's model-selection listener
+ *   (`installModelSelection`) returns `{ ...assembled, variables: { ...assembled.variables, provider, model } }` after
+ *   its own `next()`, while the variables the waterfall starts with hold only the global default the agent was created
+ *   with. A listener that interpolates before `next()` would say the default. So this one asks for the snapshot
+ *   first, calls `next()` once, and patches what `next()` returned. Registered with `prepend: true`, it runs ahead
+ *   of every listener registered without `prepend`, dsh-agent's model selection among them, so its `next()` returns
+ *   after the selection has set `model`, whatever order the preset and the agent registered theirs in. (`dsh-session-reference` reads the selected model the same way.)
+ *   The cost: a listener inside the waterfall that reads the persona sections' text sees the preset's text.
  *
  * - **A prompt's text never fails a step.** dsh's own interpolation throws on a malformed, unknown or valueless
  *   `{{variable}}`, so the row interpolates the text itself, leniently (see `interpolate.ts`), and tells dsh not to
@@ -59,8 +69,9 @@ export const Config: Schema<Config> = Schema.object({
  * Set the persona sections of `assembly` from `persona`, in place.
  *
  * Sections are found by name and patched with `Object.assign`: dsh's last `next()` returns the assembly it started
- * with, so a listener that builds new objects loses its work. Each patched section gets its text interpolated here,
- * leniently, and `interpolate: false`, so dsh renders it as it is.
+ * with, and a listener that wraps the assembly (the model selection does) keeps its section objects, so a listener
+ * that builds new ones loses its work. Each patched section gets its text interpolated here, leniently, and
+ * `interpolate: false`, so dsh renders it as it is.
  * - the **suffix** becomes `persona.suffix`, for every agent;
  * - the **prefix** becomes `persona.prefix` for a top-level agent, and for a `child` stays what it is (the persona
  *   `crew` gave it): only interpolated. A prefix that already says `interpolate: false` is left exactly as it is.
@@ -135,9 +146,11 @@ function renderOwnPrefix(assembly: PromptAssembly): string[] {
 /**
  * The `system-prompt/assemble` listener of one row.
  *
- * For an assembly with an agent, it patches the persona sections from the agent's snapshot and calls `next()`. With no
- * agent (a diagnostic assembly), with no service, or when the snapshot can't be had, it doesn't give the agent a
- * persona and calls `next()`: a step doesn't fail because of this row. It says so when it matters, once:
+ * For an assembly with an agent, it asks for the agent's snapshot, calls `next()`, and patches the persona sections of
+ * what `next()` returned, which is what it returns (see the module comment for why the patch comes after). With no
+ * agent (a diagnostic assembly), it returns `next()`. With no service, or when the snapshot can't be had or the
+ * sections can't be patched, it doesn't give the agent a persona: a step doesn't fail because of this row. Every path
+ * calls `next()` exactly once, and an error from `next()` is the caller's. It says so when it matters, once:
  * - for the whole row, when the service is missing;
  * - for each agent, when its snapshot can't be had or the row can't patch its sections, and when its prompt names
  *   variables that have no value.
@@ -162,6 +175,10 @@ export function personaListener(options: ListenerOptions): PersonaListener {
     tell(`unknown:${agent.id}`, 'the prompt of agent %s (role %s) uses variables with no value, left as written: %s',
       agent.id, role, unknown.map(variable => `{{${variable}}}`).join(', '))
   }
+  const tellFailed = (agent: Agent, error: unknown): void => {
+    tell(`failed:${agent.id}`, 'could not set the prompt of agent %s (role %s); its persona is left as its preset has it: %s',
+      agent.id, role, describe(error))
+  }
   /** What a child gets when the row can't give it a persona. The trouble that brought us here is already told. */
   const withoutPersona = (assembly: PromptAssembly, agent: Agent): void => {
     try {
@@ -172,25 +189,35 @@ export function personaListener(options: ListenerOptions): PersonaListener {
       // A section that can't be written to, or an agent that can't be told apart: nothing more to do.
     }
   }
-  const listener: Assemble = async (assembly, context, next) => {
+  const listener: Assemble = async (_assembly, context, next) => {
     const agent: Agent | undefined = context.agent
     if (agent === undefined) return next()
+    // Asked for before `next()`, so that a slow store doesn't run inside the other listeners' time.
+    let snapshot: { persona: Persona } | undefined
     const prompts = service()
     if (prompts === undefined) {
       tell('service', 'dishPrompts is not available, so agents keep the persona their preset gives them. Is the dish-prompts plugin loaded?')
-      withoutPersona(assembly, agent)
-      return next()
+    } else {
+      try {
+        snapshot = { persona: await prompts.snapshot(agent, role) }
+      } catch (error) {
+        tellFailed(agent, error)
+      }
     }
-    try {
-      const persona = await prompts.snapshot(agent, role)
-      const unknown = applyPersona(assembly, persona, !isTopLevelAgent(agent))
-      if (unknown.length > 0) tellUnknown(agent, unknown)
-    } catch (error) {
-      tell(`failed:${agent.id}`, 'could not set the prompt of agent %s (role %s); its persona is left as its preset has it: %s',
-        agent.id, role, describe(error))
-      withoutPersona(assembly, agent)
+    // Not in a `try`: an error from the waterfall is not this row's trouble. And applied to what it returns: the
+    // model selection has set the variables by now.
+    const result = await next()
+    if (snapshot !== undefined) {
+      try {
+        const unknown = applyPersona(result, snapshot.persona, !isTopLevelAgent(agent))
+        if (unknown.length > 0) tellUnknown(agent, unknown)
+        return result
+      } catch (error) {
+        tellFailed(agent, error)
+      }
     }
-    return next()
+    withoutPersona(result, agent)
+    return result
   }
   return Object.assign(listener, {
     forget(agentId: string): void {
@@ -216,7 +243,9 @@ export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger(LOGGER_NAME)
   // Read on every call: the service is optional, and may come, go and come back.
   const listener = personaListener({ role: config.role, service: () => ctx.get('dishPrompts'), logger })
-  ctx.on('system-prompt/assemble', listener)
+  // Prepended: ahead of every listener registered without `prepend`, so that `next()` returns after dsh-agent's model
+  // selection has set `model` (see the module comment).
+  ctx.on('system-prompt/assemble', listener, { prepend: true })
   // What is told about an agent is told once, and not kept after the agent is gone.
   ctx.on('agent/disposed', ({ agent }) => {
     listener.forget(String(agent.id))

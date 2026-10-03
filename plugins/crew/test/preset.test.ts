@@ -512,7 +512,7 @@ interface Ran { code: number, stdout: string, stderr: string }
 
 async function sync(args: string[], cwd?: string): Promise<Ran> {
   try {
-    const { stdout, stderr } = await run(process.execPath, [SCRIPT, ...args], { cwd })
+    const { stdout, stderr } = await run(process.execPath, [SCRIPT, ...args], { cwd, env: { PATH: process.env.PATH, HOME: await tempDir() } })
     return { code: 0, stdout, stderr }
   } catch (error) {
     const { code, stdout, stderr } = error as Ran
