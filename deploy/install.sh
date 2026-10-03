@@ -119,8 +119,9 @@ run_dsh() {
 }
 
 # Each after what it builds on: projects after config (its store), workspaces after projects (whose types it imports),
-# gates last (it reads crew, projects and workspaces).
-bundles=(copilot config prompts skills crew judge web projects workspaces gates)
+# gates after them (it reads crew, projects and workspaces), and orchestrator last (it reads crew, gates, workspaces and
+# projects).
+bundles=(copilot config prompts skills crew judge web projects workspaces gates orchestrator)
 profile_dir="${DSH_HOME:-$HOME/.dsh}/profiles/$profile"
 patch="$profile_dir/cordis.patch.yml"
 changed=0
