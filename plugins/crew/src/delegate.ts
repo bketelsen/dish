@@ -26,6 +26,12 @@
  * writes the child's record before `startContinuable`, which is given the id the record has: a child that is quick finds
  * its record when it ends. A child that dsh then refuses is ended in the record as failed, and counts as a delegation.
  *
+ * **Events (step 7; see `events.ts`).** A start publishes `dish-crew/delegated` right after its child is recorded, before
+ * the prompt is built and dsh starts it; a follow-up publishes it after the follow-up is sent and counted, with the child as
+ * the record has it then. A start dsh refused publishes `dish-crew/settled` for the run `markFailed` filed. Each is awaited
+ * inside the locks the call holds, so a listener that queues its work before it returns (dish-orchestrator's ledger) has it
+ * queued before the next delegation of the session, or on the worktree, is checked. A refusal publishes nothing.
+ *
  * **Binding a worktree** (`worktree`, a worktree dish-workspaces made, as `<project>/<slug>` or its path). After step 2 (and
  * 3, for a follow-up), before the lock, a start checks that the role writes, that dish-workspaces is running
  * (`dishWorkspaces`, read with `ctx.get`: crew doesn't depend on it, and reads it through `WorkspacesReader`), that it
@@ -68,8 +74,8 @@
  * only the agents under it.
  *
  * This module is the row and little else: everything it loads of the plugin is plain code (`models`, `allow`, `text`,
- * `record`'s running rule, and `notice`, which reads the crew's report files and nothing else outside the process), and the
- * services come in by `import type`.
+ * `record`'s running rule, `events`' publisher, and `notice`, which reads the crew's report files and nothing else outside
+ * the process), and the services come in by `import type`.
  *
  * @module dish-crew/delegate
  */
@@ -84,6 +90,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { isTopLevelAgent, maskSecrets, RETURN_NOTE_LEAD } from 'dish-kit'
 import type { DishPrompts, Persona } from 'dish-prompts'
 import { allowList, visibleTools } from './allow.ts'
+import { publisher } from './events.ts'
 import type { DishCrew, WorktreeBinding } from './index.ts'
 import { chooseRoute, offeredModels } from './models.ts'
 import type { ReviewedWork, Route } from './models.ts'
@@ -404,6 +411,9 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
   // the agents under the preset, and `noticeListener` leaves a message that isn't this agent's own child's alone.
   ctx.on('agent/pre-step', noticeListener(ctx, warn))
 
+  // `dish-crew/delegated`, and `dish-crew/settled` for a start dsh refused. Never rejects.
+  const publish = publisher(ctx, warn)
+
   /** The child `id` if this session started it. @throws a refusal that names the session's children, if not. */
   async function ownChild(call: Call, id: string, what: string, hint: string): Promise<ChildRecord> {
     const found = await readRecord(() => call.crew.records.lookup(id))
@@ -665,13 +675,19 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     }
   }
 
-  /** Record `childId` as failed, for a start dsh refused. A record that can't be written is logged: the refusal still comes. */
+  /**
+   * Record `childId` as failed, for a start dsh refused, and publish `dish-crew/settled` for the run it filed, so a start that
+   * was published as delegated also ends. A record that can't be written is logged: the refusal still comes.
+   */
   async function markFailed(call: Call, childId: string, message: string): Promise<void> {
+    let ended: Awaited<ReturnType<DishCrew['records']['endRun']>>
     try {
-      await call.crew.records.endRun(childId, { stopReason: 'error', error: message, closing: '' })
+      ended = await call.crew.records.endRun(childId, { stopReason: 'error', error: message, closing: '' })
     } catch (error) {
       warn('could not record the failed start of child %s as failed: %s', childId, describe(error))
+      return
     }
+    if (ended !== undefined) await publish('dish-crew/settled', { sessionId: ended.sessionId, child: ended.child, run: ended.run })
   }
 
   /** Steps 5 to 8 for a new child, bound to `bound` if it is given. Inside the session's lock, and the worktree's. */
@@ -686,14 +702,17 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     // its `subagent/end` has to find a record.
     const childId = randomUUID()
     const gate = bound === undefined ? undefined : await gateOf(call, bound.project)
+    let child: ChildRecord
     try {
-      await call.crew.records.addChild(call.sessionId, {
+      child = await call.crew.records.addChild(call.sessionId, {
         id: childId, role: call.role, title, model: route.model, family: route.family, ...reviews === undefined ? {} : { reviews },
         ...bound === undefined ? {} : { worktree: bound.path }, ...override === undefined ? {} : { gateOverride: override.ruling },
       })
     } catch (error) {
       throw new Error(`could not record the delegation, so nothing was started: ${describe(error)}. Try again, or tell the user.`, { cause: error })
     }
+    // Before dsh starts the child, so that its start comes before anything it ends with; inside the locks (see the header).
+    await publish('dish-crew/delegated', { sessionId: call.sessionId, child, followUp: false })
     // The closing note stays last: dish-judge ends a child's brief at it, and on a preset that loads dsh's own `send_message` it
     // refers to the note dsh adds after it. Each block ends with a blank line (`BLOCK_END`): dsh's adapters join text blocks
     // with nothing between them.
@@ -783,6 +802,16 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     } catch (error) {
       warn('could not record the follow-up to child %s: %s', target.id, describe(error))
     }
+    // Published whether or not it was counted: it was sent. The child as the record has it now, else as it would be.
+    let found: { record: ChildRecord } | undefined
+    try {
+      found = await call.crew.records.lookup(target.id)
+    } catch {
+      found = undefined
+    }
+    await publish('dish-crew/delegated', {
+      sessionId: call.sessionId, child: found?.record ?? { ...target, followUps: target.followUps + 1, last: 'running' }, followUp: true,
+    })
     return { child: target.id, role: target.role, model: target.model, label: `${target.role} · ${target.model} · ${target.title}` }
   }
 

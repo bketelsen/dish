@@ -11,10 +11,18 @@
  *   `worktreeBindings(path)` is the children bound to a worktree, with whether each is running (for `delegate`, and for
  *   dish-workspaces' `list`, `remove` and sweep);
  * - captures every crew child's runs: the error an `agent/error` reports is held for the child, `subagent/end` files the
- *   run, with that error and the closing message, in the record, and `subagent/start` marks the child running again (dsh
- *   starts a run each time it brings a child up, not only the first). A child's starts and ends are recorded in the order
- *   they were published. The listeners are the host's, so they hear every agent, and they act only on children the
- *   record knows. They never throw;
+ *   run, with that error, the closing message and the id of its finish notice, in the record, and `subagent/start` marks
+ *   the child running again (dsh starts a run each time it brings a child up, not only the first). A child's starts and
+ *   ends are recorded in the order they were published. The listeners are the host's, so they hear every agent, and they
+ *   act only on children the record knows. They never throw;
+ * - publishes `dish-crew/settled` (see `events.ts`) once `subagent/end` has filed a crew child's run, with the session, the
+ *   child as filed and the run (its structured report included), and awaits its listeners, up to their budget, before
+ *   `whenRecorded` resolves: a child's next start or end waits as well. `delegate` publishes `dish-crew/delegated`, and the
+ *   `settled` of a start dsh refused;
+ * - keeps the id of each finish notice: an `agent/inbox/inserted` listener notes a `subagent-settled` message's id for its
+ *   child, and that child's `subagent/end`, which dsh emits in the same synchronous run, just after it delivers the notice
+ *   (`notifySettlement`, then `observer.settle`, in dsh-subagent), takes it for the run (`RunRecord.notice`). An id whose end
+ *   doesn't come in that run is dropped at the next microtask, so it can't land on a later run;
  * - at start, before it provides the service, removes the sessions' records not written to for 180 days;
  * - guards its children's approvals (see `guard.ts`): an `approval/request` listener that refuses a crew child's request when
  *   dish-judge, whose answerer is the only one a child has, is not loaded. It is registered before anything is awaited, so there is
@@ -37,6 +45,7 @@ import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
+import { publisher } from './events.ts'
 import { approvalGuard } from './guard.ts'
 import { CrewRecords, closingOf, isRunning } from './record.ts'
 import type { EndedRun, LiveAgents } from './record.ts'
@@ -47,6 +56,12 @@ import type { CrewSettings } from './settings.ts'
 export type { CrewSettings, FamilySettings, Limits, ParseResult, RoleSettings, Tier } from './settings.ts'
 export type { ChildRecord, ChildStatus, EndedRun, GateOutcome, GateResult, LiveAgents, NewChild, RunEnd, RunRecord } from './record.ts'
 export { CrewRecords, gateProblem, isRunning, latestGate, statusFor } from './record.ts'
+export type {
+  CoderReport, CoderStatus, NotFixed, ReportRole, ReportRuling, ReviewAddressed, ReviewCheck, ReviewerReport, ReviewFinding, Severity,
+  StructuredReport, Verdict,
+} from './record.ts'
+export { CODER_STATUSES, SEVERITIES, VERDICTS, maskReport, reportProblem, reportRole } from './record.ts'
+export type { CrewDelegated, CrewSettled } from './events.ts'
 
 export const name = 'dish-crew'
 
@@ -74,8 +89,9 @@ export interface DishCrew {
   readonly records: CrewRecords
   /**
    * The latest `subagent/end` of `childId` that is still being recorded, or `undefined` if none is. It resolves, never
-   * rejects, with where the report went, or `undefined` if the child isn't a crew child or recording failed (which is
-   * logged). Once it has resolved it is gone from here: the run is in `records`.
+   * rejects, with where the report went and what was filed, or `undefined` if the child isn't a crew child or recording
+   * failed (which is logged). It resolves once `dish-crew/settled`'s listeners have, or their budget is spent. Once it has
+   * resolved it is gone from here: the run is in `records`.
    */
   whenRecorded(childId: string): Promise<EndedRun | undefined> | undefined
   /** The `ctx.subagents` provider the crew's children are created on: the `subagentProvider` setting. The preset row can't see the host's config. */
@@ -253,6 +269,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const records = new CrewRecords(directory, (session, path) => {
     warn('the record of session %s is not valid; it was moved to %s and the session starts a new one, so its delegation count starts again from 0', session, path)
   })
+  // `dish-crew/settled`, once a run is filed. Before the first `await`, like the listeners.
+  const publish = publisher(ctx, warn)
 
   // A crew child asks nobody but dish-judge: when dish-judge is not loaded, its approval requests are refused here, not left to the
   // browser, where nobody sees them and nothing times them out. The services are looked up on each request, so the order the two
@@ -296,6 +314,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const chain = new Map<string, Promise<void>>()
   // The end of each child that is being recorded now, until it is. For `whenRecorded`: starts are not in it. Never rejects.
   const pending = new Map<string, Promise<EndedRun | undefined>>()
+  // The id of the finish notice dsh just delivered for each child, until that child's `subagent/end` takes it, or the
+  // microtask after it was delivered drops it: dsh delivers the notice and emits the end in one synchronous run.
+  const settling = new Map<string, string>()
 
   /** Do `job` for child `id` after whatever is being recorded for it. A failure is logged as `failed` says and gives `undefined`. */
   const inOrder = <T>(id: string, failed: string, job: () => Promise<T>): Promise<T | undefined> => {
@@ -360,6 +381,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   })
 
+  // dsh delivers a child's finish notice to its parent's inbox (`notifySettlement` in dsh-subagent) and then, in the same
+  // synchronous run, emits the child's `subagent/end` (`observer.settle`): the id is noted here and taken there.
+  ctx.on('agent/inbox/inserted', (payload) => {
+    try {
+      const message: unknown = (payload as { message?: unknown } | null | undefined)?.message
+      if (!isObject(message)) return
+      const { source, id } = message as { source?: unknown, id?: unknown }
+      if (!isObject(source) || source.kind !== 'subagent-settled') return
+      const sender = source.senderSessionId
+      if (typeof sender !== 'string' || sender === '' || typeof id !== 'string') return
+      const noticeId = String(id)
+      settling.set(sender, noticeId)
+      queueMicrotask(() => {
+        if (settling.get(sender) === noticeId) settling.delete(sender)
+      })
+    } catch (cause) {
+      warn('could not note the finish notice of a child: %s', describe(cause))
+    }
+  })
+
   ctx.on('subagent/end', (info) => {
     try {
       const event: unknown = info
@@ -370,9 +411,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const { stopReason, lastAssistantMessage } = event as { stopReason?: unknown, lastAssistantMessage?: unknown }
       const error = remembered.get(id)
       remembered.delete(id)
+      const notice = settling.get(id)
+      settling.delete(id)
       const closing = closingOf(lastAssistantMessage)
-      const run = inOrder(id, 'could not record the end of child %s: %s',
-        async () => records.endRun(id, { stopReason: stopReason as string, error: await error, closing }))
+      const run = inOrder(id, 'could not record the end of child %s: %s', async () => {
+        const ended = await records.endRun(id, { stopReason: stopReason as string, error: await error, closing, ...notice === undefined ? {} : { notice } })
+        // Awaited here, so `whenRecorded`, and this child's next start or end, wait for the listeners (up to their budget).
+        if (ended !== undefined) await publish('dish-crew/settled', { sessionId: ended.sessionId, child: ended.child, run: ended.run })
+        return ended
+      })
       pending.set(id, run)
       void run.then(() => {
         if (pending.get(id) === run) pending.delete(id)

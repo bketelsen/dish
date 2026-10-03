@@ -6,7 +6,8 @@
  * - `sessions/<sha256 of the parent session id>/children.json` lists the session's children (see `ChildRecord`). It is
  *   the source for the limits, the reviewer rule and the finish notices;
  * - `sessions/<hash>/<n>-<role>-<run>.md` is the closing message of one run of one child, where `n` is the child's
- *   order in the session;
+ *   order in the session, and `<n>-<role>-<run>.json` beside it is the run's structured report, when it ended with one
+ *   (see below);
  * - `by-child/<sha256 of the child id>` holds the hash of the session its child belongs to. `subagent/end` and
  *   `agent/error` know only the child, and after a restart nothing in memory says whose it is, so this is how a run
  *   is filed.
@@ -21,10 +22,12 @@
  *   and a crash leaves at worst a temp file. Directories are mode 0o700 and files 0o600;
  * - everything that touches one session's `children.json` (a read as well, because a read can set a corrupt file
  *   aside) goes through that session's queue, so two writes can't read the same file and each drop the other's
- *   change. Sessions don't wait for each other;
+ *   change. Sessions don't wait for each other. A change to one child joins the queue in the order it was asked for:
+ *   the reads of its pointer are chained, since two reads of one file can finish in either order;
  * - a report is written before the run that names it, and a child's pointer before the child, so what a crash
  *   leaves is an orphan file and never a record of something that isn't there. A report never replaces another
- *   file: if its name is taken (the numbering started again after a corrupt `children.json`), it gets a suffix.
+ *   file: if its name is taken (the numbering started again after a corrupt `children.json`), it gets a suffix. A run's
+ *   `.md` and `.json` share their name: the first of `<n>-<role>-<run>`, `….2`, `….3` and on for which neither is there.
  *
  * Another dsh process can use the same directory (`dsh plugin add` and `--dump-config` start plugins, and a restart can
  * overlap the process before it), and the queue is in memory. Each file is still replaced whole, so none is ever torn;
@@ -47,7 +50,19 @@
  * `subagent/end`, whose listener calls `endRun`, comes only after the turn has closed. So a run's last result is written,
  * through the session's queue, before `endRun` for that run is even called, and a result recorded after a run ended is the
  * next run's. A reviewer's ruling to review work whose gate hadn't passed is kept on the reviewer as `gateOverride`, with
- * when it was given as `gateOverrideAt`.
+ * when it was given as `gateOverrideAt`. Each result also keeps the worktree's HEAD when the gate ran (`GateResult.head`), a
+ * full sha or `null`.
+ *
+ * Structured reports (step 7). A coder or a reviewer (`reportRole`) finishes with crew's `report` tool, which records its
+ * report with `setReport`: checked (`reportProblem`), cut to its own fields and masked (`maskReport`) before anything is
+ * awaited, and kept on the child (`ChildRecord.report`), a later one replacing an earlier. `endRun` writes it as the run's
+ * `.json`, moves it onto the run it files (`RunRecord.structured`, with its path as `RunRecord.structuredFile`), and takes it
+ * off the child. `RunRecord.report` stays the `.md`. That a report lands on the run it ended rests on the same order as
+ * the gates: the `report` tool awaits `setReport` inside its `execute`, and dsh-agent-loop awaits the tool before the step,
+ * and so the turn, can close; that run's `subagent/end` comes after the turn has closed. So the report reaches the
+ * session's queue before `endRun` for its run is called. A run also keeps the id of dsh's finish notice for it
+ * (`RunRecord.notice`) when crew saw the notice delivered, and a child the run and task of dish-orchestrator it works in
+ * (`run`, `task`) and, for a reviewer, whether it is the run's final review (`final`, which is never cleared).
  *
  * `prune` removes sessions nothing has written to for a while, with their pointers; see there for the rules.
  *
@@ -58,6 +73,7 @@ import type { Dirent } from 'node:fs'
 import { lstat, mkdir, open, readdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { SubagentStopReason } from '@deepseek-ai/dsh-subagent'
+import { maskSecrets } from 'dish-kit'
 
 /** Where a child is in its work, as of its latest run. */
 export type ChildStatus = 'running' | 'finished' | 'failed' | 'stopped'
@@ -93,7 +109,103 @@ export interface GateResult {
   reason?: string
   /** When it was recorded, in ms since the epoch. */
   at: number
+  /**
+   * The worktree's HEAD when the gate ran (`dishWorkspaces.headOf`), or `null` when it couldn't be read or the worktree didn't
+   * resolve. Absent on results recorded before step 7.
+   */
+  head?: string | null
 }
+
+/** A coder's `status`: the work is `done`, or it can't go on. */
+export type CoderStatus = 'done' | 'blocked' | 'needs_context'
+
+/** Every `CoderStatus`, in that order. */
+export const CODER_STATUSES: readonly CoderStatus[] = Object.freeze(['done', 'blocked', 'needs_context'] as const)
+
+/** A reviewer's verdict. */
+export type Verdict = 'approved' | 'changes_requested'
+
+/** Every `Verdict`, in that order. */
+export const VERDICTS: readonly Verdict[] = Object.freeze(['approved', 'changes_requested'] as const)
+
+/** How much a review finding matters. */
+export type Severity = 'blocking' | 'should_fix' | 'nit'
+
+/** Every `Severity`, in that order. */
+export const SEVERITIES: readonly Severity[] = Object.freeze(['blocking', 'should_fix', 'nit'] as const)
+
+/** A judgment call a coder made: `Ruling: what — why — cost if wrong`. */
+export interface ReportRuling {
+  what: string
+  why: string
+  costIfWrong: string
+}
+
+/** A review finding a coder didn't fix in a fix round, and why. */
+export interface NotFixed {
+  finding: string
+  why: string
+}
+
+/** A coder's report, as its `report` call gave it. */
+export interface CoderReport {
+  role: 'coder'
+  /** The dsh turn the report ended; 0 when crew saw none (it loaded mid-turn). */
+  turn: number
+  /** When it was recorded, in ms since the epoch. */
+  at: number
+  status: CoderStatus
+  summary: string
+  commits?: string[]
+  blockedOn?: string
+  rulings?: ReportRuling[]
+  concerns?: string[]
+  notFixed?: NotFixed[]
+}
+
+/** One finding of a review. */
+export interface ReviewFinding {
+  severity: Severity
+  /** The path, relative to the repository root. */
+  file: string
+  line?: number
+  summary: string
+  fix: string
+}
+
+/** A command a reviewer ran, and what it showed. */
+export interface ReviewCheck {
+  command: string
+  exitCode: number
+  summary: string
+}
+
+/** In a re-review: an earlier finding, whether it was addressed, and the evidence either way. */
+export interface ReviewAddressed {
+  finding: string
+  addressed: boolean
+  evidence: string
+}
+
+/** A reviewer's report, as its `report` call gave it. */
+export interface ReviewerReport {
+  role: 'reviewer'
+  turn: number
+  at: number
+  verdict: Verdict
+  /** The full sha of the commit it reviewed. */
+  head: string
+  summary: string
+  findings: ReviewFinding[]
+  checks?: ReviewCheck[]
+  addressed?: ReviewAddressed[]
+}
+
+/** What a coder or a reviewer finishes with: crew's `report` tool. */
+export type StructuredReport = CoderReport | ReviewerReport
+
+/** Which report a child gives. */
+export type ReportRole = StructuredReport['role']
 
 /** One run of a child: from a delegation or a follow-up to the child's next stop. */
 export interface RunRecord {
@@ -107,6 +219,12 @@ export interface RunRecord {
   report: string
   /** The gate results recorded during the run, oldest first. Absent when there were none. */
   gates?: GateResult[]
+  /** The structured report the run ended with: `ChildRecord.report`, moved here by `endRun`. Absent when there was none. */
+  structured?: StructuredReport
+  /** The absolute path of `structured` as a file: the `.json` beside the `.md`. */
+  structuredFile?: string
+  /** The id of dsh's finish notice for this run, when crew saw it delivered to the parent. */
+  notice?: string
 }
 
 /** What is kept for a child. */
@@ -147,6 +265,17 @@ export interface ChildRecord {
   gates?: GateResult[]
   /** The status after the latest run: `running` from the start, from a follow-up or from a wake, until the run ends. */
   last: ChildStatus
+  /**
+   * The dish-orchestrator run the child works in, as its ref `<owner>/<repo>/<id>` (`dishRuns.place` gives it). Kept for the
+   * child's life: a follow-up never re-tags it.
+   */
+  run?: string
+  /** The task of the run it works on: a worktree slug of the run. */
+  task?: string
+  /** A reviewer: the run's final review. Sticky: set at its start or by a follow-up, never cleared. */
+  final?: true
+  /** The structured report of the run in progress: `setReport` replaces it, `endRun` moves it onto the run. */
+  report?: StructuredReport
 }
 
 /** What `addChild` is given; the rest of a `ChildRecord` is the record's to set. */
@@ -163,6 +292,12 @@ export interface NewChild {
   gateOverride?: string
   /** Defaults to now. */
   startedAt?: number
+  /** The run ref the child works in (see `ChildRecord.run`). */
+  run?: string
+  /** The task of the run it works on. */
+  task?: string
+  /** A reviewer: the run's final review. */
+  final?: true
 }
 
 /** What a run's end is: dsh's stop reason, the error the child reported, and its closing message. */
@@ -171,11 +306,19 @@ export interface RunEnd {
   error?: string
   /** The text of the child's final message, or `''` if it left none. */
   closing: string
+  /** The id of dsh's finish notice for the run, when crew saw it delivered. Kept only when it is a non-empty string. */
+  notice?: string
 }
 
-/** What `endRun` gives: where the run's report was written. */
+/** What `endRun` gives: where the run's report was written, and what was filed, as copies. */
 export interface EndedRun {
   report: string
+  /** The session the child belongs to. */
+  sessionId: string
+  /** The child as filed. */
+  child: ChildRecord
+  /** The run just filed: `child.runs.at(-1)`. */
+  run: RunRecord
 }
 
 /**
@@ -293,6 +436,9 @@ function isCount(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 1
 }
 
+/** A commit id as git gives it in full: 40 hex digits (SHA-1), or 64 (SHA-256), lowercase. */
+const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+
 /** What is wrong with `value` as a `GateResult`, or `undefined` if nothing is. Fields it doesn't know are not its concern. */
 export function gateProblem(value: unknown): string | undefined {
   if (!isObject(value)) return 'it is not an object'
@@ -308,14 +454,18 @@ export function gateProblem(value: unknown): string | undefined {
   if (!isText(value.excerpt)) return 'excerpt must be a string'
   if (value.reason !== undefined && !isText(value.reason)) return 'reason must be a string when it is given'
   if (!isNumber(value.at)) return 'at must be a finite number'
+  if (value.head !== undefined && value.head !== null && !(isText(value.head) && FULL_SHA.test(value.head))) return 'head must be a commit id or null'
   return undefined
 }
 
 /** The gate result in `value` as a new object of its own fields, or `undefined` if `gateProblem` refuses it. */
 function parseGate(value: unknown): GateResult | undefined {
   if (gateProblem(value) !== undefined) return undefined
-  const { turn, round, maxRounds, outcome, command, exitCode, timedOut, durationMs, log, excerpt, reason, at } = value as GateResult
-  return { turn, round, maxRounds, outcome, command, exitCode, timedOut, durationMs, log, excerpt, ...reason === undefined ? {} : { reason }, at }
+  const { turn, round, maxRounds, outcome, command, exitCode, timedOut, durationMs, log, excerpt, reason, at, head } = value as GateResult
+  return {
+    turn, round, maxRounds, outcome, command, exitCode, timedOut, durationMs, log, excerpt, ...reason === undefined ? {} : { reason }, at,
+    ...head === undefined ? {} : { head },
+  }
 }
 
 /** The gate results in `value`, each as `parseGate` makes it, or `undefined` if it isn't a list or one of them isn't a result. */
@@ -328,6 +478,139 @@ function parseGates(value: unknown): GateResult[] | undefined {
     parsed.push(one)
   }
   return parsed
+}
+
+/** A whole number, 0 or more. */
+function isWhole(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+}
+
+/** One field of an item in a report's list: its name, and what its value must be. */
+type FieldCheck = readonly [name: string, check: 'string' | 'integer' | 'boolean' | readonly string[], optional?: 'optional']
+
+/** The fields of each kind of item in a report's lists, in the order they are kept. */
+const RULING_FIELDS: readonly FieldCheck[] = [['what', 'string'], ['why', 'string'], ['costIfWrong', 'string']]
+const NOT_FIXED_FIELDS: readonly FieldCheck[] = [['finding', 'string'], ['why', 'string']]
+const FINDING_FIELDS: readonly FieldCheck[] = [['severity', SEVERITIES], ['file', 'string'], ['line', 'integer', 'optional'], ['summary', 'string'], ['fix', 'string']]
+const CHECK_FIELDS: readonly FieldCheck[] = [['command', 'string'], ['exitCode', 'integer'], ['summary', 'string']]
+const ADDRESSED_FIELDS: readonly FieldCheck[] = [['finding', 'string'], ['addressed', 'boolean'], ['evidence', 'string']]
+
+/** What is wrong with `value` as `path`, by `check`, or `undefined`. */
+function fieldProblem(path: string, value: unknown, check: FieldCheck[1]): string | undefined {
+  if (check === 'string') return isText(value) ? undefined : `${path} must be a string`
+  if (check === 'integer') return Number.isSafeInteger(value) ? undefined : `${path} must be a whole number`
+  if (check === 'boolean') return typeof value === 'boolean' ? undefined : `${path} must be true or false`
+  return isText(value) && check.includes(value) ? undefined : `${path} must be one of ${check.join(', ')}`
+}
+
+/** What is wrong with the list `value` at `path`, each of whose items is a string, or an object of `fields`. */
+function listProblem(path: string, value: unknown, fields?: readonly FieldCheck[]): string | undefined {
+  if (!Array.isArray(value)) return `${path} must be a list`
+  for (const [index, item] of value.entries()) {
+    const at = `${path}[${index}]`
+    if (fields === undefined) {
+      if (!isText(item)) return `${at} must be a string`
+      continue
+    }
+    if (!isObject(item)) return `${at} must be an object`
+    for (const [name, check, optional] of fields) {
+      if (optional !== undefined && item[name] === undefined) continue
+      const problem = fieldProblem(`${at}.${name}`, item[name], check)
+      if (problem !== undefined) return problem
+    }
+  }
+  return undefined
+}
+
+/**
+ * What is wrong with `value` as a `StructuredReport`, or `undefined` if nothing is. Each message starts with the path of the
+ * field, such as `findings[2].severity must be one of blocking, should_fix, nit`. Fields it doesn't know are not its concern,
+ * and neither are blank strings, the form of `head` or a `blockedOn` for a status other than `done`: those are the `report`
+ * tool's checks, and the record takes any well-typed report.
+ */
+export function reportProblem(value: unknown): string | undefined {
+  if (!isObject(value)) return 'it is not an object'
+  if (value.role !== 'coder' && value.role !== 'reviewer') return 'role must be one of coder, reviewer'
+  if (!isWhole(value.turn)) return 'turn must be a whole number, 0 or more'
+  if (!isNumber(value.at)) return 'at must be a finite number'
+  if (value.role === 'coder') {
+    const problem = fieldProblem('status', value.status, CODER_STATUSES) ?? fieldProblem('summary', value.summary, 'string')
+    if (problem !== undefined) return problem
+    if (value.blockedOn !== undefined && !isText(value.blockedOn)) return 'blockedOn must be a string when it is given'
+    const lists: Array<[string, readonly FieldCheck[] | undefined]> = [['commits', undefined], ['rulings', RULING_FIELDS], ['concerns', undefined], ['notFixed', NOT_FIXED_FIELDS]]
+    for (const [name, fields] of lists) {
+      const listed = value[name] === undefined ? undefined : listProblem(name, value[name], fields)
+      if (listed !== undefined) return listed
+    }
+    return undefined
+  }
+  const problem = fieldProblem('verdict', value.verdict, VERDICTS) ?? fieldProblem('head', value.head, 'string') ?? fieldProblem('summary', value.summary, 'string')
+    ?? listProblem('findings', value.findings, FINDING_FIELDS)
+  if (problem !== undefined) return problem
+  for (const [name, fields] of [['checks', CHECK_FIELDS], ['addressed', ADDRESSED_FIELDS]] as const) {
+    const listed = value[name] === undefined ? undefined : listProblem(name, value[name], fields)
+    if (listed !== undefined) return listed
+  }
+  return undefined
+}
+
+/** The fields of each role's report, in the order they are kept, with the item fields of those that are lists of objects. */
+const REPORT_FIELDS: Readonly<Record<ReportRole, ReadonlyArray<readonly [string, (readonly FieldCheck[])?]>>> = {
+  coder: [['role'], ['turn'], ['at'], ['status'], ['summary'], ['commits'], ['blockedOn'], ['rulings', RULING_FIELDS], ['concerns'], ['notFixed', NOT_FIXED_FIELDS]],
+  reviewer: [['role'], ['turn'], ['at'], ['verdict'], ['head'], ['summary'], ['findings', FINDING_FIELDS], ['checks', CHECK_FIELDS], ['addressed', ADDRESSED_FIELDS]],
+}
+
+/** A new object of `report`'s own fields, nested items too, those absent left out. It checks nothing: see `reportProblem`. */
+function copyReport(report: Record<string, unknown>): StructuredReport {
+  const copy: Record<string, unknown> = {}
+  for (const [name, items] of REPORT_FIELDS[report.role === 'reviewer' ? 'reviewer' : 'coder']) {
+    const value = report[name]
+    if (value === undefined) continue
+    if (!Array.isArray(value)) {
+      copy[name] = value
+      continue
+    }
+    copy[name] = value.map((item: unknown) => {
+      if (items === undefined || !isObject(item)) return item
+      const one: Record<string, unknown> = {}
+      for (const [field] of items) if (item[field] !== undefined) one[field] = item[field]
+      return one
+    })
+  }
+  return copy as unknown as StructuredReport
+}
+
+/** The report in `value` as a new object of its own fields, nested items too, or `undefined` if `reportProblem` refuses it. */
+function parseReport(value: unknown): StructuredReport | undefined {
+  return reportProblem(value) === undefined ? copyReport(value as Record<string, unknown>) : undefined
+}
+
+/** `value` with every string in it, however deep, passed through `maskSecrets`. Numbers, booleans and the rest are kept. */
+function maskStrings(value: unknown): unknown {
+  if (isText(value)) return maskSecrets(value)
+  if (Array.isArray(value)) return value.map(maskStrings)
+  if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, maskStrings(item)]))
+  return value
+}
+
+/**
+ * A new report of `report`'s own fields, with every string in it passed through dish-kit's `maskSecrets`. `role` and the
+ * enums go through the same path: they can't hold a secret, and nothing is let past it.
+ */
+export function maskReport(report: StructuredReport): StructuredReport {
+  return maskStrings(copyReport(report as unknown as Record<string, unknown>)) as StructuredReport
+}
+
+/**
+ * Which report a child gives:
+ * - `reviewer` for a child with `reviews` set (only the reviewing role has it: `chooseModel` in `delegate.ts`);
+ * - `coder` for role `coder`;
+ * - `undefined` for every other child.
+ * The one definition of "coder" and "reviewer", for crew, dish-gates and dish-orchestrator.
+ */
+export function reportRole(child: Pick<ChildRecord, 'role' | 'reviews'>): ReportRole | undefined {
+  if (child.reviews !== undefined) return 'reviewer'
+  return child.role === 'coder' ? 'coder' : undefined
 }
 
 /**
@@ -345,23 +628,36 @@ export function latestGate(record: ChildRecord): GateResult | undefined {
 /** The run in `value`, or `undefined` if it isn't shaped like one. Other fields are dropped. */
 function parseRun(value: unknown): RunRecord | undefined {
   if (!isObject(value)) return undefined
-  const { endedAt, stopReason, error, report, gates } = value
+  const { endedAt, stopReason, error, report, gates, structured, structuredFile, notice } = value
   if (!isNumber(endedAt) || !isText(stopReason) || !isText(report)) return undefined
   if (error !== undefined && !isText(error)) return undefined
   const parsedGates = gates === undefined ? undefined : parseGates(gates)
   if (gates !== undefined && parsedGates === undefined) return undefined
-  return { endedAt, stopReason, ...error === undefined ? {} : { error }, report, ...parsedGates === undefined ? {} : { gates: parsedGates } }
+  const parsedReport = structured === undefined ? undefined : parseReport(structured)
+  if (structured !== undefined && parsedReport === undefined) return undefined
+  if (structuredFile !== undefined && !isText(structuredFile)) return undefined
+  if (notice !== undefined && !isText(notice)) return undefined
+  return {
+    endedAt, stopReason, ...error === undefined ? {} : { error }, report, ...parsedGates === undefined ? {} : { gates: parsedGates },
+    ...parsedReport === undefined ? {} : { structured: parsedReport }, ...structuredFile === undefined ? {} : { structuredFile },
+    ...notice === undefined ? {} : { notice },
+  }
 }
 
 /** The child in `value`, or `undefined` if it isn't shaped like one. Other fields are dropped. */
 function parseChild(value: unknown): ChildRecord | undefined {
   if (!isObject(value)) return undefined
-  const { id, n, role, title, model, family, reviews, worktree, gateOverride, gateOverrideAt, startedAt, followUps, runs, gates, last } = value
+  const { id, n, role, title, model, family, reviews, worktree, gateOverride, gateOverrideAt, startedAt, followUps, runs, gates, last, run, task, final, report } = value
   if (!isText(id) || id === '' || !isNumber(n) || !isText(role) || !isText(title) || !isText(model) || !isText(family)) return undefined
   if (reviews !== undefined && !isText(reviews)) return undefined
   if (worktree !== undefined && !isText(worktree)) return undefined
   if (gateOverride !== undefined && !isText(gateOverride)) return undefined
   if (gateOverrideAt !== undefined && !isNumber(gateOverrideAt)) return undefined
+  if (run !== undefined && !isText(run)) return undefined
+  if (task !== undefined && !isText(task)) return undefined
+  if (final !== undefined && final !== true) return undefined
+  const parsedReport = report === undefined ? undefined : parseReport(report)
+  if (report !== undefined && parsedReport === undefined) return undefined
   if (!isNumber(startedAt) || !isNumber(followUps) || !Array.isArray(runs)) return undefined
   if (!isText(last) || !['running', 'finished', 'failed', 'stopped'].includes(last)) return undefined
   const parsed: RunRecord[] = []
@@ -376,6 +672,8 @@ function parseChild(value: unknown): ChildRecord | undefined {
     id, n, role, title, model, family, ...reviews === undefined ? {} : { reviews }, ...worktree === undefined ? {} : { worktree },
     ...gateOverride === undefined ? {} : { gateOverride }, ...gateOverrideAt === undefined ? {} : { gateOverrideAt },
     startedAt, followUps, runs: parsed, ...parsedGates === undefined ? {} : { gates: parsedGates }, last: last as ChildStatus,
+    ...run === undefined ? {} : { run }, ...task === undefined ? {} : { task }, ...final === undefined ? {} : { final },
+    ...parsedReport === undefined ? {} : { report: parsedReport },
   }
 }
 
@@ -416,6 +714,9 @@ function newChildProblem(value: unknown): string | undefined {
   if (value.worktree !== undefined && !(isText(value.worktree) && isAbsolute(value.worktree))) return 'worktree must be an absolute path'
   if (value.gateOverride !== undefined && !isText(value.gateOverride)) return 'gateOverride must be a string'
   if (value.startedAt !== undefined && !isNumber(value.startedAt)) return 'startedAt must be a finite number'
+  if (value.run !== undefined && !isText(value.run)) return 'run must be a string when it is given'
+  if (value.task !== undefined && !isText(value.task)) return 'task must be a string when it is given'
+  if (value.final !== undefined && value.final !== true) return 'final must be true when it is given'
   return undefined
 }
 
@@ -474,6 +775,8 @@ export class CrewRecords {
   readonly #onCorrupt: (session: string, path: string) => void
   /** The tail of each session's queue, until it's done. */
   readonly #queues = new Map<string, Promise<void>>()
+  /** The tail of each child's pointer reads, until it's done: see `#sessionInOrder`. */
+  readonly #pointerReads = new Map<string, Promise<void>>()
 
   /**
    * @param directory - where the records are kept. Made absolute.
@@ -552,18 +855,35 @@ export class CrewRecords {
   }
 
   /**
+   * `#sessionOf(childId)`, once the reads of the same child's pointer asked for before it are done. Whoever awaits it then
+   * joins the session's queue in the order it asked: two reads of one file can finish in either order, so without this a
+   * `setReport` and an `endRun` made at once could reach the queue the other way round, and the report land on the next run.
+   */
+  #sessionInOrder(childId: unknown): Promise<string | undefined> {
+    if (!isText(childId) || childId === '') return this.#sessionOf(childId)
+    const previous = this.#pointerReads.get(childId) ?? Promise.resolve()
+    const read = previous.then(() => this.#sessionOf(childId))
+    const tail = read.then(() => {}, () => {})
+    this.#pointerReads.set(childId, tail)
+    void tail.then(() => {
+      if (this.#pointerReads.get(childId) === tail) this.#pointerReads.delete(childId)
+    })
+    return read
+  }
+
+  /**
    * Run `change` on the child `childId` in its session's file, in the session's queue, and save the file if `change`
    * says (by returning something other than `undefined`) that it changed. Gives what `change` gives, or `undefined`
-   * if the child isn't recorded.
+   * if the child isn't recorded. Changes to one child reach the queue in the order they were asked for.
    */
-  async #update<T>(childId: unknown, change: (child: ChildRecord, hash: string) => Promise<T | undefined>): Promise<T | undefined> {
-    const hash = await this.#sessionOf(childId)
+  async #update<T>(childId: unknown, change: (child: ChildRecord, hash: string, sessionId: string) => Promise<T | undefined>): Promise<T | undefined> {
+    const hash = await this.#sessionInOrder(childId)
     if (hash === undefined) return undefined
     return this.#serial(hash, async () => {
       const loaded = await this.#load(hash)
       const child = loaded?.children.find(candidate => candidate.id === childId)
       if (loaded === undefined || child === undefined) return undefined
-      const result = await change(child, hash)
+      const result = await change(child, hash, loaded.sessionId)
       if (result !== undefined) await this.#save(hash, loaded)
       return result
     })
@@ -607,6 +927,9 @@ export class CrewRecords {
         followUps: 0,
         runs: [],
         last: 'running',
+        ...record.run === undefined ? {} : { run: record.run },
+        ...record.task === undefined ? {} : { task: record.task },
+        ...record.final === undefined ? {} : { final: record.final },
       }
       // The pointer first: a crash between the two leaves a pointer to nothing, never a child nobody can find.
       await writeAtomic(this.#pointerFile(child.id), hash)
@@ -619,12 +942,15 @@ export class CrewRecords {
   /**
    * Count a follow-up sent to `childId`, which is running again until its next run ends, and, with `gateOverride`, record
    * the main agent's ruling on the child (a reviewer), replacing any it had, with now as its `gateOverrideAt`. Without one,
-   * a ruling it had stays, with its time. A child that isn't recorded is ignored.
-   * @throws TypeError if `gateOverride` is given and isn't a string. Nothing is written.
+   * a ruling it had stays, with its time. With `final: true` the child (a reviewer) becomes the run's final review; without
+   * it, `final` stays as it was: it is never cleared. A child that isn't recorded is ignored.
+   * @throws TypeError if `gateOverride` is given and isn't a string, or `final` is given and isn't `true`. Nothing is written.
    */
-  async addFollowUp(childId: string, extra?: { gateOverride?: string }): Promise<void> {
+  async addFollowUp(childId: string, extra?: { gateOverride?: string, final?: true }): Promise<void> {
     const gateOverride = extra?.gateOverride
     if (gateOverride !== undefined && !isText(gateOverride)) throw new TypeError('addFollowUp: gateOverride must be a string')
+    const final: unknown = extra?.final
+    if (final !== undefined && final !== true) throw new TypeError('addFollowUp: final must be true when it is given')
     await this.#update(childId, async (child) => {
       child.followUps += 1
       child.last = 'running'
@@ -632,7 +958,25 @@ export class CrewRecords {
         child.gateOverride = gateOverride
         child.gateOverrideAt = Date.now()
       }
+      if (final === true) child.final = true
       return true
+    })
+  }
+
+  /**
+   * Replace the structured report of `childId`'s run in progress (`ChildRecord.report`) with a masked copy of `report`'s own
+   * fields, through its session's queue. `endRun` moves it onto the run it files; see the module's header for why it lands on
+   * the run it ended. Gives the stored copy, or `undefined` for a child that isn't recorded.
+   * @throws TypeError if `report` isn't a `StructuredReport` (see `reportProblem`). Nothing is written.
+   */
+  async setReport(childId: string, report: StructuredReport): Promise<StructuredReport | undefined> {
+    const problem = reportProblem(report)
+    if (problem !== undefined) throw new TypeError(`setReport needs a report: ${problem}`)
+    // Copied and masked now, before anything is awaited, so that what the caller does with its object afterwards changes nothing.
+    const copy = maskReport(report)
+    return this.#update(childId, async (child) => {
+      child.report = copy
+      return structuredClone(copy)
     })
   }
 
@@ -671,38 +1015,54 @@ export class CrewRecords {
    * File a run that ended: write its closing message as the report `<n>-<role>-<run>.md`, add the run, and set `last`
    * from the stop reason (see `statusFor`). The report is written before the run that names it. The gate results of the
    * run in progress (`ChildRecord.gates`) go onto the run, which has no `gates` when there were none, and off the child,
-   * so the next run starts with none.
-   * Gives where the report went, or `undefined` for a child that isn't recorded, which is not an error: the events
-   * this is called from include agents crew didn't start. Whatever the other fields are, it doesn't throw because of
-   * them: a stop reason that isn't text is `unknown`, an error that isn't text is none, and a closing message that isn't
-   * text is none.
+   * so the next run starts with none. So does its structured report (`ChildRecord.report`): it is written first, as
+   * `<n>-<role>-<run>.json` beside the `.md`, and the run gets it as `structured`, with that path as `structuredFile`; a run
+   * without one has neither, and no `.json`. `end.notice`, the id of dsh's finish notice for the run, is kept when it is a
+   * non-empty string.
+   * Gives where the report went, with the session, the child as filed and the run (copies), or `undefined` for a child that
+   * isn't recorded, which is not an error: the events this is called from include agents crew didn't start. Whatever the
+   * other fields are, it doesn't throw because of them: a stop reason that isn't text is `unknown`, an error that isn't
+   * text is none, a closing message that isn't text is none, and a notice that isn't text is none.
    */
   async endRun(childId: string, end: RunEnd): Promise<EndedRun | undefined> {
     const stopReason = isText(end?.stopReason) && end.stopReason !== '' ? end.stopReason : 'unknown'
     const error = isText(end?.error) && end.error !== '' ? end.error : undefined
     const content = reportContent(isText(end?.closing) ? end.closing : '')
-    return this.#update(childId, async (child, hash) => {
-      const report = await this.#writeReport(hash, `${child.n}-${fileSafe(child.role)}-${child.runs.length + 1}`, content)
+    const notice = isText(end?.notice) && end.notice !== '' ? end.notice : undefined
+    return this.#update(childId, async (child, hash, sessionId) => {
+      const base = await this.#reportBase(hash, `${child.n}-${fileSafe(child.role)}-${child.runs.length + 1}`)
+      const structured = child.report
+      const structuredFile = structured === undefined ? undefined : `${base}.json`
+      if (structuredFile !== undefined) await writeAtomic(structuredFile, `${JSON.stringify(structured, null, 2)}\n`)
+      const report = `${base}.md`
+      await writeAtomic(report, content)
       const gates = child.gates ?? []
       delete child.gates
-      child.runs.push({ endedAt: Date.now(), stopReason, ...error === undefined ? {} : { error }, report, ...gates.length === 0 ? {} : { gates } })
+      delete child.report
+      const run: RunRecord = {
+        endedAt: Date.now(), stopReason, ...error === undefined ? {} : { error }, report, ...gates.length === 0 ? {} : { gates },
+        ...structured === undefined ? {} : { structured, structuredFile: structuredFile! }, ...notice === undefined ? {} : { notice },
+      }
+      child.runs.push(run)
       child.last = statusFor(stopReason)
-      return { report }
+      return { report, sessionId, child: structuredClone(child), run: structuredClone(run) }
     })
   }
 
-  /** Write `text` (a `reportContent`) as `<base>.md` in session `hash`'s directory, or `<base>.2.md` and on if that name is taken. */
-  async #writeReport(hash: string, base: string, text: string): Promise<string> {
+  /**
+   * The name a run's files share in session `hash`'s directory, as an absolute path without its extension: the first of
+   * `<base>`, `<base>.2`, `<base>.3` and on for which neither a `.md` nor a `.json` is there. A report never replaces a file.
+   */
+  async #reportBase(hash: string, base: string): Promise<string> {
     const directory = this.#sessionDirectory(hash)
-    let file = join(directory, `${base}.md`)
-    for (let attempt = 2; await exists(file); attempt++) file = join(directory, `${base}.${attempt}.md`)
-    await writeAtomic(file, text)
-    return file
+    let name = join(directory, base)
+    for (let attempt = 2; await exists(`${name}.md`) || await exists(`${name}.json`); attempt++) name = join(directory, `${base}.${attempt}`)
+    return name
   }
 
   /** The child `childId`, with the id of the session it belongs to, or `undefined` if it isn't recorded. */
   async lookup(childId: string): Promise<{ sessionId: string, record: ChildRecord } | undefined> {
-    const hash = await this.#sessionOf(childId)
+    const hash = await this.#sessionInOrder(childId)
     if (hash === undefined) return undefined
     return this.#serial(hash, async () => {
       const loaded = await this.#load(hash)
