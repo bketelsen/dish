@@ -11,9 +11,9 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
 import * as row from '../src/delegate.ts'
 import type { DishCrew } from '../src/index.ts'
-import { COMPARE_BYTES, noticeSummary, noticeText, rewriteNotices } from '../src/notice.ts'
+import { COMPARE_BYTES, gateLine, noticeSummary, noticeText, rewriteNotices } from '../src/notice.ts'
 import { CrewRecords } from '../src/record.ts'
-import type { ChildRecord, EndedRun, NewChild } from '../src/record.ts'
+import type { ChildRecord, EndedRun, GateResult, NewChild, RunRecord } from '../src/record.ts'
 import { DEFAULT_SETTINGS } from '../src/settings.ts'
 import { dirs, mountCrew, provideStub, tempDir, watchLogs } from './helpers.ts'
 
@@ -757,6 +757,206 @@ test('noticeText is the plan\'s wording for a finished run and for a failed one'
   assert.equal(noticeText(child, run('aborted'), 'dsh lead', 'It left no closing message.'), 'coder «add login» (claude-sonnet-5.5) was stopped. Report: `/data/1-coder-1.md`. It left no closing message.')
   assert.equal(noticeSummary(child, run('error', 'boom'), 'dsh lead'), 'coder «add login» (claude-sonnet-5.5) failed: boom.')
   assert.equal(noticeSummary(child, undefined, 'Background subagent c finished and will do no further work unless you send it more.'), 'coder «add login» (claude-sonnet-5.5) finished and will do no further work unless you send it more.')
+})
+
+// --- the gate line ----------------------------------------------------------------------------------
+
+const BOUND = { worktree: '/work/dish/.worktrees/add-login' }
+const LOG = '/state/dish/gates/bketelsen/dish/add-login/child-1-1-3.log'
+
+/** A gate result as dish-gates records it, with what a test names changed. */
+function gate(extra: Partial<GateResult> = {}): GateResult {
+  return {
+    turn: 1, round: 1, maxRounds: 3, outcome: 'passed', command: 'make test', exitCode: 0, timedOut: false, durationMs: 4200,
+    log: LOG, excerpt: '', at: 1, ...extra,
+  }
+}
+
+function runWith(gates?: GateResult[]): RunRecord {
+  return { endedAt: 1, stopReason: 'completed', report: '/data/1-coder-1.md', ...gates === undefined ? {} : { gates } }
+}
+
+test('a pass: "Gate passed (round N)."', () => {
+  assert.equal(gateLine(BOUND, runWith([gate({ round: 1 })])), 'Gate passed (round 1).')
+  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 1 }), gate({ round: 2 })])), 'Gate passed (round 2).')
+})
+
+test('rounds that ran out: the command, the exit code, the last lines in a fence, the log, and what to do next', () => {
+  const failed = gate({ outcome: 'failed', exitCode: 2, round: 3, excerpt: 'FAIL src/login.test.ts\n1 failed' })
+  assert.equal(
+    gateLine(BOUND, runWith([failed])),
+    `Gate FAILED after 3 rounds (\`make test\`, exit 2); last lines:\n\`\`\`\nFAIL src/login.test.ts\n1 failed\n\`\`\`\n`
+    + `Full log: \`${LOG}\`. Start a fix round with \`to\` or a fresh coder (escalation ladder).`,
+  )
+})
+
+test('rounds that ran out on the time limit say so in place of an exit code', () => {
+  const timedOut = gate({ outcome: 'failed', exitCode: null, timedOut: true, round: 3, excerpt: 'still going' })
+  assert.equal(
+    gateLine(BOUND, runWith([timedOut])),
+    `Gate FAILED after 3 rounds (\`make test\`, stopped at its time limit); last lines:\n\`\`\`\nstill going\n\`\`\`\n`
+    + `Full log: \`${LOG}\`. Start a fix round with \`to\` or a fresh coder (escalation ladder).`,
+  )
+})
+
+test('the fence is longer than any run of backticks in the excerpt, and at least three', () => {
+  const lines = (excerpt: string): string[] => gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 3, excerpt })]))!.split('\n')
+  assert.deepEqual(lines('plain').slice(1, 4), ['```', 'plain', '```'])
+  assert.deepEqual(lines('a ``` b').slice(1, 4), ['````', 'a ``` b', '````'])
+  assert.deepEqual(lines('``` one\n````` two\n`` three').slice(1, 5), ['``````', '``` one', '````` two', '`` three'])
+  assert.equal(lines('``` one\n````` two\n`` three')[5], '``````')
+  assert.deepEqual(lines('`single`').slice(1, 4), ['```', '`single`', '```'])
+})
+
+test('a failure with no output says so in place of a fence, and a failure with no log leaves the log out', () => {
+  assert.equal(
+    gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 3, excerpt: '' })])),
+    `Gate FAILED after 3 rounds (\`make test\`, exit 1); it printed no output. Full log: \`${LOG}\`. Start a fix round with \`to\` or a fresh coder (escalation ladder).`,
+  )
+  assert.equal(
+    gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 3, excerpt: 'boom', log: null })])),
+    'Gate FAILED after 3 rounds (`make test`, exit 1); last lines:\n```\nboom\n```\nStart a fix round with `to` or a fresh coder (escalation ladder).',
+  )
+})
+
+test('one round is "1 round", and a killed gate with no exit code says that', () => {
+  assert.match(gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 1, maxRounds: 1 })]))!, /^Gate FAILED after 1 round \(/)
+  assert.match(gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: null, round: 3 })]))!, /^Gate FAILED after 3 rounds \(`make test`, no exit code\)/)
+})
+
+test('a failure with a round to spare: the run ended before the coder finished again', () => {
+  assert.equal(
+    gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 2, maxRounds: 3, excerpt: 'not shown' })])),
+    `Gate failed in round 2 of 3 (\`make test\`, exit 1), and the run ended before the coder finished again. Full log: \`${LOG}\`.`,
+  )
+  assert.equal(
+    gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: null, timedOut: true, round: 1, log: null })])),
+    'Gate failed in round 1 of 3 (`make test`, stopped at its time limit), and the run ended before the coder finished again.',
+  )
+})
+
+test('a skip says why; an opt-out is the spec\'s sentence', () => {
+  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'skipped', command: '', exitCode: null, log: null, reason: 'the coder reported BLOCKED / NEEDS CONTEXT' })])), 'Gate skipped: the coder reported BLOCKED / NEEDS CONTEXT.')
+  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'skipped', command: '', exitCode: null, log: null, reason: 'not gated: its worktree is gone.' })])), 'Gate skipped: not gated: its worktree is gone.')
+  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'skipped', command: '', exitCode: null, log: null })])), 'Gate skipped.')
+})
+
+test('an error says it didn\'t run, and why', () => {
+  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'error', command: 'make test', exitCode: null, log: null, reason: 'the sandbox is not available' })])), 'Gate not run: the sandbox is not available.')
+  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'error', exitCode: null, log: null, reason: 'first line\nsecond   line.\n' })])), 'Gate not run: first line second line.')
+  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'error', exitCode: null, log: null })])), 'Gate not run.')
+})
+
+test('a bound child\'s run with no gate result: "Gate not run."', () => {
+  assert.equal(gateLine(BOUND, runWith()), 'Gate not run.')
+  assert.equal(gateLine(BOUND, runWith([])), 'Gate not run.')
+})
+
+test('an unbound child has no gate line, whatever its run holds', () => {
+  assert.equal(gateLine({}, runWith()), undefined)
+  assert.equal(gateLine({}, runWith([gate()])), undefined)
+})
+
+test('the line is of the run\'s last result', () => {
+  const failed = gate({ outcome: 'failed', exitCode: 1, round: 1 })
+  assert.equal(gateLine(BOUND, runWith([failed, gate({ outcome: 'failed', exitCode: 1, round: 2 }), gate({ round: 3 })])), 'Gate passed (round 3).')
+  assert.match(gateLine(BOUND, runWith([gate(), gate({ outcome: 'failed', exitCode: 1, round: 3 })]))!, /^Gate FAILED after 3 rounds/)
+})
+
+test('a command with backticks or line breaks is quoted whole, on one line', () => {
+  assert.equal(
+    gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 2, command: 'make test\n  && echo `date`' })])),
+    `Gate failed in round 2 of 3 (\`\` make test && echo \`date\` \`\`, exit 1), and the run ended before the coder finished again. Full log: \`${LOG}\`.`,
+  )
+})
+
+test('a bound child\'s notice carries the gate line after the report and before dsh\'s label', async () => {
+  const world = await setup()
+  await world.child('child-1', BOUND)
+  await world.records.addGate('child-1', gate({ outcome: 'failed', exitCode: 1, round: 1 }))
+  await world.records.addGate('child-1', gate({ round: 2 }))
+  const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Login works.' })
+  const [out] = await world.rewrite([settlement('child-1', 'completed', ['Login works.'])])
+  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. Gate passed (round 2). Its closing message:`, 'Login works.'])
+  // The collapsed row's sentence is the same as for any child.
+  assert.equal((out!.source as { summary: string }).summary, `${WHO} finished.`)
+  assert.deepEqual(world.warnings, [])
+})
+
+test('a failed gate\'s notice puts the fence, the log and the label in order', async () => {
+  const world = await setup()
+  await world.child('child-1', BOUND)
+  await world.records.addGate('child-1', gate({ outcome: 'failed', exitCode: 2, round: 3, excerpt: 'FAIL one\nFAIL two' }))
+  const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'I tried.' })
+  const [out] = await world.rewrite([settlement('child-1', 'completed', ['I tried.'])])
+  assert.deepEqual(texts(out), [
+    `${WHO} finished. Report: \`${ended!.report}\`. Gate FAILED after 3 rounds (\`make test\`, exit 2); last lines:\n\`\`\`\nFAIL one\nFAIL two\n\`\`\`\n`
+    + `Full log: \`${LOG}\`. Start a fix round with \`to\` or a fresh coder (escalation ladder). Its closing message:`,
+    'I tried.',
+  ])
+})
+
+test('a bound child\'s run with no gate result is told "Gate not run."', async () => {
+  const world = await setup()
+  await world.child('child-1', BOUND)
+  const ended = await world.records.endRun('child-1', { stopReason: 'error', error: 'rate limited', closing: 'Got partway.' })
+  const [out] = await world.rewrite([settlement('child-1', 'error', ['Got partway.'])])
+  assert.deepEqual(texts(out), [`${WHO} failed: rate limited. Report: \`${ended!.report}\`. Gate not run. Its closing message:`, 'Got partway.'])
+  // And the same for a child that left no closing message.
+  await world.child('child-2', BOUND)
+  const second = await world.records.endRun('child-2', { stopReason: 'completed', closing: '' })
+  const [none] = await world.rewrite([settlement('child-2', 'completed')])
+  assert.deepEqual(texts(none), [`${WHO} finished. Report: \`${second!.report}\`. Gate not run. It left no closing message.`])
+})
+
+test('an unbound child\'s notice is as it was', async () => {
+  const world = await setup()
+  await world.child()
+  const ended = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Login works.' })
+  const [out] = await world.rewrite([settlement('child-1', 'completed', ['Login works.'])])
+  assert.deepEqual(texts(out), [`${WHO} finished. Report: \`${ended!.report}\`. Its closing message:`, 'Login works.'])
+})
+
+test('each round\'s notice has the gate line of its own run', async () => {
+  const world = await setup()
+  await world.child('child-1', BOUND)
+  await world.records.addGate('child-1', gate({ outcome: 'failed', exitCode: 1, round: 3, excerpt: 'red' }))
+  const first = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'First try.' })
+  await world.records.addFollowUp('child-1')
+  await world.records.addGate('child-1', gate({ turn: 2, round: 1 }))
+  const second = await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Second try.' })
+  const [one, two] = await world.rewrite([settlement('child-1', 'completed', ['First try.']), settlement('child-1', 'completed', ['Second try.'])])
+  assert.ok(texts(one)[0]!.startsWith(`${WHO} finished. Report: \`${first!.report}\`. Gate FAILED after 3 rounds (\`make test\`, exit 1); last lines:\n`))
+  assert.deepEqual(texts(two), [`${WHO} finished. Report: \`${second!.report}\`. Gate passed (round 1). Its closing message:`, 'Second try.'])
+})
+
+test('a notice that matches no run has no gate line, as it has no report', async () => {
+  const world = await setup()
+  await world.child('child-1', BOUND)
+  await world.records.addGate('child-1', gate())
+  await world.records.endRun('child-1', { stopReason: 'completed', closing: 'Something else.' })
+  const [out] = await world.rewrite([settlement('child-1', 'completed', ['What the record never saw.'])])
+  assert.deepEqual(texts(out), [`${WHO} finished and will do no further work unless you send it more. Its closing message:`, 'What the record never saw.'])
+})
+
+test('noticeText puts the gate line between the report and the label, for a bound child only', () => {
+  const run = runWith([gate({ round: 2 })])
+  assert.equal(
+    noticeText({ id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', ...BOUND }, run, 'dsh lead', 'Its closing message:'),
+    'coder «add login» (claude-sonnet-5.5) finished. Report: `/data/1-coder-1.md`. Gate passed (round 2). Its closing message:',
+  )
+  assert.equal(
+    noticeText({ id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', ...BOUND }, run, 'dsh lead'),
+    'coder «add login» (claude-sonnet-5.5) finished. Report: `/data/1-coder-1.md`. Gate passed (round 2).',
+  )
+  assert.equal(
+    noticeText({ id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5' }, run, 'dsh lead', 'Its closing message:'),
+    'coder «add login» (claude-sonnet-5.5) finished. Report: `/data/1-coder-1.md`. Its closing message:',
+  )
+  assert.equal(
+    noticeSummary({ id: 'c', role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', ...BOUND }, run, 'dsh lead'),
+    'coder «add login» (claude-sonnet-5.5) finished.',
+  )
 })
 
 // --- the row ----------------------------------------------------------------------------------------
