@@ -1,5 +1,6 @@
 {
   "name": "dish-copilot",
+  "private": true,
   "version": "0.1.0",
   "description": "Sign DeepSeek Harness into a GitHub Copilot subscription",
   "type": "module",

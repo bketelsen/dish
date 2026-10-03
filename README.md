@@ -69,6 +69,10 @@ Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, termin
 
 dish also runs on its own VM, reachable on your tailnet only. That service is prod, and nothing updates it on its own: you run `incus exec minideb:dish --project dish -- dish-update`, a dry run, then the same with `--apply`. [`deploy/`](deploy) holds the install script, the systemd unit and the two scripts you run there, `update.sh` and `url.sh`. [`deploy/README.md`](deploy/README.md) says what the VM runs, how to update it, how to sign in and the one-time steps. The design is in the [deploy spec](docs/specs/deploy.md) and the [ops spec](docs/specs/ops.md).
 
+## License
+
+MIT, in [LICENSE](LICENSE). The skills adapted from [obra/superpowers](https://github.com/obra/superpowers) keep their MIT notice in [plugins/skills/defaults/NOTICE.md](plugins/skills/defaults/NOTICE.md). Links to `bketelsen/fleet`, the infrastructure repo, go to a private repository.
+
 ## Writing another plugin
 
 1. `mkdir -p plugins/<name>/src`, then copy `plugins/copilot/package.json` and `cordis.patch.yml` as a starting point. Rename the package and the row `id`.
