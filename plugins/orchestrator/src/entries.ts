@@ -141,12 +141,15 @@ function baseProblem(value: unknown): string | undefined {
   return undefined
 }
 
-/** The fields of a `pr.feedback` past the base ones: a number, a boolean, `null`, `state`, or an object of numbers. Never text. */
+/**
+ * The fields of a `pr.feedback` past the base ones: a number, a boolean, `null`, or an object of numbers; and `state`, one of
+ * `open` and `closed`. Never text: nothing GitHub wrote can ride into it.
+ */
 function feedbackProblem(value: Record<string, unknown>): string | undefined {
   for (const [field, item] of Object.entries(value)) {
     if (BASE_FIELDS.includes(field)) continue
     if (field === 'state') {
-      if (typeof item !== 'string') return 'pr.feedback\'s state must be a string'
+      if (item !== 'open' && item !== 'closed') return 'pr.feedback\'s state must be open or closed'
       continue
     }
     if (item === null || typeof item === 'number' || typeof item === 'boolean') continue

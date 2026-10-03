@@ -8,9 +8,13 @@
  *   record or the new one; a crash leaves at worst a temp file, which `load` leaves alone.
  * - **One queue a project.** `create` and `update` go through the project's promise queue, so two runs opened at once
  *   get two ids, and two changes to a record can't each drop the other's.
- * - **Checked.** What is written passes `runProblem` first; what is read back must pass it too, and sit where its
- *   `project` and `id` say. A record that doesn't is corrupt: it is renamed `<file>.corrupt-<ms>` (nothing is removed, and
- *   its id stays taken, so its ledger is never a new run's), and `onCorrupt` is told.
+ * - **Checked.** What is written is made plain JSON (a field set to `undefined` is left out, in memory as on disk) and
+ *   passes `runProblem` first; what is read back must pass it too, and sit where its `project` and `id` say. A record that
+ *   doesn't is corrupt: it is renamed `<file>.corrupt-<ms>` (nothing is removed, and its id stays taken, so its ledger is
+ *   never a new run's), and `onCorrupt` is told.
+ * - **One bad record is one record.** A record that can't be read, or a corrupt one that can't be set aside, is skipped
+ *   where it is and `onCorrupt` is told (with `aside` `''`); the rest load. Its name still holds its id. Only a directory
+ *   that can't be listed fails the load, which the next call tries again.
  * - **No secrets.** `goal`, `reason` and `plan.path` are masked (`maskSecrets`) where they are written; `goal` and `reason`
  *   are also folded to one line and cut, to 300 and 1000 characters.
  * - **Kept.** Nothing here deletes a record.
@@ -222,6 +226,22 @@ function copy(run: Run): Run {
   return structuredClone(run)
 }
 
+/** `value` as plain JSON: what the file will hold, so that the copy in memory is the same (a field set to `undefined` goes). @throws TypeError if it isn't JSON. */
+function plain<T>(value: T): T {
+  try {
+    return JSON.parse(JSON.stringify(value)) as T
+  } catch (error) {
+    throw new TypeError(`not a run: it isn't plain JSON (${error instanceof Error ? error.message : String(error)})`)
+  }
+}
+
+function messageOf(error: unknown): string {
+  return maskSecrets(error instanceof Error ? error.message : String(error))
+}
+
+/** Told about a record `load` didn't take: where it was, where it went (`''`: left where it is), and why. */
+export type OnCorrupt = (file: string, aside: string, problem?: string) => void
+
 function sameProject(a: string, b: string): boolean {
   return a.toLowerCase() === b.toLowerCase()
 }
@@ -229,7 +249,7 @@ function sameProject(a: string, b: string): boolean {
 /** The run records under one state directory. It needn't exist yet: the first write creates it. */
 export class RunStore {
   readonly #state: string
-  readonly #onCorrupt: (file: string, aside: string) => void
+  readonly #onCorrupt: OnCorrupt
   readonly #now: () => number
   /** The records, by their file. */
   #runs = new Map<string, Run>()
@@ -240,11 +260,12 @@ export class RunStore {
 
   /**
    * @param state - dish's state directory (`xdgPaths('dish').state`). Made absolute.
-   * @param options.onCorrupt - told when `load` set a corrupt record aside, with where it was and where it went. A callback
-   *   that throws is ignored.
+   * @param options.onCorrupt - told when `load` set a corrupt record aside, with where it was, where it went and why; or
+   *   when it skipped one it couldn't read or set aside, with `aside` `''` (left where it is) and the error. A callback that
+   *   throws is ignored.
    * @param options.now - the time, in milliseconds: a new run's `openedAt` when none is given, and a corrupt record's suffix.
    */
-  constructor(state: string, options: { onCorrupt?: (file: string, aside: string) => void, now?: () => number } = {}) {
+  constructor(state: string, options: { onCorrupt?: OnCorrupt, now?: () => number } = {}) {
     this.#state = resolve(state)
     this.#onCorrupt = options.onCorrupt ?? (() => {})
     this.#now = options.now ?? Date.now
@@ -297,35 +318,47 @@ export class RunStore {
           const id = entry.isFile() ? RECORD_FILE.exec(entry.name)?.[1] : undefined
           if (id === undefined) continue
           const file = join(directory, entry.name)
-          const text = await readRecord(file)
-          if (text === undefined) continue
-          const run = this.#parse(text, project, id)
-          if (run === undefined) await this.#setAside(file)
-          else runs.set(file, run)
+          try {
+            const text = await readRecord(file)
+            if (text === undefined) continue
+            const parsed = this.#parse(text, project, id)
+            if ('problem' in parsed) await this.#setAside(file, parsed.problem)
+            else runs.set(file, parsed.run)
+          } catch (error) {
+            // One record is not every run: it is skipped where it is (its name still holds its id), and the rest load.
+            this.#tell(file, '', messageOf(error))
+          }
         }
       }
     }
     return runs
   }
 
-  /** The run in `text`, if it is one and sits where it should: `project`'s directory, under its own id. */
-  #parse(text: string, project: string, id: string): Run | undefined {
+  /** The run in `text`, if it is one and sits where it should (`project`'s directory, under its own id); else why not. */
+  #parse(text: string, project: string, id: string): { run: Run } | { problem: string } {
     let value: unknown
     try {
       value = JSON.parse(text)
     } catch {
-      return undefined
+      return { problem: 'it isn\'t JSON' }
     }
-    if (runProblem(value) !== undefined) return undefined
+    const problem = runProblem(value)
+    if (problem !== undefined) return { problem: maskSecrets(problem) }
     const run = value as Run
-    return run.project === project && run.id === id ? run : undefined
+    if (run.project !== project || run.id !== id) return { problem: 'it names another run than the one its place is for' }
+    return { run }
   }
 
-  async #setAside(file: string): Promise<void> {
+  /** Rename a corrupt record `<file>.corrupt-<ms>`, and tell. @throws what the rename throws. */
+  async #setAside(file: string, problem: string): Promise<void> {
     const aside = `${file}.corrupt-${this.#now()}`
     await rename(file, aside)
+    this.#tell(file, aside, problem)
+  }
+
+  #tell(file: string, aside: string, problem: string): void {
     try {
-      this.#onCorrupt(file, aside)
+      this.#onCorrupt(file, aside, problem)
     } catch {
       // The store carries on; a caller whose logger broke can't ask it to stop.
     }
@@ -379,7 +412,7 @@ export class RunStore {
     this.#ready()
     if (!isObject(fields)) throw new TypeError('not a new run: it must be an object')
     const openedAt = fields.openedAt ?? this.#now()
-    const draft = (id: string): Run => cleaned({
+    const draft = (id: string): Run => cleaned(plain({
       id,
       project: fields.project,
       slug: fields.slug,
@@ -392,7 +425,7 @@ export class RunStore {
       state: 'open',
       driver: { session: fields.driver, since: openedAt },
       openedAt,
-    })
+    }))
     // Checked before the queue, with the id the day would give first, so a refusal writes nothing.
     const problem = runProblem(draft(runId(fields.slug, openedAt, () => false)))
     if (problem !== undefined) throw new TypeError(`not a new run: ${problem}`)
@@ -429,7 +462,7 @@ export class RunStore {
       const changed = change(copy(current))
       if (changed === undefined) return undefined
       if (!isObject(changed)) throw new TypeError('not a run: the change must give an object')
-      const next = cleaned(changed)
+      const next = cleaned(plain(changed))
       const problem = runProblem(next)
       if (problem !== undefined) throw new TypeError(`not a run: ${problem}`)
       if (next.id !== current.id || next.project !== current.project) {

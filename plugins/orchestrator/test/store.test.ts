@@ -201,6 +201,26 @@ test('update masks, folds and cuts a reason to 1000', async () => {
   assert.equal(closed!.reason!.length, 1000)
 })
 
+test('update: a field set to undefined is gone, in memory as on disk (a reopen that clears closedAt)', async () => {
+  const { state, store } = await freshStore()
+  const created = await store.create(newRun())
+  const pr = { url: 'https://github.com/Acme/widget/pull/7', number: 7 }
+  await store.update('Acme/widget', created.id, current => ({ ...current, state: 'pr', pr, closedAt: NOW + 1, driver: { session: '', since: NOW + 1 } }))
+  const reopened = await store.update('Acme/widget', created.id, current => ({
+    ...current, state: 'open', closedAt: undefined, reason: undefined, driver: { session: 'session-2', since: NOW + 2 },
+  }))
+  assert.equal('closedAt' in reopened!, false)
+  assert.equal('reason' in reopened!, false)
+  const cached = store.get('Acme/widget', created.id)!
+  assert.equal('closedAt' in cached, false)
+  assert.equal('reason' in cached, false)
+  assert.deepEqual(cached.pr, pr)
+  const again = new RunStore(state)
+  await again.load()
+  assert.deepEqual(again.get('Acme/widget', created.id), cached)
+  assert.deepEqual(Object.keys(again.get('Acme/widget', created.id)!).sort(), Object.keys(cached).sort())
+})
+
 test('update of a run the store has not got is undefined', async () => {
   const { store } = await freshStore()
   assert.equal(await store.update('Acme/widget', '20261003-nope', current => current), undefined)
@@ -356,20 +376,78 @@ test('load gives the same promise; after a failure, the next call tries again', 
   await store.load()
 
   if (process.getuid?.() === 0) {
-    t.skip('root reads a file whatever its mode')
+    t.skip('root reads a directory whatever its mode')
     return
   }
   const runs = join(state, 'orchestrator', 'Acme', 'widget', 'runs')
   await mkdir(runs, { recursive: true })
-  const file = join(runs, '20261003-fix-login.json')
-  await writeFile(file, JSON.stringify(run()))
-  await chmod(file, 0o000)
+  await writeFile(join(runs, '20261003-fix-login.json'), JSON.stringify(run()))
+  // A runs directory that can't be listed: the load fails as a whole, and is tried again.
+  await chmod(runs, 0o000)
   const failing = new RunStore(state)
-  await assert.rejects(failing.load(), { code: 'EACCES' })
-  assert.throws(() => failing.list(), /isn't loaded/)
-  await chmod(file, 0o600)
+  try {
+    await assert.rejects(failing.load(), { code: 'EACCES' })
+    assert.throws(() => failing.list(), /isn't loaded/)
+  } finally {
+    await chmod(runs, 0o700)
+  }
   await failing.load()
   assert.deepEqual(failing.list().map(one => one.id), ['20261003-fix-login'])
+})
+
+test('one record that can\'t be read is skipped and told, the others load, and its id stays taken', async t => {
+  if (process.getuid?.() === 0) {
+    t.skip('root reads a file whatever its mode')
+    return
+  }
+  const state = join(await tempDir(), 'state')
+  const runs = join(state, 'orchestrator', 'Acme', 'widget', 'runs')
+  await mkdir(runs, { recursive: true })
+  await writeFile(join(runs, '20261003-fix-login.json'), JSON.stringify(run()))
+  const unreadable = join(runs, '20261003-locked.json')
+  await writeFile(unreadable, JSON.stringify(run({ id: '20261003-locked', slug: 'locked' })))
+  await chmod(unreadable, 0o000)
+  try {
+    const told: Array<[string, string, string | undefined]> = []
+    const store = new RunStore(state, { now: () => NOW, onCorrupt: (file, aside, problem) => { told.push([file, aside, problem]) } })
+    await store.load()
+    assert.deepEqual(store.list().map(one => one.id), ['20261003-fix-login'])
+    assert.equal(told.length, 1)
+    assert.equal(told[0]![0], unreadable)
+    assert.equal(told[0]![1], '', 'left where it is')
+    assert.match(told[0]![2]!, /EACCES|permission/i)
+    // The file is still there, and create doesn't take its id.
+    assert.ok((await readdir(runs)).includes('20261003-locked.json'))
+    const created = await store.create(newRun({ slug: 'locked' }))
+    assert.equal(created.id, '20261003-locked-2')
+  } finally {
+    await chmod(unreadable, 0o600)
+  }
+})
+
+test('a corrupt record that can\'t be set aside is skipped where it is and told, and the others load', async t => {
+  if (process.getuid?.() === 0) {
+    t.skip('root renames in a directory whatever its mode')
+    return
+  }
+  const state = join(await tempDir(), 'state')
+  const runs = join(state, 'orchestrator', 'Acme', 'widget', 'runs')
+  await mkdir(runs, { recursive: true })
+  await writeFile(join(runs, '20261003-fix-login.json'), JSON.stringify(run()))
+  await writeFile(join(runs, '20261003-torn.json'), '{')
+  // Readable, but nothing in it can be renamed.
+  await chmod(runs, 0o500)
+  try {
+    const told: Array<[string, string, string | undefined]> = []
+    const store = new RunStore(state, { now: () => NOW, onCorrupt: (file, aside, problem) => { told.push([file, aside, problem]) } })
+    await store.load()
+    assert.deepEqual(store.list().map(one => one.id), ['20261003-fix-login'])
+    assert.deepEqual(told.map(([file, aside]) => [file, aside]), [[join(runs, '20261003-torn.json'), '']])
+    assert.match(told[0]![2]!, /EACCES|permission/i)
+    assert.deepEqual((await readdir(runs)).sort(), ['20261003-fix-login.json', '20261003-torn.json'])
+  } finally {
+    await chmod(runs, 0o700)
+  }
 })
 
 test('flush waits for what is queued', async () => {

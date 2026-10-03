@@ -51,6 +51,11 @@ const READ_CHUNK = 64 * 1024
 const MAX_READ_LINE_BYTES = 1024 * 1024
 /** A string the fit cuts is cut to no fewer characters than this (then `…`). */
 const KEEP_CHARS = 64
+/**
+ * An entry's own fields that hold a path (crew's report files, a gate's log, a task's or a run's worktree). The fit never
+ * cuts these: a cut path points nowhere, and it is the pointer to what the line had no room for.
+ */
+const PATH_FIELDS: readonly string[] = ['reportFile', 'structuredFile', 'log', 'path', 'worktree']
 const CUT_MARK = '…'
 /** Files are opened without following a link in the last place of the path: a link there isn't one of ours. */
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0
@@ -176,13 +181,13 @@ function longestFirst(a: Slot, b: Slot): boolean {
  * `entry`'s line, within `MAX_LINE_BYTES` with its newline, and the entry as the line holds it. Deterministic:
  *
  * 1. If the JSON and its newline fit, it is written as it is.
- * 2. Otherwise the entry gets `cut: true`, and the longest string anywhere outside the base fields is cut to
- *    `max(64, half its length)` characters, plus `…`; again while the line is too long and some such string is longer
- *    than a cut would leave it (65 characters with the mark).
+ * 2. Otherwise the entry gets `cut: true`, and the longest string anywhere outside the base fields and the entry's own
+ *    path fields (`PATH_FIELDS`) is cut to `max(64, half its length)` characters, plus `…`; again while the line is too
+ *    long and some such string is longer than a cut would leave it (65 characters with the mark).
  * 3. Then the longest array outside the base fields loses its last item, again while the line is too long.
  *
- * The base fields (`at`, `run`, `kind`, `by`, `session`, `child`, `task`) are never cut. The size is kept as it goes,
- * from what each cut takes off, so a line with thousands of strings is fitted without writing it out each time.
+ * The base fields (`at`, `run`, `kind`, `by`, `session`, `child`, `task`) and the paths are never cut. The size is kept as
+ * it goes, from what each cut takes off, so a line with thousands of strings is fitted without writing it out each time.
  * @throws RangeError if it still doesn't fit.
  */
 function fitEntry(entry: JsonObject): { line: string, entry: JsonObject } {
@@ -197,7 +202,7 @@ function fitEntry(entry: JsonObject): { line: string, entry: JsonObject } {
   walk(entry, { strings, arrays }, { next: 0 }, BASE_FIELDS)
 
   const longStrings = new Heap<Slot>(longestFirst)
-  for (const slot of strings) longStrings.push(slot)
+  for (const slot of strings) if (!(slot.holder === entry && PATH_FIELDS.includes(String(slot.key)))) longStrings.push(slot)
   while (bytes > MAX_LINE_BYTES && longStrings.size > 0) {
     const slot = longStrings.pop()!
     const text = read(slot) as string
@@ -464,8 +469,9 @@ export class Ledger {
 
   /**
    * In the file's queue: `build` gets `current()` (the file's entries now, oldest first, read directly) and returns what to
-   * append. For a decision that rests on what is in the file (a round). Never call `entries`/`read` inside `build`: they
-   * wait for this queue. A `build` that throws, or gives an entry `append` would refuse, writes nothing.
+   * append. For a decision that rests on what is in the file (a round). `build` must not call `append`, `appendWith`,
+   * `entries` or `read` for the same file: each waits for this queue, which waits for `build`, so neither would ever end.
+   * A `build` that throws, or gives an entry `append` would refuse, writes nothing.
    */
   async appendWith(project: string, id: string, build: (current: () => Promise<LedgerEntry[]>) => Promise<readonly LedgerEntry[]>): Promise<LedgerEntry[]> {
     const file = this.file(project, id)
