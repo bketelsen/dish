@@ -40,8 +40,8 @@ test('a test file run with it has a HOME of its own, which is removed when the r
       writeFileSync(${JSON.stringify(out)}, JSON.stringify({ HOME, HISTFILE, homedir: homedir(), exists: existsSync(HOME) }))
     })
   `)
-  // TMPDIR as this run has it (or none), so the child's temp directory is the one compared with below.
-  const env = { PATH: process.env.PATH, HOME: started, ...(process.env.TMPDIR === undefined ? {} : { TMPDIR: process.env.TMPDIR }) }
+  // This run's temp directory, from TMPDIR, TMP or TEMP (else /tmp), so the child's is the one compared with below.
+  const env = { PATH: process.env.PATH, HOME: started, TMPDIR: tmpdir() }
   await execFileAsync(process.execPath, ['--test', '--import', PRELOAD, probe], { cwd: dir, env })
 
   const seen = JSON.parse(await readFile(out, 'utf8')) as { HOME: string, HISTFILE: string, homedir: string, exists: boolean }
