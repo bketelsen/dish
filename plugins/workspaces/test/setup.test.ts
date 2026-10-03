@@ -4,19 +4,18 @@ import { access, chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promise
 import { dirname, join } from 'node:path'
 import { childEnvironment } from '../src/env.ts'
 import { SAFE_FLAGS } from '../src/git.ts'
-import { KILL_GRACE_MS, LOG_TAIL_BYTES, internals, onMergedCode, runSetup, skipReason } from '../src/setup.ts'
-import type { MergedCheck, SetupOptions, SetupResult } from '../src/setup.ts'
+import { KILL_GRACE_MS, LOG_TAIL_BYTES, githubDefault, runSetup, skipReason } from '../src/setup.ts'
+import type { GitHubDefault, SetupOptions, SetupResult } from '../src/setup.ts'
 import { NOSYSTEM, dishHome, makeBare, makeClone, run, runOk, scratchGitEnv, tempDir, withEnv } from './helpers.ts'
 import type { Clone } from './helpers.ts'
 
 /** Shaped like a GitHub installation token (`ghs_` and 40 letters and digits); not one. */
 const TOKEN = `ghs_${'Ab1Cd2Ef3G'.repeat(4)}`
 
-// The code's own git drops every GIT_* name of process.env; this gives it no system config, as every test git has.
-// (Setup's environment never gets it: a setup command that runs git exports GIT_CONFIG_NOSYSTEM itself, `NOSYSTEM_SH`.)
-internals.gitEnv = NOSYSTEM
-
-/** Put first in a setup command that runs git: setup's scrub drops every GIT_* name it is given. */
+/**
+ * Put first in a setup command that runs git: setup's scrub drops every GIT_* name it is given, so a test's
+ * `GIT_CONFIG_NOSYSTEM` never reaches setup's git unless the command exports it itself.
+ */
 const NOSYSTEM_SH = 'export GIT_CONFIG_NOSYSTEM=1; '
 
 async function exists(file: string): Promise<boolean> {
@@ -96,11 +95,6 @@ async function setupIn(dir: string, command: string, options: Partial<SetupOptio
     env: await bashEnv(dir),
     ...options,
   })
-}
-
-function reasonOf(check: MergedCheck): string {
-  assert.equal(check.ok, false, 'expected the check to refuse')
-  return (check as { ok: false, reason: string }).reason
 }
 
 // --- runSetup ---------------------------------------------------------------------------------------------------------
@@ -374,8 +368,8 @@ test('a time limit that is not a positive number of milliseconds is refused', as
 
 test('skipReason says why and gives the command to run', () => {
   assert.equal(
-    skipReason('base dish/plan-x isn\'t on origin/main', '/w/acme/widget/.worktrees/x', 'pnpm install'),
-    "setup didn't run outside the sandbox: base dish/plan-x isn't on origin/main. Run it yourself in /w/acme/widget/.worktrees/x: pnpm install",
+    skipReason('it is an existing checkout', '/w/acme/widget', 'pnpm install'),
+    "setup didn't run outside the sandbox: it is an existing checkout. Run it yourself in /w/acme/widget: pnpm install",
   )
   assert.equal(
     skipReason('it has a nested repository.', '/w', 'make'),
@@ -501,7 +495,7 @@ async function readdirOf(path: string): Promise<string[]> {
   return readdir(path)
 }
 
-// --- onMergedCode ------------------------------------------------------------------------------------------------------
+// --- githubDefault -----------------------------------------------------------------------------------------------------
 
 interface Fixture extends Clone {
   dir: string
@@ -518,14 +512,13 @@ async function fixture(files: Record<string, string> = { 'README.md': '# widget\
 }
 
 /** A commit pushed to GitHub's main (from a scratch clone), so the clone is behind until it fetches. Returns its sha. */
-async function pushToMain(f: Fixture, file: string, text: string, prepare?: (work: string) => Promise<void>): Promise<string> {
+async function pushToMain(f: Fixture, file: string, text: string): Promise<string> {
   const work = join(await tempDir(), 'work')
   const env = await scratchGitEnv(dirname(work))
   await runOk('git', ['clone', '-q', f.url, work], { env })
   await mkdir(dirname(join(work, file)), { recursive: true })
   await writeFile(join(work, file), text)
   await runOk('git', ['-C', work, 'add', '-A'], { env })
-  await prepare?.(work)
   await runOk('git', ['-C', work, 'commit', '-q', '-m', `add ${file}`], { env })
   await runOk('git', ['-C', work, 'push', '-q', 'origin', 'main'], { env })
   return (await runOk('git', ['-C', work, 'rev-parse', 'HEAD'], { env })).trim()
@@ -536,166 +529,38 @@ async function fetch(f: Fixture): Promise<void> {
   await runOk('git', ['-C', f.clone, 'fetch', '-q', 'origin'], { env: f.env })
 }
 
-/** A commit an agent made: on `dish/x` from origin/main, changing `a`. The checkout goes back to main. */
-async function agentCommit(f: Fixture, branch = 'dish/x'): Promise<string> {
-  await runOk('git', ['-C', f.clone, 'checkout', '-q', '-b', branch], { env: f.env })
-  await writeFile(join(f.clone, 'a'), 'evil\n')
-  await runOk('git', ['-C', f.clone, 'add', 'a'], { env: f.env })
-  await runOk('git', ['-C', f.clone, 'commit', '-q', '-m', 'evil'], { env: f.env })
-  const sha = (await runOk('git', ['-C', f.clone, 'rev-parse', 'HEAD'], { env: f.env })).trim()
-  await runOk('git', ['-C', f.clone, 'checkout', '-q', 'main'], { env: f.env })
-  return sha
+/** githubDefault with the code's git given a scratch home. */
+async function word(f: Fixture): Promise<GitHubDefault> {
+  return withEnv(await dishHome(f.dir), () => githubDefault(f.clone, { env: NOSYSTEM }))
 }
 
-/** An unrelated commit (an orphan), as an agent would make to carry its own tree. */
-async function orphanCommit(f: Fixture): Promise<string> {
-  const tree = (await runOk('git', ['-C', f.clone, 'mktree'], { env: f.env, input: '' })).trim()
-  return (await runOk('git', ['-C', f.clone, 'commit-tree', tree, '-m', 'orphan'], { env: f.env })).trim()
+function reasonOf(found: GitHubDefault): string {
+  assert.ok('reason' in found, `expected no word from GitHub, got ${JSON.stringify(found)}`)
+  return found.reason
 }
 
-/** Whether plain git (with the clone's refs, replace refs, grafts and commit-graph honoured) calls `a` an ancestor of `b`. */
-async function plainIsAncestor(f: Fixture, a: string, b: string, env: Record<string, string> = f.env): Promise<boolean> {
-  const result = await run('git', ['-C', f.clone, 'merge-base', '--is-ancestor', a, b], { env })
-  assert.ok(result.code === 0 || result.code === 1, result.stderr)
-  return result.code === 0
-}
-
-/** onMergedCode with the code's git given a scratch home. */
-async function check(f: Fixture, at: { commit: string }, branch = 'main', signal?: AbortSignal): Promise<MergedCheck> {
-  return withEnv(await dishHome(f.dir), () => onMergedCode(f.clone, at, branch, signal))
-}
-
-test("onMergedCode { commit }: GitHub's main, and a commit before it, are merged", async () => {
+test("githubDefault: GitHub's default branch and its sha, never the clone's own origin refs", async () => {
   const f = await fixture()
-  assert.deepEqual(await check(f, { commit: f.main }), { ok: true })
-  const next = await pushToMain(f, 'b', 'b\n')
-  await fetch(f)
-  assert.deepEqual(await check(f, { commit: next }), { ok: true })
-  assert.deepEqual(await check(f, { commit: f.main }), { ok: true }, 'an ancestor of the tip')
-})
-
-test('onMergedCode { commit }: a local commit on dish/x is not, and the reason names the branch and origin/main', async () => {
-  const f = await fixture()
-  const evil = await agentCommit(f)
-  const reason = reasonOf(await check(f, { commit: evil }))
-  assert.match(reason, /dish\/x/)
-  assert.match(reason, /isn't on origin\/main/)
-  assert.ok(reason.includes(evil.slice(0, 7)))
-})
-
-test('onMergedCode { commit }: a planted refs/remotes/origin/main is not trusted (and would have fooled a local check)', async () => {
-  const f = await fixture()
-  const evil = await agentCommit(f)
+  assert.deepEqual(await word(f), { branch: 'main', sha: f.main })
+  // An agent's commit, and origin/main and origin/HEAD pointed at it: what GitHub says is unchanged.
+  await runOk('git', ['-C', f.clone, 'commit', '-q', '--allow-empty', '-m', 'evil'], { env: f.env })
+  const evil = (await runOk('git', ['-C', f.clone, 'rev-parse', 'HEAD'], { env: f.env })).trim()
   await runOk('git', ['-C', f.clone, 'update-ref', 'refs/remotes/origin/main', evil], { env: f.env })
-  assert.equal(await plainIsAncestor(f, evil, 'origin/main'), true, 'the fixture is real: the local ref says merged')
-  assert.match(reasonOf(await check(f, { commit: evil })), /isn't on origin\/main/)
-})
-
-test('onMergedCode { commit }: a planted replace ref does not make a commit merged (and does fool plain git)', async () => {
-  const f = await fixture()
-  const evil = await orphanCommit(f)
-  // GitHub's main, replaced by a copy whose parent is the agent's commit.
-  await runOk('git', ['-C', f.clone, 'replace', '--graft', f.main, evil], { env: f.env })
-  assert.equal(await plainIsAncestor(f, evil, f.main), true, 'the fixture is real')
-  assert.match(reasonOf(await check(f, { commit: evil })), /isn't on origin\/main/)
-})
-
-test('onMergedCode { commit }: a planted .git/info/grafts does not make a commit merged (and does fool plain git)', async () => {
-  const f = await fixture()
-  const evil = await orphanCommit(f)
-  const grafts = join(f.clone, '.git', 'info', 'grafts')
-  await writeFile(grafts, `${f.main} ${evil}\n`)
-  assert.equal(await plainIsAncestor(f, evil, f.main, { ...f.env, GIT_GRAFT_FILE: grafts }), true, 'the fixture is real')
-  assert.match(reasonOf(await check(f, { commit: evil })), /isn't on origin\/main/)
-})
-
-/**
- * Rewrite `.git/objects/info/commit-graph` so that `commit`'s first parent is `parent`: what an agent can write by hand.
- * (Format: a header, a chunk table, then the OID fanout, the sorted OIDs, and per commit its tree, two parent positions
- * and its generation; `GDA2` holds each commit's corrected-date offset.) `commit`'s generation is raised above
- * `parent`'s, so git's walk doesn't stop before it.
- */
-async function forgeCommitGraph(file: string, commit: string, parent: string): Promise<void> {
-  const graph = await readFile(file)
-  assert.equal(graph.toString('latin1', 0, 4), 'CGPH')
-  const hash = graph[5] === 1 ? 20 : 32
-  const chunks: Record<string, number> = {}
-  for (let index = 0; index <= graph[6]!; index++) {
-    const at = 8 + index * 12
-    chunks[graph.toString('latin1', at, at + 4)] = Number(graph.readBigUInt64BE(at + 4))
-  }
-  const count = graph.readUInt32BE(chunks.OIDF! + 255 * 4)
-  const oids: string[] = []
-  for (let index = 0; index < count; index++) oids.push(graph.toString('hex', chunks.OIDL! + index * hash, chunks.OIDL! + (index + 1) * hash))
-  const child = oids.indexOf(commit)
-  const forged = oids.indexOf(parent)
-  assert.ok(child >= 0 && forged >= 0, 'both commits are in the graph')
-  const data = chunks.CDAT! + child * (hash + 16)
-  graph.writeUInt32BE(forged, data + hash)
-  // Topological level 3 (the top 30 bits), the commit time's top bits kept.
-  graph.writeUInt32BE(((3 << 2) | (graph.readUInt32BE(data + hash + 8) & 3)) >>> 0, data + hash + 8)
-  if (chunks.GDA2 !== undefined) graph.writeUInt32BE(1_000_000, chunks.GDA2 + child * 4)
-  await chmod(file, 0o644)
-  await writeFile(file, graph)
-}
-
-test('onMergedCode { commit }: a forged commit-graph does not make a commit merged (and does fool plain git)', async () => {
-  const f = await fixture()
-  const tip = await pushToMain(f, 'b', 'b\n')
-  await fetch(f)
-  const evil = await orphanCommit(f)
   await runOk('git', ['-C', f.clone, 'branch', 'dish/x', evil], { env: f.env })
-  await runOk('git', ['-C', f.clone, 'commit-graph', 'write', '--reachable'], { env: f.env })
-  // The tip's parent (the first main) now has the agent's commit as its parent, in the graph only.
-  await forgeCommitGraph(join(f.clone, '.git', 'objects', 'info', 'commit-graph'), f.main, evil)
-  assert.equal(await plainIsAncestor(f, evil, tip), true, 'the fixture is real: the graph makes it an ancestor')
-  assert.match(reasonOf(await check(f, { commit: evil })), /isn't on origin\/main/)
+  await runOk('git', ['-C', f.clone, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/dish/x'], { env: f.env })
+  assert.deepEqual(await word(f), { branch: 'main', sha: f.main })
 })
 
-test("onMergedCode { commit }: a gitlink on GitHub's main doesn't stop it (a fresh checkout leaves it empty)", async () => {
-  const f = await fixture()
-  const tip = await pushToMain(f, 'b', 'b\n', async work => {
-    const env = await scratchGitEnv(dirname(work))
-    await runOk('git', ['-C', work, 'update-index', '--add', '--cacheinfo', `160000,${f.main},vendor/sub`], { env })
-  })
-  await fetch(f)
-  assert.deepEqual(await check(f, { commit: tip }), { ok: true })
-})
-
-test("onMergedCode { commit }: an unknown commit, or one that looks like an option, isn't merged", async () => {
-  const f = await fixture()
-  assert.match(reasonOf(await check(f, { commit: 'f'.repeat(40) })), /isn't in the clone/)
-  assert.match(reasonOf(await check(f, { commit: '--all' })), /isn't a commit/)
-  assert.match(reasonOf(await check(f, { commit: '' })), /isn't a commit/)
-})
-
-test("onMergedCode: when GitHub can't be asked, or its main isn't in the clone, it couldn't confirm", async () => {
+test("githubDefault: when GitHub has moved on since the fetch, or can't be reached, it couldn't confirm", async () => {
   const f = await fixture()
   // GitHub has moved on since the last fetch.
-  await pushToMain(f, 'b', 'b\n')
-  const behind = reasonOf(await check(f, { commit: f.main }))
+  const next = await pushToMain(f, 'b', 'b\n')
+  const behind = reasonOf(await word(f))
   assert.match(behind, /^couldn't confirm the default branch with GitHub/)
   assert.match(behind, /isn't in the clone/)
   await fetch(f)
-  assert.deepEqual(await check(f, { commit: f.main }), { ok: true })
+  assert.deepEqual(await word(f), { branch: 'main', sha: next })
   // GitHub can't be reached.
   await runOk('git', ['-C', f.clone, 'remote', 'set-url', 'origin', `file://${join(f.dir, 'nowhere.git')}`], { env: f.env })
-  assert.match(reasonOf(await check(f, { commit: f.main })), /^couldn't confirm the default branch with GitHub/)
+  assert.match(reasonOf(await word(f)), /^couldn't confirm the default branch with GitHub: ls-remote failed/)
 })
-
-test("onMergedCode: a default branch that isn't GitHub's is refused", async () => {
-  const f = await fixture()
-  const evil = await agentCommit(f)
-  // An agent can point origin/HEAD at its own branch; GitHub's HEAD still says main.
-  const reason = reasonOf(await check(f, { commit: evil }, 'dish/x'))
-  assert.match(reason, /^couldn't confirm the default branch with GitHub/)
-  assert.match(reason, /GitHub's default branch is main, not dish\/x/)
-})
-
-test('onMergedCode: an aborted signal is not merged', async () => {
-  const f = await fixture()
-  const controller = new AbortController()
-  controller.abort()
-  assert.match(reasonOf(await check(f, { commit: f.main }, 'main', controller.signal)), /aborted/)
-})
-

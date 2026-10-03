@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { access, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { GitHubApp } from '../src/github.ts'
 import { checkedBranch, githubWord, internals as sweepInternals, isMerged, sweepProject } from '../src/sweep.ts'
@@ -96,6 +96,55 @@ test("isMerged: a planted replace ref doesn't make a tip an ancestor (and does f
   const plain = await run('git', ['-C', f.clone, 'merge-base', '--is-ancestor', tip, 'origin/main'], { env: f.env })
   assert.equal(plain.code, 0, 'the fixture fools plain git')
   assert.equal((await f.call(() => isMerged(f.clone, recordOf(made), tip, githubWord(f.clone), []))).merged, false)
+})
+
+/**
+ * Rewrite `.git/objects/info/commit-graph` so that `commit`'s first parent is `parent`: what an agent can write by hand.
+ * (Format: a header, a chunk table, then the OID fanout, the sorted OIDs, and per commit its tree, two parent positions
+ * and its generation; `GDA2` holds each commit's corrected-date offset.) `commit`'s generation is raised above
+ * `parent`'s, so git's walk doesn't stop before it.
+ */
+async function forgeCommitGraph(file: string, commit: string, parent: string): Promise<void> {
+  const graph = await readFile(file)
+  assert.equal(graph.toString('latin1', 0, 4), 'CGPH')
+  const hash = graph[5] === 1 ? 20 : 32
+  const chunks: Record<string, number> = {}
+  for (let index = 0; index <= graph[6]!; index++) {
+    const at = 8 + index * 12
+    chunks[graph.toString('latin1', at, at + 4)] = Number(graph.readBigUInt64BE(at + 4))
+  }
+  const count = graph.readUInt32BE(chunks.OIDF! + 255 * 4)
+  const oids: string[] = []
+  for (let index = 0; index < count; index++) oids.push(graph.toString('hex', chunks.OIDL! + index * hash, chunks.OIDL! + (index + 1) * hash))
+  const child = oids.indexOf(commit)
+  const forged = oids.indexOf(parent)
+  assert.ok(child >= 0 && forged >= 0, 'both commits are in the graph')
+  const data = chunks.CDAT! + child * (hash + 16)
+  graph.writeUInt32BE(forged, data + hash)
+  // Topological level 3 (the top 30 bits), the commit time's top bits kept.
+  graph.writeUInt32BE(((3 << 2) | (graph.readUInt32BE(data + hash + 8) & 3)) >>> 0, data + hash + 8)
+  if (chunks.GDA2 !== undefined) graph.writeUInt32BE(1_000_000, chunks.GDA2 + child * 4)
+  await chmod(file, 0o644)
+  await writeFile(file, graph)
+}
+
+test("isMerged: a forged commit-graph doesn't make a tip an ancestor (and does fool plain git)", async () => {
+  const f = await worktreeFixture()
+  const made = await create(f, 'x')
+  const next = await f.pushMain('b.txt', 'b\n')
+  await f.git(['fetch', '-q', 'origin'])
+  // An agent's commit of its own tree, on the worktree's branch.
+  const tree = (await run('git', ['-C', f.clone, 'mktree'], { env: f.env, input: '' })).stdout.trim()
+  const evil = await f.git(['commit-tree', tree, '-m', 'orphan'])
+  await f.git(['update-ref', 'refs/heads/dish/x', evil])
+  await f.git(['commit-graph', 'write', '--reachable'])
+  // GitHub's main's parent (the worktree's base) now has the agent's commit as its parent, in the graph only.
+  await forgeCommitGraph(join(f.clone, '.git', 'objects', 'info', 'commit-graph'), made.base, evil)
+  const plain = await run('git', ['-C', f.clone, 'merge-base', '--is-ancestor', evil, next], { env: f.env })
+  assert.equal(plain.code, 0, 'the fixture is real: the graph makes it an ancestor')
+  const check = await f.call(() => isMerged(f.clone, recordOf(made), evil, githubWord(f.clone), []))
+  assert.equal(check.merged, false)
+  assert.match(check.reason ?? '', /isn't on GitHub's main/)
 })
 
 test("isMerged: a tip or a target that isn't a commit id is refused; checkedBranch refuses what isn't a plain branch name", async () => {

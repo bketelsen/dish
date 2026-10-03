@@ -152,12 +152,10 @@ export interface WorktreeState {
  * This is A, which the user chose on 2026-10-02. A worktree sits inside the clone, and tools read config
  * from parent directories (`pnpm-workspace.yaml`, `.pnpmfile.cjs`, `.npmrc`, a parent `package.json`'s workspaces,
  * `.cargo/config.toml`, `go.work`, …), which agents in the project's workspace can write: merged code in the worktree
- * could still run code an agent wrote, outside the sandbox (setup.ts's known limits). Only a fresh clone is free of it.
+ * could still run code an agent wrote, outside the sandbox. Only a fresh clone is free of it.
  *
- * Option B (not chosen) would make this, right after `create`'s fetch: `checkClone(clone, deps.cloneExpectations(
- * project))`, then `onMergedCode(clone, { commit: base }, defaultBranch, signal)`, and when that's ok `runSetup({
- * command: project.setup, cwd: path, timeoutMs: project.setupTimeoutMs, log: worktreeSetupLogFile(…), signal })`;
- * else `skipReason(check.reason, path, command)`.
+ * Option B, not chosen, ran setup here when the worktree's base was merged code. Its merged-code check
+ * (`onMergedCode` in setup.ts) was removed: see the history.
  */
 function worktreeSetup(project: Project, path: string): SetupOutcome {
   if (project.setup === undefined || project.setup.trim() === '') return { ran: false, reason: 'no setup' }

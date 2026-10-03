@@ -30,7 +30,6 @@ import type { ProjectState } from 'dish-projects'
 import type { Project } from 'dish-projects/registry'
 import { internals as cloneInternals } from '../src/clone.ts'
 import type { WorkspacesInternals } from '../src/service.ts'
-import { internals as setupInternals } from '../src/setup.ts'
 import { internals as sweepInternals } from '../src/sweep.ts'
 import { internals as worktreeInternals } from '../src/worktrees.ts'
 import { startFakeGit } from './fake-git-http.ts'
@@ -87,7 +86,6 @@ export function scratchGit(): void {
   cloneInternals.gitEnv = NOSYSTEM
   worktreeInternals.gitEnv = NOSYSTEM
   sweepInternals.gitEnv = NOSYSTEM
-  setupInternals.gitEnv = NOSYSTEM
 }
 
 /** A project as dish-projects parses one. */

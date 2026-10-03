@@ -1,29 +1,27 @@
 /**
- * A project's `setup`, run by dish (not by an agent) outside dsh's sandbox, like a CI job, and the check that decides
- * whether it may run there at all.
+ * A project's `setup`, run by dish (not by an agent) outside dsh's sandbox, like a CI job, and GitHub's word on a
+ * clone's default branch (`githubDefault`, which the sweep uses for ancestry).
  *
- * - **runSetup** runs `bash -c <setup>` in a clone or a new worktree: stdin closed, the environment `childEnvironment()`
- *   gives dish's own children (dsh's scrub, no `GIT_*` name, `GIT_TERMINAL_PROMPT=0`) plus `SAFE_FLAGS`' settings as
- *   `GIT_CONFIG_*` and `GIT_GRAFT_FILE=/dev/null`, its own process group, and a time limit. A timeout or an abort sends
- *   the group TERM, then KILL after `KILL_GRACE_MS`; so does bash's exit, for anything it left running in its group.
- *   The last 64 KB of its output, masked, is the log.
- * - **onMergedCode** is the spec's decision 1, as hardened on 2026-10-02 (option A, then Task 6's review): setup runs
- *   outside the sandbox only on code a human merged, and only in a checkout dish has just made (its own fresh clone, or
- *   a new worktree), since an existing checkout's ignored files can't be trusted. So it checks a commit, never a
- *   working tree. An agent in the workspace can write anything in the clone, `.git` included, so nothing the check reads
- *   may be the agent's to choose:
- *   - GitHub's word: `ls-remote --symref origin HEAD` names the default branch and its sha. A local `origin/<default>`
- *     (or `origin/HEAD`) is never read.
- *   - Ancestry ignores replace refs and grafts (git()'s `SAFE_FLAGS` and environment) and the commit-graph file
- *     (`core.commitGraph=false`), each of which an agent can plant to make its commit look like an ancestor.
- *   - No gitlink or nested-repository check: see `onMergedCode`.
+ * - **runSetup** runs `bash -c <setup>` only in dish's own fresh clone, at onboarding (onboard.ts): an adopted clone
+ *   (adopting, or Retry) and a new worktree are skipped with the command to run instead, since an existing
+ *   checkout's ignored files, and a worktree's clone around it, can't be trusted. Stdin closed, the environment
+ *   `childEnvironment()` gives dish's own children (dsh's scrub, no `GIT_*` name, `GIT_TERMINAL_PROMPT=0`) plus
+ *   `SAFE_FLAGS`' settings as `GIT_CONFIG_*` and `GIT_GRAFT_FILE=/dev/null`, its own process group, and a time limit. A
+ *   timeout or an abort sends the group TERM, then KILL after `KILL_GRACE_MS`; so does bash's exit, for anything it left
+ *   running in its group. The last 64 KB of its output, masked, is the log.
+ * - **githubDefault** asks GitHub (`ls-remote --symref origin HEAD`), never the clone's own `origin/*` refs, which an
+ *   agent in the workspace can write.
  *
- * What neither covers (known limits, on top of the spec's forged objects and the time between check and run):
- * - **A new worktree is not a clean room.** It sits at `<clone>/.worktrees/<slug>`, inside a clone agents can write,
- *   and tools read config from parent directories: pnpm and npm workspaces (`pnpm-workspace.yaml`, a parent
- *   `package.json`'s `workspaces`), `.pnpmfile.cjs`, `.npmrc`, Node's `node_modules` resolution up the tree,
- *   `.cargo/config.toml`, `go.work`, and the like. Such a file an agent put in the clone reaches the worktree's setup,
- *   so merged code in the worktree can still run code an agent wrote. Only the fresh clone is free of this.
+ * The check that once let setup run in a new worktree on merged code (`onMergedCode`, the spec's option B) was removed
+ * with the user's choice of A on 2026-10-02: see the history.
+ *
+ * Why a new worktree can't be trusted: it sits at `<clone>/.worktrees/<slug>`, inside a clone agents can write, and
+ * tools read config from parent directories: pnpm and npm workspaces (`pnpm-workspace.yaml`, a parent `package.json`'s
+ * `workspaces`), `.pnpmfile.cjs`, `.npmrc`, Node's `node_modules` resolution up the tree, `.cargo/config.toml`,
+ * `go.work`, and the like. Such a file an agent put in the clone reaches a worktree's setup, so even merged code in the
+ * worktree could run code an agent wrote. Only the fresh clone is free of this.
+ *
+ * Known limits of setup's protection:
  * - **`GIT_CONFIG_COUNT` protects the git that setup runs, not everything:**
  *   - a tool that builds its own environment (dropping these names), or passes its own `GIT_CONFIG_COUNT` or `-c`
  *     (which can turn a setting back);
@@ -76,9 +74,6 @@ function safeSettings(): Array<[string, string]> {
   return pairs
 }
 
-/** For tests only, never set by dish: put on top of the environment of this module's own git (a test's `GIT_CONFIG_NOSYSTEM`); never setup's. */
-export const internals: { gitEnv?: Record<string, string> } = {}
-
 /**
  * setup's environment: `childEnvironment(env)`, then SAFE_FLAGS' settings as `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`
  * and `GIT_CONFIG_VALUE_<n>` (git gives these the precedence of `-c`, so no config file of the clone's can undo them)
@@ -100,7 +95,7 @@ function setupEnvironment(env: NodeJS.ProcessEnv | undefined): Record<string, st
 export interface SetupOptions {
   /** The project's `setup`, run by `bash -c`. */
   command: string
-  /** Where it runs: the clone, or a new worktree. */
+  /** Where it runs: dish's fresh clone. */
   cwd: string
   /** After this long, the group is ended (TERM, then KILL). */
   timeoutMs: number
@@ -424,69 +419,7 @@ function lastLines(text: string, count: number): string {
   return lines.slice(-count).join('\n')
 }
 
-// --- on merged code only -------------------------------------------------------------------------------------------
-
-export type MergedCheck = { ok: true } | { ok: false, reason: string }
-
-/**
- * Whether setup may run outside the sandbox, in a checkout dish has just made of `at.commit` (the spec's decision 1, as
- * hardened 2026-10-02: option A, then fresh checkouts only).
- * - First the remote's word: `ls-remote --symref origin HEAD` (through the credential helper), right after the
- *   caller's fetch, gives GitHub's default branch and its sha. `defaultBranch` must be that branch. A local
- *   `origin/<defaultBranch>` is never trusted: an agent can write refs. If ls-remote fails, GitHub names another
- *   branch, or the sha isn't in the clone, setup is skipped ("couldn't confirm the default branch with GitHub").
- * - The commit is an ancestor of (or equal to) that sha.
- *
- * A gitlink (a submodule) in the commit is not refused. The rule against nested repositories was for an existing
- * checkout, where `--ignore-submodules=dirty` hides edits inside one. A commit can't hold a nested repository (git
- * refuses a `.git` path), and dish's `worktree add` (submodule recursion off) leaves a gitlink an empty directory. If
- * setup fetches it (`git submodule update`), it gets the commit the merged tree pins, from the URL the merged
- * `.gitmodules` names, into a module directory git makes new (a fresh clone's `.git/modules`, or a new worktree's own
- * `.git/worktrees/<name>/modules`, not the shared `.git/modules`: checked with git 2.47). It also writes
- * `submodule.<name>.url` and `.active` into the clone's shared `.git/config`. This says nothing about the rest of
- * what a new worktree's setup can read from the clone around it (see the module's known limits).
- *
- * Ancestry ignores replace refs, grafts and the commit-graph file. Uses git() only. Never throws: a failure is a
- * refusal with its reason.
- *
- * Before it, the caller fetches and checks the clone (`checkClone` with the expected `url`): `origin` is whatever the
- * clone's config says, so only that check keeps an agent from pointing it at a remote of its own.
- */
-export async function onMergedCode(clone: string, at: { commit: string }, defaultBranch: string, signal?: AbortSignal): Promise<MergedCheck> {
-  try {
-    return await mergedCheck(clone, at.commit, defaultBranch, signal)
-  } catch (error) {
-    if (signal?.aborted) return aborted()
-    return { ok: false, reason: `the check failed: ${shown(messageOf(error), 200)}` }
-  }
-}
-
-async function mergedCheck(clone: string, revision: string, defaultBranch: string, signal?: AbortSignal): Promise<MergedCheck> {
-  if (signal?.aborted) return aborted()
-  if (revision === '' || revision.startsWith('-') || /[\x00-\x20\x7f]/.test(revision)) {
-    return { ok: false, reason: `${JSON.stringify(shown(revision, 60))} isn't a commit` }
-  }
-  const remote = await githubDefault(clone, { branch: defaultBranch, signal, env: internals.gitEnv })
-  if (signal?.aborted) return aborted()
-  if ('reason' in remote) return { ok: false, reason: remote.reason }
-  const commit = await resolveCommit(clone, revision, signal)
-  if (signal?.aborted) return aborted()
-  if (commit === undefined) return { ok: false, reason: `commit ${shown(revision, 60)} isn't in the clone` }
-  if (!await isAncestor(clone, commit, remote.sha, signal)) {
-    if (signal?.aborted) return aborted()
-    return { ok: false, reason: `commit ${await describe(clone, commit, signal)} isn't on origin/${shown(defaultBranch, 100)}` }
-  }
-  return { ok: true }
-}
-
-function aborted(): MergedCheck {
-  return { ok: false, reason: 'the check was aborted' }
-}
-
-/** Run dish's git in `dir`, the commit-graph file off. */
-function gitIn(dir: string, args: readonly string[], signal?: AbortSignal): Promise<GitResult> {
-  return git(['-C', dir, ...args], { signal, env: { ...internals.gitEnv } })
-}
+// --- GitHub's word ------------------------------------------------------------------------------------------------
 
 /** GitHub's default branch and its commit, or why dish couldn't hear it. */
 export type GitHubDefault = { branch: string, sha: string } | { reason: string }
@@ -494,14 +427,14 @@ export type GitHubDefault = { branch: string, sha: string } | { reason: string }
 /**
  * GitHub's word on its default branch, right after the caller's fetch: `ls-remote --symref origin HEAD` (through the
  * credential helper) names the branch and its sha, which must be in the clone. A local `origin/<default>` or
- * `origin/HEAD` is never read: an agent in the workspace can write refs. With `options.branch`, GitHub's branch must be
- * that one. A failure is a reason starting "couldn't confirm the default branch with GitHub"; throws only when git
- * can't be started. `options.env` goes on top of git()'s (a test's `GIT_CONFIG_NOSYSTEM`).
+ * `origin/HEAD` is never read: an agent in the workspace can write refs. A failure is a reason starting "couldn't
+ * confirm the default branch with GitHub"; throws only when git can't be started. `options.env` goes on top of git()'s
+ * (a test's `GIT_CONFIG_NOSYSTEM`).
  *
  * The caller has fetched and checked the clone (`checkClone` with the expected `url`) just before: `origin` is whatever
- * the clone's config says. Used by `onMergedCode` and by the sweep (sweep.ts) for ancestry.
+ * the clone's config says. Used by the sweep (sweep.ts) for ancestry.
  */
-export async function githubDefault(clone: string, options: { branch?: string, signal?: AbortSignal, env?: Record<string, string> } = {}): Promise<GitHubDefault> {
+export async function githubDefault(clone: string, options: { signal?: AbortSignal, env?: Record<string, string> } = {}): Promise<GitHubDefault> {
   const { signal } = options
   const run = (args: readonly string[]): Promise<GitResult> => git(['-C', clone, ...args], { signal, env: { ...options.env } })
   const listed = await run(['ls-remote', '--symref', 'origin', 'HEAD'])
@@ -522,35 +455,11 @@ export async function githubDefault(clone: string, options: { branch?: string, s
     return { reason: `${UNCONFIRMED}: origin didn't name its default branch` }
   }
   const branch = target.slice('refs/heads/'.length)
-  if (options.branch !== undefined && branch !== options.branch) {
-    return { reason: `${UNCONFIRMED}: GitHub's default branch is ${shown(branch, 100)}, not ${shown(options.branch, 100)}` }
-  }
   const inClone = await run(['rev-parse', '--verify', '--quiet', '--end-of-options', `${sha}^{commit}`])
   if (inClone.code !== 0 || inClone.stdout.trim() !== sha) {
     return { reason: `${UNCONFIRMED}: its ${shown(branch, 100)} (${sha.slice(0, 12)}) isn't in the clone; fetch, then try again` }
   }
   return { branch, sha }
-}
-
-/** `revision`'s commit in `dir`, or undefined when there is none. */
-async function resolveCommit(dir: string, revision: string, signal?: AbortSignal): Promise<string | undefined> {
-  const result = await gitIn(dir, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${revision}^{commit}`], signal)
-  const sha = result.stdout.trim()
-  return result.code === 0 && SHA.test(sha) ? sha : undefined
-}
-
-/** Whether `commit` is `tip` or an ancestor of it (an error is a no). */
-async function isAncestor(dir: string, commit: string, tip: string, signal?: AbortSignal): Promise<boolean> {
-  const result = await gitIn(dir, ['merge-base', '--is-ancestor', commit, tip], signal)
-  return result.code === 0 && !result.timedOut && !result.aborted
-}
-
-/** A short sha, and the local branches at it (an agent's names, shown safely), for a reason. */
-async function describe(dir: string, commit: string, signal?: AbortSignal): Promise<string> {
-  const short = commit.slice(0, 12)
-  const listed = await gitIn(dir, ['for-each-ref', `--points-at=${commit}`, '--format=%(refname:short)', 'refs/heads/'], signal)
-  const names = listed.code === 0 ? listed.stdout.split('\n').filter(name => name !== '').slice(0, 3).map(name => shown(name, 60)) : []
-  return names.length === 0 ? short : `${short} (${names.join(', ')})`
 }
 
 /** The first non-empty line of git's stderr, masked and cut short. */
@@ -561,7 +470,7 @@ function firstLine(stderr: string): string {
 
 export type SetupOutcome = { ran: false, reason: string } | ({ ran: true } & SetupResult)
 
-/** The skip message: why, and the command to run instead, e.g. "setup didn't run outside the sandbox: base dish/plan-x isn't on origin/main. Run it yourself in <cwd>: <command>". */
+/** The skip message: why, and the command to run instead, e.g. "setup didn't run outside the sandbox: it is an existing checkout. Run it yourself in <cwd>: <command>". */
 export function skipReason(why: string, cwd: string, command: string): string {
   const reason = why.replace(/\.+$/, '')
   return `setup didn't run outside the sandbox: ${reason}. Run it yourself in ${cwd}: ${command}`
