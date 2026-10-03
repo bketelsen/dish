@@ -24,6 +24,7 @@ The design is in the [deploy spec](../docs/specs/deploy.md) and the [ops spec](.
 |---|---|
 | `install.sh` | Builds dish and installs it into a dsh profile. Idempotent. |
 | `profile.ts` | Writes dish's rows into the profile's `cordis.patch.yml`. `install.sh` runs it. |
+| `pnpm-copies.ts` | Makes dish's own installs copies of pnpm's store, not hard links into it. `install.sh` runs it. |
 | `dish-sandbox` | dsh's sandbox runner on the VM: bwrap with dsh's own profile, plus a writable home less a protected list. See [The sandbox](#the-sandbox). |
 | `dish-web.service` | The systemd user unit. `update.sh` copies it into `~/.config/systemd/user`. |
 | `update.sh` | Updates the VM: fetch, move the checkout, `install.sh`, the unit, and a restart when the service is stale. You run it through fleet's `dish-update`. |
@@ -51,8 +52,9 @@ Its steps, in order:
    - **The `sandbox` row**, with `DISH_SANDBOX_HOME=on`: `runnerCommand: [<checkout>/deploy/dish-sandbox]` and `runnerFailureSignatures: ['bwrap: ', 'dish-sandbox: ']`. With it off, those two keys go, and the row with them unless it holds something else.
    - Other rows, comments and key order stay as they are. A file that is already right is not rewritten.
 4. **The bundles.** For copilot, config, prompts, skills, crew, judge and web, in that order, `pnpm exec dsh plugin --profile <profile> add ./plugins/<name>`, only when the profile doesn't link it yet. That is dsh's own binary, not the launcher, so the profile is the one `DSH_HOME` names.
+5. **Copies, not links.** pnpm hard-links its store's files into `node_modules` where it can (the VM's ext4), so dish's files would share their inodes with every agent's project and with the store, which a sandboxed command can write on the VM. The checkout's `pnpm-workspace.yaml` says `packageImportMethod: clone-or-copy` (a reflink on btrfs, else a copy), `install.sh` writes the same into the profile's `pnpm-workspace.yaml` before step 4, and here it replaces every file in the checkout's and the profile's `node_modules` that is still a link by a copy of its own (`pnpm-copies.ts`), since pnpm never imports a package again for a changed setting. When there is nothing to copy, it is a scan. Agents' own installs still link.
 
-It prints what it did, `install: sandbox home: on` or `off` among it, and its last line is `install: no changes to the profile` or `install: profile changed`. A changed `sandbox` row is a changed profile. On a failure it stops and names the step on stderr, as `install: FAILED at step: …`. It prints nothing secret.
+It prints what it did, `install: sandbox home: on` or `off`, `install: the profile's pnpm installs copy: updated` (or `unchanged`) and `install: links into pnpm's store replaced by copies: <n>` among it, and its last line is `install: no changes to the profile` or `install: profile changed`. A changed `sandbox` row is a changed profile. On a failure it stops and names the step on stderr, as `install: FAILED at step: …`. It prints nothing secret.
 
 **Isolation.** Every dsh command `install.sh` runs gets its four XDG directories pointed at a throwaway directory, which is removed on exit. A dsh command that loads a profile boots its plugins, and `dish-config` creates `~/.config/dish/config.git` when it boots. An install that did that on a fresh machine would leave an empty local store, and the first start with a remote would then push it over the one on GitHub instead of restoring it. In dsh 0.2.0-rc.2 the two commands the script uses boot nothing, so this guards against a later dsh. `HOME` and `DSH_HOME` stay real, so the profile lands where `dsh web` reads it. Those commands also run without `DSH_DISH_HOME`: under `pnpm dev` the launcher sets it, and it moves dish's directories ahead of `XDG_*`, so the throwaway directories would otherwise do nothing.
 
@@ -79,6 +81,15 @@ incus exec minideb:dish --project dish -- dish-update                  # dry run
 incus exec minideb:dish --project dish -- dish-update --apply          # update to origin/main
 incus exec minideb:dish --project dish -- dish-update --apply <ref>    # roll back to a commit or tag
 ```
+
+**Rolling back past the sandbox runner** (to a commit before `sandbox-home` merged): take its row off the profile first. The older checkout has no `deploy/dish-sandbox`, and its `install.sh` doesn't know the row, so every sandboxed command would fail until you did. Then roll back, which restarts:
+
+```sh
+incus exec minideb:dish --project dish -- su - dish -c '/opt/dish/node/bin/node ~/dish/deploy/profile.ts --patch ~/.dsh/profiles/web/cordis.patch.yml --no-sandbox-runner'
+incus exec minideb:dish --project dish -- dish-update --apply <ref>
+```
+
+The first prints `updated` (or `unchanged` when there was no row) and touches no other row.
 
 `minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`. The scripts' own hints, such as `run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)`, give that form for Minideb itself; from the desktop, add the `minideb:` remote.
 
@@ -293,19 +304,25 @@ dsh runs each agent shell command in bwrap: `/` read-only, a fresh `/dev` and `/
 - **The protected list,** read-only whether it exists yet or not:
   - dish and dsh themselves: `$DSH_HOME` and `~/.dsh`, dish's four XDG directories (`~/.config/dish`, `~/.local/share/dish`, `~/.local/state/dish`, `~/.cache/dish`, or where `XDG_*` puts them), `$DSH_DISH_HOME`, and the checkout, `~/dish`, so no agent can change `dish-sandbox`;
   - credentials and git: `~/.ssh`, `~/.gnupg`, `~/.gitconfig`, `~/.config/git` and `~/.git-credentials`, since dish's own git reads the account's global config outside the sandbox;
-  - what runs later outside the sandbox without anyone acting: `~/.config/systemd` and `~/.local/share/systemd`, `~/.config/environment.d`, `~/.config/autostart`, `~/.pam_environment`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.bash_logout`, `~/.profile`, and `~/.config/mise`, fleet's global mise config;
+  - files that run later outside the sandbox without anyone acting: `~/.config/systemd` and `~/.local/share/systemd`, `~/.config/environment.d`, `~/.config/autostart`, `~/.pam_environment`; the shell's startup files `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.bash_logout` and `~/.profile`, and `~/.bash_aliases`, `~/.bash_completion` and `~/.local/share/bash-completion`, which Debian's `.bashrc` and bash-completion read; `~/.config/mise`, fleet's global mise config; `~/.config/pnpm` and `~/.npmrc`, which pnpm reads when `install.sh` and dsh's plugin manager run it; and `~/node_modules`, `~/.node_modules` and `~/.node_libraries`, where node looks for a module dish's own `node_modules` doesn't have;
   - each `--protect <path>` (absolute, or `~/…`) added by hand after the path in the row's `runnerCommand`. A later install keeps them.
+  - A path on the list is frozen: whatever it holds stays as it is, read-only. Add one only when its content can stay as it is.
 - **Missing ones are made first,** outside the sandbox, as `dish`: a directory empty with mode 0700, a file empty with mode 0600, a `--protect` path as a directory. A made `~/.bash_profile` reads `~/.profile` (or `~/.bash_login`, when that exists), because a login bash reads only the first of the three, and an empty one would hide `~/.profile`.
 - **Nothing protected can be moved out of the way.** Each directory between home and a protected path (`~/.config`, `~/.local/share`, and so on) is bound onto itself, so it is a mount point: it stays writable, but `mv` and `rm` on it, and on a protected path, fail with "Device or resource busy". A write to a protected path fails with "Read-only file system", and dsh offers the escalation, as before.
-- **Its own failures** print `dish-sandbox: <reason>` and exit 1, and bwrap's print `bwrap: `. The row's `runnerFailureSignatures` make dsh report such a run as one that did not run, a sandbox problem, not the command's failure. The reasons: no `HOME`, a relative `HOME` (or `/`, or one that isn't a directory), no `--`, a `--protect` that isn't absolute or `~/…`, a protected path it can't make, or no bwrap at `/usr/bin/bwrap` or `/usr/local/bin/bwrap`. It runs outside the sandbox before every command, so it looks nothing up on `PATH`.
-- **On for the VM, off by default elsewhere.** `update.sh` runs `install.sh` with `DISH_SANDBOX_HOME=on`. Dev keeps the read-only home, so a dev chat's agent can't write your real `~/.cache`, `~/.cargo` or mise's installs. To try it in dev, run `DISH_SANDBOX_HOME=on pnpm dev`; a later `pnpm dev` without it turns it off again. Don't, when your `PATH` has a directory in your home (`~/.local/bin`, `~/bin`, mise's shims): dsh looks `bash` up on `PATH` for every escalated command, so a sandboxed command could put one there that the next escalation runs.
-- **Turning it on takes two updates.** The first `dish-update --apply` after this lands runs the `update.sh` it started with, which doesn't set `DISH_SANDBOX_HOME`, so the new `install.sh` leaves the row out. The second runs the new `update.sh`, which writes the row, says `install: profile changed`, and restarts.
+- **Its own failures** print `dish-sandbox: <reason>` and exit 1, and bwrap's print `bwrap: `. The row's `runnerFailureSignatures` make dsh report such a run as one that did not run, a sandbox problem, not the command's failure. The reasons: no `HOME`, a relative `HOME` (or `/`, or one that isn't a directory), no `--`, a `--protect` that isn't absolute or `~/…`, a protected path that is a symbolic link or sits under one (bwrap can't mount on a link: replace the link with what it points to), a protected path it can't make, or no bwrap at `/usr/bin/bwrap` or `/usr/local/bin/bwrap`. It runs outside the sandbox before every command, so it looks nothing up on `PATH`.
+- **On for the VM, off by default elsewhere.** `update.sh` runs `install.sh` with `DISH_SANDBOX_HOME=on`. Dev keeps the read-only home, so a dev chat's agent can't write your real `~/.cache`, `~/.cargo` or mise's installs. To try it in dev, run `DISH_SANDBOX_HOME=on pnpm dev`; a later `pnpm dev` without it turns it off again. The checkout is protected, so a chat whose workspace is the checkout, or a folder in it, can't write there: use a workspace outside the checkout. Don't try it at all when your `PATH` has a directory in your home (`~/.local/bin`, `~/bin`, mise's shims): dsh looks `bash` up on `PATH` for every escalated command, so a sandboxed command could put one there that the next escalation runs.
+- **Turning it on takes two updates.** The first `dish-update --apply` after this lands runs the `update.sh` it started with, which doesn't set `DISH_SANDBOX_HOME`, so the new `install.sh` leaves the row out (it does make dish's installs copies already). The new prompts already say the home is writable; until the second update, an agent that meets "Read-only file system" runs the command again escalated, as before. The second runs the new `update.sh`, which writes the row, says `install: profile changed`, and restarts.
+- **Check the copies** after the update: this prints nothing, and `stat -c %h` on any file under `~/dish/node_modules/.pnpm/` prints `1`:
+
+  ```sh
+  incus exec minideb:dish --project dish -- su - dish -c 'find ~/dish/node_modules ~/.dsh/profiles/web/node_modules -type f -links +1 | head -3'
+  incus exec minideb:dish --project dish -- su - dish -c 'stat -c %h ~/dish/node_modules/.pnpm/yaml@2.9.1/node_modules/yaml/package.json'
+  ```
 - **Limits.**
-  - Sandboxed code can leave things in the home directory that run later outside the sandbox: a binary in `~/.local/bin` or `~/go/bin`, a mise install, a poisoned cache. They run when an escalated command, or fleet's play, uses them. The protected list covers what runs without anyone acting.
-  - A protected path, or a directory above one, that is a symbolic link is protected where it points, but the link itself can be replaced. On the VM none is.
+  - Sandboxed code can leave things in the home directory that run later outside the sandbox: a binary in `~/.local/bin` or `~/go/bin`, a mise install, a poisoned cache. They run when an escalated command, or fleet's play, uses them. The protected list covers the files that run later without anyone acting; it does not stop a command that asks the user manager to run something (see the session bus in [Security notes](#security-notes)).
+  - A workspace at or under a protected path is read-only, since the protections come last.
   - Caches are shared across workspaces.
   - dsh's `write` and `edit` tools keep their own fence (workspace and temp only). To write a file in the home directory, an agent uses `bash`.
-  - dsh's bwrap profile leaves the account's D-Bus session bus (`$XDG_RUNTIME_DIR/bus`) reachable, and with it the systemd user manager. On the desktop a sandboxed `busctl --user` read the manager's properties ([the spec's notes](../docs/specs/sandbox-home.md#notes-from-the-build)). That is older than this hook, and the protected list doesn't cover it.
 
 ## Security notes
 
@@ -315,5 +332,6 @@ dsh runs each agent shell command in bwrap: `/` read-only, a fresh `/dev` and `/
 - **Clones of dish under `~/work`** use the read-only deploy key, until step 6b's GitHub App.
 - **Never run `deploy/*.sh` as root by their paths.** `dish` can write them. Root's way in is `dish-update` and `dish-url`.
 - **The sandbox confines writes, not reads.** On the VM it lets a command write the home directory except the protected list ([The sandbox](#the-sandbox)), and reads were never confined: an agent's shell can read anything `dish` can, including the deploy keys in `~/.ssh` (one of them read-write for `dish-config`) and `~/.dsh/.credentials.yaml` (the Copilot sign-in, the TypeSafe key and the browser-session secret). File modes don't help, since the agent is the same user. The desktop has the same exposure.
+- **The session bus is open.** A sandboxed command can reach the account's D-Bus session bus and systemd user manager (`$XDG_RUNTIME_DIR/bus`, `$XDG_RUNTIME_DIR/systemd/private`), and through them have something run outside the sandbox, past the protected list. This is older than this hook and left open on purpose: the sandbox guards against accidents, not a determined agent, and the VM is the boundary.
 - **The judge's gate is the guard.** Reading a credential file doesn't serve a coding task, so the gate asks you, or refuses for a crew child. Secrets are masked in the judge's log and in what is sent to TypeSafe.
 - **The backup holds the credential file.** The VM's nightly backup captures it, so the NAS copy is as sensitive as the VM.

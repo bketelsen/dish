@@ -78,7 +78,11 @@ This is most of the friction from the qwen session, and it would hit every Go pr
 - **Sandboxed code can leave things in the home directory that run later outside the sandbox:** a binary in `~/.local/bin` or `~/go/bin`, a mise install, a poisoned cache.
   - It runs when an escalated command (one you or the judge approved) or fleet's play uses it.
   - Accepted: such commands already run code the sandbox wrote (the repo's own install scripts), and the VM is the boundary.
-  - The protected list covers the paths that run without anyone acting: shell startup, systemd user units, git's config and dish itself.
+  - The protected list covers the files that run later without anyone acting: shell startup, systemd user units, git's and pnpm's config, node's module lookups above the checkout, and dish itself. It does not stop a command that asks the user manager to run something (see the session bus, below).
+- **The session bus is open.** A sandboxed command can reach the account's D-Bus session bus and systemd user manager (`$XDG_RUNTIME_DIR/bus`, `$XDG_RUNTIME_DIR/systemd/private`), and through them have something run outside the sandbox, past the protected list. This is older than this hook and left open on purpose: the sandbox guards against accidents, not a determined agent, and the VM is the boundary.
+- **A protected path is frozen.** Whatever it holds stays as it is, read-only, so a path joins the list only when its content can stay as it is.
+- **A workspace at or under a protected path is read-only,** since the protections come last: the checkout, for one, as dev's default workspace is with `DISH_SANDBOX_HOME=on pnpm dev`. Use a workspace outside the checkout.
+- **A protected path that is a symbolic link,** or that sits under one, stops every sandboxed command with a `dish-sandbox:` message naming it: bwrap can't mount on a link, and a link in a writable directory could be replaced. Replace the link with what it points to. On the VM there is none.
 - **Reads were never confined.** An agent's shell can read `~/.dsh/.credentials.yaml` and `~/.ssh`. That is unchanged (`deploy/README.md`).
 - **dsh's file tools are still fenced.** `write` and `edit` use dsh's in-process fence (workspace and temp only), which this hook doesn't reach. To write a file in the home directory, an agent uses `bash`.
 - **Caches are shared across workspaces.** A command in one project can write a cache that a command in another project reads.
@@ -123,11 +127,15 @@ There is one implementer, then one review.
 ## The rollout (for you)
 
 1. Merge `sandbox-home`.
-2. On the VM, run `dish-update --apply`. It turns this on and restarts.
-3. In a chat, check that:
+2. On the VM, run `dish-update --apply` twice (corrected in the build).
+   - The first runs the `update.sh` it started with, which doesn't set `DISH_SANDBOX_HOME`, so the new `install.sh` leaves the row out. It already makes dish's installs copies of pnpm's store (see the notes), and the new prompts already say the home is writable. That is harmless until the second run: an agent that meets "Read-only file system" runs the command again escalated, as before.
+   - The second runs the new `update.sh`, which writes the row, says `install: profile changed`, and restarts.
+3. Check that dish's installs are copies: `incus exec minideb:dish --project dish -- su - dish -c 'find ~/dish/node_modules ~/.dsh/profiles/web/node_modules -type f -links +1 | head -3'` prints nothing, and `stat -c %h` on any file under `~/dish/node_modules/.pnpm/` prints `1`.
+4. In a chat, check that:
    - `go mod download` or `pnpm install` in a project runs with no prompt;
    - `touch ~/.ssh/x` fails with "Read-only file system".
-4. Fleet's reworked mise PR (toolchains and the trust path) can merge before or after this.
+5. Fleet's reworked mise PR (toolchains and the trust path) can merge before or after this.
+6. Rolling back past this branch: take the row off first, or every sandboxed command fails, because the older checkout has no `deploy/dish-sandbox`. The command is in `deploy/README.md` ([Updating](../../deploy/README.md#updating)).
 
 ## Notes from the build
 
@@ -150,14 +158,26 @@ Built on branch `sandbox-home`, 2026-10-02, against dsh 0.2.0-rc.2.
 5. **read-only mode needs only bwrap and the `--`.** It reads neither `HOME` nor the `--protect` values, so it doesn't fail on them.
 6. **`--protect`.** A missing path is made as a directory. A value that is neither absolute nor `~/…` is a failure, not ignored. `profile.ts` keeps `--protect` pairs that follow the runner in `runnerCommand`, so a later install doesn't drop them.
 7. **Nothing from `PATH`.** The script runs outside the sandbox, so besides bwrap it uses only `/usr/bin/mkdir` (or `/bin/mkdir`) and bash builtins. It turns its own `set -euo pipefail` and `-p` off before `exec`, since bash passes them on when `SHELLOPTS` is exported.
-8. **Links.** A protected path that is a symbolic link is never made through, and is bound as it is; a link to nothing makes bwrap fail, which dsh reports as a runner failure.
+8. **Links** (changed in the fix round). bwrap 0.12 can't mount on a link ("Can't mount on symlink destination"), so a protected path that is a symbolic link, or a directory between home and one that is, made bwrap fail every call. The script now stops first, with `dish-sandbox: <path> is a symbolic link, …: replace it with what it points to`. It never makes anything through a link. The home itself is bound by its real path (`pwd -P`), so a home reached through a link still works.
 9. **`--no-sandbox-runner`** removes dish's two keys, and the row only when nothing else is left in it (a `probeTimeoutMs` set by hand stays).
 10. **`DISH_SANDBOX_HOME`** other than `on`, `off`, empty or unset stops `install.sh` before it starts.
+
+#### The fix round (after the review)
+
+11. **dish's own installs copy pnpm's store.** On the VM's ext4, pnpm hard-links the store's files into `node_modules`, so the checkout and the profile shared inodes with the store, which sandboxed commands can now write, and with every agent's project. The checkout's `pnpm-workspace.yaml` says `packageImportMethod: clone-or-copy` (a reflink on the desktop's btrfs, so dev costs nothing), and `install.sh` writes the same into the profile's `pnpm-workspace.yaml`, which dsh's plugin manager uses too. Agents' own installs still link.
+    - pnpm never re-imports what it linked before: checked with a scratch store on one file system. After the setting, `pnpm install --frozen-lockfile` said "Already up to date", and `pnpm install --force` left the link count at 2. Only a fresh `node_modules` gave 1. Deleting `node_modules` under the running service is a window of missing files, so `install.sh` instead replaces each file with more than one link by a copy of its own, renamed over it (`deploy/pnpm-copies.ts --unlink`), in the checkout's and the profile's `node_modules`, on every run. It is a scan when there is nothing to copy. It runs from the first `dish-update --apply`, since that already runs the new `install.sh`.
+    - Changing the setting doesn't make pnpm purge `node_modules` (no `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`), and the store and which store is used are unchanged, so the store-pin contract holds.
+    - Other profiles under `~/.dsh` are not touched; the VM has only `web`.
+12. **Node's module lookups above the checkout:** `~/node_modules`, `~/.node_modules` and `~/.node_libraries` are protected, made as empty directories (the reviewer showed dsh web loading a planted `bufferutil` from a parent `node_modules`).
+13. **Bash's other startup files:** `~/.bash_aliases`, `~/.bash_completion` and `~/.local/share/bash-completion`.
+14. **pnpm's own config** (added beyond the review): `~/.config/pnpm` and `~/.npmrc`. `install.sh` and dsh's plugin manager run pnpm outside the sandbox, and pnpm 11 reads `~/.config/pnpm/config.yaml`, where a `scriptShell` would run for every script (checked: `pnpm config get script-shell` read it from there; it ignored the same setting in `~/.npmrc`, which still holds the registry and its credentials). An agent's `pnpm config set --global` now fails; per-project settings work.
+15. **`profile.ts --patch <path> --no-sandbox-runner`** (or `--sandbox-runner <path>`) with no dish-config inputs writes the sandbox row alone: the step before a rollback past this branch.
 
 ### Where the spec was wrong, or I disagree
 
 - **The rollout takes two `dish-update --apply` runs.** The first after the merge runs the `update.sh` already in memory, which doesn't set `DISH_SANDBOX_HOME`, so the new `install.sh` leaves the row out. The second runs the new `update.sh`, which writes the row and restarts.
-- **The session bus is reachable from the sandbox.** dsh's bwrap profile doesn't hide `$XDG_RUNTIME_DIR`. On the desktop, inside that profile, `busctl --user get-property org.freedesktop.systemd1 … Version` answered (nothing was started). A sandboxed command can so ask the account's systemd user manager to run something (a transient unit), outside the sandbox and the protected list. This is older than this hook, and the VM, which has `dbus-user-session` and linger, very likely has it too. Hiding the runtime directory (`--tmpfs /run/user/<uid>` in `dish-sandbox`) would close it, at the cost of agent-, ssh- and gpg-agent sockets there; that is your call, so it is not built.
+- **The session bus is reachable from the sandbox.** dsh's bwrap profile doesn't hide `$XDG_RUNTIME_DIR`. On the desktop, inside that profile, `busctl --user get-property org.freedesktop.systemd1 … Version` answered (nothing was started). You decided to leave it open and say so: see Known limits.
+- **mise's trust state is writable.** `mise trust` writes `~/.local/state/mise`, so a sandboxed command can trust a config it wrote. Whether that matters depends on where fleet's play runs mise; `~/.config/mise` itself is protected.
 - **Dev with home directories on `PATH`.** dsh looks `bash` up on `PATH` for every escalated command. With `DISH_SANDBOX_HOME=on` on a desktop whose `PATH` has `~/.local/bin` (or mise's shims), a sandboxed command can put a `bash` there that the next escalation runs unsandboxed. The VM's `PATH` is root-owned. `deploy/README.md` says so.
 - **"permission denied"** is in dsh's denial dialect for a `runnerCommand`, so an `ssh … Permission denied (publickey)` failure also gets the escalation hint. That is dsh's, not ours.
 
