@@ -944,7 +944,7 @@ test('the marker regex is bounded: unclosed mask openings cost linear time, and 
   assert.equal(taskOf(agentOf({ events: [userEvent(1, `a ${long} b`)] }), true), `a ${long} b`)
 })
 
-test('a child\'s brief is the first text block of its first prompt, clipped in the middle: the 5.8k brief keeps its commit instructions', () => {
+test('a child\'s brief is its first prompt before the note about reporting, clipped in the middle: the 5.8k brief keeps its commit instructions', () => {
   assert.equal(LONG_BRIEF.length, 5_853)
   const task = taskOf(agentOf({ child: true, events: [userEvent(1, [LONG_BRIEF, CREW_NOTE, DSH_NOTE]), otherEvent(2)] }), false)
   assert.equal(task, clipMiddle(LONG_BRIEF, MAX_PART_CHARS))

@@ -63,8 +63,9 @@
  *     session the first prompt was "hello!" and the request came second, where two long pastes after it would otherwise
  *     have pushed it out.
  *   - **A child's** task comes from its own events, which `session.inheritedEventCount` says where they start (a forked
- *     child's log begins with its parent's). The brief is the first non-empty text block of its first prompt: crew's closing
- *     note and dsh's return note ("Your parent agent id is …") are the blocks after it. Then the latest instruction after the
+ *     child's log begins with its parent's). The brief is the text blocks of its first prompt before the note about how to
+ *     report, joined (`briefOf`): the task, a bound coder's worktree block and a reviewer's ruling, but not crew's closing
+ *     note or dsh's return note, which begin "Your parent agent id is …" (`RETURN_NOTE_LEAD`). Then the latest instruction after the
  *     brief, if there is one, each cut to `MAX_PART_CHARS`. An instruction is a prompt a person typed into the child (a
  *     `user` message with a string `rpcId`, which dsh's `subagent.prompt` gives it; dsh's auto-review, `isHumanInstruction`,
  *     tells one the same way), or an `agent-message` whose `senderSessionId` is the header's `parentSession` (a `delegate`
@@ -598,7 +599,8 @@ function briefOf(texts: readonly string[]): string | undefined {
 
 /**
  * A child's task: its brief, and the latest instruction after it, each clipped. The brief is the text of its first prompt
- * (`source.kind === 'user'`) up to the note about how to report (`briefOf`): its task, and a bound coder's worktree block. An instruction is a later prompt a person typed into the child (`source.kind === 'user'` with a string `rpcId`,
+ * (`source.kind === 'user'`) up to the note about how to report (`briefOf`): its task, and a bound coder's worktree block.
+ * An instruction is a later prompt a person typed into the child (`source.kind === 'user'` with a string `rpcId`,
  * which dsh's `subagent.prompt` gives it, and dsh's auto-review reads as a human instruction), or a message from its parent
  * (`agent-message` whose `senderSessionId` is `parent`), without dsh's leading block. With no `parent`, no `agent-message`
  * counts; nothing else ever does.

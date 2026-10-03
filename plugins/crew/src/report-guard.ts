@@ -10,9 +10,10 @@
  * message. It answers in two steps, and the step that has the fuller answer is the one that is folded.
  *
  * The crew prompts already say "Never send your findings or report that way: report once, in your closing message". Some models
- * do it anyway, and dsh pulls the same way: the note dsh appends to a continuable child's task tells it to send its result to its
- * parent with `send_message` before it finishes (`delegate` puts a note of its own in front of it, see `delegate.ts`). A prompt
- * can't win against that alone, so the call is refused where it is made. The refusal is a tool error the child reads on its next
+ * do it anyway. dsh used to pull the same way, with a note on a continuable child's task telling it to send its result to its
+ * parent with `send_message`; on the dish preset that note is gone (`control.ts`), and comes back only on a preset saved in
+ * Settings that still loads dsh's `send_message` (`delegate`'s note then says it is wrong). A prompt can't be relied on alone,
+ * so the call is refused where it is made. The refusal is a tool error the child reads on its next
  * step.
  *
  * ### What it does
@@ -72,7 +73,7 @@ import { describe, GUARD_LOOKUP_BUDGET_MS, idOf, within } from './guard.ts'
 /** The longest `send_message` a crew child may send unless the setting says otherwise: 1200 characters, a question and not a report. */
 export const DEFAULT_MESSAGE_LIMIT = 1200
 
-/** The tool the guard watches: dsh's, named in `dsh-tool-subagent-control`. */
+/** The tool the guard watches, by name: `dish-crew/control`'s on the dish preset, or dsh's (`dsh-tool-subagent-control`) on another. */
 const SEND_MESSAGE = 'send_message'
 
 /**
