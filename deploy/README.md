@@ -77,6 +77,14 @@ incus exec minideb:dish --project dish -- dish-update --apply          # update 
 incus exec minideb:dish --project dish -- dish-update --apply <ref>    # roll back to a commit or tag
 ```
 
+**Rolling back past 6b,** to a commit without `plugins/projects` and `plugins/workspaces`, takes one step first: remove their two bundles from the profile while the checkout still has them. An older `install.sh` doesn't know them, so the profile would keep linking two directories the rollback removes. Run it as `dish`, with only the unit's `HOME` and `PATH`, as `update.sh` does (see the store-pin contract under [install.sh](#installsh)):
+
+```sh
+incus exec minideb:dish --project dish -- su - dish -c 'cd ~/dish && env -i HOME="$HOME" PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin pnpm exec dsh plugin --profile web remove dish-workspaces dish-projects'
+```
+
+Then roll back with `dish-update --apply <ref>`. The clones under `~/work` and dish's records stay, and a later update to a commit with the two plugins links them again.
+
 `minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`. The scripts' own hints, such as `run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)`, give that form for Minideb itself; from the desktop, add the `minideb:` remote.
 
 ### Who runs it
@@ -241,7 +249,7 @@ dish's projects ([`dish-projects`](../plugins/projects/) and [`dish-workspaces`]
 - **The key** is kept in dsh's credential file (`~/.dsh/.credentials.yaml`), never in the config store, and never shown again.
 - **Agents' git** gets a read token for the projects' repos through a credential helper each clone's config names, so `git fetch` works and `git push` is refused. Only the harness will push (step 7).
 - **The clones** are `~/work/<owner>/<repo>`. A clone already there is adopted if its origin is the repo on GitHub; one with a deploy-key alias origin (`git@github-dish:…`, from before 6b) isn't. Onboarding names it; move it aside.
-- **Setup** (a project's `setup`, such as `pnpm install`) runs outside the sandbox only in dish's own fresh clone, at onboarding.
+- **Setup** (a project's `setup`, such as `pnpm install`) runs outside the sandbox only in dish's own fresh clone, at onboarding, with the unit's `PATH` (dish's Node and pnpm; a repo on mise needs `mise exec -- …`). In a task worktree, the main agent runs it escalated, which the judge may allow or put to you.
 
 ## Prod and dev
 
@@ -259,8 +267,9 @@ dish has two configurations. Only the VM's service is prod; everything else is d
 - **The launcher,** `scripts/env.ts`, runs `pnpm dsh …`. In dev it sets `DSH_HOME=<checkout>/.dev/dsh`, `DSH_DISH_HOME=<checkout>/.dev` and `DISH_ENV=dev`, replacing inherited values, and puts the checkout's `node_modules/.bin` first on `PATH`. `DISH_ENV=prod` passes the environment through. It sets no `XDG_*` variable and nothing of pnpm's: dsh passes its environment on to every agent shell, and those would move `gh`'s and git's configuration and pnpm's store.
 - **`DSH_DISH_HOME`** moves all four of dish's directories at once (dish-kit's `xdgPaths`), ahead of `XDG_*`. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands.
 - **The service is prod** because its unit runs dsh's binary directly, with the account's defaults. It sets no `DISH_ENV`: dsh would pass it on, and every agent's `pnpm dsh` would be prod.
-- **Where the guarantee stops.** Dev is the default for `pnpm dsh` (the launcher) and `pnpm dev` only. dsh gives every agent shell the running dsh's own `DSH_HOME` (`dsh-shell-env`), and on the VM that is prod's `~/.dsh`. So `deploy/install.sh`, `pnpm exec dsh` or `node_modules/.bin/dsh`, run directly in an agent's shell on the VM, use prod's profile, and, with `DSH_DISH_HOME` dropped from agent shells, prod's `~/.config/dish` too. The environment doesn't stop that. What stops a write there is the sandbox: `~/.dsh` and `~/.config/dish` lie outside the workspace, so the command needs dsh's write escalation, which asks you (or the judge, for a crew child). A guard is a non-goal ([ops spec](../docs/specs/ops.md#the-boundary-of-the-guarantee), decision 1).
+- **Where the guarantee stops.** Dev is the default for `pnpm dsh` (the launcher) and `pnpm dev` only. dsh gives every agent shell the running dsh's own `DSH_HOME` (`dsh-shell-env`), and on the VM that is prod's `~/.dsh`. So `deploy/install.sh`, `pnpm exec dsh` or `node_modules/.bin/dsh`, run directly in an agent's shell on the VM, use prod's profile, and, with `DSH_DISH_HOME` dropped from agent shells, prod's `~/.config/dish` too. The environment doesn't stop that. What stops a write there is the sandbox: `~/.dsh` and `~/.config/dish` lie outside the workspace, so the command needs dsh's write escalation, which the judge may allow or put to you (for a crew child, the judge allows it or it is refused). A guard is a non-goal ([ops spec](../docs/specs/ops.md#the-boundary-of-the-guarantee), decision 1).
 - **`pnpm dev`** installs dish into dev's profile with `install.sh`, with `DISH_REMOTE=''` whatever the environment says, then serves it on `127.0.0.1:3090` and prints `dev: open <url>`. Its dsh, and so every agent shell under it, gets none of `install.sh`'s inputs: `DISH_REMOTE`, `DISH_USER_*` and `DISH_PROFILE` are removed, and `DISH_ENV=dev` is set. It refuses `DISH_ENV=prod`. The [README](../README.md#setup) has how to use and stop it.
+- **Dev's work root is inside the checkout.** Dev's clones are under `<checkout>/.dev/work`, inside the dish checkout's git repository and its pnpm workspace (the checkout's `pnpm-workspace.yaml`). A tool that looks in parent directories finds the checkout: `pnpm install` in a dev project with no `pnpm-workspace.yaml` of its own installs the dish checkout instead. For such a project, make its setup `pnpm install --ignore-workspace`, or use a test repo with its own workspace file. dish's own git stops looking at the clone (`GIT_CEILING_DIRECTORIES`).
 - **Dev on the VM** listens on the VM's loopback, like the service. Reach it with a tunnel to `127.0.0.1:3090`, the same way as the [fallback tunnel](#fallback-a-tunnel), then open the link `pnpm dev` printed:
 
   ```sh
@@ -291,7 +300,7 @@ The first run builds the tree and creates the profile. A second run, with the sa
 ## Security notes
 
 - **Agents run as `dish`.** Its one sudo right is fleet's apt wrapper, `/usr/local/sbin/dish-apt-get`: `sudo /usr/local/sbin/dish-apt-get update`, or `install <package>…`. It takes plain Debian package names only, and runs `apt-get -o APT::Cmd::Pattern-Only=true install --yes --no-install-recommends --no-remove <names>`: each name is exactly that package, and nothing installed is removed to make room. Everything else, options, paths, `.deb` files and versions included, is refused. A package's maintainer scripts still run as root, so each install is a real grant.
-- **sudo works only in an escalated command.** dsh's sandbox runs with `NoNewPrivs`, so sudo can't raise privileges inside it. An install is an agent command that dsh runs outside the sandbox: the main agent asks you, and a crew child's is refused unless the judge approves.
+- **sudo works only in an escalated command.** dsh's sandbox runs with `NoNewPrivs`, so sudo can't raise privileges inside it. An install is an agent command that dsh runs outside the sandbox: for the main agent the judge may allow it or ask you, and a crew child's is refused unless the judge allows it.
 - **mise** is `/usr/local/bin/mise`, pinned and root-owned by fleet, so it can't update itself. The tools it installs live in `dish`'s home. Its shims aren't on the unit's `PATH`, so agents run tools with `mise exec`.
 - **Clones under `~/work`** fetch with the GitHub App's read token, through the credential helper. The token files in `~/.local/state/dish/workspaces/tokens/` are readable by agents: read-only, an hour each, and only for the projects' repos.
 - **Never run `deploy/*.sh` as root by their paths.** `dish` can write them. Root's way in is `dish-update` and `dish-url`.
