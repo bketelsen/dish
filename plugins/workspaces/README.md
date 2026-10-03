@@ -29,7 +29,7 @@ Then, on **Settings → GitHub App**, set the App ID and the private key, and pr
 |---|---|
 | `<work root>/<owner>/<repo>` | A project's clone. The work root is `~/work` in prod and `<checkout>/.dev/work` in dev (dish-kit's `workRoot()`: `$DSH_DISH_HOME/work` when that is set). |
 | `<work root>/<owner>/.<repo>.cloning-<8 hex>` | A clone being made. It is renamed into place when it's done, and removed if the clone fails. |
-| `<clone>/.worktrees/<slug>` | A task worktree, on branch `dish/<slug>`. `.worktrees/` is in the clone's `.git/info/exclude`. `.worktrees/.cache` is 6c's, never touched here. |
+| `<clone>/.worktrees/<slug>` | A task worktree, on branch `dish/<slug>`. `.worktrees/` is in the clone's `.git/info/exclude`. Anything else in `.worktrees/`, such as a cache a project's `gateEnv` puts there, is never touched here. |
 | `<work root>/scratch` | The scratch workspace, for general chats. |
 | `<state>/workspaces/<owner>/<repo>/clone.json` | What dish knows of the clone: adopted or not, the installation, its workspace, the last fetch, the last setup. |
 | `<state>/workspaces/<owner>/<repo>/setup.log` | The last 64 KB of onboarding's setup, masked, mode 0600. |
@@ -114,7 +114,7 @@ After the fetches of `create` and of `prepare` (at each start), and in the hourl
 - **Merged** means GitHub lists a merged pull request whose head is the branch's tip (`GET /repos/{o}/{r}/commits/{tip}/pulls`), which covers squash merges, or the branch has commits of its own and its tip is an ancestor of the default branch as GitHub reports it (`git ls-remote --symref origin HEAD`, right after the fetch; the clone's own `origin/*` refs are never trusted). A worktree still at its base, such as a new one, is never merged, whatever GitHub says about that commit. A branch that gained commits after its pull request merged isn't either.
 - **Removed:** a merged worktree that is clean, bound to no running coder, and not handed to a coder (resolved) in the last 5 minutes. `.worktrees` (a real directory) and the worktree's path (its own real path) are checked once more, else "worktree <slug> can't be removed: …; dish keeps it, its branch and its record"; then `git worktree remove` on its own path, never `--force` and never `git worktree prune`, then its branch, with a compare-and-delete (`git update-ref -d refs/heads/dish/<slug> <tip>`: only while it is still the tip that was found merged), and its record.
 - **Kept,** with the reason: not merged; dirty (modified or untracked files, a gitlink, a nested repository, a worktree inside it; ignored files such as `node_modules` don't count); bound; resolved recently; a `.git` that isn't what git made; an error, such as its branch checked out in another worktree (the worktree, the branch and the record all stay).
-- **Never looked at:** anything under `.worktrees/` without a record, such as a worktree you made by hand or 6c's `.cache`.
+- **Never looked at:** anything under `.worktrees/` without a record, such as a worktree you made by hand or a gate's cache.
 
 A worktree whose directory and branch you removed by hand has its record dropped. A failure on one worktree is logged and the sweep goes on.
 
@@ -132,7 +132,7 @@ interface DishWorkspaces {
   createWorktree(project, slug, base?, options?): Promise<CreatedWorktree>
   listWorktrees(project?): Promise<WorktreeInfo[]>
   removeWorktree(project, slug, force?): Promise<void>
-  resolve(pathOrRef): Promise<Worktree | undefined>         // for delegate and 6c's gates
+  resolve(pathOrRef): Promise<Worktree | undefined>         // for delegate and dish-gates
   resolveProblem(pathOrRef): Promise<string | undefined>    // why resolve gave undefined: a worktree dish made whose clone or own check fails, or whose branch is gone
   sweep(project?): Promise<SweepResult>                     // empty for a project that isn't ready once locked
   appStatus(test): Promise<AppStatus>                       // for Settings → GitHub App
@@ -167,9 +167,9 @@ Two decisions, both yours on 2026-10-02 (the spec's "Decided after the checks"):
 2. **Both Apps are read-only for now** (Contents, Pull requests and Metadata read). An agent can read dsh's credential file, so with a write App it could mint a token that pushes. Step 7 adds write, with a way to keep the key from agents.
 
 Known limits (the spec's [list](../../docs/specs/projects-workspaces.md#known-limits) has them all):
-- **Check, then act.** The clone check and dish's next git command are two steps, as are the last checks and the rename of `.git/config`, and the last look at `.worktrees` and `git worktree remove`. An agent racing dish could slip a key past the check once, or swap `.git` or `.worktrees` for a link in between. Closing it means running dish's working-tree git inside the sandbox, which 6c's runner makes possible.
+- **Check, then act.** The clone check and dish's next git command are two steps, as are the last checks and the rename of `.git/config`, and the last look at `.worktrees` and `git worktree remove`. An agent racing dish could slip a key past the check once, or swap `.git` or `.worktrees` for a link in between. Closing it means running dish's working-tree git inside the sandbox, which 6c didn't take on: [dish-gates](../gates/) runs the project's gate in the sandbox, and no git of its own.
 - **Forged objects.** An agent can overwrite a stored object under its real hash. A fresh clone is free of that; it is why nothing else runs setup unsandboxed.
-- **The judge can allow a worktree's install without you, when the sandboxed run fails.** Setup doesn't run outside the sandbox in a new worktree: it runs in the sandbox, which on the VM can write the home directory. Only if that fails with "Read-only file system" (a system install, or a dev machine where `DISH_SANDBOX_HOME` is off) does the main agent run it again escalated, and the judge, a model, may allow that without asking a human. The install scripts the coders wrote then run outside the sandbox. You decided this on 2026-10-02. 6c's sandboxed runner can take the install over.
+- **The judge can allow a worktree's install without you, when the sandboxed run fails.** Setup doesn't run outside the sandbox in a new worktree: it runs in the sandbox, which on the VM can write the home directory. Only if that fails with "Read-only file system" (a system install, or a dev machine where `DISH_SANDBOX_HOME` is off) does the main agent run it again escalated, and the judge, a model, may allow that without asking a human. The install scripts the coders wrote then run outside the sandbox. You decided this on 2026-10-02. Since [bketelsen/dish#10](https://github.com/bketelsen/dish/pull/10) the install runs in the sandbox first, and the escalated run is only the fallback.
 - **A fresh clone under a workspace runs setup while the workspace's chats can write there:** the project's own kept workspace (a Retry after the clone was deleted by hand; remove, delete the clone, add again), or any workspace when there's no `clone.json` from before (one you registered by hand at the path of an old clone you moved aside). Accepted, so that setup isn't skipped.
 - **A nested repository inside an ignored folder** (a clone under `node_modules/`) is an ignored file to git, so removing its worktree deletes it, history and edits included.
 - **Linux only** for writing a clone's config: the location checks read `/proc/self/fd`. Elsewhere dish configures no clone.

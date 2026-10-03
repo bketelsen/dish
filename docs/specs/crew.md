@@ -100,6 +100,8 @@ delegate({
   to?,             // an existing crew child's id: send it this task as a follow-up (fix round) instead of starting a new child
   reviews?,        // reviewer only: the crew child id whose work is reviewed, or "main" for the main agent's own work
   model?,          // optional override, a model id from crew.yaml's families; not allowed to break the reviewer rule
+  worktree?,       // a coder's worktree, from dish-workspaces (6b: see the projects and workspaces spec)
+  gateOverride?,   // the main agent's ruling to review work whose gate hasn't passed (6c: see Gates, below)
 })
 → { child, role, model, label }
 ```
@@ -187,6 +189,8 @@ It moves here from `dish-prompts`, as `presets/dish.patch.yml`, still generated 
 
   Messages from children crew didn't start pass through untouched.
 
+  A coder bound to a worktree gets one more sentence after the report, on how its gate ended ([Gates](#gates-6c)).
+
 ## The record
 
 Crew keeps its own runtime record, because the session log can't hold custom events. It lives in `$XDG_DATA_HOME/dish/crew/`: `sessions/<sha256(parent session id)>/` per session, and `by-child/<sha256(child id)>` pointers so a child's runs are filed after a restart. Each session directory holds:
@@ -197,6 +201,32 @@ Crew keeps its own runtime record, because the session log can't hold custom eve
 - **Deleting old records:** session directories not written to for 180 days are pruned at startup.
 
 The notice gives the report's path. The main agent decides whether to promote a report into a repo's docs or, later, the memory vault.
+
+Since 6c, a run also keeps its gate results (`runs[].gates`), and a reviewer the main agent's `gateOverride` ([Gates](#gates-6c)).
+
+## Gates (6c)
+
+[dish-gates](gates.md) runs a project's gate when a coder bound to a worktree is about to finish, and keeps the results in crew's record. Crew reads `dishGates` with `ctx.get`, structurally, and doesn't depend on it: the service being there turns on everything below.
+- **`GateResult`** is crew's type: `{ turn, round, maxRounds, outcome: 'passed' | 'failed' | 'skipped' | 'error', command, exitCode, timedOut, durationMs, log, excerpt, reason?, at }` (the [gates spec](gates.md#the-record-crew) has each field).
+  - **Where it lives.** dish-gates writes it with `records.addGate(child, result)`, through the session's queue, awaited before the coder's turn can close. While the run is in progress the results are on the child (`ChildRecord.gates`); `endRun` moves them onto the run it files (`RunRecord.gates`), and the next run starts with none.
+  - **`latestGate(record)`** is the run in progress's last result, or, when no run is in progress, the latest run's last; none while a run is in progress and has none yet.
+  - A malformed result is refused (`TypeError`) and nothing is written; a file with one is set aside as corrupt, like any malformed field. Files from before 6c parse.
+- **The brief.** A bound coder's worktree block gains: "When you finish, dish runs this project's gate (`<gate>`) in your worktree, and a failure comes back to you. If you're blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped." The gate is `dishGates.gateFor(project)`. Without it, 6b's block is unchanged.
+- **The notice line,** after the report, from the run's last result:
+  - passed: "Gate passed (round N)."
+  - failed in the last round: "Gate FAILED after N rounds (`<gate>`, exit <code>); last lines:", the excerpt in a code fence longer than any run of backticks in it, then "Full log: `<log>`. Start a fix round with `to` or a fresh coder (escalation ladder)." A timeout says "stopped at its time limit" in place of the exit code;
+  - failed with a round to spare (the run ended some other way): "Gate failed in round N of M (`<gate>`, exit <code>), and the run ended before the coder finished again. Full log: `<log>`."
+  - skipped: "Gate skipped: <reason>."; error: "Gate not run: <reason>.";
+  - no result: "Gate not run.", only while dish-gates runs.
+
+  The collapsed row's sentence doesn't change.
+- **The review check.** A start with `reviews: <child>`, and a follow-up to a reviewer (a re-review), read the reviewed child's record through `lookup`, inside the session's lock. While that child is bound to a worktree and its gate hasn't passed, the call is refused, with where the gate stands and how to go on: "<role> «<title>» (child <id>)'s gate hasn't passed (<standing>). Send it a fix round with `to: "<id>"`, or start the review anyway with `gateOverride: "Ruling: what — why — cost if wrong"`." Not passed is:
+  - the child is still running ("it is still running"; wait for its notice);
+  - its latest run's last result isn't a pass ("failed, round 3 of 3; log <path>", "skipped: <reason>", "error: <reason>");
+  - that run has no result ("no gate result: it didn't run (for example, the coder ran before dish-gates was on)").
+
+  Not checked: unbound children, `reviews: "main"`, and any review while dish-gates isn't running.
+- **`gateOverride`** is the ruling, folded onto one line. An empty one is none, as for every optional parameter. One with nothing past a leading `Ruling:`, or the placeholder itself, is refused: "gateOverride needs the ruling itself: what — why — cost if wrong". A ruling is recorded on the reviewer (`ChildRecord.gateOverride`; a follow-up's replaces it), and the reviewer gets a block after its task, before the closing note: "The harness's gate for the work you review (<role> «<title>», child <id>) hasn't passed: <standing>. The main agent started this review anyway, with this ruling: <ruling>". A re-review without one keeps the reviewer's ruling while the reviewed child hasn't run since the reviewer started. When nothing is refused, `gateOverride` is ignored and not recorded.
 
 ## Seeing the crew
 

@@ -4,8 +4,9 @@
  * project's lock.
  *
  * - **Which worktrees:** only those dish made (a record in its state directory, which agents can't write), each at
- *   `<clone>/.worktrees/<slug>` on `dish/<slug>`. Anything else under `.worktrees/` (6c's `.cache`, a plan's ledger, a
- *   worktree made by hand) is never looked at, and no other worktree's administrative files are pruned.
+ *   `<clone>/.worktrees/<slug>` on `dish/<slug>`. Anything else under `.worktrees/` (a cache a project's `gateEnv` puts
+ *   there, a plan's ledger, a worktree made by hand) is never looked at, and no other worktree's administrative files are
+ *   pruned.
  * - **Merged** (`isMerged`): the pull request that holds the branch's tip is merged (GitHub's `commits/{tip}/pulls`
  *   lists one with `merged_at` set and `head.sha` the tip: squash merges included, and a branch that gained commits
  *   after its pull request merged excluded), or the branch has commits of its own and its tip is an ancestor of
