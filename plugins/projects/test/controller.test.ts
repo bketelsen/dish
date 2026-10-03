@@ -1150,6 +1150,70 @@ test('edit of a project the list does not have says so', async () => {
   assert.match(state().notice?.text ?? '', /acme\/missing/)
 })
 
+// --- focus ---------------------------------------------------------------------------------------
+
+/** Where the page was last asked to move focus, and whether that is a new request since `before`. */
+function focusedTo(state: PageState, before: PageState['focus']): string | undefined {
+  const focus = state.focus
+  return focus === undefined || focus.seq === before?.seq ? undefined : focus.to
+}
+
+test('focus: after an action that takes away the control that had it, the page is asked to move focus where the eye goes', async () => {
+  const made = await opened()
+  const { fake, page, state } = made
+  // Edit opens the form in the project's place: its heading.
+  let before = state().focus
+  await page.face.startEdit('acme/widget')
+  assert.equal(focusedTo(state(), before), 'form')
+  // Cancel goes back to the project.
+  before = state().focus
+  page.face.cancel()
+  assert.equal(focusedTo(state(), before), 'project')
+  // A saved edit: the project's heading.
+  await page.face.startEdit('acme/widget')
+  page.face.editField('role', 'changed')
+  await checked(made)
+  before = state().focus
+  await page.face.save()
+  assert.equal(state().form, null)
+  assert.equal(focusedTo(state(), before), 'project')
+  // A save the registry refuses: the notice that says why.
+  await page.face.startAdd()
+  await fillAdd(made, 'acme/new')
+  fake.entries.set('acme/new', fields())
+  before = state().focus
+  await page.face.save()
+  assert.notEqual(state().form, null)
+  assert.equal(focusedTo(state(), before), 'notice')
+  // Leaving that form for a project, once the edits are dropped (the question's buttons go): the project.
+  page.face.select('acme/widget')
+  before = state().focus
+  await page.face.confirmDiscard()
+  assert.equal(state().form, null)
+  assert.equal(focusedTo(state(), before), 'project')
+  // Cancel of a new project goes back to the project that is open.
+  await page.face.startAdd()
+  before = state().focus
+  page.face.cancel()
+  assert.equal(state().selected, 'acme/widget')
+  assert.equal(focusedTo(state(), before), 'project')
+  // Retry (its button may go with the state it leaves): the notice.
+  before = state().focus
+  await page.face.retry('acme/widget')
+  assert.equal(focusedTo(state(), before), 'notice')
+  // A removal takes the project away: the notice.
+  page.face.askRemove('acme/widget')
+  before = state().focus
+  await page.face.remove()
+  assert.equal(state().selected, undefined)
+  assert.equal(focusedTo(state(), before), 'notice')
+  // Nothing open after a cancel: the page's title.
+  await page.face.startAdd()
+  before = state().focus
+  page.face.cancel()
+  assert.equal(focusedTo(state(), before), 'page')
+})
+
 test('dismiss clears the notice', async () => {
   const { page, state } = await opened()
   await page.face.retry('acme/gadget')

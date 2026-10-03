@@ -169,6 +169,12 @@ const css = `
   -webkit-text-security: disc;
 }
 
+/* A button that is busy keeps focus (aria-disabled, not disabled), and looks as dsh draws a disabled one. */
+.dish-workspaces [aria-disabled='true'] {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
 /* Notes, notices and the question before a removal */
 .dish-workspaces-note {
   margin: 0;

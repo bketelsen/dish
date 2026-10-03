@@ -7,10 +7,15 @@ import type { PageNotice } from './controller.ts'
 import { skippedParts, stateLabel, stateTone } from './format.ts'
 import type { Notice } from './outcome.ts'
 
-/** The result of the last thing the person did, with what the registry itself said beneath it. */
-export function NoticeBar({ notice, dismiss }: { notice: PageNotice, dismiss: () => void }) {
+/** The result of the last thing the person did, with what the registry itself said beneath it. It can take focus (`id`). */
+export function NoticeBar({ id, notice, dismiss }: { id?: string, notice: PageNotice, dismiss: () => void }) {
   return (
-    <div className={`dish-projects-notice dish-projects-notice-bar dish-projects-notice-${notice.tone}`} role={notice.tone === 'error' ? 'alert' : 'status'}>
+    <div
+      id={id}
+      tabIndex={-1}
+      className={`dish-projects-notice dish-projects-notice-bar dish-projects-notice-${notice.tone}`}
+      role={notice.tone === 'error' ? 'alert' : 'status'}
+    >
       <div className="dish-projects-notice-body">
         <span>{notice.text}</span>
         {notice.detail !== undefined && notice.detail !== '' && <span className="dish-projects-muted">{notice.detail}</span>}

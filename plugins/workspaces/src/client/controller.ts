@@ -139,6 +139,16 @@ export function canTest(state: Pick<PageState, 'status' | 'testing' | 'credentia
   return true
 }
 
+/**
+ * Which card shows a failed status read, so it is shown once (with one Try again): the credentials card while there is
+ * no status yet (the first read failed, and the fields can't be drawn without the names it brings), else the status
+ * card. `undefined` when the last read didn't fail.
+ */
+export function statusErrorIn(state: Pick<PageState, 'status'>): 'credentials' | 'status' | undefined {
+  if (state.status.error === undefined) return undefined
+  return state.status.value === undefined ? 'credentials' : 'status'
+}
+
 // --- calls ---------------------------------------------------------------------------------------
 
 type Settled<T> = { ok: true, value: T } | { ok: false, notice: Notice }

@@ -359,6 +359,15 @@ const css = `
 .dish-projects .dish-projects-danger {
   color: var(--dsw-alias-state-error-primary);
 }
+/* A button that is busy keeps focus (aria-disabled, not disabled), and looks as dsh draws a disabled one. */
+.dish-projects [aria-disabled='true'] {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+/* Headings and the notice take focus after an action that took away the control that had it; a click doesn't ring them. */
+.dish-projects [tabindex='-1']:focus:not(:focus-visible) {
+  outline: none;
+}
 .dish-projects-confirm,
 .dish-projects-conflict {
   display: flex;

@@ -10,7 +10,7 @@ import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-setti
 import type { InjectFace } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ProjectInfo } from '../protocol.ts'
 import { canRetry } from './controller.ts'
-import type { PageState, ProjectsActions } from './controller.ts'
+import type { FocusRequest, PageState, ProjectsActions } from './controller.ts'
 import { Form } from './Form.tsx'
 import { fetchText, optionText, retryHint, statusLine, thenText } from './format.ts'
 import { LoadError, NoticeBar, Note, SkippedNote, StatusChip } from './parts.tsx'
@@ -20,6 +20,14 @@ type Props = SettingsSectionOwnerProps & InjectFace<ProjectsActions>
 
 type Actions = Omit<ProjectsActions, 'hooks'>
 
+/** The element each focus request goes to (the page's title when the one asked for isn't drawn). */
+const FOCUS_TARGETS: Record<FocusRequest['to'], string> = {
+  project: 'dish-projects-current',
+  form: 'dish-projects-form-title',
+  notice: 'dish-projects-notice',
+  page: 'dish-projects-title',
+}
+
 export function Projects(props: Props) {
   const { usePage, open, hide } = props
   const state = usePage(page => page)
@@ -28,6 +36,16 @@ export function Projects(props: Props) {
     void open()
     return () => { hide() }
   }, [open, hide])
+  // Focus where the controller asks, once per request: an action took away the control that had it, and focus would
+  // fall to the page. A request from before this mount isn't acted on.
+  const handled = useRef(state.focus?.seq)
+  useEffect(() => {
+    const focus = state.focus
+    if (focus === undefined || focus.seq === handled.current) return
+    handled.current = focus.seq
+    const target = document.getElementById(FOCUS_TARGETS[focus.to]) ?? document.getElementById(FOCUS_TARGETS.page)
+    target?.focus()
+  }, [state.focus])
   const { projects, selected, notice, form } = state
   // Without the list there is no telling what a name is up against, so there is nothing to show beside the error.
   const listed = state.listLoaded && (state.listError === undefined || projects.length > 0)
@@ -37,14 +55,14 @@ export function Projects(props: Props) {
 
   return (
     <div className="dish-projects">
-      <h2 className="dish-projects-title">Projects</h2>
+      <h2 className="dish-projects-title" id={FOCUS_TARGETS.page} tabIndex={-1}>Projects</h2>
       <p className="dish-projects-intro">
         The repositories dish works in. Adding one clones it (or adopts a clone already under the work root), runs its setup, and
         gives it a workspace in the sidebar. The list is projects.yaml in the config store: agents can propose changes to it, and
         you accept them on History.
       </p>
       {state.stream === 'down' && <p className="dish-projects-muted">Live updates paused. Reconnecting…</p>}
-      {notice !== undefined && <NoticeBar notice={notice} dismiss={props.dismiss} />}
+      {notice !== undefined && <NoticeBar id={FOCUS_TARGETS.notice} notice={notice} dismiss={props.dismiss} />}
       <Question state={state} actions={props} />
       {state.problem !== null && <Note tone="error">{brokenFileText(state.problem)}</Note>}
       {state.pendingProposals > 0 && <Note tone="warn">{proposalsText(state.pendingProposals)}</Note>}
@@ -155,7 +173,7 @@ function ProjectView({ state, project, actions }: { state: PageState, project: P
   return (
     <div className="dish-projects-stack">
       <div className="dish-projects-heading">
-        <h3 className="dish-projects-project-title">{name}</h3>
+        <h3 className="dish-projects-project-title" id={FOCUS_TARGETS.project} tabIndex={-1}>{name}</h3>
         <StatusChip state={status.state} />
       </div>
       {status.state === 'failed' && (
@@ -202,7 +220,8 @@ function ProjectView({ state, project, actions }: { state: PageState, project: P
       <RemoveControl project={project} state={state} actions={actions}>
         <Button variant="primary" size="sm" disabled={state.readOnly || !idle} onClick={() => { void actions.startEdit(name) }}>Edit</Button>
         {canRetry(project) && (
-          <Button variant="outline" size="sm" title={retryHint(status.state)} disabled={!idle} onClick={() => { void actions.retry(name) }}>
+          // aria-disabled, not disabled: Retry pressed would disable itself, and focus would fall to the page.
+          <Button variant="outline" size="sm" title={retryHint(status.state)} aria-disabled={!idle} onClick={() => { if (idle) void actions.retry(name) }}>
             {retrying ? 'Retrying…' : 'Retry'}
           </Button>
         )}

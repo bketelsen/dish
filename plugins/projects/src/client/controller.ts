@@ -31,6 +31,10 @@
  * - **Live updates** come from dish-config's remote, which may not be there: a change to `projects.yaml` or a proposal reads
  *   the list again, and without the remote nothing arrives that way.
  *
+ * - **Focus** follows the person: an action that takes away the control that had focus (Save and Cancel close the form,
+ *   Edit opens it, Remove takes the project away, Retry may take its own button away) asks the page to move focus
+ *   (`focus`) to where the eye goes next: the open project's heading, the form's, the notice, or the page's title.
+ *
  * Answers that arrive after the person has moved on are dropped, by a counter per kind of answer.
  */
 
@@ -128,6 +132,16 @@ export interface PageNotice extends Notice {
   tone: 'info' | 'success' | 'error'
 }
 
+/**
+ * Where the page moves focus once it has drawn the state that asks: `project` is the open project's heading, `form` the
+ * form's, `notice` the notice above the page, `page` the page's title (when there is no project open). `seq` is new
+ * with every request, so each is acted on once.
+ */
+export interface FocusRequest {
+  to: 'project' | 'form' | 'notice' | 'page'
+  seq: number
+}
+
 /** What is being done now, so a second click can't start it again: a save, a removal, or `retry:<project>`. */
 export type Busy = 'save' | 'remove' | `retry:${string}`
 
@@ -157,6 +171,8 @@ export interface PageState {
   busy?: Busy
   /** Whether dish-config's `watch` is delivering: `off` without its remote, `down` between a lost carrier and the next item. */
   stream: 'off' | 'connecting' | 'live' | 'down'
+  /** Where focus goes after the last action that took away the control that had it. */
+  focus?: FocusRequest
 }
 
 /** What a component can ask of the page, beside the `usePage` hook the `hooks` entry becomes. */
@@ -405,6 +421,9 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     if (form !== null) patch({ form: { ...form, ...next } })
   }
   const info = (text: string): PageNotice => ({ tone: 'info', text })
+  let focusSeq = 0
+  /** Ask the page to move focus to `to` once it has drawn this state. */
+  const focusOn = (to: FocusRequest['to']): void => { patch({ focus: { to, seq: ++focusSeq } }) }
 
   /** Bumped when the form is opened or closed: a write's answer for an earlier form is not for this page. */
   let formGeneration = 0
@@ -760,11 +779,13 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     }
     if (current.checking) {
       patch({ busy: undefined, notice: info('The settings changed while they were being checked — save again.') })
+      focusOn('notice')
       await settleEvents()
       return
     }
     if (current.problem !== null) {
       patch({ busy: undefined, notice: { tone: 'error', text: `Can't save: ${current.problem}` } })
+      focusOn('notice')
       await settleEvents()
       return
     }
@@ -774,6 +795,8 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     patch({ busy: undefined })
     if (!result.ok) {
       await refused(result, name)
+      // A conflict's panel takes focus itself; anything else is said in the notice.
+      if (get().conflict === undefined) focusOn('notice')
       return
     }
     const commit = result.value
@@ -785,6 +808,7 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     }
     closeForm()
     patch({ selected: name })
+    focusOn('project')
     await refreshProjects()
   }
 
@@ -811,6 +835,8 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
       if (result.code === 'CONFLICT' || result.code === 'NOT_FOUND') {
         patch({ notice: { tone: 'error', ...result.notice } })
         await refreshProjects()
+        // The project may be gone from the list, and Remove with it.
+        focusOn('notice')
         return
       }
       await refused(result, name)
@@ -825,6 +851,7 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     if (get().selected === name) patch({ selected: undefined })
     const form = get().form
     if (form !== null && form.name.trim() === name) closeForm()
+    focusOn('notice')
     await refreshProjects()
   }
 
@@ -837,6 +864,8 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     else patch({ notice: { tone: 'success', text: `Queued ${name} for onboarding` } })
     // Either way the status is what the service says now.
     await refreshProjects()
+    // A project queued again has no Retry while it is onboarded: the notice says what happened.
+    focusOn('notice')
   }
 
   // --- the face -----------------------------------------------------------------------------------
@@ -890,6 +919,8 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     }
     patch({ selected: name })
     await openForm(editForm(project, state.commit))
+    // Edit is gone with the project's view: the form's heading.
+    if (get().form?.mode === 'edit' && get().form?.name === name) focusOn('form')
   }
 
   const confirmDiscard = async (): Promise<void> => {
@@ -900,6 +931,8 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
     switch (confirm.then.to) {
       case 'select':
         select(confirm.then.name)
+        // The question's buttons are gone: the project it opened.
+        if (get().selected === confirm.then.name) focusOn('project')
         return
       case 'edit':
         await startEdit(confirm.then.name)
@@ -964,6 +997,8 @@ export function createProjects(api: ProjectsApi, options: ProjectsOptions = {}):
       if (writing()) return
       closeForm()
       if (get().confirm?.kind === 'discard') patch({ confirm: null })
+      const selected = get().selected
+      focusOn(selected !== undefined && get().projects.some(project => project.name === selected) ? 'project' : 'page')
     },
     askRemove,
     remove,

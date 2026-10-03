@@ -87,7 +87,7 @@ export function Form({ state, form, actions }: { state: PageState, form: FormSta
       onKeyDown={onKeyDown}
       onSubmit={(event) => { event.preventDefault(); if (!cannotSave) void actions.save() }}
     >
-      <h3 className="dish-projects-form-title">{adding ? 'Add a project' : `Edit ${form.name}`}</h3>
+      <h3 className="dish-projects-form-title" id="dish-projects-form-title" tabIndex={-1}>{adding ? 'Add a project' : `Edit ${form.name}`}</h3>
       {readOnly && <Note tone="warn">The config store isn't running, so projects can't be changed. Start dish-config to save.</Note>}
       {conflict !== undefined && <ConflictPanel form={form} theirs={conflict.theirs} actions={actions} />}
       <div className="dish-projects-grid">
@@ -136,7 +136,7 @@ export function Form({ state, form, actions }: { state: PageState, form: FormSta
         <TextField
           id="dish-projects-setup"
           label="Setup (optional)"
-          hint="Run in a fresh clone when the project is onboarded, outside the sandbox. Skipped in a clone that is already there. It may have several lines."
+          hint="Run in a fresh clone when the project is onboarded, outside the sandbox. Skipped in a clone that is already there. It may have several lines. It runs with dish's own Node and pnpm: for a repo whose tools mise manages, run them through mise, as mise exec -- pnpm install --frozen-lockfile (after mise trust, if mise asks for it)."
           value={form.fields.setup}
           placeholder="pnpm install --frozen-lockfile"
           multiline

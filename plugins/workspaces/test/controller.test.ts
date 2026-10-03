@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import { createAppCard, canTest } from '../src/client/controller.ts'
+import { createAppCard, canTest, statusErrorIn } from '../src/client/controller.ts'
 import type { AppCardController, PageState } from '../src/client/controller.ts'
 import { APP_ID_MAX, KEY_MAX, appIdValue, privateKeyValue } from '../src/client/input.ts'
 import { relativeTime, selectionText, sourceLabel } from '../src/client/format.ts'
@@ -231,6 +231,21 @@ test('a status that can\'t be read is an error with a way to try again, and the 
   assert.equal(r.state().status.load, 'ready')
   assert.equal(r.state().credentials.load, 'ready')
   assert.equal(r.credentials.calls.length, 1)
+})
+
+test('a status read that fails is shown once: in the credentials card while there is no status yet, then in the status card', async () => {
+  const r = rig()
+  assert.equal(statusErrorIn(r.state()), undefined)
+  r.app.down = true
+  await r.card.face.open()
+  assert.equal(statusErrorIn(r.state()), 'credentials', 'the first read failed: the names the fields need are missing too')
+  r.app.down = false
+  await r.card.face.refresh()
+  assert.equal(statusErrorIn(r.state()), undefined)
+  r.app.down = true
+  await r.card.face.refresh()
+  assert.equal(r.state().status.value !== undefined, true, 'the last status is kept')
+  assert.equal(statusErrorIn(r.state()), 'status')
 })
 
 test('dsh\'s credentials can\'t be read: an error for the credentials, and the status stands', async () => {

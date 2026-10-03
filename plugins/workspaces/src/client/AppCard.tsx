@@ -14,7 +14,7 @@ import { Button, Input, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { InjectFace } from '@deepseek-ai/dsh-client-ui-slots'
 import type { AppStatus } from '../protocol.ts'
-import { canTest } from './controller.ts'
+import { canTest, statusErrorIn } from './controller.ts'
 import type { AppCardActions, CredentialKind, CredentialState, PageNotice, PageState } from './controller.ts'
 import { relativeTime, selectionText, sourceLabel } from './format.ts'
 import type { Notice } from './outcome.ts'
@@ -63,9 +63,7 @@ function CredentialsCard({ state, actions }: { state: PageState, actions: Action
         </Note>
       )}
       {credentials.load === 'error' && credentials.error !== undefined && <LoadError notice={credentials.error} retry={() => { void actions.refresh() }} />}
-      {state.status.load === 'error' && state.status.error !== undefined && names === undefined && (
-        <LoadError notice={state.status.error} retry={() => { void actions.refresh() }} />
-      )}
+      {statusErrorIn(state) === 'credentials' && <LoadError notice={state.status.error!} retry={() => { void actions.refresh() }} />}
       {names === undefined && state.status.load === 'loading' && <p className="dish-workspaces-muted">Checking with dish and dsh…</p>}
       {names !== undefined && credentials.load === 'loading' && <p className="dish-workspaces-muted">Checking with dsh…</p>}
       {names !== undefined && (
@@ -266,6 +264,8 @@ function StatusCard({ state, actions }: { state: PageState, actions: Actions }) 
   const value = status.value
   // With dsh saying a credential is missing, a test's "not set" is the card above's news already.
   const missing = credentials.load === 'ready' && !(state.appId.configured && state.privateKey.configured)
+  // aria-disabled, not disabled: a button that disables itself while its test is out drops focus to the page.
+  const testable = canTest(state)
   return (
     <section className="dish-workspaces-card" aria-labelledby="dish-workspaces-status-title">
       <div className="dish-workspaces-card-head">
@@ -274,13 +274,13 @@ function StatusCard({ state, actions }: { state: PageState, actions: Actions }) 
           {value !== undefined && !missing && <Verdict value={value} />}
         </h3>
         <div className="dish-workspaces-actions">
-          <Button variant="outline" size="sm" disabled={!canTest(state)} onClick={() => { void actions.runTest() }}>
+          <Button variant="outline" size="sm" aria-disabled={!testable} onClick={() => { if (testable) void actions.runTest() }}>
             {testing ? 'Testing…' : 'Test'}
           </Button>
         </div>
       </div>
       {status.load === 'loading' && value === undefined && <p className="dish-workspaces-muted">Loading…</p>}
-      {status.error !== undefined && <LoadError notice={status.error} retry={() => { void actions.refresh() }} />}
+      {statusErrorIn(state) === 'status' && <LoadError notice={status.error!} retry={() => { void actions.refresh() }} />}
       {testNotice !== undefined && (
         <div className="dish-workspaces-notice dish-workspaces-notice-error" role="alert">
           <div className="dish-workspaces-notice-body">
