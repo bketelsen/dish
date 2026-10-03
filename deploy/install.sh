@@ -10,13 +10,26 @@
 #   DISH_USER_NAME   the store's commit author name. Required.
 #   DISH_USER_EMAIL  the store's commit author email. Required.
 #   DISH_PROFILE     the dsh profile to install into. Default `web`.
+#   DISH_SANDBOX_HOME  `on` runs every sandboxed agent command through deploy/dish-sandbox, which lets it write the home
+#                    directory less a protected list: the profile's `sandbox` row gets it as its runnerCommand. `off`,
+#                    empty or unset takes that away again. update.sh (the VM) sets it to `on`; dev leaves it off unless
+#                    you set it (docs/specs/sandbox-home.md).
 # The profile lives under $DSH_HOME (default ~/.dsh). Nothing here is secret, and nothing here is printed that is.
 #
 # Steps, in order. A failure stops the script and names the step on stderr:
 #   1. pnpm install --frozen-lockfile, then pnpm build
-#   2. create the profile when it is missing
-#   3. write dish's rows into the profile's cordis.patch.yml (deploy/profile.ts)
+#   2. create the profile when it is missing, and have its pnpm installs copy (deploy/pnpm-copies.ts)
+#   3. write dish's rows into the profile's cordis.patch.yml (deploy/profile.ts), the sandbox row included
 #   4. link the bundles that are not linked yet
+#   5. replace the files in the checkout's and the profile's node_modules that are hard links into pnpm's store
+#
+# Copies, not links (steps 2 and 5). pnpm hard-links its store's files into node_modules where it can (the VM's ext4),
+# so the checkout's files would share their inodes with every agent's project, and with DISH_SANDBOX_HOME on a sandboxed
+# command can write the store and those projects. Step 1 installs with `--package-import-method=clone-or-copy`, the
+# profile's pnpm-workspace.yaml says `packageImportMethod: clone-or-copy`, and step 5 copies what earlier installs
+# linked, which pnpm never re-imports. The flag is on the command, not in the checkout's pnpm-workspace.yaml: that file
+# goes with every clone of dish, and agents' clones and worktrees should keep linking (copies of ~545 MB each on ext4).
+# None of this touches the store itself, or which store is used (the store-pin contract below).
 #
 # The rows go in before the bundles on purpose. The dish-config row patches a row that the config bundle inserts, so
 # between steps 3 and 4 it has no target. dsh only complains about that when it composes the profile (`--dump-config`
@@ -69,6 +82,14 @@ trap 'exit 143' TERM HUP
 : "${DISH_USER_NAME:?DISH_USER_NAME must be set: the commit author name for the config store}"
 : "${DISH_USER_EMAIL:?DISH_USER_EMAIL must be set: the commit author email for the config store}"
 profile=${DISH_PROFILE:-web}
+case ${DISH_SANDBOX_HOME-} in
+  on) sandbox_home=on ;;
+  off | '') sandbox_home=off ;;
+  *)
+    echo "install: DISH_SANDBOX_HOME must be on or off (unset means off), not \"$DISH_SANDBOX_HOME\"" >&2
+    exit 1
+    ;;
+esac
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd -- "$root"
@@ -116,7 +137,7 @@ bundle_state() {
 }
 
 begin 'pnpm install --frozen-lockfile'
-pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile --package-import-method=clone-or-copy
 
 begin 'pnpm build'
 pnpm build
@@ -134,6 +155,10 @@ if [ ! -f "$profile_dir/package.json" ]; then
   changed=1
 fi
 
+# dsh wrote the profile's pnpm-workspace.yaml when it made the profile; dsh's plugin manager runs pnpm there later too.
+begin "having the $profile profile's pnpm installs copy"
+profile_copies=$(node deploy/pnpm-copies.ts --workspace "$profile_dir/pnpm-workspace.yaml")
+
 begin "writing dish's rows into $patch"
 remote_args=(--no-remote)
 remote_shown='none, the store stays local'
@@ -141,8 +166,10 @@ if [ -n "$DISH_REMOTE" ]; then
   remote_args=("--remote=$DISH_REMOTE")
   remote_shown=$DISH_REMOTE
 fi
+sandbox_args=(--no-sandbox-runner)
+if [ "$sandbox_home" = on ]; then sandbox_args=("--sandbox-runner=$root/deploy/dish-sandbox"); fi
 # The --opt=value form, so that a value that starts with a dash is not read as another option.
-rows=$(node deploy/profile.ts --patch "$patch" "${remote_args[@]}" "--user-name=$DISH_USER_NAME" "--user-email=$DISH_USER_EMAIL")
+rows=$(node deploy/profile.ts --patch "$patch" "${remote_args[@]}" "--user-name=$DISH_USER_NAME" "--user-email=$DISH_USER_EMAIL" "${sandbox_args[@]}")
 if [ "$rows" != unchanged ]; then changed=1; fi
 
 added=()
@@ -160,9 +187,17 @@ for name in "${bundles[@]}"; do
   changed=1
 done
 
+begin "replacing hard links into pnpm's store with copies"
+unlinked=$(node deploy/pnpm-copies.ts --unlink "$root/node_modules" --unlink "$profile_dir/node_modules")
+copied=0
+while read -r _ count _; do copied=$((copied + count)); done <<<"$unlinked"
+
 step='printing the summary'
 echo "install: profile $profile at $profile_dir: $profile_made"
 echo "install: dish rows ($remote_shown): $rows"
+echo "install: sandbox home: $sandbox_home"
+echo "install: the profile's pnpm installs copy: ${profile_copies#workspace: }"
+echo "install: links into pnpm's store replaced by copies: $copied"
 echo "install: bundles added: ${added[*]:-none}; already linked: ${linked[*]:-none}"
 if [ "$changed" -eq 0 ]; then
   echo 'install: no changes to the profile'

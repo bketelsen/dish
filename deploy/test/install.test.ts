@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -177,6 +177,21 @@ function assertRowsFirst(calls: DshCall[]): void {
   for (const call of adds) assert.equal(call.patchHasRow, true, `dsh ${call.args.join(' ')}: the patch file had no dish-config row yet`)
 }
 
+/** The first regular file under `dir` with more than one link, if any: a link into pnpm's store, or anything else. */
+function firstLinked(dir: string): string | undefined {
+  const pending = [dir]
+  while (pending.length > 0) {
+    const current = pending.pop()!
+    for (const name of readdirSync(current)) {
+      const path = join(current, name)
+      const entry = lstatSync(path)
+      if (entry.isDirectory()) pending.push(path)
+      else if (entry.isFile() && entry.nlink > 1) return path
+    }
+  }
+  return undefined
+}
+
 /** The account's own XDG directories hold nothing of dish's: no `dish` directory, so no config store. */
 async function assertNoStore(scratch: Scratch): Promise<void> {
   for (const [name, path] of Object.entries(scratch.xdg)) {
@@ -192,6 +207,18 @@ for (const name of ['DISH_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL']) {
     const result = await run(INSTALL, [], scratch)
     assert.notEqual(result.code, 0)
     assert.match(result.stderr, new RegExp(`${name} must be set`))
+    assert.match(result.stderr, /install: FAILED at step: checking the inputs/)
+    assert.equal(existsSync(scratch.dshHome), false, 'no dsh home was made')
+    assert.equal(dshCalls(scratch).length, 0)
+  })
+}
+
+for (const value of ['1', 'true', 'ON']) {
+  test(`install.sh stops before doing anything with DISH_SANDBOX_HOME=${value}: it is on or off`, async () => {
+    const scratch = await makeScratch({ DISH_SANDBOX_HOME: value })
+    const result = await run(INSTALL, [], scratch)
+    assert.notEqual(result.code, 0)
+    assert.match(result.stderr, new RegExp(`install: DISH_SANDBOX_HOME must be on or off \\(unset means off\\), not "${value}"`))
     assert.match(result.stderr, /install: FAILED at step: checking the inputs/)
     assert.equal(existsSync(scratch.dshHome), false, 'no dsh home was made')
     assert.equal(dshCalls(scratch).length, 0)
@@ -215,7 +242,16 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.match(first.stdout, /install: profile web at .*: created/)
   assert.match(first.stdout, /install: dish rows \(.*\): updated/)
   assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge web projects workspaces; already linked: none/)
+  assert.match(first.stdout, /^install: sandbox home: off$/m)
+  assert.match(first.stdout, /^install: the profile's pnpm installs copy: updated$/m)
+  assert.match(first.stdout, /^install: links into pnpm's store replaced by copies: \d+$/m)
   assert.match(first.stdout, /install: profile changed/)
+  // dish's own installs are copies, not links into the store an agent's command can write.
+  const profileWorkspace = parse(await readFile(join(scratch.dshHome, 'profiles', 'web', 'pnpm-workspace.yaml'), 'utf8')) as Record<string, unknown>
+  assert.equal(profileWorkspace.packageImportMethod, 'clone-or-copy')
+  assert.equal(profileWorkspace.nodeLinker, 'hoisted', "dsh's own settings stay")
+  assert.equal(firstLinked(join(scratch.dshHome, 'profiles', 'web', 'node_modules')), undefined)
+  assert.equal(firstLinked(join(ROOT, 'node_modules')), undefined)
   const firstCalls = dshCalls(scratch)
   assert.equal(firstCalls.length, 1 + BUNDLES.length, 'one dsh command makes the profile, one links each bundle')
   assertIsolated(scratch, firstCalls)
@@ -232,6 +268,8 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.match(second.stdout, /install: dish rows \(.*\): unchanged/)
   assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge web projects workspaces/)
   assert.match(second.stdout, /install: no changes to the profile/)
+  assert.match(second.stdout, /^install: the profile's pnpm installs copy: unchanged$/m)
+  assert.match(second.stdout, /^install: links into pnpm's store replaced by copies: 0$/m)
   assert.equal(dshCalls(scratch).length, 1 + BUNDLES.length, 'the second run starts no dsh command')
   assert.equal(statSync(patch).mtimeMs, patchBefore, 'the patch file was not rewritten')
   assert.equal(statSync(manifest).mtimeMs, manifestBefore, "the profile's package.json was not rewritten")
@@ -240,6 +278,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
 
   // The first install made `dish` the default preset. A default chosen in the UI afterwards is kept by the next install.
   assert.match(patchText, /^ {4}default: standard\n {4}selectedDefault: dish\n/m)
+  assert.doesNotMatch(patchText, /id: sandbox/, 'with DISH_SANDBOX_HOME unset, no sandbox row')
   const chosenText = patchText.replace('    selectedDefault: dish\n', '    selectedDefault: standard\n')
   assert.notEqual(chosenText, patchText)
   await writeFile(patch, chosenText)
@@ -289,24 +328,59 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   await assertNoStore(scratch)
 })
 
-test('install.sh makes a custom profile from the web one, takes an empty remote, and values that start with a dash', { skip: SKIP, timeout: 600_000 }, async () => {
-  const scratch = await makeScratch({ DISH_PROFILE: 'dish-scratch', DISH_REMOTE: '', DISH_USER_NAME: '-Dash Test', DISH_USER_EMAIL: '--dash@example.invalid' })
+test('install.sh makes a custom profile from the web one, takes an empty remote, values that start with a dash, and DISH_SANDBOX_HOME', { skip: SKIP, timeout: 600_000 }, async () => {
+  const scratch = await makeScratch({ DISH_PROFILE: 'dish-scratch', DISH_REMOTE: '', DISH_USER_NAME: '-Dash Test', DISH_USER_EMAIL: '--dash@example.invalid', DISH_SANDBOX_HOME: 'on' })
   const profile = join(scratch.dshHome, 'profiles', 'dish-scratch')
+  const patch = join(profile, 'cordis.patch.yml')
+  type Row = { id: string; name?: string; config: Record<string, unknown> }
+  const sandboxRow = async (): Promise<Row | undefined> => (parse(await readFile(patch, 'utf8')) as Row[]).find((row) => row.id === 'sandbox')
 
   const first = await run(INSTALL, [], scratch)
   assert.equal(first.code, 0, first.stderr)
   assert.match(first.stdout, /install: profile dish-scratch at .*: created/)
   assert.match(first.stdout, /install: dish rows \(none, the store stays local\): updated/)
+  assert.match(first.stdout, /^install: sandbox home: on$/m)
   const manifest = JSON.parse(await readFile(join(profile, 'package.json'), 'utf8')) as { dsh: { profile: { bundles: string[] } } }
   assert.deepEqual(manifest.dsh.profile.bundles, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', ...BUNDLES])
-  const rows = parse(await readFile(join(profile, 'cordis.patch.yml'), 'utf8')) as Array<{ id: string; config: Record<string, string> }>
+  const rows = parse(await readFile(patch, 'utf8')) as Row[]
   assert.deepEqual(rows.find((row) => row.id === 'dish-config')?.config, { remote: '', userName: '-Dash Test', userEmail: '--dash@example.invalid' })
+  // The runner is this checkout's own script, by the path pwd -P gives.
+  assert.deepEqual(await sandboxRow(), {
+    id: 'sandbox',
+    name: '@deepseek-ai/dsh-sandbox-local',
+    config: { runnerCommand: [join(realpathSync(ROOT), 'deploy', 'dish-sandbox')], runnerFailureSignatures: ['bwrap: ', 'dish-sandbox: '] },
+  })
   assertIsolated(scratch, dshCalls(scratch))
   assertRowsFirst(dshCalls(scratch))
+
+  // What dsh makes of it: the sandbox provider's row, patched with the runner.
+  const throwaway = join(scratch.dir, 'throwaway')
+  const dump = await run('pnpm', ['exec', 'dsh', '--profile', 'dish-scratch', '--dump-config'], scratch, {
+    ...scratch.env,
+    DSH_DISH_HOME: undefined,
+    XDG_CONFIG_HOME: join(throwaway, 'config'),
+    XDG_STATE_HOME: join(throwaway, 'state'),
+    XDG_DATA_HOME: join(throwaway, 'data'),
+    XDG_CACHE_HOME: join(throwaway, 'cache'),
+  })
+  assert.equal(dump.code, 0, dump.stderr)
+  // A long path is folded (`- >-` and the path on the next line).
+  assert.match(dump.stdout, /^# == @deepseek-ai\/dsh-base, patched by .*cordis\.patch\.yml\n- id: sandbox\n {2}name: '@deepseek-ai\/dsh-sandbox-local'\n {2}config:\n {4}runnerCommand:\n {6}- (?:>-\n {8})?\/\S*\/deploy\/dish-sandbox\n {4}runnerFailureSignatures:\n {6}- 'bwrap: '\n {6}- 'dish-sandbox: '\n/m)
 
   const second = await run(INSTALL, [], scratch)
   assert.equal(second.code, 0, second.stderr)
   assert.match(second.stdout, /install: no changes to the profile/)
+
+  // Off takes the row away again, which changes the profile; unset is off too.
+  const off = await run(INSTALL, [], scratch, { ...scratch.env, DISH_SANDBOX_HOME: 'off' })
+  assert.equal(off.code, 0, off.stderr)
+  assert.match(off.stdout, /^install: dish rows \(none, the store stays local\): updated$/m)
+  assert.match(off.stdout, /^install: sandbox home: off$/m)
+  assert.match(off.stdout, /install: profile changed/)
+  assert.equal(await sandboxRow(), undefined)
+  const unset = await run(INSTALL, [], scratch, { ...scratch.env, DISH_SANDBOX_HOME: undefined })
+  assert.equal(unset.code, 0, unset.stderr)
+  assert.match(unset.stdout, /install: no changes to the profile/)
   await assertNoStore(scratch)
 })
 
