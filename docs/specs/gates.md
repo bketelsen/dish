@@ -39,7 +39,7 @@ When a crew coder bound to a worktree is about to end its turn, dish runs the pr
 
 - **Gates longer than 10 minutes.** A long build like snosi's image isn't a gate; use its lint or validate step. Open item 1 asks whether dish could wait longer itself.
 - **Gating the main agent's own work.** Its skills tell it to run the gate.
-- **Pushing, PRs and the escalation ladder beyond a turn's rounds** (step 7) (built in step 7: [orchestrator](orchestrator.md)).
+- **Pushing, PRs and the escalation ladder beyond a turn's rounds** (built in step 7: [orchestrator](orchestrator.md)).
 
 ## The hook
 

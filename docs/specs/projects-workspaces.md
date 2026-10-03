@@ -4,9 +4,9 @@ Status: merged as [bketelsen/dish#7](https://github.com/bketelsen/dish/pull/7) a
 
 ## Rollout (2026-10-03)
 
-- **One App, for now.** The VM uses the dev App, `bketelsen-dish-dev`, read-only. The separate prod App of decision 7, `bketelsen-dish` in the plan's rollout, hasn't been made.
+- **One App, for now.** The VM uses the dev App, `bketelsen-dish-dev`, read-only. The separate prod App of decision 7, `bketelsen-dish` in the plan's rollout, hasn't been made. *Later on 2026-10-03:* you made it, with write access, for step 7, and the VM uses it; dev keeps `bketelsen-dish-dev`.
 - **Your chat test passed,** on the project `bketelsen/clippy`: `git fetch`, `worktree` create and list, a bound coder committing as `bketelsen-dish-dev[bot]`, `remove` with `force`, and `git push` refused with 403.
-- **Not reported yet:** the squash-merge sweep check, step 8 of the plan's [rollout](../plans/2026-10-02-projects.md#the-rollout-for-you).
+- **The squash-merge sweep check,** step 8 of the plan's [rollout](../plans/2026-10-02-projects.md#the-rollout-for-you), was done on 2026-10-03.
 - **Since the merge,** a worktree's setup runs in the sandbox ([bketelsen/dish#10](https://github.com/bketelsen/dish/pull/10)), as [Notes from the build](#notes-from-the-build) say.
 
 ## Summary

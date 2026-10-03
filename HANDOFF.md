@@ -28,7 +28,7 @@ Everything below is merged and running on the VM.
 | Copilot, config store, prompts, skills, crew, judge, web settings | steps up to 6a | |
 | `ops` (6a): prod and dev, `dish-update`, `dish-url` | `df9c4b1`; fleet #38 and #39 | |
 | friction fixes and one-approval | `8545e8d`, `8a1ff3d` | |
-| `projects` + `workspaces` (6b) | #7, with follow-up #10 | The chat test passed on `bketelsen/clippy`. The squash-merge sweep check (plan step 8) hasn't been run yet. |
+| `projects` + `workspaces` (6b) | #7, with follow-up #10 | The chat test passed on `bketelsen/clippy`, and the squash-merge sweep check (plan step 8) was done on 2026-10-03. |
 | `sandbox-home` | #9 | The writable home is live, less a protected list (spec: [sandbox-home](docs/specs/sandbox-home.md)). |
 | The judge's read-only rule | #11 | A read-only command runs without the task check. |
 | The account's mise config and toolchains | fleet #40 and #41 | Node 24.21.0, pnpm 11.25.0, Go 1.27.1, Python 3.14.8. Configs under `~/work` are trusted. |
