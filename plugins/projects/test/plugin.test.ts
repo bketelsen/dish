@@ -10,8 +10,8 @@ import { PROJECTS_PATH, SEED_TEXT, namespaceSpec, serializeProjects } from '../s
 import type { ProjectFields } from '../src/registry.ts'
 import type { ProjectStatus } from '../src/status.ts'
 import {
-  captureStderr, fakeDriver, freshInstance, mountConfig, mountProjects, outsideCommit, provideStub, tempDir, useScratchEnv, waitFor,
-  watchLogs,
+  captureStderr, fakeDriver, freshInstance, mountConfig, mountProjects, outsideCommit, provideStub, tempDir, useScratchEnv, wakeAll,
+  waitFor, watchLogs, whenFound,
 } from './helpers.ts'
 
 useScratchEnv()
@@ -44,8 +44,12 @@ async function start(options: { driver?: boolean, repository?: string, keepInsta
   const fake = fakeDriver()
   const changed: string[][] = []
   const statuses: Array<[string, ProjectStatus]> = []
+  const statusWakers = new Set<() => void>()
   ctx.on('dish-projects/changed', (names) => { changed.push(names) })
-  ctx.on('dish-projects/status', (name, status) => { statuses.push([name, status]) })
+  ctx.on('dish-projects/status', (name, status) => {
+    statuses.push([name, status])
+    wakeAll(statusWakers)
+  })
   let config: ReturnType<typeof mountConfig> | undefined = mountConfig(ctx, repository)
   await config
   let stub = options.driver === false ? undefined : provideStub(ctx, 'dishWorkspaces', fake.driver)
@@ -63,6 +67,17 @@ async function start(options: { driver?: boolean, repository?: string, keepInsta
     statusFile: instance?.statusFile,
     projects,
     service: () => ctx.get('dishProjects') as DishProjects,
+    /**
+     * The first `dish-projects/status` of `name` that `check` accepts, among those emitted from the `from`th on: one
+     * emitted already, or the next. Told of each as it is emitted (no polling).
+     */
+    reached: (what: string, name: string, check: (status: ProjectStatus) => boolean, from = 0) => whenFound(what, () => {
+      for (let index = from; index < statuses.length; index++) {
+        const [project, status] = statuses[index]!
+        if (project === name && check(status)) return status
+      }
+      return undefined
+    }, statusWakers),
     write: (text: string) => ctx.dishConfig.write([{ path: PROJECTS_PATH, text }], { author: USER }),
     provideDriver: async () => {
       stub = provideStub(ctx, 'dishWorkspaces', fake.driver)
@@ -413,13 +428,17 @@ test('without dish-workspaces a project waits as pending and says why; it is onb
   const run = await start({ driver: false })
   try {
     await run.write(registry({ 'acme/widget': fields() }))
-    await waitFor('the project to say why it waits', () => run.service().status('acme/widget').message === 'dish-workspaces isn\'t running')
+    // Event-driven throughout: the job that found no dish-workspaces may still be saving this status when the driver is
+    // provided below (as under load), which must not drop the onboarding (onboarding.test.ts has that race exactly).
+    const waiting = await run.reached('the project to say why it waits', 'acme/widget', status => status.message === 'dish-workspaces isn\'t running')
+    assert.equal(waiting.state, 'pending')
     assert.equal(run.service().status('acme/widget').state, 'pending')
     assert.equal(run.fake.calls.length, 0)
 
     await run.provideDriver()
     ;(await run.fake.next('onboard', 'acme/widget')).resolve()
-    await waitState(run.service, 'acme/widget', 'ready')
+    const ready = await run.reached('the project to be ready', 'acme/widget', status => status.state === 'ready')
+    assert.equal(ready.message, undefined)
 
     // dish-workspaces restarts: its clones are prepared again.
     await run.removeDriver()

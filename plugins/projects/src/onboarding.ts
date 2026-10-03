@@ -7,7 +7,9 @@
  *   lock still guards its clone.
  * - **No duplicates.** A project already queued isn't queued again: the queued job takes the newer fields, and an
  *   onboarding asked for while a prepare is queued turns that job into an onboarding. A project whose onboarding is
- *   running isn't queued again; one whose prepare is running gets its onboarding queued behind it.
+ *   running isn't queued again; one whose prepare is running gets its onboarding queued behind it. A job whose end is
+ *   decided (its driver call has settled, or it found no driver) and is only recording it counts no more: what is
+ *   asked for then (dish-workspaces back, the fields changed) is queued behind it, not dropped.
  * - **Status.** Each step `dish-workspaces` reports moves the project's status (`installation`, `clone` and
  *   `configure` are cloning; `setup` and `workspace` are setup; any other is ignored), and the end is `ready` or
  *   `failed`. Each change is set in the status store and emitted. A job that dish-projects aborted (a removal, a stop)
@@ -87,7 +89,10 @@ interface Job {
 
 interface Running extends Job {
   controller: AbortController
-  /** The driver's call has settled: what is left is the job's own record, which an interrupt must not undo. */
+  /**
+   * The driver's call has settled, or there was no driver: what is left is the job's own record, which an interrupt must
+   * not undo, and which a new job for the project needn't wait to be queued behind.
+   */
   finishing: boolean
   /** The job has settled. */
   settled: boolean
@@ -150,7 +155,7 @@ export class Onboarding {
       return
     }
     const running = this.#running
-    if (running !== undefined && running.key === key && !running.controller.signal.aborted) {
+    if (running !== undefined && running.key === key && !running.controller.signal.aborted && !running.finishing) {
       if (running.kind === 'onboard' || kind === 'prepare') return
     }
     this.#queue.push({ key, project, kind })
@@ -269,6 +274,8 @@ export class Onboarding {
     const { signal } = running.controller
     const driver = this.#workspaces()
     if (driver === undefined) {
+      // Decided: dish-workspaces appearing while this is saved queues the project again (see `enqueue`).
+      running.finishing = true
       await this.#record(project, { state: 'pending', message: NO_WORKSPACES, at: this.#now() })
       return
     }

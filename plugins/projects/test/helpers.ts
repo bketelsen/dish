@@ -77,6 +77,38 @@ export async function waitFor<T>(what: string, check: () => Promise<T | undefine
   }
 }
 
+/**
+ * Wait, without polling, for `find` to give something: it is asked now, and again each time a waker in `wakers` is
+ * called (the code that changes what it looks at calls them all). Fails naming `what` if nothing comes within
+ * `deadlineMs`: a diagnostic for a wait that will never end, under the runner's own 60 s, not a pace.
+ */
+export function whenFound<T>(what: string, find: () => T | undefined, wakers: Set<() => void>, deadlineMs = 50_000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const now = find()
+    if (now !== undefined) {
+      resolve(now)
+      return
+    }
+    const wake = (): void => {
+      const found = find()
+      if (found === undefined) return
+      wakers.delete(wake)
+      clearTimeout(deadline)
+      resolve(found)
+    }
+    const deadline = setTimeout(() => {
+      wakers.delete(wake)
+      reject(new Error(`${what} never came (waited ${deadlineMs / 1000} s)`))
+    }, deadlineMs)
+    wakers.add(wake)
+  })
+}
+
+/** Call every waker of `wakers` (see `whenFound`). */
+export function wakeAll(wakers: Set<() => void>): void {
+  for (const wake of [...wakers]) wake()
+}
+
 /** Mount dish-config on `repository`, with terminal output off and a person's identity of its own. */
 export function mountConfig(ctx: Context, repository: string, config: Partial<configPlugin.Config> = {}) {
   return ctx.plugin(configPlugin, {
@@ -164,10 +196,11 @@ export interface DriverCall {
 
 /**
  * A `dishWorkspaces` stand-in whose every call waits until the test settles it. `calls` lists them in order.
- * `onboard` resolves with setup run unless the test says otherwise.
+ * `onboard` resolves with setup run unless the test says otherwise. `next` is told of each call as it is made (no polling).
  */
 export function fakeDriver(): { driver: WorkspacesDriver, calls: DriverCall[], next(kind: 'onboard' | 'prepare', name: string): Promise<DriverCall> } {
   const calls: DriverCall[] = []
+  const wakers = new Set<() => void>()
   const call = (kind: 'onboard' | 'prepare', target: Project, signal?: AbortSignal, progress: (step: string) => void = () => {}) =>
     new Promise<{ setup: { ran: boolean, reason?: string } }>((resolve, reject) => {
       const entry: DriverCall = {
@@ -180,6 +213,7 @@ export function fakeDriver(): { driver: WorkspacesDriver, calls: DriverCall[], n
         reject: (error) => { entry.settled = true; reject(error) },
       }
       calls.push(entry)
+      wakeAll(wakers)
     })
   const driver: WorkspacesDriver = {
     onboard: (target, options) => call('onboard', target, options.signal, options.progress),
@@ -188,7 +222,7 @@ export function fakeDriver(): { driver: WorkspacesDriver, calls: DriverCall[], n
   return {
     driver,
     calls,
-    next: (kind, name) => waitFor(`a ${kind} call for ${name}`, () => calls.find(entry => !entry.settled && entry.kind === kind && entry.project.name === name)),
+    next: (kind, name) => whenFound(`a ${kind} call for ${name}`, () => calls.find(entry => !entry.settled && entry.kind === kind && entry.project.name === name), wakers),
   }
 }
 

@@ -229,6 +229,40 @@ test('without dish-workspaces an onboarding leaves the project pending and says 
   assert.deepEqual(events.map(([name, value]) => `${name} ${value.state}`), ['acme/a pending'])
 })
 
+test('dish-workspaces appearing while a job is still recording that it waits for it: the project is queued again, not dropped', async () => {
+  const { fake, onboarding, status, state } = await harness()
+  // The plugin's restart pass (dish-workspaces appeared) queues the project while the job that found no driver, or saw
+  // the driver go, is still saving its pending status: the job is still the running one then. (The flake of
+  // plugin.test.ts's "without dish-workspaces …" under load: the status file's write outlasted the pass.)
+  const comesBack = (): void => {
+    state.onEmit = (name, value) => {
+      if (name !== 'acme/a' || value.message !== 'dish-workspaces isn\'t running') return
+      state.onEmit = undefined
+      state.driver = fake.driver
+      onboarding.enqueue(project('acme/a'), 'onboard')
+    }
+  }
+
+  // No driver when the job starts.
+  state.driver = undefined
+  comesBack()
+  onboarding.enqueue(project('acme/a'), 'onboard')
+  ;(await fake.next('onboard', 'acme/a')).resolve()
+  await onboarding.idle()
+  assert.equal(status.get('acme/a').state, 'ready')
+
+  // The driver gone under a running onboarding (its close rejected it, with no interrupt first).
+  onboarding.enqueue(project('acme/a'), 'onboard')
+  const call = await fake.next('onboard', 'acme/a')
+  state.driver = undefined
+  comesBack()
+  call.reject(new DOMException('The operation was aborted.', 'AbortError'))
+  ;(await fake.next('onboard', 'acme/a')).resolve()
+  await onboarding.idle()
+  assert.equal(status.get('acme/a').state, 'ready')
+  assert.deepEqual(fake.calls.map(entry => `${entry.kind} ${entry.project.name}`), ['onboard acme/a', 'onboard acme/a', 'onboard acme/a'])
+})
+
 test('a prepare that fails marks the project failed; one that succeeds leaves it ready; one for a project no longer ready is skipped', async () => {
   const { fake, onboarding, status } = await harness()
   await status.set('acme/a', READY)
