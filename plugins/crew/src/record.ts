@@ -39,6 +39,15 @@
  * `startRun`, `endRun` and the lookups take what events give them, so they never throw because of what they were given: a child
  * nobody recorded is `undefined`, and a stop reason or a closing message of the wrong type is made into text.
  *
+ * Gate results (`GateResult`, 6c). dish-gates gates a coder bound to a worktree when its turn is about to end, and records
+ * each result with `addGate`. A run has no entry in `runs` until it ends, so the results of the run in progress sit on the
+ * child (`ChildRecord.gates`), and `endRun` moves them onto the run it files (`RunRecord.gates`): the next run starts with
+ * none. That they land on the right run rests on an order dsh keeps, not on anything here. dish-gates awaits `addGate` inside
+ * `agent/turn-stopping`, which dsh-agent-loop awaits (`dispatch.serial`) before the turn can close; the run's
+ * `subagent/end`, whose listener calls `endRun`, comes only after the turn has closed. So a run's last result is written,
+ * through the session's queue, before `endRun` for that run is even called, and a result recorded after a run ended is the
+ * next run's. A reviewer's ruling to review work whose gate hadn't passed is kept on the reviewer as `gateOverride`.
+ *
  * `prune` removes sessions nothing has written to for a while, with their pointers; see there for the rules.
  *
  * @module dish-crew/record
@@ -52,6 +61,39 @@ import type { SubagentStopReason } from '@deepseek-ai/dsh-subagent'
 /** Where a child is in its work, as of its latest run. */
 export type ChildStatus = 'running' | 'finished' | 'failed' | 'stopped'
 
+/**
+ * How a gate ended: the gate `passed` (exit 0) or `failed`; it was `skipped` (the coder opted out, or there was nothing to
+ * gate: the worktree is gone, or its project isn't registered); or it couldn't run (`error`).
+ */
+export type GateOutcome = 'passed' | 'failed' | 'skipped' | 'error'
+
+/** Every `GateOutcome`, in that order. */
+export const GATE_OUTCOMES: readonly GateOutcome[] = Object.freeze(['passed', 'failed', 'skipped', 'error'] as const)
+
+/** One gate run for a bound coder, or why none ran, as dish-gates records it. */
+export interface GateResult {
+  /** The dsh turn of the child's session whose end it gated: rounds are counted per turn. */
+  turn: number
+  /** 1 + the failures already recorded for this turn. */
+  round: number
+  /** dish-gates' `maxRounds` when it was recorded. */
+  maxRounds: number
+  outcome: GateOutcome
+  /** The gate as it ran; `''` when none ran. */
+  command: string
+  exitCode: number | null
+  timedOut: boolean
+  durationMs: number
+  /** The log's absolute path, or `null` when there is none. */
+  log: string | null
+  /** The output's last lines (at most 10 lines and 1000 characters), masked; `''` when there is none. */
+  excerpt: string
+  /** For `skipped` and `error`: why, on one line. */
+  reason?: string
+  /** When it was recorded, in ms since the epoch. */
+  at: number
+}
+
 /** One run of a child: from a delegation or a follow-up to the child's next stop. */
 export interface RunRecord {
   /** When the run ended, in ms since the epoch. */
@@ -62,6 +104,8 @@ export interface RunRecord {
   error?: string
   /** The absolute path of the report: the run's closing message. */
   report: string
+  /** The gate results recorded during the run, oldest first. Absent when there were none. */
+  gates?: GateResult[]
 }
 
 /** What is kept for a child. */
@@ -82,11 +126,18 @@ export interface ChildRecord {
    * child. A follow-up keeps it, and dish-gates (6c) reads it here, through `lookup`.
    */
   worktree?: string
+  /**
+   * For a reviewer: the main agent's ruling to review work whose gate hadn't passed (`delegate`'s `gateOverride`). A
+   * follow-up's ruling replaces it.
+   */
+  gateOverride?: string
   /** When the child was recorded, in ms since the epoch. */
   startedAt: number
   /** How many follow-ups it has been sent. */
   followUps: number
   runs: RunRecord[]
+  /** The gate results of the run in progress, oldest first; `endRun` moves them onto the run. Absent when there are none. */
+  gates?: GateResult[]
   /** The status after the latest run: `running` from the start, from a follow-up or from a wake, until the run ends. */
   last: ChildStatus
 }
@@ -101,6 +152,8 @@ export interface NewChild {
   reviews?: string
   /** The worktree the child is bound to: an absolute path, canonical (the caller's `realpath`). */
   worktree?: string
+  /** For a reviewer: the main agent's ruling to review work whose gate hadn't passed. */
+  gateOverride?: string
   /** Defaults to now. */
   startedAt?: number
 }
@@ -228,22 +281,76 @@ function fileSafe(role: string): string {
   return role.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64)
 }
 
+/** A whole number, 1 or more. */
+function isCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 1
+}
+
+/** What is wrong with `value` as a `GateResult`, or `undefined` if nothing is. Fields it doesn't know are not its concern. */
+export function gateProblem(value: unknown): string | undefined {
+  if (!isObject(value)) return 'it is not an object'
+  for (const field of ['turn', 'round', 'maxRounds'] as const) {
+    if (!isCount(value[field])) return `${field} must be a whole number, 1 or more`
+  }
+  if (!isText(value.outcome) || !GATE_OUTCOMES.includes(value.outcome as GateOutcome)) return `outcome must be one of ${GATE_OUTCOMES.join(', ')}`
+  if (!isText(value.command)) return 'command must be a string'
+  if (value.exitCode !== null && !Number.isInteger(value.exitCode)) return 'exitCode must be a whole number or null'
+  if (typeof value.timedOut !== 'boolean') return 'timedOut must be true or false'
+  if (!isNumber(value.durationMs)) return 'durationMs must be a finite number'
+  if (value.log !== null && !isText(value.log)) return 'log must be a string or null'
+  if (!isText(value.excerpt)) return 'excerpt must be a string'
+  if (value.reason !== undefined && !isText(value.reason)) return 'reason must be a string when it is given'
+  if (!isNumber(value.at)) return 'at must be a finite number'
+  return undefined
+}
+
+/** The gate result in `value` as a new object of its own fields, or `undefined` if `gateProblem` refuses it. */
+function parseGate(value: unknown): GateResult | undefined {
+  if (gateProblem(value) !== undefined) return undefined
+  const { turn, round, maxRounds, outcome, command, exitCode, timedOut, durationMs, log, excerpt, reason, at } = value as GateResult
+  return { turn, round, maxRounds, outcome, command, exitCode, timedOut, durationMs, log, excerpt, ...reason === undefined ? {} : { reason }, at }
+}
+
+/** The gate results in `value`, each as `parseGate` makes it, or `undefined` if it isn't a list or one of them isn't a result. */
+function parseGates(value: unknown): GateResult[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const parsed: GateResult[] = []
+  for (const item of value) {
+    const one = parseGate(item)
+    if (one === undefined) return undefined
+    parsed.push(one)
+  }
+  return parsed
+}
+
+/**
+ * The newest gate result of `record`: the run in progress's last, else (when no run is in progress) its latest run's last;
+ * `undefined` if neither has one. An older run's result is never the latest run's: while a run is in progress (`last` is
+ * `running`, a restart included) and has no result yet, there is none, not the previous run's.
+ */
+export function latestGate(record: ChildRecord): GateResult | undefined {
+  return record.gates?.at(-1) ?? (record.last === 'running' ? undefined : record.runs.at(-1)?.gates?.at(-1))
+}
+
 /** The run in `value`, or `undefined` if it isn't shaped like one. Other fields are dropped. */
 function parseRun(value: unknown): RunRecord | undefined {
   if (!isObject(value)) return undefined
-  const { endedAt, stopReason, error, report } = value
+  const { endedAt, stopReason, error, report, gates } = value
   if (!isNumber(endedAt) || !isText(stopReason) || !isText(report)) return undefined
   if (error !== undefined && !isText(error)) return undefined
-  return { endedAt, stopReason, ...error === undefined ? {} : { error }, report }
+  const parsedGates = gates === undefined ? undefined : parseGates(gates)
+  if (gates !== undefined && parsedGates === undefined) return undefined
+  return { endedAt, stopReason, ...error === undefined ? {} : { error }, report, ...parsedGates === undefined ? {} : { gates: parsedGates } }
 }
 
 /** The child in `value`, or `undefined` if it isn't shaped like one. Other fields are dropped. */
 function parseChild(value: unknown): ChildRecord | undefined {
   if (!isObject(value)) return undefined
-  const { id, n, role, title, model, family, reviews, worktree, startedAt, followUps, runs, last } = value
+  const { id, n, role, title, model, family, reviews, worktree, gateOverride, startedAt, followUps, runs, gates, last } = value
   if (!isText(id) || id === '' || !isNumber(n) || !isText(role) || !isText(title) || !isText(model) || !isText(family)) return undefined
   if (reviews !== undefined && !isText(reviews)) return undefined
   if (worktree !== undefined && !isText(worktree)) return undefined
+  if (gateOverride !== undefined && !isText(gateOverride)) return undefined
   if (!isNumber(startedAt) || !isNumber(followUps) || !Array.isArray(runs)) return undefined
   if (!isText(last) || !['running', 'finished', 'failed', 'stopped'].includes(last)) return undefined
   const parsed: RunRecord[] = []
@@ -252,9 +359,12 @@ function parseChild(value: unknown): ChildRecord | undefined {
     if (one === undefined) return undefined
     parsed.push(one)
   }
+  const parsedGates = gates === undefined ? undefined : parseGates(gates)
+  if (gates !== undefined && parsedGates === undefined) return undefined
   return {
     id, n, role, title, model, family, ...reviews === undefined ? {} : { reviews }, ...worktree === undefined ? {} : { worktree },
-    startedAt, followUps, runs: parsed, last: last as ChildStatus,
+    ...gateOverride === undefined ? {} : { gateOverride },
+    startedAt, followUps, runs: parsed, ...parsedGates === undefined ? {} : { gates: parsedGates }, last: last as ChildStatus,
   }
 }
 
@@ -293,6 +403,7 @@ function newChildProblem(value: unknown): string | undefined {
   if (!isText(value.title)) return 'title must be a string'
   if (value.reviews !== undefined && !isText(value.reviews)) return 'reviews must be a string'
   if (value.worktree !== undefined && !(isText(value.worktree) && isAbsolute(value.worktree))) return 'worktree must be an absolute path'
+  if (value.gateOverride !== undefined && !isText(value.gateOverride)) return 'gateOverride must be a string'
   if (value.startedAt !== undefined && !isNumber(value.startedAt)) return 'startedAt must be a finite number'
   return undefined
 }
@@ -479,6 +590,7 @@ export class CrewRecords {
         family: record.family,
         ...record.reviews === undefined ? {} : { reviews: record.reviews },
         ...record.worktree === undefined ? {} : { worktree: record.worktree },
+        ...record.gateOverride === undefined ? {} : { gateOverride: record.gateOverride },
         startedAt: record.startedAt ?? Date.now(),
         followUps: 0,
         runs: [],
@@ -493,15 +605,38 @@ export class CrewRecords {
   }
 
   /**
-   * Count a follow-up sent to `childId`, which is running again until its next run ends. A child that isn't recorded is
-   * ignored.
+   * Count a follow-up sent to `childId`, which is running again until its next run ends, and, with `gateOverride`, record
+   * the main agent's ruling on the child (a reviewer), replacing any it had. Without one, a ruling it had stays. A child
+   * that isn't recorded is ignored.
+   * @throws TypeError if `gateOverride` is given and isn't a string. Nothing is written.
    */
-  async addFollowUp(childId: string): Promise<void> {
+  async addFollowUp(childId: string, extra?: { gateOverride?: string }): Promise<void> {
+    const gateOverride = extra?.gateOverride
+    if (gateOverride !== undefined && !isText(gateOverride)) throw new TypeError('addFollowUp: gateOverride must be a string')
     await this.#update(childId, async (child) => {
       child.followUps += 1
       child.last = 'running'
+      if (gateOverride !== undefined) child.gateOverride = gateOverride
       return true
     })
+  }
+
+  /**
+   * Append `result` to the gate results of `childId`'s run in progress (`ChildRecord.gates`), through its session's queue,
+   * as a copy of its own fields. `endRun` moves them onto the run it files; see the module's header for why a result lands
+   * on the run it gated. Gives `false` for a child that isn't recorded.
+   * @throws TypeError if `result` isn't a `GateResult` (see `gateProblem`). Nothing is written.
+   */
+  async addGate(childId: string, result: GateResult): Promise<boolean> {
+    const problem = gateProblem(result)
+    if (problem !== undefined) throw new TypeError(`addGate needs a gate result: ${problem}`)
+    // Copied now, before anything is awaited, so that what the caller does with its object afterwards changes nothing here.
+    const copy = parseGate(result)!
+    const added = await this.#update(childId, async (child) => {
+      child.gates = [...child.gates ?? [], copy]
+      return true
+    })
+    return added === true
   }
 
   /**
@@ -519,7 +654,9 @@ export class CrewRecords {
 
   /**
    * File a run that ended: write its closing message as the report `<n>-<role>-<run>.md`, add the run, and set `last`
-   * from the stop reason (see `statusFor`). The report is written before the run that names it.
+   * from the stop reason (see `statusFor`). The report is written before the run that names it. The gate results of the
+   * run in progress (`ChildRecord.gates`) go onto the run, which has no `gates` when there were none, and off the child,
+   * so the next run starts with none.
    * Gives where the report went, or `undefined` for a child that isn't recorded, which is not an error: the events
    * this is called from include agents crew didn't start. Whatever the other fields are, it doesn't throw because of
    * them: a stop reason that isn't text is `unknown`, an error that isn't text is none, and a closing message that isn't
@@ -531,7 +668,9 @@ export class CrewRecords {
     const content = reportContent(isText(end?.closing) ? end.closing : '')
     return this.#update(childId, async (child, hash) => {
       const report = await this.#writeReport(hash, `${child.n}-${fileSafe(child.role)}-${child.runs.length + 1}`, content)
-      child.runs.push({ endedAt: Date.now(), stopReason, ...error === undefined ? {} : { error }, report })
+      const gates = child.gates ?? []
+      delete child.gates
+      child.runs.push({ endedAt: Date.now(), stopReason, ...error === undefined ? {} : { error }, report, ...gates.length === 0 ? {} : { gates } })
       child.last = statusFor(stopReason)
       return { report }
     })
