@@ -1213,6 +1213,9 @@ test('latestGate: the run in progress\'s last result, else the latest run\'s las
   assert.equal(latestGate(childRecord({ gates: [], runs: [run([a, b])], last: 'finished' })), b)
   // The latest run had none: an older run's result isn't this run's.
   assert.equal(latestGate(childRecord({ runs: [run([b]), run()], last: 'failed' })), undefined)
+  // A run in progress with no result yet (a fix round, or one left running by a restart) has none, not the last run's pass.
+  assert.equal(latestGate(childRecord({ last: 'running', runs: [run([b])] })), undefined)
+  assert.equal(latestGate(childRecord({ last: 'running', gates: [c], runs: [run([b])] })), c)
   assert.equal(latestGate(childRecord()), undefined)
   assert.equal(latestGate(childRecord({ runs: [run([])] })), undefined)
 })
