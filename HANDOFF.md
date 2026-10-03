@@ -40,7 +40,7 @@ Everything below is merged and running on the VM.
 
 **Shelved:** mise approvals (the `dish-mise` wrapper, the judge's trusted rule and its checkbox). The work sits on the local branches `mise-approvals`, `mise-t1`, `mise-t2` and `mise-t3` in `~/projects/dish`, and was never pushed. sandbox-home replaced it: plain `mise install` works in the sandbox. Delete those branches when you're sure.
 
-**The GitHub App:** the VM uses `bketelsen-dish-dev` (read-only: Contents and Pull requests). The plan assumed a second App, `bketelsen-dish`, for prod. On 2026-10-03 the user decided to make the prod App, with write access, and switch keys on Settings → GitHub App. Until then an agent's `git push` gets 403, though the prompts already tell agents to open pull requests.
+**The GitHub App:** the user made the prod App, with write access, on 2026-10-03, for Settings → GitHub App (dev keeps `bketelsen-dish-dev`, read-only). dish's code still asks only for read tokens, so an agent's `git push` gets 403 by design (6b's decision 9): in step 7, `open_pr` is the one thing that pushes, with a write token it mints in memory. The [orchestrator spec](docs/specs/orchestrator.md)'s first question is how to keep a write App's key from being misused, since agents can read it.
 
 ## Running it
 
@@ -94,14 +94,13 @@ Sessions are `session.v4.jsonl.zstd` under the workspace's directory, and a crew
    - seen in a real session (clippy README, 2026-10-03, 10:48–11:05 UTC): a coder that reported BLOCKED had its gate skipped, and the commit run's gate passed in 0.3 s (Go's test cache was warm). The coder also ran `go test` itself, because the main agent's brief told it to;
    - still to see live: a failing gate fixed in round 2, and a review that needs a ruling.
 2. **Watch the next sessions after #17.** Replayed against Jev, the clippy run's 24 stops and asks come to about 4 with the new `/tmp` wording and the VM's thresholds. Check that it holds in practice. Also check whether agents keep scratch files in `/tmp` (with `mktemp -d -p /tmp`) rather than `.worktrees/`, and whether the main agent hands image checks to a child.
-3. **6b's last check:** the squash-merge sweep check in the [plan's rollout](docs/plans/2026-10-02-projects.md#the-rollout-for-you), step 8.
-4. **The prod App:** the user is making it (above). Then switch keys on Settings → GitHub App, and check that an agent can push a branch.
-5. **`README.md:19`** says Settings → GitHub App takes dev's own App, which waits on the prod App decision.
-6. **Going public.** An audit on 2026-10-03 found no real secret anywhere in the history. Before flipping the repo to public, run, with direnv loaded, `git log --all --format=%h -S"${TYPESAFE_API_KEY:8:16}"`: no output means the key was never committed. The two `apikey_…` values in `packages/dish-kit/test/secrets.test.ts` should be the fakes their comment says they are. Also: delete the merged branches, turn off the wiki if unused, and skim the PR descriptions. Links to `bketelsen/fleet` go to a private repository.
-7. **[ROADMAP.md](ROADMAP.md)'s backlog.** The items that matter most in daily use:
+3. **Step 7, `orchestrator`:** the [spec](docs/specs/orchestrator.md) is drafted from the 2026-10-03 brainstorm and waits for your review and its four questions. Done before it: 6b's sweep check and the prod App (both 2026-10-03). Under the spec, only `open_pr` pushes: an agent's own `git push` still gets 403, because dish's git tokens stay read-only.
+4. **`README.md:19`** says Settings → GitHub App takes dev's own App: update it for the prod App.
+5. **Going public.** An audit on 2026-10-03 found no real secret anywhere in the history. Before flipping the repo to public, run, with direnv loaded, `git log --all --format=%h -S"${TYPESAFE_API_KEY:8:16}"`: no output means the key was never committed. The two `apikey_…` values in `packages/dish-kit/test/secrets.test.ts` should be the fakes their comment says they are. Also: delete the merged branches, turn off the wiki if unused, and skim the PR descriptions. Links to `bketelsen/fleet` go to a private repository.
+6. **[ROADMAP.md](ROADMAP.md)'s backlog.** The items that matter most in daily use:
    - Chromium and `libxml2-utils` on the VM;
    - dev-server previews.
-8. **dsh issues worth filing upstream**, seen in sessions:
+7. **dsh issues worth filing upstream**, seen in sessions:
    - `{{model}}` shows the preset's model, not the session's;
    - the child "send your result" note can't be turned off;
    - a provider without a key fails the first turn and the title;
