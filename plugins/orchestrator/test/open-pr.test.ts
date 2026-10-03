@@ -318,7 +318,9 @@ test('open_pr: without dish-gates the gate didn\'t run, which refuses it', async
 
 test('open_pr: no final review, one that requested changes, a stale approval, and a non-final approval each refuse it', async () => {
   const { w, run, tool } = await setup()
-  const tail = 'Delegate a fresh reviewer with `final: true` (or send the final reviewer a re-review with `to`), or give `reviewRuling: "Ruling: what — why — cost if wrong"` to open past it.'
+  // `to` works only from the chat that started the reviewer (crew refuses it across chats, as after a takeover).
+  const tail = 'Delegate a fresh reviewer with `final: true` (or, from the chat that started it, send the final reviewer a re-review with `to`), '
+    + 'or give `reviewRuling: "Ruling: what — why — cost if wrong"` to open past it.'
   let message = await refused(call(tool), '- no final review approved bbbbbbb: there is none yet. ', tail)
   assert.ok(!message.includes('the gate'), 'only the failed checks are given')
   await verdict(w, run, { child: 'rev-2', verdict: 'changes_requested' })

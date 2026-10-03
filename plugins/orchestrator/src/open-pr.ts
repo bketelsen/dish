@@ -163,7 +163,7 @@ export function refusalText(run: Run, head: string, found: Found): string {
   }
   if (!found.reviewOk) {
     lines.push(`- no final review approved ${shortSha(head)}: ${reviewPhrase(found.final)}. Delegate a fresh reviewer with \`final: true\` `
-      + `(or send the final reviewer a re-review with \`to\`), or give \`reviewRuling: "${RULING_FORM}"\` to open past it.`)
+      + `(or, from the chat that started it, send the final reviewer a re-review with \`to\`), or give \`reviewRuling: "${RULING_FORM}"\` to open past it.`)
   }
   return maskSecrets(lines.join('\n'))
 }
