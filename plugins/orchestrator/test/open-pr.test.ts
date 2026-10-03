@@ -199,6 +199,39 @@ test('open_pr: a worktree that doesn\'t resolve, with and without resolveProblem
   assert.deepEqual(await written(w, run), [])
 })
 
+test('open_pr: a run whose own worktree was removed is refused, though a later run made one at its path; the later run\'s open_pr works', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  // The run's worktree removed (dish-workspaces told orchestrator), and another chat's run made one of the same slug.
+  w.worktrees.clear()
+  await w.runs.worktreeRemoved(PROJECT, run.slug)
+  const later = await w.open({ session: OTHER_SESSION, goal: 'Something else' })
+  assert.equal(later.worktree, run.worktree)
+  assert.equal(later.baseCommit, run.baseCommit)
+  await refused(call(tool), `the run's worktree ${run.worktree} can't be pushed: it is gone (dish removed it). Nothing was pushed.`)
+  assert.equal(w.gates.calls.runAt.length, 0)
+  nothingWritten(w)
+  assert.deepEqual(await written(w, run), ['task.removed'])
+  assert.equal(w.record(run)?.state, 'open')
+  // The later run's own open_pr pushes its branch and opens its pull request.
+  await verdict(w, later)
+  const value = await call(tool, {}, mainExec(OTHER_SESSION))
+  assert.equal(value.existing, false)
+  assert.equal(w.record(later)?.pr?.number, value.number)
+  assert.equal(w.record(run)?.pr, undefined)
+})
+
+test('open_pr: a worktree at the run\'s path cut from another commit than the run\'s is refused', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  const tree = w.worktrees.get(run.worktree)!
+  w.worktrees.set(run.worktree, { ...tree, base: SHA_C })
+  await refused(call(tool), `the run's worktree ${run.worktree} can't be pushed: it is gone (the worktree there now was cut from c0ffee1, not the run's aaaaaaa). Nothing was pushed.`)
+  assert.equal(w.gates.calls.runAt.length, 0)
+  nothingWritten(w)
+  assert.deepEqual(await written(w, run), [])
+})
+
 test('open_pr: a worktree that isn\'t clean (with why), and isClean rejecting', async () => {
   const { w, run, tool } = await setup()
   await verdict(w, run)

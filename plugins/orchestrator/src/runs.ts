@@ -37,7 +37,7 @@ import { parseRef, runRef, SEGMENT, SLUG, splitProject } from './paths.ts'
 import type { CreatedForRun, JoinedRun, LadderEntry, Placement, PlaceTarget, RunInfo } from './service.ts'
 import type { Services } from './services.ts'
 import type { Run, RunStore } from './store.ts'
-import { cut, given, oneLine, rulingBody, shortSession } from './text.ts'
+import { cut, given, oneLine, rulingBody, shortSession, shortSha } from './text.ts'
 
 export interface Logger {
   info(format: string, ...args: unknown[]): void
@@ -131,6 +131,17 @@ function isText(value: unknown): value is string {
 
 function sameProject(a: string, b: string): boolean {
   return a.toLowerCase() === b.toLowerCase()
+}
+
+/**
+ * Whether the worktree dish-workspaces resolved at a run's path is another one: cut from another commit than the run's (a
+ * later run of the same slug makes its worktree at the same path, on a fresh `dish/<slug>`). Gives that commit's first 7
+ * characters, or undefined for the run's own, and when `resolve` gave no commit to compare.
+ */
+export function otherBase(resolved: unknown, run: Run): string | undefined {
+  const base = isObject(resolved) ? resolved.base : undefined
+  if (typeof base !== 'string' || base === '' || base.toLowerCase() === run.baseCommit.toLowerCase()) return undefined
+  return shortSha(base)
 }
 
 /** A run as `driving` gives it. */
@@ -659,8 +670,20 @@ export class Runs {
     })
   }
 
-  /** A `pr` run can be reopened while its worktree is one dish made. @throws Error with the refusal's words. */
+  /**
+   * A `pr` run can be reopened while its own worktree is one dish made: not removed (its ledger), and the worktree at its
+   * path cut from the run's commit (a later run of the same slug makes one at the same path, on a fresh `dish/<slug>`).
+   * @throws Error with the refusal's words.
+   */
   async #checkReopen(run: Run): Promise<void> {
+    const gone = `run \`${run.id}\` can't be reopened: its worktree is gone (the sweep removes it once its pull request ${run.pr?.url ?? ''} is merged). Open a new run with \`run\` \`open\`.`
+    let entries: LedgerEntry[]
+    try {
+      entries = await this.entries(run)
+    } catch (error) {
+      throw new Error(`run \`${run.id}\`'s ledger can't be read: ${describe(error)}`, { cause: error })
+    }
+    if (!openTasks(run, entries).has(run.slug)) throw new Error(gone)
     const workspaces = this.services.workspaces()
     if (workspaces === undefined) throw new Error(`dish-workspaces isn't running, so run \`${run.id}\`'s worktree can't be checked`)
     let resolved: unknown
@@ -670,7 +693,14 @@ export class Runs {
       throw new Error(`run \`${run.id}\`'s worktree can't be checked: ${describe(error)}`, { cause: error })
     }
     if (resolved === TIMED_OUT) throw new Error(`run \`${run.id}\`'s worktree can't be checked: dish-workspaces took longer than ${seconds(this.#lookupMs)}`)
-    if (resolved !== undefined && resolved !== null) return
+    if (resolved !== undefined && resolved !== null) {
+      const base = otherBase(resolved, run)
+      if (base !== undefined) {
+        throw new Error(`run \`${run.id}\` can't be reopened: its worktree is gone (${run.worktree} is now another worktree, cut from ${base}, not ${shortSha(run.baseCommit)}). `
+          + 'Open a new run with `run` `open`.')
+      }
+      return
+    }
     // A worktree dish made that fails its safety check resolves to nothing too: say why, as open_pr does.
     let problem: unknown
     try {

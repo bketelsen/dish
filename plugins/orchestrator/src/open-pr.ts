@@ -3,7 +3,8 @@
  * reopened for review feedback, push its new head to the same pull request.
  *
  * - **The order is the contract.** No step pushes, opens, edits or comments before every step above it passed: the caller,
- *   the arguments, the run, its lock, dish-workspaces, no coder at work, a worktree dish can push, clean, its head (and, on a
+ *   the arguments, the run, its lock, dish-workspaces, no coder at work, the run's own worktree (not removed, cut from the
+ *   run's commit) and one dish can push, clean, its head (and, on a
  *   reopened run, GitHub's branch not ahead), the gate on that head, the worktree unchanged since, the final review of that
  *   head, the overrides, `pr.checked`. Then the push, the pull request, and the record.
  * - **The head that was checked is the head pushed.** `headOf` is read once; `runAt` gates that head (an `error` when the
@@ -28,10 +29,10 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { maskSecrets } from 'dish-kit'
 import type { GateCheck } from 'dish-gates'
-import { latestFinal, sameHead } from './derive.ts'
+import { latestFinal, openTasks, sameHead } from './derive.ts'
 import type { VerdictView } from './derive.ts'
 import type { PrFinal, PrGate } from './entries.ts'
-import { describe, mainSession } from './runs.ts'
+import { describe, mainSession, otherBase } from './runs.ts'
 import type { HarnessInput, Runs, ToolDeps } from './runs.ts'
 import type { Run } from './store.ts'
 import { RULING_FORM, cut, given, hasRuling, oneLine, rulingBody, shortSha } from './text.ts'
@@ -313,7 +314,15 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
       }
     }
 
-    // 7. A worktree dish can push.
+    // 7. A worktree dish can push, and the run's own: not removed (its ledger), and cut from the run's commit. A later run of
+    // the same slug makes its worktree at the same path, on a fresh dish/<slug>, which this run must never push.
+    let ledger: Awaited<ReturnType<typeof runs.entries>>
+    try {
+      ledger = await runs.entries(run)
+    } catch (error) {
+      throw fail(`can't read the run's ledger: ${describe(error).replace(/\.+$/, '')}. ${NOTHING}`, error)
+    }
+    if (!openTasks(run, ledger).has(run.slug)) throw fail(`the run's worktree ${run.worktree} can't be pushed: it is gone (dish removed it). ${NOTHING}`)
     let resolved: Awaited<ReturnType<typeof workspaces.resolve>>
     try {
       resolved = await workspaces.resolve(run.worktree)
@@ -331,6 +340,10 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
       throw fail(`the run's worktree ${run.worktree} can't be pushed: ${why}. ${NOTHING}`)
     }
     if (resolved.branch !== run.branch) throw fail(`the run's worktree is on ${line(String(resolved.branch), 200)}, not ${run.branch}. ${NOTHING}`)
+    const other = otherBase(resolved, run)
+    if (other !== undefined) {
+      throw fail(`the run's worktree ${run.worktree} can't be pushed: it is gone (the worktree there now was cut from ${other}, not the run's ${shortSha(run.baseCommit)}). ${NOTHING}`)
+    }
 
     // 8. Clean.
     let clean: Awaited<ReturnType<typeof workspaces.isClean>>

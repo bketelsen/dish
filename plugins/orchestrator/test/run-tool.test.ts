@@ -376,6 +376,53 @@ test('resume: a run with a pull request reopens for review feedback; refused onc
   })
 })
 
+test('resume: a merged run whose worktree was removed is refused, though a later run of the same slug has a worktree at its path; the later run is untouched', async () => {
+  const w = await world()
+  const old = await prRun(w, { slug: 'feat' })
+  // The pull request merged: the sweep removed the worktree, and told orchestrator.
+  w.worktrees.delete(old.worktree)
+  w.worktrees.delete(`${PROJECT}/feat`)
+  await w.runs.worktreeRemoved(PROJECT, 'feat')
+  // A later run with the same slug: the same path, a fresh dish/feat (here cut from the same commit).
+  const fresh = await w.open({ slug: 'feat', session: OTHER_SESSION, goal: 'Something else' })
+  assert.equal(fresh.worktree, old.worktree)
+  assert.equal(fresh.baseCommit, old.baseCommit)
+  const before = w.record(old)
+  const freshBefore = w.record(fresh)
+  await assert.rejects(call(w, { action: 'resume', id: old.id }), {
+    message: `run \`${old.id}\` can't be reopened: its worktree is gone (the sweep removes it once its pull request ${PR_URL} is merged). Open a new run with \`run\` \`open\`.`,
+  })
+  assert.deepEqual(w.record(old), before)
+  assert.deepEqual(w.record(fresh), freshBefore)
+  assert.equal(w.store.drivenBy(SESSION), undefined)
+  assert.deepEqual(await w.kinds(old), ['run.opened', 'run.closed', 'task.removed'])
+})
+
+test('resume: a run with a pull request whose worktree path is now another worktree (cut from another commit) is refused', async () => {
+  const w = await world()
+  const old = await prRun(w, { slug: 'feat' })
+  // Removed while dish-orchestrator wasn't told (no task.removed), and made again from a newer commit.
+  const tree = w.worktrees.get(old.worktree)!
+  w.worktrees.set(old.worktree, { ...tree, base: SHA_C })
+  w.worktrees.set(`${PROJECT}/feat`, { ...tree, base: SHA_C })
+  const before = w.record(old)
+  await assert.rejects(call(w, { action: 'resume', id: old.id }), {
+    message: `run \`${old.id}\` can't be reopened: its worktree is gone (${old.worktree} is now another worktree, cut from ${shortSha(SHA_C)}, not ${shortSha(BASE)}). `
+      + 'Open a new run with `run` `open`.',
+  })
+  assert.deepEqual(w.record(old), before)
+  assert.equal(w.store.drivenBy(SESSION), undefined)
+  // Its ledger can't be read: it can't be checked, so it isn't reopened.
+  w.worktrees.set(old.worktree, { ...tree })
+  const entries = w.runs.entries.bind(w.runs)
+  w.runs.entries = async () => { throw new Error(`EACCES: permission denied ${TOKEN}`) }
+  await assert.rejects(call(w, { action: 'resume', id: old.id }), { message: `run \`${old.id}\`'s ledger can't be read: EACCES: permission denied ${MASKED_TOKEN}` })
+  w.runs.entries = entries
+  assert.deepEqual(w.record(old), before)
+  // Cut from the run's own commit, it reopens.
+  assert.match((await call(w, { action: 'resume', id: old.id })).text, /^Reopened run /)
+})
+
 test('resume: a bare id, owner/repo/id, an unknown id, an id in two projects, and no id', async () => {
   const w = await world()
   const here = await w.open({ session: OTHER_SESSION })
