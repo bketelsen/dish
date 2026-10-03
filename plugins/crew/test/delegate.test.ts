@@ -134,6 +134,10 @@ interface World {
   placeAsked: Array<{ sessionId: string, target: Record<string, unknown> }>
   /** What `dishRuns.ladder` was given, in order. */
   ladderCalls: LadderEntry[]
+  /** What the `dishRuns` stub's `driving` gives, by session: the run it drives. `undefined` (none) for a session it doesn't have. */
+  driving: Map<string, unknown>
+  /** What `dishRuns.driving` was asked, in order. */
+  drivingAsked: string[]
   stub: {
     /** An error `startContinuable` throws instead of starting. */
     startFails: Error | undefined
@@ -157,6 +161,8 @@ interface World {
     placeFails: Error | undefined
     /** An error `dishRuns.ladder` throws instead of answering. */
     ladderFails: Error | undefined
+    /** An error `dishRuns.driving` throws instead of answering. */
+    drivingFails: Error | undefined
   }
   main: Agent
   /** A scoped agent as dsh makes one under the preset. */
@@ -211,6 +217,7 @@ async function world(options: Options = {}): Promise<World> {
   const stub: World['stub'] = {
     startFails: undefined, sendFails: undefined, resolveFails: undefined, startMs: 0, noPrompt: new Set(), promptFails: undefined, startedStatus: 'running',
     resolveWorktreeFails: undefined, resolveProblemFails: undefined, gateForFails: undefined, placeFails: undefined, ladderFails: undefined,
+    drivingFails: undefined,
   }
   const workspace = await realpath(await tempDir())
   const worktrees = new Map<string, Worktree>()
@@ -221,6 +228,8 @@ async function world(options: Options = {}): Promise<World> {
   const placements = new Map<string, unknown>()
   const placeAsked: World['placeAsked'] = []
   const ladderCalls: LadderEntry[] = []
+  const driving = new Map<string, unknown>()
+  const drivingAsked: string[] = []
 
   if (options.agents !== false) await provide(ctx, 'agents', { get: (id: string) => agents.get(id) })
   await provide(ctx, 'llm', {
@@ -292,6 +301,11 @@ async function world(options: Options = {}): Promise<World> {
         ladderCalls.push({ ...entry })
         if (stub.ladderFails !== undefined) throw stub.ladderFails
       },
+      async driving(sessionId: string) {
+        drivingAsked.push(sessionId)
+        if (stub.drivingFails !== undefined) throw stub.drivingFails
+        return driving.get(sessionId)
+      },
     })
   }
   if (options.realPrompts === true) {
@@ -331,7 +345,7 @@ async function world(options: Options = {}): Promise<World> {
 
   return {
     ctx, settings, records, directory, mainModel, agents, starts, sends, resolves, personaAsked, recordedAtStart, stub, main, agent, exec, tool,
-    workspace, worktrees, resolveAsked, problems, gates, gateAsked, placements, placeAsked, ladderCalls,
+    workspace, worktrees, resolveAsked, problems, gates, gateAsked, placements, placeAsked, ladderCalls, driving, drivingAsked,
     delegate: (args, who = exec()) => tool.execute(args, who),
     async makeWorktree(slug, root = workspace) {
       const path = join(root, '.worktrees', slug)
@@ -2591,6 +2605,7 @@ const TOKEN = `ghp_${'A1b2C3d4E5'.repeat(4)}`
 const NO_RUN = '`final` had no effect: this chat drives no run, so there is no final review for `open_pr` to read.'
 const NO_ORCHESTRATOR = '`final` had no effect: dish keeps no runs here (dish-orchestrator isn\'t loaded).'
 const FINAL_OTHER_RUN = '`final` had no effect: this reviewer was started outside the run this chat drives now, so start a fresh reviewer with `final: true` for that run\'s final review.'
+const UNPLACED = '`final` had no effect: dish couldn\'t place this reviewer in a run, so `final` wasn\'t recorded; try again with a fresh reviewer and `final: true`.'
 
 /** The ladder's refusal of more coder work on task `task` at `round`, as the plan words it. */
 function ladderRefusal(round: number, task = 'fix-1'): string {
@@ -2699,9 +2714,8 @@ test('final: with no run placed, or without dish-orchestrator, the reviewer star
   const record = await recordOf(w, result.child)
   assert.ok(!('final' in record) && !('run' in record) && !('task' in record))
   assert.equal(result.note, NO_RUN)
-  // A place that fails is no run.
-  w.stub.placeFails = new Error('broken')
-  assert.equal((await w.delegate({ ...REVIEW, title: 'again', reviews: 'main', final: true })).note, NO_RUN)
+  // No run placed: dish-orchestrator is asked whether the chat drives one, which it doesn't.
+  assert.deepEqual(w.drivingAsked, [SESSION])
 
   const without = await world()
   const off = await without.delegate({ ...REVIEW, reviews: 'main', final: true })
@@ -2711,6 +2725,48 @@ test('final: with no run placed, or without dish-orchestrator, the reviewer star
   // And the output shows it.
   const render = (args: Record<string, unknown>, value: Record<string, string>) => (without.tool.output.render as any)(args, value)[0].text
   assert.equal(render({ ...REVIEW, reviews: 'main', final: true }, off), `started reviewer «review the login» on ${off.model} (child ${off.child})\n${NO_ORCHESTRATOR}`)
+})
+
+test('final: a place that failed, or gave no run while the chat drives one, says dish couldn\'t place the reviewer, not that the chat drives no run', async () => {
+  const w = await world({ runs: true })
+  const logs = watchLogs(w.ctx)
+  /** A final reviewer of the main agent's work, finished at once (crew runs at most 4 children); its answer. */
+  const reviewer = async (title: string): Promise<any> => {
+    const result = await w.delegate({ ...REVIEW, title, reviews: 'main', final: true })
+    await finish(w, result.child)
+    return result
+  }
+  // place throws, or answers with no run in it: crew logs it, and needn't ask which run the chat drives.
+  w.stub.placeFails = new Error('broken')
+  assert.equal((await reviewer('thrown')).note, UNPLACED)
+  w.stub.placeFails = undefined
+  w.placements.set(`${SESSION}||main`, { run: '' })
+  assert.equal((await reviewer('malformed')).note, UNPLACED)
+  w.placements.delete(`${SESSION}||main`)
+  assert.deepEqual(w.drivingAsked, [])
+  // No run placed while the chat drives one: dish-orchestrator's place failed or ran out of time (it logs which).
+  w.driving.set(SESSION, { ref: RUN, id: '20261003-fix-1', state: 'open' })
+  const unplaced = await reviewer('gave up')
+  assert.equal(unplaced.note, UNPLACED)
+  assert.ok(!('final' in await recordOf(w, unplaced.child)))
+  assert.deepEqual(w.drivingAsked, [SESSION])
+  // A follow-up the same.
+  const again = await w.delegate({ ...REVIEW, task: 'Again.', to: unplaced.child, final: true })
+  assert.equal(again.note, UNPLACED)
+  await finish(w, unplaced.child)
+  // driving failing too: dish can't say, so it couldn't place it; logged.
+  w.stub.drivingFails = new Error('no store')
+  assert.equal((await reviewer('no answer')).note, UNPLACED)
+  assert.ok(logs.includes('[dish-crew] warn: could not ask dish-orchestrator which run this chat drives: no store'), logs.join('\n'))
+  w.stub.drivingFails = undefined
+  // No run, and none driven: today's text.
+  w.driving.delete(SESSION)
+  assert.equal((await reviewer('none')).note, NO_RUN)
+  // Without final, driving isn't asked.
+  const asked = w.drivingAsked.length
+  const plain = await w.delegate({ ...REVIEW, title: 'plain', reviews: 'main' })
+  assert.ok(!('note' in plain))
+  assert.equal(w.drivingAsked.length, asked)
 })
 
 test('final: on a role that doesn\'t review it is refused, before the prompt, the target or anything else is read', async () => {

@@ -74,7 +74,8 @@
  * - **`final`** (the reviewer role only; refused for any other, before anything is read) asks `place` for the run's final
  *   review, and is recorded on the reviewer (`ChildRecord.final`, sticky) only when `place` gives it, and, for a follow-up,
  *   only in the run the reviewer is tagged with: one started outside that run can't give its final review. Otherwise the
- *   answer's note says it had no effect; nothing is refused.
+ *   answer's note says it had no effect, and why: the chat drives no run, the reviewer is another run's, or dish couldn't
+ *   place it (`place` failed, or gave no run while `dishRuns.driving` says the chat drives one); nothing is refused.
  * - **The escalation ladder.** A coder start or follow-up on a run's task is a round, which `place` counts from the run's
  *   ledger. Rounds 1 to 4 get a note in the answer (`ladderNote`). From `LADDER_RULING_ROUND` the call is refused, unless
  *   `ruling` holds a ruling; either way `dishRuns.ladder` records it, and a refusal there is the only one that writes (to the
@@ -113,6 +114,7 @@ import { isTopLevelAgent, maskSecrets, RETURN_NOTE_LEAD } from 'dish-kit'
 import type { DishPrompts, Persona } from 'dish-prompts'
 import { allowList, visibleTools } from './allow.ts'
 import { publisher } from './events.ts'
+import { within } from './guard.ts'
 import type { DishCrew, WorktreeBinding } from './index.ts'
 import { chooseRoute, offeredModels } from './models.ts'
 import type { ReviewedWork, Route } from './models.ts'
@@ -269,12 +271,14 @@ interface LadderEntry {
 }
 
 /**
- * What the row reads of dish-orchestrator with `ctx.get('dishRuns')`, structurally: crew doesn't depend on it. Neither
- * method rejects there; a throw here is a broken service, logged and gone past.
+ * What the row reads of dish-orchestrator with `ctx.get('dishRuns')`, structurally: crew doesn't depend on it. No method
+ * rejects there; a throw here is a broken service, logged and gone past. `driving` (the open run a chat drives) is asked
+ * only to word `final`'s note when `place` placed nothing.
  */
 interface RunsReader {
   place(sessionId: string, where: PlaceTarget): Promise<Placement | undefined>
   ladder(entry: LadderEntry): Promise<void>
+  driving?(sessionId: string): Promise<unknown>
 }
 
 /** What a ruling says, as the refusals and the parameter put it. */
@@ -284,11 +288,21 @@ const RULING_FORM = `Ruling: ${RULING_BODY}`
 /** The placeholder, with or without `Ruling:`, compared without case: a model that copies it back has given no ruling. */
 const PLACEHOLDERS: readonly string[] = [RULING_FORM.toLowerCase(), RULING_BODY.toLowerCase()]
 
+/** What `placement` gives for a `place` that threw, or answered with no run in it. */
+const UNPLACED: unique symbol = Symbol('not placed')
+
 /** Where a reviewed coder's gate stands while the coder is still running. */
 const STILL_RUNNING = 'it is still running'
 
-/** The note for `final` that placed nothing: no run, or a `place` that failed. */
+/** The note for `final` that placed nothing because this chat drives no run. */
 const FINAL_NO_RUN = '`final` had no effect: this chat drives no run, so there is no final review for `open_pr` to read.'
+/**
+ * The note for `final` that placed nothing although dish couldn't tell there is no run: `place` failed (thrown, a malformed
+ * answer, or dish-orchestrator's own failure or time limit, which gives no run while the chat drives one).
+ */
+const FINAL_UNPLACED = '`final` had no effect: dish couldn\'t place this reviewer in a run, so `final` wasn\'t recorded; try again with a fresh reviewer and `final: true`.'
+/** How long `final`'s note waits for `dishRuns.driving`: it reads the run records in memory. */
+const DRIVING_BUDGET_MS = 2000
 /** The note for `final` on a follow-up to a reviewer whose tags don't name the run `place` gives now (another run, or none). */
 const FINAL_OTHER_RUN = '`final` had no effect: this reviewer was started outside the run this chat drives now, so start a fresh reviewer with `final: true` for that run\'s final review.'
 /** The note for `final` without dish-orchestrator. */
@@ -802,17 +816,18 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
   }
 
   /**
-   * `dishRuns.place`'s answer, checked: `undefined` for no run, and for a throw or an answer with no run in it, which is
-   * logged. A `task` is kept when it is a non-empty string, a `round` only with a task and when it is a whole number, and
-   * `final` only when it is `true`. Never throws: a delegation is never refused for a run it couldn't be placed in.
+   * `dishRuns.place`'s answer, checked: `undefined` for no run, and `UNPLACED` for a throw or an answer with no run in it,
+   * which is logged (either is no run for the tags). A `task` is kept when it is a non-empty string, a `round` only with a
+   * task and when it is a whole number, and `final` only when it is `true`. Never throws: a delegation is never refused for
+   * a run it couldn't be placed in.
    */
-  async function placement(call: Call, runs: RunsReader, where: PlaceTarget): Promise<Placement | undefined> {
+  async function placement(call: Call, runs: RunsReader, where: PlaceTarget): Promise<Placement | typeof UNPLACED | undefined> {
     let answer: unknown
     try {
       answer = await runs.place(call.sessionId, where)
     } catch (error) {
       warn('could not place a delegation in a run: %s', describe(error))
-      return undefined
+      return UNPLACED
     }
     if (answer === undefined) return undefined
     const found = (typeof answer === 'object' && answer !== null ? answer : {}) as Record<string, unknown>
@@ -825,7 +840,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
         shown = typeof answer
       }
       warn('could not place a delegation in a run: dishRuns.place gave no run (%s)', truncate(maskSecrets(shown), 200))
-      return undefined
+      return UNPLACED
     }
     const placed: Placement = { run }
     if (typeof task === 'string' && task !== '') {
@@ -834,6 +849,22 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     }
     if (found.final === true) placed.final = true
     return placed
+  }
+
+  /**
+   * For `final`'s note, when `place` gave no run: whether that was dish's failure rather than no run, that is, the chat
+   * drives an open run (dish-orchestrator's `place` gives no run past its time limit or on a failure, which it logs), or
+   * `driving` can't say (thrown, or no answer within DRIVING_BUDGET_MS; logged). Without `driving`, no run.
+   */
+  async function placeFailed(call: Call, runs: RunsReader): Promise<boolean> {
+    if (typeof runs.driving !== 'function') return false
+    try {
+      const driven = await within(Promise.resolve().then(() => runs.driving!(call.sessionId)), DRIVING_BUDGET_MS)
+      return driven !== undefined && driven !== null
+    } catch (error) {
+      warn('could not ask dish-orchestrator which run this chat drives: %s', describe(error))
+      return true
+    }
   }
 
   /** `dishRuns.ladder`, whose failure is logged and gone past: the refusal, or the ruled call, stands either way. */
@@ -857,11 +888,14 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
   async function placeCall(call: Call, where: { worktree?: string | undefined, reviews?: string | undefined }, target?: ChildRecord): Promise<Placed> {
     const { runs } = call
     if (runs === undefined) return { tags: {}, ...call.final ? { note: FINAL_NO_RUNS } : {} }
-    const placed = await placement(call, runs, {
+    const answer = await placement(call, runs, {
       ...where.worktree === undefined ? {} : { worktree: where.worktree },
       ...where.reviews === undefined ? {} : { reviews: where.reviews },
       ...call.final ? { final: true } : {},
     })
+    const placed = answer === UNPLACED ? undefined : answer
+    // `final` placed nothing: say why, never "no run" for a chat that drives one.
+    const unplaced = call.final && placed === undefined && (answer === UNPLACED || await placeFailed(call, runs))
     // A follow-up's reviewer gives the final review of its own run only: tagged with another run, or none, the ledger would
     // put the verdict where `open_pr` doesn't read it.
     const elsewhere = target !== undefined && placed !== undefined && (target.run === undefined || placed.run !== target.run)
@@ -869,7 +903,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     const own = target ?? placed
     const tags = { ...own?.run === undefined ? {} : { run: own.run }, ...own?.task === undefined ? {} : { task: own.task } }
     const finish = (note?: string): Placed => {
-      const notes = [note, call.final && !final ? (elsewhere ? FINAL_OTHER_RUN : FINAL_NO_RUN) : undefined].filter(text => text !== undefined)
+      const notes = [note, call.final && !final ? (elsewhere ? FINAL_OTHER_RUN : unplaced ? FINAL_UNPLACED : FINAL_NO_RUN) : undefined].filter(text => text !== undefined)
       return { tags, ...final ? { final: true } : {}, ...notes.length === 0 ? {} : { note: notes.join(' ') } }
     }
     const { task } = tags
