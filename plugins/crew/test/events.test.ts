@@ -125,3 +125,13 @@ test('a listener\'s error is masked in the log', async () => {
   assert.equal(warnings.length, 1)
   assert.ok(!warnings[0]!.includes(token), warnings[0])
 })
+
+test('a listener that rejects with something that can\'t be read is still logged, and the publish still resolves', async () => {
+  const ctx = new Context()
+  const { publish, warnings } = publishing(ctx)
+  ctx.on('dish-crew/settled', async () => { throw Object.create(null) })
+  ctx.on('dish-crew/delegated', async () => { throw { toString() { throw new Error('no') } } })
+  await publish('dish-crew/settled', { sessionId: 's1', child: child(), run: run() })
+  await publish('dish-crew/delegated', { sessionId: 's1', child: child(), followUp: false })
+  assert.deepEqual(warnings, ['a dish-crew/settled listener failed', 'a dish-crew/delegated listener failed'])
+})

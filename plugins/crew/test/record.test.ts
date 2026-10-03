@@ -1611,7 +1611,7 @@ test('EndedRun has the session, the filed child and the run, as copies', async (
 
 test('setReport and endRun called at once: the report is on the run that ends', async () => {
   const { records } = await fixture()
-  for (let round = 0; round < 10; round++) {
+  for (let round = 0; round < 50; round++) {
     const id = `c${round}`
     await records.addChild('s1', newChild(id))
     const [, ended] = await Promise.all([records.setReport(id, coderReport({ turn: round })), records.endRun(id, { stopReason: 'completed', closing: 'x' })])

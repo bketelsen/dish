@@ -76,7 +76,12 @@ export function publisher(ctx: Context, warn: (format: string, ...args: unknown[
   }
   const failed = (name: string, error: unknown): void => {
     for (const cause of error instanceof AggregateError ? error.errors : [error]) {
-      if (!unloaded(cause)) say('a %s listener failed: %s', name, maskSecrets(describe(cause)))
+      try {
+        if (!unloaded(cause)) say('a %s listener failed: %s', name, maskSecrets(describe(cause)))
+      } catch {
+        // A cause that can't be read (no `toString`, or one that throws) is still a failure, and still never rejects.
+        say('a %s listener failed', name)
+      }
     }
   }
   const publish = async (name: 'dish-crew/delegated' | 'dish-crew/settled', event: CrewDelegated | CrewSettled): Promise<void> => {
