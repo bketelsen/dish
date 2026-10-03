@@ -1,0 +1,12 @@
+# The gates plugin (the dishGates service). A host plugin: it hears every
+# agent's end of turn, and when a crew coder bound to a worktree is about to
+# finish, it runs the project's gate in that worktree through dsh's sandboxed
+# shell, records the result in the crew's record, and steers a failure back to
+# the coder, up to `maxRounds` gate runs per turn. It reads `dishCrew`,
+# `dishWorkspaces`, `dishProjects` and `shell` with `ctx.get` on each use, so
+# there is no order to keep. Config rows: `maxRounds` (gate runs per turn, 3 by
+# default), `tailLines` (how many of the gate's last lines go to the coder, 200
+# by default) and `terminal` (print the plugin's own log lines to the terminal).
+- insert:
+    - id: dish-gates
+      name: dish-gates
