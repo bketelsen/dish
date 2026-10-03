@@ -4,7 +4,7 @@
  * - **Read once.** `load` reads every record into memory, and the rest answer from that copy (each gives copies). Writes go
  *   to the file first and then to the copy, so the copy is what is on disk, as far as this process knows.
  * - **Written whole.** A temp file in the same directory (`wx`, 0600), synced, renamed over the record, then the
- *   directory synced (crew's `writeAtomic`, record.ts:423–458, copied). Directories are made 0700. A reader sees the old
+ *   directory synced (crew's `writeAtomic`, copied). Directories are made 0700. A reader sees the old
  *   record or the new one; a crash leaves at worst a temp file, which `load` leaves alone.
  * - **One queue a project.** `create` and `update` go through the project's promise queue, so two runs opened at once
  *   get two ids, and two changes to a record can't each drop the other's.
@@ -28,8 +28,8 @@ import type { Dirent } from 'node:fs'
 import { mkdir, open, readdir, rename, unlink } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { maskSecrets } from 'dish-kit'
-import { recordFile, recordsRoot, RUN_ID, runId, RUNS_DIRECTORY, runsDirectory, SEGMENT, SLUG, splitProject } from './paths.ts'
-import { cut, oneLine } from './text.ts'
+import { recordFile, recordsRoot, RUN_ID, runId, RUNS_DIRECTORY, runsDirectory, sameProject, SEGMENT, SLUG, splitProject } from './paths.ts'
+import { cut, errorCode, isObject, isText, oneLine } from './text.ts'
 
 export type RunState = 'open' | 'pr' | 'abandoned'
 export const RUN_STATES: readonly RunState[] = ['open', 'pr', 'abandoned']
@@ -87,20 +87,8 @@ const TAKEN_FILE = /^([0-9]{8}-[a-z0-9][a-z0-9-]{0,49})\.json(?:\.corrupt-\d+)?$
 /** Files are opened without following a link in the last place of the path: a link there isn't one of ours. */
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0
 
-function errorCode(error: unknown): unknown {
-  return (error as { code?: unknown } | null)?.code
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
 function isTime(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
-}
-
-function isText(value: unknown): value is string {
-  return typeof value === 'string' && value !== ''
 }
 
 /** What is wrong with `value` as a Run, or undefined. */
@@ -241,10 +229,6 @@ function messageOf(error: unknown): string {
 
 /** Told about a record `load` didn't take: where it was, where it went (`''`: left where it is), and why. */
 export type OnCorrupt = (file: string, aside: string, problem?: string) => void
-
-function sameProject(a: string, b: string): boolean {
-  return a.toLowerCase() === b.toLowerCase()
-}
 
 /** The run records under one state directory. It needn't exist yet: the first write creates it. */
 export class RunStore {

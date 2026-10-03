@@ -21,7 +21,7 @@ export type CrewReader = Pick<DishCrew, 'records' | 'worktreeBindings'>
 export type GatesReader = Pick<DishGates, 'runAt'>
 /** A project's registration. */
 export type ProjectsReader = Pick<DishProjects, 'get'>
-/** dsh's agent registry (`ctx.agents`): the live agent of an id, if there is one (`isRunning`'s LiveAgents, crew record.ts:352). */
+/** dsh's agent registry (`ctx.agents`): the live agent of an id, if there is one (crew's `LiveAgents`, which its `isRunning` reads). */
 export interface AgentsReader {
   get(id: string): unknown
 }

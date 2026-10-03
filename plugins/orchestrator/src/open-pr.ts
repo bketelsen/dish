@@ -38,7 +38,7 @@ import type { PrFinal, PrGate } from './entries.ts'
 import { describe, mainSession, otherBase } from './runs.ts'
 import type { HarnessInput, Runs, ToolDeps } from './runs.ts'
 import type { Run } from './store.ts'
-import { RULING_FORM, cut, given, hasRuling, oneLine, rulingBody, shortSha } from './text.ts'
+import { RULING_FORM, cut, given, hasRuling, line, oneLine, rulingBody, sentence, shortSha } from './text.ts'
 
 export const MAIN_ONLY = 'open_pr is for the main agent only'
 export const NO_RUN = 'open_pr needs a run this chat drives: `run` `open` or `resume` one first (`run` `list` shows the open runs).'
@@ -138,11 +138,6 @@ function took(ms: number): string {
   return `${Math.floor(seconds / 60)} min ${seconds % 60} s`
 }
 
-/** One masked line, cut to `max`. */
-function line(text: string, max = 1000): string {
-  return cut(oneLine(maskSecrets(text)), max)
-}
-
 /** What the gate found, as one phrase after "the gate". */
 function gatePhrase(gate: PrGate | null, gatesMissing: boolean): string {
   if (gatesMissing) return 'didn\'t run: dish-gates isn\'t running'
@@ -226,11 +221,6 @@ function fail(text: string, cause?: unknown): Error {
 /** Whether the call was cancelled: read afresh each time (it changes while the call waits). */
 function aborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true
-}
-
-/** `text` ending with a full stop. */
-function sentence(text: string): string {
-  return /[.!?]$/.test(text) ? text : `${text}.`
 }
 
 /** The arguments, as far as they don't need the run. @throws Error with the refusal's words. */

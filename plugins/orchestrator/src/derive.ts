@@ -14,6 +14,7 @@
 import { HARNESS_KINDS, MAIN_KINDS } from './entries.ts'
 import type { LedgerEntry } from './entries.ts'
 import type { Run } from './store.ts'
+import { isObject } from './text.ts'
 
 export interface GateView { child: string, outcome: string, exitCode: number | null, head: string | null, at: number, log: string | null }
 export interface VerdictView {
@@ -64,10 +65,6 @@ const STATUSES: readonly string[] = ['done', 'blocked', 'needs_context']
 const VERDICTS: readonly string[] = ['approved', 'changes_requested']
 /** A full commit id: sha-1's 40 hex digits, or sha-256's 64. */
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
-
-function isObject(value: unknown): value is Fields {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
 
 function isNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)

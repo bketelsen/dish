@@ -6,10 +6,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  ledgerFile, parseRef, recordFile, RUN_ID, runId, runRef, SEGMENT, SLUG, splitProject,
+  ledgerFile, parseRef, recordFile, RUN_ID, runId, runRef, SEGMENT, SLUG, sameProject, splitProject,
 } from '../src/paths.ts'
-import { age, cut, given, hasRuling, oneLine, RULING_FORM, rulingBody, shortSession, shortSha } from '../src/text.ts'
-import { DAY, HOUR, MINUTE, NOW } from './helpers.ts'
+import {
+  age, cut, errorCode, given, hasRuling, isObject, isText, line, masked, oneLine, RULING_FORM, rulingBody, sentence, shortSession, shortSha,
+} from '../src/text.ts'
+import { DAY, HOUR, MASKED_TOKEN, MINUTE, NOW, TOKEN } from './helpers.ts'
 
 // --- text -------------------------------------------------------------------------------------------------------------
 
@@ -72,6 +74,29 @@ test('shortSha and shortSession', () => {
   assert.equal(shortSession('42'), '42')
 })
 
+test('isObject, isText and errorCode', () => {
+  assert.equal(isObject({}), true)
+  for (const value of [null, [], 'x', 1, undefined]) assert.equal(isObject(value), false, JSON.stringify(value))
+  assert.equal(isText('x'), true)
+  for (const value of ['', 1, null, undefined, ['x']]) assert.equal(isText(value), false, JSON.stringify(value))
+  assert.equal(errorCode(Object.assign(new Error('gone'), { code: 'ENOENT' })), 'ENOENT')
+  assert.equal(errorCode(new Error('plain')), undefined)
+  assert.equal(errorCode(null), undefined)
+  assert.equal(errorCode(undefined), undefined)
+})
+
+test('sentence, line and masked', () => {
+  assert.equal(sentence('done'), 'done.')
+  for (const text of ['done.', 'done!', 'done?']) assert.equal(sentence(text), text)
+  assert.equal(line(`  a\n  b ${TOKEN}\t`), `a b ${MASKED_TOKEN}`)
+  assert.equal(line('x'.repeat(1200)).length, 1000)
+  assert.equal(line('abcdef', 4), 'abc…')
+  const deep = masked({ [TOKEN]: [TOKEN, { inner: `key ${TOKEN}`, n: 1, ok: true, none: null }] })
+  assert.deepEqual(deep, { [MASKED_TOKEN]: [MASKED_TOKEN, { inner: `key ${MASKED_TOKEN}`, n: 1, ok: true, none: null }] })
+  assert.equal(masked(TOKEN), MASKED_TOKEN)
+  assert.equal(masked(7), 7)
+})
+
 test('age at each boundary', () => {
   assert.equal(age(NOW, NOW), 'just now')
   assert.equal(age(NOW + MINUTE, NOW), 'just now', 'a time ahead of now')
@@ -93,6 +118,11 @@ test('age at each boundary', () => {
 test('the record and the ledger of a run', () => {
   assert.equal(recordFile('/s/dish', 'Acme/widget.js', '20261003-fix-login'), '/s/dish/orchestrator/Acme/widget.js/runs/20261003-fix-login.json')
   assert.equal(ledgerFile('/d/dish', 'Acme/widget.js', '20261003-fix-login-2'), '/d/dish/ledgers/Acme/widget.js/20261003-fix-login-2.jsonl')
+})
+
+test('sameProject: the same owner/repo, without case', () => {
+  assert.equal(sameProject('Acme/Widget', 'acme/widget'), true)
+  assert.equal(sameProject('acme/widget', 'acme/gadget'), false)
 })
 
 test('splitProject takes owner/repo, each one segment', () => {

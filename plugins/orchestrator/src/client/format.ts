@@ -11,7 +11,7 @@ const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 
 /**
- * How long before `now` a time was, in a few words (workspaces' `relativeTime`, client/format.ts:19). Rounds down, so
+ * How long before `now` a time was, in a few words (dish-workspaces' client `relativeTime`). Rounds down, so
  * "59 min ago" never becomes "60 min ago"; after 30 days it is the (UTC) date. A time ahead of `now` (a clock that runs fast)
  * is "just now", and one that names no date (a ledger line can say anything) is "at an unknown time".
  * @param time - milliseconds since the epoch.

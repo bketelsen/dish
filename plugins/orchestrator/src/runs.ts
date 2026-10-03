@@ -33,11 +33,11 @@ import { HARNESS_KINDS, MAIN_KINDS } from './entries.ts'
 import type { HarnessEntry, LedgerEntry, MainEntry } from './entries.ts'
 import type { Ledger } from './ledger.ts'
 import { KeyedLock } from './locks.ts'
-import { parseRef, runRef, SEGMENT, SLUG, splitProject } from './paths.ts'
+import { parseRef, runRef, sameProject, SEGMENT, SLUG, splitProject } from './paths.ts'
 import type { CreatedForRun, JoinedRun, LadderEntry, Placement, PlaceTarget, RunInfo } from './service.ts'
 import type { Services } from './services.ts'
 import type { Run, RunStore } from './store.ts'
-import { cut, given, oneLine, rulingBody, shortSession, shortSha } from './text.ts'
+import { cut, given, isObject, isText, oneLine, rulingBody, shortSession, shortSha } from './text.ts'
 
 export interface Logger {
   info(format: string, ...args: unknown[]): void
@@ -123,18 +123,6 @@ export function describe(error: unknown): string {
   return cut(oneLine(maskSecrets(text)), 1000)
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function isText(value: unknown): value is string {
-  return typeof value === 'string' && value !== ''
-}
-
-function sameProject(a: string, b: string): boolean {
-  return a.toLowerCase() === b.toLowerCase()
-}
-
 /**
  * Whether the worktree dish-workspaces resolved at a run's path is another one: cut from another commit than the run's (a
  * later run of the same slug makes its worktree at the same path, on a fresh `dish/<slug>`). Gives that commit's first 7
@@ -189,7 +177,7 @@ interface Found {
 
 /**
  * The caller of a main-agent tool: `String(exec.agent.id)` when `isTopLevelAgent(exec.agent)` and it is non-empty, else
- * undefined. The same id crew's `delegate` takes as its session (`delegate.ts:819`), the worktree tool passes to
+ * undefined. The same id crew's `delegate` takes as its session (`String(agent.id)`), the worktree tool passes to
  * worktreeCreated, and dsh's agent registry is keyed by. `run`, `open_pr` and `pr_feedback` use it.
  */
 export function mainSession(exec: { agent?: unknown }): string | undefined {

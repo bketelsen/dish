@@ -39,6 +39,7 @@ import type {
   ErrorCode, GateView, JsonValue, LedgerLine, LedgerPage, Outcome, RulingView, RunDetail, RunRow, RunSummary, TaskView, VerdictView,
 } from './protocol.ts'
 import type { Run, RunStore } from './store.ts'
+import { masked } from './text.ts'
 
 /** The Cordis service key. (The wire namespace is `NAMESPACE`.) */
 export const SERVICE = 'dishRunsRemote'
@@ -89,16 +90,6 @@ function describe(error: unknown): string {
 /** `value` as the wire will carry it: JSON, with no key (or array item) left `undefined`. */
 function wire<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
-}
-
-/** `value` with every string in it, and every key, passed through the secret mask: for what came from outside the code. */
-function masked<T>(value: T): T {
-  if (typeof value === 'string') return maskSecrets(value) as T
-  if (Array.isArray(value)) return value.map(masked) as T
-  if (typeof value === 'object' && value !== null) {
-    return Object.fromEntries(Object.entries(value).map(([key, inner]) => [maskSecrets(key), masked(inner)])) as T
-  }
-  return value
 }
 
 /**

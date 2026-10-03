@@ -17,8 +17,13 @@ import { join } from 'node:path'
 
 /** One path segment: letters, digits, `.`, `_` and `-`, and not `.` or `..`. */
 export const SEGMENT = /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/
-/** A worktree's (and a run's) slug: dish-workspaces' rule (worktrees.ts:52), copied. */
+/** A worktree's (and a run's) slug: dish-workspaces' rule (its worktrees module's `SLUG`), copied. */
 export const SLUG = /^[a-z0-9][a-z0-9-]{0,39}$/
+/** Whether two `owner/repo` names are the same project: GitHub's names don't tell case apart. */
+export function sameProject(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase()
+}
+
 /** `<yyyymmdd>-<slug>`, with `-2`, `-3`, … when the day's slug was taken. */
 export const RUN_ID = /^[0-9]{8}-[a-z0-9][a-z0-9-]{0,49}$/
 

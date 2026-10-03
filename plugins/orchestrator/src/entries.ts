@@ -13,6 +13,8 @@
  * @module dish-orchestrator/entries
  */
 
+import { isObject } from './text.ts'
+
 export const HARNESS_KINDS = ['run.opened', 'run.resumed', 'run.takenOver', 'run.plan', 'run.goal', 'task.opened', 'task.removed',
   'child.started', 'child.ended', 'gate.result', 'review.verdict', 'ladder.refused', 'ladder.ruled', 'pr.checked', 'pr.opened',
   'pr.updated', 'pr.feedback', 'run.closed'] as const
@@ -124,10 +126,6 @@ export type HarnessEntry = RunOpened | RunResumed | RunTakenOver | RunPlan | Run
   | GateResultEntry | ReviewVerdict | LadderRefused | LadderRuled | PrChecked | PrOpened | PrUpdated | PrFeedback | RunClosed
 export type MainEntry = RulingEntry | DeferredEntry | NoteEntry
 export type LedgerEntry = HarnessEntry | MainEntry
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
 
 /** What is wrong with `value`'s base fields, or undefined. `kind` is any string here. */
 function baseProblem(value: unknown): string | undefined {

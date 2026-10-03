@@ -34,7 +34,7 @@ import type { StatusContext } from './status.ts'
 import type { Services, WorkspacesReader } from './services.ts'
 import { GOAL_MAX, REASON_MAX } from './store.ts'
 import type { Run } from './store.ts'
-import { cut, given, oneLine, shortSession, shortSha } from './text.ts'
+import { cut, errorCode, given, line, sentence, shortSession, shortSha } from './text.ts'
 
 export const MAIN_ONLY = 'the run tool is for the main agent only'
 export const NO_RUN = 'This chat drives no run: `run` `open` one (making a worktree opens one too), or `resume` one; `run` `list` shows the open runs.'
@@ -101,11 +101,6 @@ interface Answer {
   text: string
 }
 
-/** Folded to one line, masked, and cut to `max`: a field the ledger or the record keeps. */
-function line(text: string, max: number): string {
-  return cut(oneLine(maskSecrets(oneLine(text))), max)
-}
-
 /** A note: line breaks kept, trailing blanks off each line, runs of blank lines folded to one; masked, and cut to `max`. */
 function noteText(text: string, max: number): string {
   const folded = text.replace(/\r\n?/g, '\n').split('\n').map(part => part.trimEnd()).join('\n').replace(/\n{3,}/g, '\n\n').trim()
@@ -115,15 +110,6 @@ function noteText(text: string, max: number): string {
 /** An argument as a refusal shows it: one line, masked, short. */
 function shown(text: string): string {
   return line(text, SHOWN_MAX)
-}
-
-/** `text` ending a sentence: a period added unless it ends with one (or `!` or `?`) already. */
-function sentence(text: string): string {
-  return /[.!?]$/.test(text) ? text : `${text}.`
-}
-
-function errorCode(error: unknown): unknown {
-  return (error as { code?: unknown } | null)?.code
 }
 
 /** Whether `path` (relative, from `relative()`) leads out of the directory it is relative to. */
@@ -445,7 +431,7 @@ async function compare(workspaces: WorkspacesReader | undefined, run: Run): Prom
 }
 
 /** An error as the model gets it: its message masked once more. */
-function masked(error: unknown): Error {
+function maskedError(error: unknown): Error {
   let message: string
   try {
     message = error instanceof Error ? error.message : String(error)
@@ -471,7 +457,7 @@ export function runTool(deps: ToolDeps): ToolDefinition {
       try {
         answer = await tool.perform(args as Args, exec)
       } catch (error) {
-        throw masked(error)
+        throw maskedError(error)
       }
       return { action: args.action, run: answer.run, text: maskSecrets(answer.text) }
     },
