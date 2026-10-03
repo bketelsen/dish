@@ -113,8 +113,9 @@ test('Environment is exactly two entries, PATH and TMPDIR, and TMPDIR is made be
   // Under ~/.cache/dish, which dish-sandbox protects: only then does it give sandboxed commands the machine's /tmp.
   assert.deepEqual(service.ExecStartPre, [
     '/usr/bin/mkdir -p -m 0700 %h/.cache/dish %h/.cache/dish/tmp',
-    // dsh is stopped then: what has been untouched for 10 days goes, as systemd-tmpfiles ages /tmp. A failure doesn't stop the start.
-    '-/usr/bin/find %h/.cache/dish/tmp -mindepth 1 -maxdepth 1 -mtime +10 -exec rm -rf -- {} +',
+    // dsh is stopped then: each file untouched for 10 days goes, then each directory left empty and as old, as
+    // systemd-tmpfiles ages /tmp. A failure doesn't stop the start.
+    '-/usr/bin/find %h/.cache/dish/tmp -mindepth 1 -depth -mtime +10 ( ! -type d -o -empty ) -delete',
   ])
 })
 
