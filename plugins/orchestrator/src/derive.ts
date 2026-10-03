@@ -62,7 +62,8 @@ const HARNESS: readonly string[] = HARNESS_KINDS
 const MAIN: readonly string[] = MAIN_KINDS
 const STATUSES: readonly string[] = ['done', 'blocked', 'needs_context']
 const VERDICTS: readonly string[] = ['approved', 'changes_requested']
-const HEX = /^[0-9a-f]{7,64}$/i
+/** A full commit id: sha-1's 40 hex digits, or sha-256's 64. */
+const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
 
 function isObject(value: unknown): value is Fields {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -175,11 +176,13 @@ export function gateAt(entries: readonly LedgerEntry[], head: string): GateView 
   })
 }
 
-/** Both hex shas, 7 to 64 characters: equal without case, or the shorter is a prefix of the longer. */
+/**
+ * Both full shas (40 or 64 hex digits), equal without case. Never a prefix (correction 6): an abbreviated sha could match
+ * another commit. A missing head (a review of work outside git) matches nothing.
+ */
 export function sameHead(a: unknown, b: unknown): boolean {
-  if (!isString(a) || !isString(b) || !HEX.test(a) || !HEX.test(b)) return false
-  const [short, long] = a.length <= b.length ? [a.toLowerCase(), b.toLowerCase()] : [b.toLowerCase(), a.toLowerCase()]
-  return long.startsWith(short)
+  if (!isString(a) || !isString(b) || !FULL_SHA.test(a) || !FULL_SHA.test(b)) return false
+  return a.toLowerCase() === b.toLowerCase()
 }
 
 /** The coder of `task`: its newest coder start, and the end of that child that came after it, if any. */

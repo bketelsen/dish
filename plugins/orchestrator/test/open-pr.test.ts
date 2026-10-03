@@ -487,7 +487,7 @@ test('open_pr: all passing pushes the head, opens the pull request, and closes t
   await assert.rejects(call(tool), (error: Error) => error.message === NO_RUN)
 })
 
-test('open_pr: a final reviewer\'s re-review with `to` counts; so does an approval of a 7-character prefix', async () => {
+test('open_pr: a final reviewer\'s re-review with `to` counts; an approval of a 7-character prefix doesn\'t (full shas only)', async () => {
   const { w, run, tool } = await setup()
   await verdict(w, run, { child: 'rev-1', head: SHA_A })
   await verdict(w, run, { child: 'rev-1', head: HEAD })
@@ -495,6 +495,10 @@ test('open_pr: a final reviewer\'s re-review with `to` counts; so does an approv
 
   const other = await setup()
   await verdict(other.w, other.run, { head: HEAD.slice(0, 7) })
+  await refused(call(other.tool), '- no final review approved bbbbbbb: the latest final review (child rev-1) approved bbbbbbb, not this head.')
+  nothingWritten(other.w)
+  // Its uppercase full sha does count.
+  await verdict(other.w, other.run, { head: HEAD.toUpperCase() })
   assert.equal((await call(other.tool)).number, 1)
 })
 
