@@ -244,10 +244,10 @@ test('open_pr: a worktree that isn\'t clean (with why), and isClean rejecting', 
   assert.deepEqual(await written(w, run), [])
 })
 
-/** open_pr's line for untracked files, naming `names`. */
-function untrackedLine(names: string): string {
+/** open_pr's line for untracked files, naming `names`: after a refusal, or after the pull request opened (`opened`). */
+function untrackedLine(names: string, opened = false): string {
   return `Untracked, not in the pull request: ${names}. If the project's gate writes them, have a coder add them to \`.gitignore\`; `
-    + 'if one should be in the pull request, have a coder commit it and call `open_pr` again.'
+    + `if one should be in the pull request, have a coder commit it, ${opened ? 'then `run` `resume` and call `open_pr` again' : 'and call `open_pr` again'}.`
 }
 
 test('open_pr: a gate that leaves untracked files (a `go build` binary) doesn\'t loop: the PR opens, and the answer names them', async () => {
@@ -269,7 +269,7 @@ test('open_pr: a gate that leaves untracked files (a `go build` binary) doesn\'t
   assert.equal(w.workspaces.calls.pushBranch.length, 1)
   assert.equal(value.number, 1)
   const lines = value.text.split('\n')
-  assert.equal(lines.at(-1), untrackedLine('clippy'))
+  assert.equal(lines.at(-1), untrackedLine('clippy', true))
   assert.equal(lines.filter(text => text.startsWith('Untracked')).length, 1)
   assert.deepEqual(await written(w, run), ['pr.checked', 'pr.opened', 'run.closed'])
 })

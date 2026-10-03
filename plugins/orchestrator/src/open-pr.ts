@@ -67,10 +67,14 @@ const DESCRIPTION = [
   '- A refused check pushes nothing. It takes as long as the gate. It ends the run.',
 ].join('\n')
 
-/** The line naming the untracked files the checks saw (masked, as dish-workspaces gives them), which the push leaves out. */
-export function untrackedLine(names: readonly string[]): string {
+/**
+ * The line naming the untracked files the checks saw (masked, as dish-workspaces gives them), which the push leaves out.
+ * After a pull request opened the run is closed, so the way back to it is `run` `resume` first.
+ */
+export function untrackedLine(names: readonly string[], opened = false): string {
+  const again = opened ? 'then `run` `resume` and call `open_pr` again' : 'and call `open_pr` again'
   return maskSecrets(`Untracked, not in the pull request: ${names.map(name => line(String(name), 200)).join(', ')}. `
-    + 'If the project\'s gate writes them, have a coder add them to `.gitignore`; if one should be in the pull request, have a coder commit it and call `open_pr` again.')
+    + `If the project's gate writes them, have a coder add them to \`.gitignore\`; if one should be in the pull request, have a coder commit it, ${again}.`)
 }
 
 /** `error` with the untracked line after its message, when the checks saw untracked files. */
@@ -566,7 +570,7 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
     lines.push(`Run \`${run.id}\` is closed. Humans merge; dish removes the run's own worktree once the PR is merged, and task worktrees are removed with \`worktree\` \`remove\`. `
       + 'Review feedback: `run` `resume` reopens it.')
     lines.push(...unrecorded)
-    if (seen.untracked !== undefined && seen.untracked.length > 0) lines.push(untrackedLine(seen.untracked))
+    if (seen.untracked !== undefined && seen.untracked.length > 0) lines.push(untrackedLine(seen.untracked, true))
     return { url, number, existing: pull.existing, head, text: maskSecrets(lines.join('\n')) }
   }
 }
