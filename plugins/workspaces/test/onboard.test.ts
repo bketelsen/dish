@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { appendFile, chmod, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { workRoot } from 'dish-kit'
 import { fetchClone, internals } from '../src/clone.ts'
@@ -134,7 +134,7 @@ test('an installation that hasn\'t accepted Pull requests read still onboards', 
 test('an App not installed on the owner fails at installation, naming what to do, and clones nothing', async () => {
   const run = await prepare({ installed: false, registry: false })
   const error = await failsAt(onboard(run), 'installation')
-  assert.equal(error.message, 'install the dish App on acme and give it widget')
+  assert.equal(error.message, 'install the dish App on acme and give it widget, then press Retry on Settings → Projects')
   assert.deepEqual(run.steps, ['installation'])
   assert.equal(await exists(run.world.workRoot), false)
 })
@@ -142,7 +142,7 @@ test('an App not installed on the owner fails at installation, naming what to do
 test('without the App\'s credentials it fails at installation, pointing at the card', async () => {
   const run = await prepare({ credentials: false, registry: false })
   const error = await failsAt(onboard(run), 'installation')
-  assert.equal(error.message, 'set the GitHub App on Settings → GitHub App')
+  assert.equal(error.message, 'set the GitHub App on Settings → GitHub App, then press Retry on Settings → Projects')
   assert.equal(await exists(run.world.workRoot), false)
 })
 
@@ -152,11 +152,47 @@ test('a failing setup fails the project with its masked tail, and records the ru
   assert.match(error.message, /^setup exited 3; last lines:/)
   assert.match(error.message, /last/)
   assert.match(error.message, /token /)
+  // Retry adopts the clone and skips setup, so the message says how to run it again.
+  const clone = await realpath(join(run.world.workRoot, 'acme', 'widget'))
+  assert.ok(error.message.endsWith(`\nRetry won't run setup again in this clone: remove the clone and press Retry, or run it yourself in ${clone}`), error.message)
   assert.deepEqual(run.steps, ['installation', 'clone', 'configure', 'setup'])
   const state = await readCloneState(cloneStateFile(run.world.state, 'acme', 'widget'))
   assert.deepEqual({ ...state?.setup, at: 0 }, { at: 0, ran: true, exitCode: 3, timedOut: false })
   assert.equal(state?.workspace, null)
   await assertNoToken(run, error.message, String(error.stack))
+})
+
+test('a failing setup\'s message keeps its last lines within what dish-projects shows, and always ends with what to do', async () => {
+  const run = await prepare({ registry: false })
+  const line = 'x'.repeat(150)
+  const error = await failsAt(onboard(run, { setup: `for i in $(seq 1 30); do echo "$i ${line}"; done; exit 2`, setupTimeoutMs: 30_000 }), 'setup')
+  assert.ok(error.message.length <= 900, `${error.message.length} characters`)
+  assert.match(error.message, /^setup exited 2; last lines:\n/)
+  assert.match(error.message, new RegExp(`\\n30 ${line}\\n`), 'the last line is kept')
+  assert.ok(!error.message.includes(`\n1 ${line}`), 'the first lines are dropped')
+  assert.match(error.message, /remove the clone and press Retry, or run it yourself in \S+$/)
+})
+
+test('a fresh clone at a path a dsh workspace already points at (one kept from before) skips setup, giving the command', async () => {
+  const run = await prepare()
+  const { world } = run
+  try {
+    // The project was onboarded once, removed, its clone deleted by hand: its workspace stays in dsh.
+    const path = join(world.workRoot, 'acme', 'widget')
+    await mkdir(path, { recursive: true })
+    const kept = await run.registry!.registry.create(path, 'acme/widget')
+    await rm(path, { recursive: true })
+    const setup = 'echo ran >> .setup-ran'
+    const result = await onboard(run, { setup })
+    assert.equal(result.adopted, false, 'a fresh clone')
+    assert.deepEqual(result.setup, { ran: false, reason: skipReason('a dsh workspace already points at this path', result.clone, setup) })
+    assert.equal(await exists(join(result.clone, '.setup-ran')), false)
+    assert.deepEqual(result.workspace, { id: kept.id })
+    const state = await readCloneState(cloneStateFile(world.state, 'acme', 'widget'))
+    assert.deepEqual({ ...state?.setup, at: 0 }, { at: 0, ran: false, exitCode: null, timedOut: false, reason: result.setup.ran ? '' : result.setup.reason })
+  } finally {
+    await run.registry?.stop()
+  }
 })
 
 test('a setup that runs past its time is killed, and fails the project', async () => {

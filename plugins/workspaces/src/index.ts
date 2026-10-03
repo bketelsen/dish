@@ -98,6 +98,7 @@ export function start(ctx: Context, config: Config, internals: WorkspacesInterna
     listWorktrees: project => service.listWorktrees(project),
     removeWorktree: (project, slug, force) => service.removeWorktree(project, slug, force),
     resolve: pathOrRef => service.resolve(pathOrRef),
+    resolveProblem: pathOrRef => service.resolveProblem(pathOrRef),
     sweep: project => service.sweep(project),
     appStatus: test => service.appStatus(test),
   }

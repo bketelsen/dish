@@ -289,8 +289,10 @@ export function createDishProjects(options: ProjectsOptions): ProjectsService {
       } else if (before === undefined) {
         onboarding.enqueue(project, 'onboard')
       } else if (edited && (state === 'failed' || state === 'pending')) {
-        // A failed one may be fixed (a setup corrected, say); a waiting one takes the new fields when it runs. A ready
-        // one is left alone, and one being onboarded finishes with what it had.
+        // A failed one is tried again with the new fields. That doesn't rerun a corrected setup: the clone dish made is
+        // there, so onboarding adopts it and skips setup (the failure's message says to remove the clone, or run setup by
+        // hand). A waiting one takes the new fields when it runs. A ready one is left alone, and one being onboarded
+        // finishes with what it had.
         onboarding.enqueue(project, 'onboard')
       }
     }

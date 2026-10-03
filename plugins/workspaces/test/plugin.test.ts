@@ -181,6 +181,14 @@ test('end to end: a project in projects.yaml is onboarded; a restart prepares it
     assert.deepEqual(await run.service()!.resolve(join(link, 'acme', 'widget', '.worktrees', 'feature')), byRef)
     assert.equal(await run.service()!.resolve('acme/widget/nothing'), undefined)
     assert.equal(await run.service()!.resolve('acme/other/feature'), undefined)
+    assert.equal(await run.service()!.resolveProblem('acme/widget/feature'), undefined)
+    assert.equal(await run.service()!.resolveProblem('acme/widget/nothing'), undefined)
+    // A clone that fails dish's safety check: resolve gives nothing, and resolveProblem says why.
+    await runOk('git', ['-C', clone, 'config', 'core.pager', 'less'], { env: world.env })
+    assert.equal(await run.service()!.resolve('acme/widget/feature'), undefined)
+    assert.equal(await run.service()!.resolveProblem('acme/widget/feature'),
+      `acme/widget's clone (${clone}) failed dish's safety check: .git/config sets core.pager, which dish doesn't allow`)
+    await runOk('git', ['-C', clone, 'config', '--unset', 'core.pager'], { env: world.env })
 
     // list shows who is bound (dishCrew), and remove refuses while that child runs.
     run.crew.bindings.set(value.path, [{ child: 'child-1', sessionId: 'sess-main', role: 'coder', title: 'Build it', running: true }])

@@ -540,7 +540,7 @@ export async function cloneOrAdopt(project: Project, deps: CloneDeps, signal?: A
 async function adopt(path: string, project: Project, deps: CloneDeps): Promise<string> {
   const web = originOf(deps.web)
   const refuse = (finding: string): OnboardError =>
-    new OnboardError('clone', `${path} is there already, and dish can't adopt it: ${finding}. dish leaves it as it is; move it away or fix it, then retry`)
+    new OnboardError('clone', `${path} is there already, and dish can't adopt it: ${finding}. dish leaves it as it is; move it away or fix it, then press Retry on Settings → Projects`)
 
   const kind = await kindOf(path)
   if (kind === 'link') throw refuse('it is a symbolic link')
@@ -598,7 +598,7 @@ async function cloneFresh(path: string, project: Project, deps: CloneDeps, signa
     throw new OnboardError('clone', `no read token for ${project.owner}: ${messageOf(error)}`)
   }
   if (dropped.some(repo => repo.toLowerCase() === project.repo.toLowerCase())) {
-    throw new OnboardError('clone', `the dish App can't read ${project.name}: give it the repo on GitHub, then retry`)
+    throw new OnboardError('clone', `the dish App can't read ${project.name}: give it the repo on GitHub, then press Retry on Settings → Projects`)
   }
   if (signal?.aborted) throw abortError(`cloning ${project.name}`)
 

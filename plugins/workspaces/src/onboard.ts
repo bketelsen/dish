@@ -10,7 +10,9 @@
  *    still onboards), then `configureClone`.
  * 4. **setup:** outside the sandbox only in a clone dish has just made (its own fresh clone of GitHub's default branch).
  *    An adopted clone (adopting, or Retry) is skipped with the command to run: an existing checkout's ignored files
- *    can't be trusted (the spec's "Fresh checkouts only").
+ *    can't be trusted (the spec's "Fresh checkouts only"). So is a fresh clone at a path a dsh workspace already points
+ *    at (one kept after the project was removed and its clone deleted): chats in that workspace could write in the
+ *    clone while setup runs. A setup that fails says how to run it again: Retry adopts the clone and skips setup.
  * 5. **workspace:** registered with dsh's workspace registry, titled with the project's name, and recorded; without a
  *    registry (a profile other than `web`), skipped, to be registered when one appears. The signal is checked first, so
  *    a project removed while it onboarded never gets a workspace.
@@ -44,8 +46,16 @@ export type { OnboardStep } from './clone.ts'
 export const NO_REGISTRY = 'no workspace registry in this profile'
 /** Why setup doesn't run in an adopted clone. */
 export const EXISTING_CHECKOUT = 'it is an existing checkout'
+/** Why setup doesn't run in a fresh clone that a dsh workspace already points at. */
+export const WORKSPACE_THERE = 'a dsh workspace already points at this path'
+/** What to do about setup's failure: Retry adopts the clone and skips setup. */
+const AFTER_FAILURE = "Retry won't run setup again in this clone: remove the clone and press Retry, or run it yourself in"
 /** How many lines of setup's log a failure's message carries. */
 const FAILURE_LINES = 20
+/** The longest a failure's message is: dish-projects shows a status's first 1000 characters, and masks it again. */
+const FAILURE_CHARS = 900
+/** What a message about the App adds: the project waits as failed until Retry. */
+const THEN_RETRY = 'then press Retry on Settings → Projects'
 
 export interface OnboardResult {
   clone: string
@@ -79,7 +89,7 @@ function messageOf(error: unknown): string {
 
 /** What a failed GitHub call means for the step: the App not set at all points at its card. */
 function githubFailure(step: OnboardStep, what: string, error: unknown): OnboardError {
-  if (error instanceof GitHubError && error.kind === 'no-credentials') return new OnboardError(step, 'set the GitHub App on Settings → GitHub App')
+  if (error instanceof GitHubError && error.kind === 'no-credentials') return new OnboardError(step, `set the GitHub App on Settings → GitHub App, ${THEN_RETRY}`)
   return new OnboardError(step, `${what}: ${messageOf(error)}`)
 }
 
@@ -89,9 +99,24 @@ function asStepError(step: OnboardStep, error: unknown): Error {
   return new OnboardError(step, messageOf(error))
 }
 
-/** The last `count` lines of `text`. */
-function lastLines(text: string, count: number): string {
-  return text.replace(/\n$/, '').split('\n').slice(-count).join('\n')
+/**
+ * The last `count` lines of `text`, as many of them as fit in `max` characters (whole lines, from the end; a last line
+ * longer than that keeps its end).
+ */
+function lastLines(text: string, count: number, max: number): string {
+  const lines = text.replace(/\n$/, '').split('\n').slice(-count)
+  const kept: string[] = []
+  let size = 0
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]!
+    if (size + line.length + 1 > max) {
+      if (kept.length === 0) kept.unshift(`…${line.slice(line.length - Math.max(0, max - 1))}`)
+      break
+    }
+    kept.unshift(line)
+    size += line.length + 1
+  }
+  return kept.join('\n')
 }
 
 /** Steps 1–5, reporting each step through `progress` before it starts. Errors are OnboardError with a masked message. */
@@ -124,7 +149,7 @@ export async function onboardProject(
   const installation = await deps.app.installationFor(project.owner, project.repo).catch((error: unknown) => {
     throw githubFailure('installation', `looking up the dish App's installation on ${project.name} failed`, error)
   })
-  if (installation === undefined) throw new OnboardError('installation', `install the dish App on ${project.owner} and give it ${project.repo}`)
+  if (installation === undefined) throw new OnboardError('installation', `install the dish App on ${project.owner} and give it ${project.repo}, ${THEN_RETRY}`)
   try {
     await save({
       clone: state?.clone ?? clonePath(deps.workRoot, project.owner, project.repo),
@@ -137,7 +162,7 @@ export async function onboardProject(
     await deps.tokens.setRepositories(withRepo(deps.repositories(), project, installation.id))
     const { dropped } = await deps.tokens.ensureFileToken(project.owner)
     if (dropped.some(repo => repo.toLowerCase() === project.repo.toLowerCase())) {
-      throw new OnboardError('installation', `install the dish App on ${project.owner} and give it ${project.repo}`)
+      throw new OnboardError('installation', `install the dish App on ${project.owner} and give it ${project.repo}, ${THEN_RETRY}`)
     }
   } catch (error) {
     throw asStepError('installation', error)
@@ -171,8 +196,8 @@ export async function onboardProject(
   let setup: SetupOutcome
   if (project.setup === undefined) {
     setup = { ran: false, reason: 'no setup' }
-  } else if (adopted) {
-    setup = { ran: false, reason: skipReason(EXISTING_CHECKOUT, clone, project.setup) }
+  } else if (adopted || await workspaceAt(deps.registry(), clone)) {
+    setup = { ran: false, reason: skipReason(adopted ? EXISTING_CHECKOUT : WORKSPACE_THERE, clone, project.setup) }
     await save({ ...state!, setup: { at: Date.now(), ran: false, exitCode: null, timedOut: false, reason: setup.reason } }).catch((error: unknown) => {
       throw asStepError('setup', error)
     })
@@ -189,8 +214,9 @@ export async function onboardProject(
       const how = result.timedOut
         ? `setup timed out after ${project.setupTimeout}`
         : result.exitCode !== null ? `setup exited ${result.exitCode}` : result.signal !== null ? `setup was ended by ${result.signal}` : "setup couldn't start"
-      const tail = lastLines(result.tail, FAILURE_LINES)
-      throw new OnboardError('setup', `${how}; last lines:${tail === '' ? ' (none)' : `\n${tail}`}`)
+      const after = `${AFTER_FAILURE} ${clone}`
+      const tail = lastLines(result.tail, FAILURE_LINES, FAILURE_CHARS - how.length - after.length - 20)
+      throw new OnboardError('setup', `${how}; last lines:${tail === '' ? ' (none)' : `\n${tail}`}\n${after}`)
     }
     setup = { ran: true, ...result }
   }
@@ -206,6 +232,19 @@ export async function onboardProject(
     return { clone, adopted, setup, workspace: { id: workspace.id } }
   } catch (error) {
     throw asStepError('workspace', error)
+  }
+}
+
+/**
+ * Whether dsh's workspace registry (when this profile has one) has a workspace at `clone`: one kept from before, which
+ * dish didn't make for this onboarding. A registry that can't be asked fails the step, and setup doesn't run.
+ */
+async function workspaceAt(registry: WorkspaceRegistryLike | undefined, clone: string): Promise<boolean> {
+  if (registry === undefined) return false
+  try {
+    return await registry.resolveByPath(clone) !== undefined
+  } catch (error) {
+    throw new OnboardError('setup', `couldn't ask dsh's workspace registry whether a workspace points at ${clone}: ${messageOf(error)}`)
   }
 }
 

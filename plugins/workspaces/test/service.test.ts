@@ -1,9 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { lstat, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import { helperValue, tokensDir } from '../src/paths.ts'
+import { helperValue, tokensDir, worktreeRecordFile } from '../src/paths.ts'
 import { createDishWorkspaces } from '../src/service.ts'
 import type { WorkspacesInternals, WorkspacesService } from '../src/service.ts'
 import { exists, filesHolding } from './onboard-helpers.ts'
@@ -234,6 +234,8 @@ test('prepare configures before it fetches: a helper path from an older checkout
   const run = await setup()
   try {
     await run.service.onboard(widget)
+    // dish-projects prepares a project that is ready.
+    run.projects.set('acme/widget', 'ready')
     const clone = join(run.world.workRoot, 'acme', 'widget')
     const web = run.world.git.origin
     const current = helperValue(HELPER, tokensDir(run.world.state), web)
@@ -269,6 +271,7 @@ test('prepare stays ready when GitHub can\'t give the bot identity: the clone ke
   const run = await setup()
   try {
     await run.service.onboard(widget)
+    run.projects.set('acme/widget', 'ready')
     const clone = join(run.world.workRoot, 'acme', 'widget')
     const config = join(clone, '.git', 'config')
     const web = run.world.git.origin
@@ -399,6 +402,132 @@ test('a project removed while its registration waits for the lock gets no worksp
     release()
     await teardown(run)
     await mounted?.stop()
+  }
+})
+
+/**
+ * A record of a worktree whose directory and branch are both gone: a sweep drops it (`missing`), so while the file is
+ * there, the project wasn't swept.
+ */
+async function plantGone(run: Setup, owner: string, repo: string, slug: string): Promise<string> {
+  const file = worktreeRecordFile(run.world.state, owner, repo, slug)
+  await mkdir(join(file, '..'), { recursive: true })
+  await writeFile(file, JSON.stringify({ project: `${owner}/${repo}`, slug, branch: `dish/${slug}`, base: 'a'.repeat(40), baseRef: 'origin/main', createdAt: 1 }))
+  return file
+}
+
+/** Credentials whose reads wait while `hold` is on, and count those that waited: so a prepare can hold its project's lock. */
+function heldCredentials(world: ServiceWorld) {
+  let gate: Promise<void> | undefined
+  let open = (): void => {}
+  let waiting = 0
+  return {
+    stub: {
+      async resolve(ref: string) {
+        if (gate !== undefined) {
+          waiting++
+          await gate
+        }
+        const value = world.credentials.get(ref)
+        return value === undefined ? undefined : { value, source: 'file' }
+      },
+    },
+    hold(): void {
+      gate = new Promise<void>((resolve) => { open = resolve })
+    },
+    release(): void {
+      gate = undefined
+      open()
+    },
+    waiting: () => waiting,
+  }
+}
+
+/** The fake git server's requests for `owner/repo` from `from` on. */
+function requestsFor(run: Setup, repo: string, from: number): string[] {
+  return run.world.git.requests.slice(from).map(request => request.path).filter(path => path.startsWith(`/${repo}.git/`))
+}
+
+test('prepare of a project whose clone was deleted by hand says so, and that Retry clones it again', async () => {
+  const run = await setup()
+  try {
+    await run.service.onboard(widget)
+    run.projects.set('acme/widget', 'ready')
+    const clone = join(run.world.workRoot, 'acme', 'widget')
+    await rm(clone, { recursive: true, force: true })
+    await assert.rejects(run.service.prepare(widget), (error: Error) => {
+      assert.equal(error.message, `the clone at ${clone} is gone; press Retry on Settings → Projects to clone it again`)
+      return true
+    })
+    // Retry onboards it again: a fresh clone.
+    const again = await run.service.onboard(widget)
+    assert.equal(again.adopted, false)
+    assert.ok(await exists(join(clone, '.git')))
+  } finally {
+    await teardown(run)
+  }
+})
+
+test('a project removed while it is prepared is neither fetched nor swept', async () => {
+  const world = await startServiceWorld()
+  const held = heldCredentials(world)
+  const run = await setup({ world, credentials: held.stub })
+  try {
+    await run.service.onboard(widget)
+    run.projects.set('acme/widget', 'ready')
+    await run.service.idle()
+    const record = await plantGone(run, 'acme', 'widget', 'gone-1')
+    const before = run.service.describe('acme/widget')?.lastFetch
+    // The prepare holds the project's lock while it asks for the bot identity; the project is removed meanwhile.
+    run.service.credentialsChanged(APP_ID_NAME)
+    held.hold()
+    const preparing = run.service.prepare(widget)
+    await waitFor('prepare to hold the lock', () => held.waiting() > 0)
+    run.projects.remove('acme/widget')
+    const from = run.world.git.requests.length
+    held.release()
+    await preparing
+    await run.service.idle()
+    assert.deepEqual(requestsFor(run, 'acme/widget', from), [], 'not fetched')
+    assert.deepEqual(run.service.describe('acme/widget')?.lastFetch, before)
+    assert.ok(await exists(record), 'not swept')
+  } finally {
+    held.release()
+    await teardown(run)
+  }
+})
+
+test('a project removed while the hourly round is under way is neither fetched nor swept by it', async () => {
+  const world = await startServiceWorld()
+  const held = heldCredentials(world)
+  const timers = fakeTimers()
+  const run = await setup({ world, credentials: held.stub, timers, internals: { firstRoundMs: 1_000, roundEveryMs: 7_000 } })
+  try {
+    await run.service.onboard(widget)
+    await run.service.onboard(gadget)
+    run.projects.set('acme/widget', 'ready')
+    run.projects.set('acme/gadget', 'ready')
+    await run.service.idle()
+    const widgetRecord = await plantGone(run, 'acme', 'widget', 'gone-1')
+    const gadgetRecord = await plantGone(run, 'acme', 'gadget', 'gone-1')
+    // gadget's lock is held (a prepare waiting for the bot identity) when the round lists both and starts on widget.
+    run.service.credentialsChanged(APP_ID_NAME)
+    held.hold()
+    const preparing = run.service.prepare(gadget)
+    await waitFor('prepare to hold the lock', () => held.waiting() > 0)
+    timers.fire(1_000)
+    await waitFor('the round to sweep widget', async () => !(await exists(widgetRecord)))
+    // The round waits for gadget's lock now, with gadget in the list it made; gadget is removed.
+    run.projects.remove('acme/gadget')
+    const from = run.world.git.requests.length
+    held.release()
+    await preparing
+    await run.service.idle()
+    assert.deepEqual(requestsFor(run, 'acme/gadget', from), [], 'not fetched')
+    assert.ok(await exists(gadgetRecord), 'not swept')
+  } finally {
+    held.release()
+    await teardown(run)
   }
 })
 

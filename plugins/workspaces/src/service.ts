@@ -30,7 +30,9 @@
  * - **The hourly round:** first `firstRoundMs` after `start`, then every `roundEveryMs`: per ready project, one at a time,
  *   under its lock: its fetch (which makes sure of its read token first), then the sweep. A round never overlaps the one
  *   before (a tick while one runs is skipped). A failure is logged once per project and error, and the round goes on.
- *   After `createWorktree` and `prepare` (each fetched), that project's sweep runs in the background.
+ *   After `createWorktree` and `prepare` (each fetched), that project's sweep runs in the background. Only a project
+ *   that is still ready once it has its lock is fetched and swept: one removed after the round listed it, or while a
+ *   prepare of it ran, is left alone.
  * - **`close`:** no more work is taken; every timer is cleared; everything in flight is aborted and awaited (its children
  *   dead), and rejects with an Error named `AbortError` (dish-projects leaves such a project pending, never failed); then
  *   the token files are removed (`TokenManager.close`).
@@ -39,7 +41,7 @@
  */
 
 import { readFileSync, readdirSync, realpathSync } from 'node:fs'
-import { readdir } from 'node:fs/promises'
+import { lstat, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
@@ -93,9 +95,10 @@ export interface DishWorkspaces {
   onboard(project: Project, options?: { signal?: AbortSignal, progress?: (step: OnboardStep) => void }): Promise<OnboardResult>
   /**
    * For a ready project at start: step 3 again (the helper path, the identity, the safety check), then its fetch; and its
-   * workspace, if it has none and a registry is there. It fails only when the clone can't be configured or checked: a bot
-   * identity GitHub can't give (the network not up yet) leaves the clone's own, and a failed fetch is in `lastFetch`;
-   * each is logged once.
+   * workspace, if it has none and a registry is there. It fails only when the clone is gone ("the clone at <path> is
+   * gone; press Retry on Settings → Projects to clone it again") or can't be configured or checked: a bot identity GitHub
+   * can't give (the network not up yet) leaves the clone's own, and a failed fetch is in `lastFetch`; each is logged
+   * once. A project that is no longer ready once it is configured (removed meanwhile) isn't fetched.
    */
   prepare(project: Project): Promise<void>
   /** What dish knows of `name`'s clone, from memory; undefined for a project with no clone state. */
@@ -106,7 +109,12 @@ export interface DishWorkspaces {
   removeWorktree(project: string, slug: string, force?: boolean): Promise<void>
   /** For delegate and gates: `<project>/<slug>`, or a worktree's path (any spelling: crew's records are canonical); a worktree dish made, of a registered project. */
   resolve(pathOrRef: string): Promise<Worktree | undefined>
-  /** Fetch, then sweep, one project or every ready one. */
+  /**
+   * For a refusal's words, after `resolve` gave `undefined`: why, for a worktree dish made whose clone or worktree fails
+   * dish's safety check, or whose branch is gone (`Worktrees.problem`); `undefined` for anything else.
+   */
+  resolveProblem(pathOrRef: string): Promise<string | undefined>
+  /** Fetch, then sweep, one project or every ready one. A project that isn't ready (by the time it has its lock) is neither. */
   sweep(project?: string): Promise<SweepResult>
   /**
    * What GitHub says of the App, for Settings → GitHub App. `test` makes the test (`GET /app`, the installations, the bot) and
@@ -227,6 +235,17 @@ function abortedBy(signal: AbortSignal): Error {
   const error = new Error('aborted')
   error.name = 'AbortError'
   return error
+}
+
+/** Whether nothing is at `path` (a link counts as something). Another error is not "missing": what reads it next says what it is. */
+async function missing(path: string): Promise<boolean> {
+  try {
+    await lstat(path)
+    return false
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    return code === 'ENOENT' || code === 'ENOTDIR'
+  }
 }
 
 /** How many worktree records `<project state>/worktrees` holds (`<slug>.json`). */
@@ -454,6 +473,8 @@ class Service implements WorkspacesService {
         if (current === undefined) {
           throw new Error(`dish has no record of ${project.name}'s clone (${file}); press Retry on Settings → Projects to onboard it again`)
         }
+        // Deleted by hand: Retry onboards the project again, which makes a fresh clone.
+        if (await missing(current.clone)) throw new Error(`the clone at ${current.clone} is gone; press Retry on Settings → Projects to clone it again`)
         if (current.installation !== null) await this.#addRepositories(new Map([[project.owner.toLowerCase(), { installation: current.installation, repos: [project.repo] }]]))
         const topic = `project ${project.name.toLowerCase()}`
         let troubled = false
@@ -470,6 +491,8 @@ class Service implements WorkspacesService {
         // Configure first: the fetch checks the clone with today's helper path, which this puts back.
         await configureClone(current.clone, project, identity, this.#cloneDeps)
         if (signal.aborted) throw abortedBy(signal)
+        // Removed (or no longer ready) while it was prepared: no fetch, and the sweep queued after this does nothing.
+        if (!this.#stillReady(project)) return
         try {
           await this.#fetch(project, signal)
         } catch (error) {
@@ -564,6 +587,12 @@ class Service implements WorkspacesService {
     const projects = this.#projects()
     if (projects === undefined || this.#closed) return undefined
     return this.#worktrees.resolve(pathOrRef, await projects.list())
+  }
+
+  async resolveProblem(pathOrRef: string): Promise<string | undefined> {
+    const projects = this.#projects()
+    if (projects === undefined || this.#closed) return undefined
+    return this.#worktrees.problem(pathOrRef, await projects.list())
   }
 
   async sweep(name?: string): Promise<SweepResult> {
@@ -687,7 +716,12 @@ class Service implements WorkspacesService {
     return fetchClone(this.#cloneOf(project), project, this.#cloneDeps, signal)
   }
 
+  /**
+   * Under the project's lock: its fetch (unless the caller has just made one), then its sweep. Nothing for a project
+   * that isn't ready now: one removed after the round listed it, or while the work queued behind it (a prepare's sweep).
+   */
   async #fetchAndSweep(project: Project, signal: AbortSignal, fetchFirst: boolean): Promise<SweepResult> {
+    if (!this.#stillReady(project)) return { removed: [], kept: [] }
     try {
       if (fetchFirst) await this.#fetch(project, signal)
       if (signal.aborted) throw abortedBy(signal)
