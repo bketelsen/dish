@@ -146,7 +146,10 @@ export interface PullFeedback {
   reviewComments: Array<{ path: string, line: number | null, author: string, body: string, outdated: boolean, at: string | null }>
   issueComments: Array<{ author: string, body: string, at: string | null }>
   checks: Array<{ name: string, source: 'check-run' | 'status', status: string, conclusion: string | null }>
-  /** Why the checks couldn't be read: the token lacks Checks or Commit statuses read. */
+  /**
+   * Why the checks couldn't be read (wholly or in part: `checks` holds what the other source gave): the token lacks
+   * Checks or Commit statuses read, or GitHub failed ("could not read the checks: …", masked and cut).
+   */
   checksUnavailable?: string
   /** Which lists filled a page of 100 (GitHub may have more). */
   more: { reviews: boolean, reviewComments: boolean, issueComments: boolean, checks: boolean }
@@ -390,14 +393,17 @@ function reviewsOf(list: RawList): PullFeedback['reviews'] {
   })
 }
 
-/** Review comments: `outdated` when GitHub cleared `line` (the diff moved past the comment). */
+/**
+ * Review comments: `outdated` when GitHub cleared `line` (the diff moved past the comment). A comment on a whole file
+ * (`subject_type: 'file'`) has no line and isn't outdated.
+ */
 function reviewCommentsOf(list: RawList): PullFeedback['reviewComments'] {
   return list.items.slice(0, FEEDBACK_ITEMS).flatMap((item) => {
     if (!isRecord(item) || typeof item.path !== 'string' || typeof item.body !== 'string') return []
     const line = typeof item.line === 'number' && Number.isFinite(item.line) ? item.line : null
     return [{
       path: untrusted(item.path, FEEDBACK_TEXT_CHARS), line, author: authorOf(item),
-      body: untrusted(item.body, FEEDBACK_BODY_CHARS, true), outdated: line === null, at: optionalText(item.created_at),
+      body: untrusted(item.body, FEEDBACK_BODY_CHARS, true), outdated: line === null && item.subject_type !== 'file', at: optionalText(item.created_at),
     }]
   })
 }
@@ -992,18 +998,21 @@ class Service implements WorkspacesService {
     const reviewList = needed(reviews, 'reviews')
     const reviewCommentList = needed(reviewComments, 'review comments')
     const issueCommentList = needed(issueComments, 'comments')
-    let unavailable = false
+    // The checks are a part pr_feedback can do without: a source that fails leaves them unavailable, with why, and the
+    // other source's checks, the reviews and the comments still come.
+    const unavailable: string[] = []
     const checks: PullFeedback['checks'] = []
     let moreChecks = false
     for (const [settled, read] of [[runs, checkRunsOf], [statuses, statusesOf]] as const) {
       if (settled.status === 'fulfilled') {
         checks.push(...read(settled.value))
         moreChecks ||= settled.value.full
-      } else if (cantReadChecks(settled.reason)) {
-        unavailable = true
-      } else {
-        throw new Error(`could not read the checks: ${shown(messageOf(settled.reason), MESSAGE_CHARS)}`)
+        continue
       }
+      const why = cantReadChecks(settled.reason)
+        ? `the dish App can't read checks of ${project.name}: it needs Checks and Commit statuses read (accept them on GitHub; Settings → GitHub App)`
+        : `could not read the checks: ${shown(messageOf(settled.reason), MESSAGE_CHARS)}`
+      if (!unavailable.includes(why)) unavailable.push(why)
     }
     return {
       number: details.number,
@@ -1020,9 +1029,7 @@ class Service implements WorkspacesService {
       reviewComments: reviewCommentsOf(reviewCommentList),
       issueComments: issueCommentsOf(issueCommentList),
       checks: checks.slice(0, 2 * FEEDBACK_ITEMS),
-      ...(unavailable
-        ? { checksUnavailable: `the dish App can't read checks of ${project.name}: it needs Checks and Commit statuses read (accept them on GitHub; Settings → GitHub App)` }
-        : {}),
+      ...(unavailable.length > 0 ? { checksUnavailable: unavailable.join('; ') } : {}),
       more: { reviews: reviewList.full, reviewComments: reviewCommentList.full, issueComments: issueCommentList.full, checks: moreChecks },
     }
   }

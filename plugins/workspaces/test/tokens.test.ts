@@ -335,6 +335,20 @@ describe('TokenManager', () => {
     await assertNoTokenLeaks(fake, dir, directory, lines)
   })
 
+  it('apiToken falls back to API_BASE_PERMISSIONS only on a 422: a 500 for the wide set rejects, mints no narrow token, keeps nothing and logs nothing of Checks', async () => {
+    const { fake, lines, manager } = await setup()
+    await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget'] } }))
+    const minted = fake.minted.length
+    fake.failNext('/app/installations/77/access_tokens', 500, { message: 'GitHub is down' })
+    await assert.rejects(manager.apiToken('acme'), /^GitHubError: POST \/app\/installations\/77\/access_tokens answered HTTP 500: GitHub is down$/)
+    assert.equal(fake.minted.length, minted, 'no narrow token was minted')
+    assert.deepEqual(lines.filter(line => line.includes('Checks and Commit statuses')), [])
+    // Nothing narrow was kept: the next call mints the wide set.
+    await manager.apiToken('acme')
+    assert.deepEqual(fake.minted.at(-1)!.permissions, { ...API_PERMISSIONS })
+    await manager.close()
+  })
+
   it('writeToken mints a new token on each call for one repo with the asked permissions, and keeps nothing: no file, no cache, no timer', async () => {
     const { fake, dir, directory, lines, pending, manager } = await setup(['widget', 'gadget'], { write: true })
     await manager.setRepositories(owners({ acme: { installation: 77, repos: ['widget', 'gadget'] } }))

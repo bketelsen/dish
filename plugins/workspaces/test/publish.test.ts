@@ -6,6 +6,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { appendFileSync } from 'node:fs'
 import { chmod, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -309,6 +310,33 @@ test("pushBranch never pushes to origin: a remote.origin.pushurl in the clone's 
     assert.ok(!run.world.git.requests.some(request => request.path.startsWith('/acme/gadget.git/') && request.service === 'git-receive-pack'))
   } finally {
     await writeFile(global, saved)
+    await teardown(run)
+  }
+})
+
+test("pushBranch runs from its isolated repository: config an agent plants in the clone after resolve checked it (an insteadOf to another repository) changes nothing", async () => {
+  const run = await setup()
+  const widgetUrl = `${run.world.git.origin}/acme/widget.git`
+  const gadgetUrl = `${run.world.git.origin}/acme/gadget.git`
+  const gadgetBare = join(run.world.root, 'acme', 'gadget.git')
+  try {
+    const tip = await run.commit(run.worktree.path, 'one')
+    // Planted between dish's check of the clone (in resolve) and the push: when the write token is minted.
+    let planted = false
+    run.world.github.onToken((_token, permissions) => {
+      if (permissions.contents !== 'write' || planted) return
+      planted = true
+      appendFileSync(join(run.clone, '.git', 'config'), `[url "${gadgetUrl}"]\n\tinsteadOf = ${widgetUrl}\n\tpushInsteadOf = ${widgetUrl}\n`)
+    })
+    assert.deepEqual(await run.service.pushBranch('acme/widget', 'fix-1', { head: tip }), { head: tip })
+    assert.equal(planted, true, 'the config was planted before the push')
+    // The fixture: git in the clone does follow it.
+    assert.equal(await run.git(['ls-remote', '--get-url', 'origin']), gadgetUrl)
+    assert.equal(await bareTip(run), tip)
+    assert.equal(await bareTip(run, 'dish/fix-1', gadgetBare), undefined)
+    assert.ok(!run.world.git.requests.some(request => request.path.startsWith('/acme/gadget.git/') && request.service === 'git-receive-pack'))
+  } finally {
+    await run.git(['config', '--remove-section', `url.${gadgetUrl}`]).catch(() => {})
     await teardown(run)
   }
 })
@@ -840,6 +868,75 @@ test("readPull: a ghs_ token and a URL password in a review's body are masked; a
   }
 })
 
+test("readPull: a file-level review comment (subject_type file, no line) isn't outdated; a line comment whose line GitHub cleared is", async () => {
+  const run = await setup()
+  try {
+    await run.service.openPull('acme/widget', { head: 'dish/fix-1', title: 'Fix', body: '' })
+    Object.assign(run.world.github.pullRequests[0]!, { headSha: HEAD_SHA })
+    run.world.github.feedback('acme/widget', 1, {
+      reviewComments: [
+        { path: 'docs/a.md', line: null, position: null, subject_type: 'file', user: { login: 'ann' }, body: 'This whole file goes.' },
+        { path: 'src/b.ts', line: null, subject_type: 'line', user: { login: 'bob' }, body: 'Old remark.' },
+        { path: 'src/c.ts', line: 3, subject_type: 'line', user: { login: 'bob' }, body: 'Current.' },
+      ],
+    })
+    const feedback = await run.service.readPull('acme/widget', 1)
+    assert.deepEqual(feedback.reviewComments.map(({ path, line, outdated }) => ({ path, line, outdated })), [
+      { path: 'docs/a.md', line: null, outdated: false },
+      { path: 'src/b.ts', line: null, outdated: true },
+      { path: 'src/c.ts', line: 3, outdated: false },
+    ])
+  } finally {
+    await teardown(run)
+  }
+})
+
+test("readPull masks and caps every other string GitHub gives too (check names, status contexts, paths, the head and base refs, the mergeable state, times and commits), and keeps 100 check runs at most, with more.checks", async () => {
+  const run = await setup()
+  try {
+    await run.service.openPull('acme/widget', { head: 'dish/fix-1', title: 'Fix', body: '' })
+    /** A token, a control character, and 300 characters in all. */
+    const bad = (what: string): string => `${what} ${LEAK}\x07${'x'.repeat(300)}`
+    Object.assign(run.world.github.pullRequests[0]!, { headSha: HEAD_SHA, head: bad('head'), base: bad('base'), mergeableState: bad('state') })
+    run.world.github.feedback('acme/widget', 1, {
+      reviews: [{ user: { login: 'ann' }, state: 'COMMENTED', body: 'ok', submitted_at: bad('at'), commit_id: bad('commit') }],
+      reviewComments: [{ path: bad('path'), line: 1, user: { login: 'ann' }, body: 'ok', created_at: bad('created') }],
+      issueComments: [{ user: { login: 'ann' }, body: 'ok', created_at: bad('created') }],
+    })
+    run.world.github.checks('acme/widget', HEAD_SHA, {
+      checkRuns: [{ name: bad('run'), status: bad('status'), conclusion: bad('conclusion') }],
+      statuses: [{ context: bad('context'), state: bad('state') }],
+    })
+    const feedback = await run.service.readPull('acme/widget', 1)
+    const strings = [
+      feedback.head.ref, feedback.base.ref, feedback.mergeableState,
+      feedback.reviews[0]!.at!, feedback.reviews[0]!.commit!, feedback.reviewComments[0]!.path, feedback.reviewComments[0]!.at!,
+      feedback.issueComments[0]!.at!,
+      // A check run's name, status and conclusion; a status's context and state (its `status` is dish's own word).
+      ...feedback.checks.flatMap(check => check.source === 'check-run' ? [check.name, check.status, check.conclusion!] : [check.name, check.conclusion!]),
+    ]
+    assert.equal(strings.length, 13)
+    for (const text of strings) {
+      assert.ok(!text.includes(LEAK) && text.includes('‹secret: a GitHub token›'), text)
+      assert.ok(!/[\x00-\x1f\x7f]/.test(text), text)
+      assert.equal(Array.from(text).length, 200, text)
+      assert.ok(text.endsWith('…'), text)
+    }
+    assert.deepEqual(feedback.checks.map(check => check.source), ['check-run', 'status'])
+    assert.equal(feedback.more.checks, false)
+
+    // A page of check runs larger than asked for: 100 are kept, and more.checks says there were more.
+    const many = Array.from({ length: 130 }, (_, index) => ({ name: `job ${index}`, status: 'completed', conclusion: 'success' }))
+    run.world.github.failNext(`/repos/acme/widget/commits/${HEAD_SHA}/check-runs`, 200, { total_count: 130, check_runs: many })
+    const capped = await run.service.readPull('acme/widget', 1)
+    assert.equal(capped.checks.filter(check => check.source === 'check-run').length, 100)
+    assert.equal(capped.checks.filter(check => check.source === 'status').length, 1)
+    assert.equal(capped.more.checks, true)
+  } finally {
+    await teardown(run)
+  }
+})
+
 test('readPull: with 100 review comments, more.reviewComments is true', async () => {
   const run = await setup()
   try {
@@ -870,13 +967,50 @@ test('readPull: an App without Checks or Commit statuses read: checksUnavailable
     assert.equal(feedback.issueComments.length, 1)
     assert.deepEqual(run.world.github.minted.filter(mint => mint.permissions.checks === undefined && mint.permissions.pull_requests === 'read').map(mint => mint.permissions),
       [{ metadata: 'read', pull_requests: 'read' }], 'the narrower API token')
-    // Another failure of the checks is an error.
+    // Another failure of the checks besides is said too; the rest still comes.
     run.world.github.failNext(`/repos/acme/widget/commits/${HEAD_SHA}/check-runs`, 500, { message: 'boom' })
-    await assert.rejects(run.service.readPull('acme/widget', 1), /^Error: could not read the checks: GET .*check-runs answered HTTP 500: boom$/)
+    const both = await run.service.readPull('acme/widget', 1)
+    assert.equal(both.checksUnavailable, `could not read the checks: GET /repos/acme/widget/commits/${HEAD_SHA}/check-runs answered HTTP 500: boom; `
+      + "the dish App can't read checks of acme/widget: it needs Checks and Commit statuses read (accept them on GitHub; Settings → GitHub App)")
+    assert.equal(both.reviews.length, 2)
+    // Reviews and comments can't be done without: their failure rejects.
     run.world.github.failNext('/repos/acme/widget/pulls/1/reviews', 500, { message: 'down' })
     await assert.rejects(run.service.readPull('acme/widget', 1), /^Error: could not read pull request #1's reviews: GET .*answered HTTP 500: down$/)
     run.world.github.failNext('/repos/acme/widget/issues/1/comments', 502, { message: 'bad gateway' })
     await assert.rejects(run.service.readPull('acme/widget', 1), /^Error: could not read pull request #1's comments: /)
+  } finally {
+    await teardown(run)
+  }
+})
+
+test("readPull: any other failure of the check runs or the combined status (a 500, a 502, GitHub's 422 for a commit it hasn't) leaves the checks unavailable, masked, keeps the other source's, and the reviews and comments still come", async () => {
+  const run = await setup()
+  try {
+    await withFeedback(run)
+    const runs = `/repos/acme/widget/commits/${HEAD_SHA}/check-runs`
+    const status = `/repos/acme/widget/commits/${HEAD_SHA}/status`
+    run.world.github.failNext(runs, 500, { message: `boom ${LEAK}` })
+    const noRuns = await run.service.readPull('acme/widget', 1)
+    assert.equal(noRuns.checksUnavailable, `could not read the checks: GET ${runs} answered HTTP 500: boom ‹secret: a GitHub token›`)
+    assert.deepEqual(noRuns.checks.map(check => [check.source, check.name]), [['status', 'deploy/preview'], ['status', 'coverage']])
+    assert.equal(noRuns.reviews.length, 2)
+    assert.equal(noRuns.reviewComments.length, 2)
+    assert.equal(noRuns.issueComments.length, 1)
+
+    run.world.github.failNext(status, 422, { message: `No commit found for SHA: ${HEAD_SHA}` })
+    const noStatus = await run.service.readPull('acme/widget', 1)
+    assert.equal(noStatus.checksUnavailable, `could not read the checks: GET ${status} answered HTTP 422: No commit found for SHA: ${HEAD_SHA}`)
+    assert.deepEqual(noStatus.checks.map(check => [check.source, check.name]), [['check-run', 'ci / test'], ['check-run', 'ci / lint']])
+
+    run.world.github.failNext(runs, 502, { message: 'bad gateway' })
+    run.world.github.failNext(status, 403, { message: 'You have exceeded a secondary rate limit' }, { 'retry-after': '60' })
+    const neither = await run.service.readPull('acme/widget', 1)
+    assert.equal(neither.checksUnavailable, `could not read the checks: GET ${runs} answered HTTP 502: bad gateway; `
+      + `could not read the checks: GET ${status} answered HTTP 403: You have exceeded a secondary rate limit`)
+    assert.deepEqual(neither.checks, [])
+    assert.equal(neither.issueComments.length, 1)
+    // Read fully again, there is no checksUnavailable.
+    assert.equal('checksUnavailable' in await run.service.readPull('acme/widget', 1), false)
   } finally {
     await teardown(run)
   }
