@@ -49,9 +49,11 @@
  *   running, or the latest result of its latest run isn't a pass, or that run has none. It reads the child's record through
  *   `lookup`, inside the session's lock, as the reviewer rule does. The refusal says where the gate stands and how to go
  *   on: wait for the notice, send a fix round, or give `gateOverride` with a ruling. A ruling (folded onto one line; one
- *   with nothing past a leading `Ruling:` is refused) is recorded on the reviewer (`ChildRecord.gateOverride`) and told
- *   to it in a block after its task (`gateOverrideBrief`). When nothing is refused (the gate passed, the child is unbound,
- *   `reviews: "main"`, or dish-gates isn't running), `gateOverride` is ignored and not recorded.
+ *   with nothing past a leading `Ruling:`, or the placeholder itself, is refused) is recorded on the reviewer
+ *   (`ChildRecord.gateOverride`) and told to it in a block after its task (`gateOverrideBrief`). A re-review keeps the
+ *   reviewer's ruling while the reviewed child hasn't run since the reviewer was created. When nothing is refused (the
+ *   gate passed, the child is unbound, `reviews: "main"`, or dish-gates isn't running), `gateOverride` is ignored and not
+ *   recorded.
  *
  * What counts as running: the child's agent is stepping, or the record says running and the agent exists (accepted, not
  * stepping yet). A record that says running with no agent is a crash's, and isn't running. A follow-up's own target is left
@@ -148,8 +150,12 @@ interface GatesReader {
   gateFor(project: string): Promise<string | undefined>
 }
 
+/** What a ruling says, as the refusals and the parameter put it. */
+const RULING_BODY = 'what — why — cost if wrong'
 /** How a ruling is written, as the refusals and the parameter say it. */
-const RULING_FORM = 'Ruling: what — why — cost if wrong'
+const RULING_FORM = `Ruling: ${RULING_BODY}`
+/** The placeholder, with or without `Ruling:`, compared without case: a model that copies it back has given no ruling. */
+const PLACEHOLDERS: readonly string[] = [RULING_FORM.toLowerCase(), RULING_BODY.toLowerCase()]
 
 /** Where a reviewed coder's gate stands while the coder is still running. */
 const STILL_RUNNING = 'it is still running'
@@ -159,8 +165,12 @@ function oneLine(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
-/** Whether a `gateOverride` (on one line) holds a ruling: something past a leading `Ruling:`, with a letter or a digit in it. */
+/**
+ * Whether a `gateOverride` (on one line) holds a ruling: something past a leading `Ruling:`, with a letter or a digit in
+ * it, that isn't the placeholder the refusal shows.
+ */
 function hasRuling(override: string): boolean {
+  if (PLACEHOLDERS.includes(oneLine(override).toLowerCase())) return false
   return /[\p{L}\p{N}]/u.test(override.replace(/^[\s#>*_`]*ruling[*_`]*\s*:[*_`]*/iu, ''))
 }
 
@@ -331,15 +341,14 @@ interface Override {
 /**
  * Why `child`'s gate counts as not passed, for the review check, or `undefined` when it passed or isn't checked: dish-gates
  * isn't running, or the child isn't bound to a worktree. Not passed is: the child is still running; the latest result of its
- * latest run isn't a pass; or that run has none (an error or an abort ended it before its turn could, or dsh stopped
- * mid-gate). A run the record still has in progress while the child isn't running is one dsh stopped (a restart): it is the
- * latest run, so what it recorded before it stopped is its result, and an older run's result isn't.
+ * latest run isn't a pass; or that run has none (an error or an abort ended it before its turn could, dsh stopped mid-gate,
+ * or it ran before dish-gates was on).
  */
 function gateStanding(call: Call, child: ChildRecord): string | undefined {
   if (call.gates === undefined || child.worktree === undefined) return undefined
   if (isRunning(child, call.agents)) return STILL_RUNNING
-  const latest = child.last === 'running' ? child.gates?.at(-1) : latestGate(child)
-  if (latest === undefined) return 'no gate result: it didn\'t run'
+  const latest = latestGate(child)
+  if (latest === undefined) return `no gate result: it didn't run (for example, the ${child.role} ran before dish-gates was on)`
   if (latest.outcome === 'passed') return undefined
   if (latest.outcome === 'failed') return oneLine(`failed, round ${latest.round} of ${latest.maxRounds}${latest.log === null ? '' : `; log ${latest.log}`}`)
   const reason = latest.reason === undefined ? '' : oneLine(latest.reason)
@@ -427,21 +436,32 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
   /**
    * The review check (6c), for a review of `child`'s work, on the record `reviewedWork` read inside the session's lock.
    * `undefined` when there is nothing to override (see `gateStanding`): a `gateOverride` given is then ignored. Otherwise
-   * the call's ruling, and the block the reviewer gets.
-   * @param lead - a follow-up's lead-in: a re-review is checked as a review is, and told so.
+   * the ruling, and the block the reviewer gets.
+   *
+   * A re-review with no `gateOverride` keeps the reviewer's ruling when the reviewed child hasn't run since the reviewer
+   * was created: its latest run ended before then, and none is in progress or running. The ruling was given on exactly the
+   * standing it has now; any fix round, crash or resume of that child ends it.
+   * @param followUp - a re-review's lead-in, and the reviewer it goes to.
    * @throws a refusal that says where the gate stands and how to go on, when there is no ruling or one with none in it.
    */
-  function gateCheck(call: Call, child: ChildRecord, lead?: string): Override | undefined {
+  function gateCheck(call: Call, child: ChildRecord, followUp?: { lead: string, reviewer: ChildRecord }): Override | undefined {
     const standing = gateStanding(call, child)
     if (standing === undefined) return undefined
+    const block = (ruling: string): Override => ({ ruling, block: gateOverrideBrief(`${child.role} «${child.title}», child ${child.id}`, standing, ruling) })
     const next = standing === STILL_RUNNING
-      ? `Wait for its finish notice, which says how its gate ended, and ${lead === undefined ? 'delegate the review' : 'send the follow-up'} then`
-      : `Send ${lead === undefined ? 'it' : `that ${child.role}`} a fix round with \`to\``
-    const anyway = lead === undefined ? 'start the review anyway' : 'send this follow-up anyway'
-    const refused = `${lead === undefined ? '' : `${lead} `}${who(child)}'s gate hasn't passed (${standing}). ${next}, or ${anyway} with \`gateOverride: "${RULING_FORM}"\`.`
-    if (call.gateOverride === undefined) throw new Error(refused)
-    if (!hasRuling(call.gateOverride)) throw new Error(`gateOverride needs the ruling itself: what — why — cost if wrong. ${refused}`)
-    return { ruling: call.gateOverride, block: gateOverrideBrief(`${child.role} «${child.title}», child ${child.id}`, standing, call.gateOverride) }
+      ? `Wait for its finish notice, which says how its gate ended, and ${followUp === undefined ? 'delegate the review' : 'send the follow-up'} then`
+      : `Send ${followUp === undefined ? 'it' : `that ${child.role}`} a fix round with \`to: "${child.id}"\``
+    const anyway = followUp === undefined ? 'start the review anyway' : 'send this follow-up anyway'
+    const refused = `${followUp === undefined ? '' : `${followUp.lead} `}${who(child)}'s gate hasn't passed (${standing}). ${next}, or ${anyway} with \`gateOverride: "${RULING_FORM}"\`.`
+    if (call.gateOverride === undefined) {
+      const reviewer = followUp?.reviewer
+      const lastEnded = child.runs.at(-1)?.endedAt
+      if (reviewer?.gateOverride !== undefined && standing !== STILL_RUNNING && child.last !== 'running'
+        && lastEnded !== undefined && lastEnded < reviewer.startedAt) return block(reviewer.gateOverride)
+      throw new Error(refused)
+    }
+    if (!hasRuling(call.gateOverride)) throw new Error(`gateOverride needs the ruling itself: ${RULING_BODY}. ${refused}`)
+    return block(call.gateOverride)
   }
 
   /** Step 5 for a start: the route of the new child, `reviews` as it is recorded, and the record of a crew child it reviews. */
@@ -704,7 +724,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     if (call.roleSettings.reviews) {
       // A re-review is a review: the work it reviews is checked as for a start.
       const reviewed = await checkReviewer(call, target)
-      override = reviewed === undefined ? undefined : gateCheck(call, reviewed, `can't send a follow-up to ${call.role} child ${target.id}:`)
+      override = reviewed === undefined ? undefined : gateCheck(call, reviewed, { lead: `can't send a follow-up to ${call.role} child ${target.id}:`, reviewer: target })
     } else if (call.reviews !== undefined) {
       const reviewer = reviewerName(call.settings)
       throw new Error(`reviews is for the reviewer role (${reviewer}), and ${call.role} doesn't review. Leave reviews out, or delegate to ${reviewer}.`)

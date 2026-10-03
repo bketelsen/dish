@@ -1872,6 +1872,8 @@ const SKIPPED = gateResult({ outcome: 'skipped', command: '', exitCode: null, du
 
 /** How the reviewer's block names the work it reviews. */
 const REVIEWED = 'coder «add login», child c1'
+/** Where the gate of a coder with no gate result stands. */
+const NO_RESULT = 'no gate result: it didn\'t run (for example, the coder ran before dish-gates was on)'
 
 /**
  * Put coder `id` of this session in the record, bound to a worktree, with `gates` recorded during its run. With `ended`
@@ -1889,7 +1891,7 @@ async function boundCoder(w: World, id: string, gates: readonly GateResult[], en
 
 /** The refusal of a review start whose reviewed coder c1's gate stands at `standing`, when it isn't running. */
 function gateRefusal(standing: string): string {
-  return `coder «add login» (child c1)'s gate hasn't passed (${standing}). Send it a fix round with \`to\`, or start the review anyway with ${RULING_HINT}.`
+  return `coder «add login» (child c1)'s gate hasn't passed (${standing}). Send it a fix round with \`to: "c1"\`, or start the review anyway with ${RULING_HINT}.`
 }
 
 test('worktreeBrief with a gate is 6b\'s block and then the gate sentence; without one it is 6b\'s, byte for byte', () => {
@@ -1969,7 +1971,7 @@ test('a review of a bound coder whose gate hasn\'t passed is refused, saying why
     ['skipped', [SKIPPED], 'skipped: the coder reported BLOCKED / NEEDS CONTEXT'],
     ['not run', [gateResult({ outcome: 'error', command: '', exitCode: null, durationMs: 0, log: null, reason: 'dsh\'s shell here doesn\'t sandbox commands, so dish won\'t run the gate' })],
       'error: dsh\'s shell here doesn\'t sandbox commands, so dish won\'t run the gate'],
-    ['no result: the run ended before its turn could', [], 'no gate result: it didn\'t run'],
+    ['no result: the run ended before its turn could', [], NO_RESULT],
   ]
   for (const [what, gates, standing] of cases) {
     const w = await world({ dishGates: true })
@@ -2011,7 +2013,7 @@ test('the latest run is what counts: an older run\'s pass doesn\'t cover a newer
   await boundCoder(restarted, 'c1', [gateResult()])
   await restarted.records.addFollowUp('c1')
   restarted.agents.delete('c1')
-  assert.equal(await refusal(restarted.delegate({ ...REVIEW, reviews: 'c1' })), gateRefusal('no gate result: it didn\'t run'))
+  assert.equal(await refusal(restarted.delegate({ ...REVIEW, reviews: 'c1' })), gateRefusal(NO_RESULT))
   // What was recorded of that run before it stopped is its result.
   await restarted.records.addGate('c1', { ...FAILED_3[0]!, turn: 2 })
   assert.equal(await refusal(restarted.delegate({ ...REVIEW, reviews: 'c1' })), gateRefusal('failed, round 1 of 3; log /state/gates/frostyard/snosi/fix-1/c1-1-1.log'))
@@ -2056,7 +2058,9 @@ test('a review with a ruling starts: the ruling, on one line, is recorded and to
 test('an override with no ruling in it is refused, with what a ruling is and how to go on', async () => {
   const w = await world({ dishGates: true })
   await boundCoder(w, 'c1', [SKIPPED])
-  for (const blank of ['Ruling:', '  ruling:  ', 'Ruling: — —', 'RULING:\n']) {
+  // The placeholder the refusal shows is no ruling either, with or without `Ruling:`, in any case, however it is spaced.
+  const placeholders = ['Ruling: what — why — cost if wrong', 'what — why — cost if wrong', '  RULING:  What —\n why —  Cost if wrong ', 'What — Why — Cost If Wrong']
+  for (const blank of ['Ruling:', '  ruling:  ', 'Ruling: — —', 'RULING:\n', ...placeholders]) {
     assert.equal(await refusal(w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: blank })),
       `gateOverride needs the ruling itself: what — why — cost if wrong. ${gateRefusal('skipped: the coder reported BLOCKED / NEEDS CONTEXT')}`, JSON.stringify(blank))
   }
@@ -2103,7 +2107,7 @@ test('a re-review (a follow-up to a reviewer, with to) is checked the same way: 
   await w.records.endRun('c1', { stopReason: 'completed', closing: 'done' })
 
   const standing = `failed, round 3 of 3; log ${LOG_3}`
-  const body = `coder «add login» (child c1)'s gate hasn't passed (${standing}). Send that coder a fix round with \`to\`, or send this follow-up anyway with ${RULING_HINT}.`
+  const body = `coder «add login» (child c1)'s gate hasn't passed (${standing}). Send that coder a fix round with \`to: "c1"\`, or send this follow-up anyway with ${RULING_HINT}.`
   const lead = `can't send a follow-up to reviewer child ${reviewer.child}:`
   const again = { ...REVIEW, task: 'Review the fix.', to: reviewer.child }
   assert.equal(await refusal(w.delegate(again)), `${lead} ${body}`)
@@ -2142,4 +2146,59 @@ test('a re-review of the main agent\'s own work, or of an unbound coder, is not 
   await w.delegate({ ...REVIEW, task: 'Again.', to: theirs.child })
   assert.equal(w.sends.length, 2)
   assert.ok(!('gateOverride' in (await w.records.lookup(theirs.child))!.record))
+})
+
+test('a re-review keeps the reviewer\'s ruling while the coder hasn\'t run since the reviewer was made, and not once it has', async () => {
+  const w = await world({ dishGates: true })
+  await boundCoder(w, 'c1', [SKIPPED])
+  // The reviewer is made after the coder's run ended.
+  await new Promise(resolve => setTimeout(resolve, 10))
+  const ruling = 'Ruling: review it anyway — the task answers its question — a missed bug'
+  const reviewer = await w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: ruling })
+  await finish(w, reviewer.child)
+  const standing = 'skipped: the coder reported BLOCKED / NEEDS CONTEXT'
+
+  // No new ruling: the one on record stands, and the reviewer is told it again.
+  await w.delegate({ ...REVIEW, task: 'Look again at the form.', to: reviewer.child })
+  assert.deepEqual(w.sends[0]!.content, [{ type: 'text', text: 'Look again at the form.' }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }])
+  let record = (await w.records.lookup(reviewer.child))!.record
+  assert.equal(record.gateOverride, ruling)
+  assert.equal(record.followUps, 1)
+  // A new ruling replaces it.
+  await finish(w, reviewer.child)
+  const newer = 'Ruling: once more — the form changed little — a missed bug'
+  await w.delegate({ ...REVIEW, task: 'Once more.', to: reviewer.child, gateOverride: newer })
+  assert.deepEqual(w.sends[1]!.content, [{ type: 'text', text: 'Once more.' }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, newer) }])
+  record = (await w.records.lookup(reviewer.child))!.record
+  assert.equal(record.gateOverride, newer)
+  await finish(w, reviewer.child)
+
+  // The coder runs again (a fix round): the ruling was about the work before it, so it no longer stands.
+  const lead = `can't send a follow-up to reviewer child ${reviewer.child}:`
+  const again = { ...REVIEW, task: 'Review the fix.', to: reviewer.child }
+  await w.records.addFollowUp('c1')
+  assert.match(await refusal(w.delegate(again)), /\(it is still running\)\. Wait for its finish notice/)
+  // dsh stopped it mid-run (a restart): the record says running, and there is no agent.
+  w.agents.delete('c1')
+  assert.equal(await refusal(w.delegate(again)),
+    `${lead} coder «add login» (child c1)'s gate hasn't passed (${NO_RESULT}). Send that coder a fix round with \`to: "c1"\`, or send this follow-up anyway with ${RULING_HINT}.`)
+  // Its run ends, skipped again.
+  w.agents.set('c1', { status: 'idle' })
+  await w.records.addGate('c1', { ...SKIPPED, turn: 2 })
+  await w.records.endRun('c1', { stopReason: 'completed', closing: 'BLOCKED: which form?' })
+  assert.equal(await refusal(w.delegate(again)),
+    `${lead} coder «add login» (child c1)'s gate hasn't passed (${standing}). Send that coder a fix round with \`to: "c1"\`, or send this follow-up anyway with ${RULING_HINT}.`)
+  assert.equal(w.sends.length, 2)
+  assert.equal((await w.records.lookup(reviewer.child))!.record.followUps, 2)
+
+  // A reviewer started while the coder was still running: the coder's run ended after the reviewer was made.
+  const early = await world({ dishGates: true })
+  await boundCoder(early, 'c1', [], false)
+  const started = await early.delegate({ ...REVIEW, reviews: 'c1', gateOverride: ruling })
+  await finish(early, started.child)
+  early.agents.set('c1', { status: 'idle' })
+  await early.records.addGate('c1', FAILED_3[2]!)
+  await early.records.endRun('c1', { stopReason: 'completed', closing: 'done' })
+  assert.match(await refusal(early.delegate({ ...REVIEW, task: 'Again.', to: started.child })), /gate hasn't passed \(failed, round 3 of 3/)
+  assert.equal(early.sends.length, 0)
 })
