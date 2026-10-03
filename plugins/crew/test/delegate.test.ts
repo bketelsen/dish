@@ -2605,7 +2605,8 @@ const TOKEN = `ghp_${'A1b2C3d4E5'.repeat(4)}`
 const NO_RUN = '`final` had no effect: this chat drives no run, so there is no final review for `open_pr` to read.'
 const NO_ORCHESTRATOR = '`final` had no effect: dish keeps no runs here (dish-orchestrator isn\'t loaded).'
 const FINAL_OTHER_RUN = '`final` had no effect: this reviewer was started outside the run this chat drives now, so start a fresh reviewer with `final: true` for that run\'s final review.'
-const UNPLACED = '`final` had no effect: dish couldn\'t place this reviewer in a run, so `final` wasn\'t recorded; try again with a fresh reviewer and `final: true`.'
+const UNPLACED = '`final` had no effect: dish couldn\'t place this reviewer in a run, so `final` wasn\'t recorded; try again with a fresh reviewer and `final: true`; '
+  + 'if it is bound to a closed run\'s worktree, `run` `resume` that run first.'
 
 /** The ladder's refusal of more coder work on task `task` at `round`, as the plan words it. */
 function ladderRefusal(round: number, task = 'fix-1'): string {

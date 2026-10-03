@@ -811,6 +811,17 @@ test('refusalText: only the failed checks\' lines, under the run and the head', 
   ].join('\n'))
 })
 
+test('refusalText: a final review that requested changes says so, with its head or without one (never "gave no head")', () => {
+  const run = { id: '20261003-fix-login' } as Run
+  const final = { child: 'rev-2', verdict: 'changes_requested' as const, final: true, at: 0, findings: { blocking: 1, should_fix: 0, nit: 0 } }
+  const found = { gate: null, gateOk: true, reviewOk: false, gatesMissing: false }
+  const headless = refusalText(run, HEAD, { ...found, final })
+  assert.match(headless, /^- no final review approved bbbbbbb: the latest final review \(child rev-2\) requested changes\. Delegate a fresh reviewer/m)
+  assert.ok(!headless.includes('gave no head'), headless)
+  const atHead = refusalText(run, HEAD, { ...found, final: { ...final, head: SHA_A } })
+  assert.match(atHead, /^- no final review approved bbbbbbb: the latest final review \(child rev-2\) requested changes at aaaaaaa\. Delegate/m)
+})
+
 test('open_pr: a ledger line that can\'t be written is logged and named in the answer; the push, the pull request and the record stand', async () => {
   const { w, run, tool } = await setup()
   await verdict(w, run)

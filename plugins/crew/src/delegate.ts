@@ -298,9 +298,11 @@ const STILL_RUNNING = 'it is still running'
 const FINAL_NO_RUN = '`final` had no effect: this chat drives no run, so there is no final review for `open_pr` to read.'
 /**
  * The note for `final` that placed nothing although dish couldn't tell there is no run: `place` failed (thrown, a malformed
- * answer, or dish-orchestrator's own failure or time limit, which gives no run while the chat drives one).
+ * answer, or dish-orchestrator's own failure or time limit, which gives no run while the chat drives one). A reviewer bound
+ * to a closed run's worktree (state `pr` or abandoned) gets it too, while the chat drives another run, and so would a retry.
  */
-const FINAL_UNPLACED = '`final` had no effect: dish couldn\'t place this reviewer in a run, so `final` wasn\'t recorded; try again with a fresh reviewer and `final: true`.'
+const FINAL_UNPLACED = '`final` had no effect: dish couldn\'t place this reviewer in a run, so `final` wasn\'t recorded; try again with a fresh reviewer and `final: true`; '
+  + 'if it is bound to a closed run\'s worktree, `run` `resume` that run first.'
 /** How long `final`'s note waits for `dishRuns.driving`: it reads the run records in memory. */
 const DRIVING_BUDGET_MS = 2000
 /** The note for `final` on a follow-up to a reviewer whose tags don't name the run `place` gives now (another run, or none). */

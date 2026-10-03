@@ -6,11 +6,11 @@
  * @module dish-orchestrator/status
  */
 
-import type { BranchComparison } from 'dish-workspaces'
+import type { BranchComparison, Cleanliness } from 'dish-workspaces'
 import { sameHead } from './derive.ts'
 import type { GateView, RunSummary, TaskView, VerdictView } from './derive.ts'
 import type { Run } from './store.ts'
-import { age, shortSession, shortSha } from './text.ts'
+import { age, cut, oneLine, shortSession, shortSha } from './text.ts'
 
 /** What `run` `status` read besides the ledger. */
 export interface StatusContext {
@@ -19,8 +19,8 @@ export interface StatusContext {
   now: number
   /** The run's worktree now: `headOf`. */
   head?: string
-  /** The run's worktree now: `isClean`. */
-  clean?: { clean: true } | { clean: false, why: string }
+  /** The run's worktree now: `isClean` with `{ untracked: 'ignore' }`, as `open_pr` asks (clean may name untracked files). */
+  clean?: Cleanliness
   /** Why `head` or `clean` couldn't be read. */
   headProblem?: string
   /** derive's `gateAt(entries, head)`. */
@@ -134,6 +134,12 @@ function finalLine(final: VerdictView | undefined, head: string | undefined, now
   return `Final review: approved ${shortSha(approvedHead)} (child ${final.child}, ${age(final.at, now)})${then}`
 }
 
+/** A clean worktree's untracked files, as `open_pr` would leave them out: ` (untracked, not pushed: a, b)`; '' for none. */
+function untrackedPhrase(untracked: readonly string[] | undefined): string {
+  if (!Array.isArray(untracked) || untracked.length === 0) return ''
+  return ` (untracked, not pushed: ${untracked.map(name => cut(oneLine(String(name)), 200)).join(', ')})`
+}
+
 /** What `open_pr` would find now, on one line. */
 function openPrLine(summary: RunSummary, context: StatusContext): string {
   const { head, clean } = context
@@ -141,7 +147,7 @@ function openPrLine(summary: RunSummary, context: StatusContext): string {
   let found: string
   if (head === undefined) found = `the head can't be read: ${problem}`
   else if (clean === undefined) found = `head ${shortSha(head)}, but whether it is clean can't be read: ${problem}`
-  else if (clean.clean) found = `head ${shortSha(head)}, clean`
+  else if (clean.clean) found = `head ${shortSha(head)}, clean${untrackedPhrase(clean.untracked)}`
   else found = `head ${shortSha(head)}, not clean: ${clean.why} (it refuses until that's fixed)`
   const last = context.gateAtHead === undefined ? '' : ` (the last result at this head: ${context.gateAtHead.outcome}, ${age(context.gateAtHead.at, context.now)})`
   const final = summary.finalReview
