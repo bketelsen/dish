@@ -390,6 +390,23 @@ test('open_pr: no final review, one that requested changes, a stale approval, an
   assert.deepEqual((checked[3]!.final as { child: string }).child, 'rev-3')
 })
 
+test('open_pr: a latest final review that gave no head refuses it, saying so; a reviewRuling opens past it', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run, { child: 'rev-1' })
+  // A newer final review without a head (its reviewer reported none): the approval of this head before it no longer counts.
+  await w.runs.harness(run, {
+    kind: 'review.verdict', session: SESSION, child: 'rev-2', task: run.slug, verdict: 'approved', final: true, findings: { blocking: 0, should_fix: 0, nit: 0 },
+  })
+  await refused(call(tool), '- no final review approved bbbbbbb: the latest final review (child rev-2) gave no head: the reviewer must report the full sha of the head it approved. '
+    + 'Delegate a fresh reviewer with `final: true`')
+  nothingWritten(w)
+  const [checked] = await entriesOf(w, run, 'pr.checked')
+  assert.equal(checked!.reviewOk, false)
+  assert.deepEqual(checked!.final, { child: 'rev-2', verdict: 'approved', at: (await entriesOf(w, run, 'review.verdict'))[1]!.at })
+  const value = await call(tool, { reviewRuling: RULING })
+  assert.match(value.text, /without an approved final review of it, on your ruling/)
+})
+
 test('open_pr: both checks failing give both lines, the gate\'s first', async () => {
   const { w, run, tool } = await setup()
   w.gates.impl.runAt = async () => gate({})

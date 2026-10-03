@@ -44,7 +44,7 @@ export interface LedgerCoderReport {
   notFixed?: { finding: string, why: string }[]
 }
 export interface LedgerReviewerReport {
-  role: 'reviewer', turn: number, at: number, verdict: 'approved' | 'changes_requested', head: string
+  role: 'reviewer', turn: number, at: number, verdict: 'approved' | 'changes_requested', head?: string
   summary: string, findings: { severity: 'blocking' | 'should_fix' | 'nit', file: string, line?: number, summary: string, fix: string }[]
   checks?: { command: string, exitCode: number, summary: string }[], addressed?: { finding: string, addressed: boolean, evidence: string }[]
 }
@@ -86,13 +86,14 @@ export interface GateResultEntry extends Base<'gate.result', 'harness'> {
   log: string | null, head: string | null, gateTurn: number, gateRound: number, reason?: string
 }
 export interface ReviewVerdict extends Base<'review.verdict', 'harness'> {
-  child: string, verdict: 'approved' | 'changes_requested', head: string, final: boolean
+  /** `head`: the reviewer's report's; absent when it gave none (a review of work outside git), and then it approves no head. */
+  child: string, verdict: 'approved' | 'changes_requested', head?: string, final: boolean
   findings: { blocking: number, should_fix: number, nit: number }
 }
 export interface LadderRefused extends Base<'ladder.refused', 'harness'> { task: string, round: number }
 export interface LadderRuled extends Base<'ladder.ruled', 'harness'> { task: string, round: number, ruling: string }
 export interface PrGate { outcome: string, exitCode: number | null, timedOut: boolean, durationMs: number, log: string | null, head: string | null, reason?: string }
-export interface PrFinal { child: string, verdict: string, head: string, at: number }
+export interface PrFinal { child: string, verdict: string, head?: string, at: number }
 export interface PrChecked extends Base<'pr.checked', 'harness'> {
   head: string, gate: PrGate | null, final: PrFinal | null, gateOk: boolean, reviewOk: boolean
   overrides: { gate?: string, review?: string }, result: 'pass' | 'refused', refused?: string[]

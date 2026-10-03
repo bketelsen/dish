@@ -147,6 +147,17 @@ test('statusText: the final review, approved at the head now, approved at a stal
   assert.equal(lineOf(none, 'Final review:'), 'Final review: none yet: `delegate` a reviewer with `final: true`.')
 })
 
+test('statusText: a final review without a head (work outside git), approved or not, and a task\'s line without one', () => {
+  const { head: _head, ...headless } = verdict()
+  const approved = statusText(run(), summary({ finalReview: headless, tasks: [task({ verdict: headless })] }), context())
+  assert.equal(lineOf(approved, 'Final review:'), 'Final review: approved (child r1, 3 min ago), but it gave no head: '
+    + '`open_pr` needs a final review that reports the full sha of the head it approved, or `reviewRuling`.')
+  assert.equal(lineOf(approved, '- fix-login'), '- fix-login (the run\'s own worktree): no coder yet; no gate result; review approved (final)')
+  assert.match(lineOf(approved, '`open_pr` now:'), /no final review approved this head/)
+  const changes = statusText(run(), summary({ finalReview: { ...headless, verdict: 'changes_requested' } }), context())
+  assert.equal(lineOf(changes, 'Final review:'), 'Final review: changes requested (child r1).')
+})
+
 test('statusText: rulings, newest 20 first, then how many older; deferred findings and notes', () => {
   const rulings: RulingView[] = Array.from({ length: 23 }, (_, index) => ({
     at: NOW - (23 - index) * MINUTE, by: index % 2 === 0 ? 'main' as const : 'harness' as const, source: 'ruling' as const, text: `ruling ${index}`,

@@ -107,7 +107,7 @@ export function endedEntries(run: Run, e: Settled, head: string | null, at: numb
   }
   return [ended, {
     at, run: run.id, kind: 'review.verdict', by: 'harness', session: e.sessionId, child: child.id, ...task === undefined ? {} : { task },
-    verdict: report.verdict, head: report.head, final: child.final === true, findings,
+    verdict: report.verdict, ...report.head === undefined ? {} : { head: report.head }, final: child.final === true, findings,
   }]
 }
 

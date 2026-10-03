@@ -1083,6 +1083,9 @@ test('reportBlock: a reviewer\'s verdict and head, the counts, each finding with
   assert.equal(reportBlock(FULL_REVIEW), FULL_REVIEW_BLOCK)
   // A clean review: no findings, and nothing else.
   assert.equal(reportBlock(reviewerReport()), `Verdict: approved, at \`${SHA}\`\nSummary: Looks right.\nFindings: none`)
+  // A review of work outside git gives no head: the verdict says none.
+  const { head: _head, ...headless } = reviewerReport({ verdict: 'changes_requested' })
+  assert.equal(reportBlock(headless), 'Verdict: changes requested\nSummary: Looks right.\nFindings: none')
   // Only the counts above 0, in the order of the severities.
   const counts = (severities: Array<'blocking' | 'should_fix' | 'nit'>): string => reportBlock(reviewerReport({
     findings: severities.map(severity => ({ severity, file: 'a.ts', summary: 's', fix: 'f' })),

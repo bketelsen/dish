@@ -60,7 +60,8 @@ export interface GateView { child: string, outcome: string, exitCode: number | n
 
 /** A reviewer's verdict (derive's `VerdictView`). */
 export interface VerdictView {
-  child: string, verdict: 'approved' | 'changes_requested', head: string, final: boolean, at: number
+  /** `head`: absent when the reviewer gave none (a review of work outside git). */
+  child: string, verdict: 'approved' | 'changes_requested', head?: string, final: boolean, at: number
   findings: { blocking: number, should_fix: number, nit: number }
 }
 

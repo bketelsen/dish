@@ -215,8 +215,9 @@ const DESCRIBE: { [kind: string]: (fields: Fields, line: LedgerLine) => Said | u
   },
   'review.verdict'(f) {
     const [verdict, head] = [str(f.verdict), str(f.head)]
-    if (verdict === undefined || head === undefined) return undefined
-    const text = [`${verdictLabel(verdict)} at ${shortSha(head)}`]
+    // No head: a review of work outside git. A head that isn't text is a line that doesn't fit.
+    if (verdict === undefined || (f.head !== undefined && head === undefined)) return undefined
+    const text = [head === undefined ? `${verdictLabel(verdict)}, no head given` : `${verdictLabel(verdict)} at ${shortSha(head)}`]
     const findings = f.findings
     if (isObject(findings)) {
       const [blocking, shouldFix, nits] = [num(findings.blocking), num(findings.should_fix), num(findings.nit)]
@@ -247,7 +248,8 @@ const DESCRIBE: { [kind: string]: (fields: Fields, line: LedgerLine) => Said | u
     if (f.final === null) text.push('no final review of this head')
     else if (isObject(f.final)) {
       const verdict = str(f.final.verdict)
-      if (verdict !== undefined) text.push(`final review: ${verdictLabel(verdict)} at ${sha(f.final.head)}${str(f.final.child) === undefined ? '' : ` by ${str(f.final.child)}`}`)
+      const at = f.final.head === undefined ? ', no head given' : ` at ${sha(f.final.head)}`
+      if (verdict !== undefined) text.push(`final review: ${verdictLabel(verdict)}${at}${str(f.final.child) === undefined ? '' : ` by ${str(f.final.child)}`}`)
     }
     if (isObject(f.overrides)) {
       const [gate, review] = [str(f.overrides.gate), str(f.overrides.review)]

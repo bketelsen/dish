@@ -113,20 +113,25 @@ function taskLine(view: TaskView, now: number): string {
   const gate = view.gate
   line += gate === undefined ? '; no gate result' : `; gate ${gate.outcome}${gate.head === null ? '' : ` at ${shortSha(gate.head)}`} (${age(gate.at, now)})`
   const verdict = view.verdict
-  if (verdict !== undefined) line += `; review ${verdictWords(verdict.verdict)}${verdict.final ? ' (final)' : ''} at ${shortSha(verdict.head)}`
+  if (verdict !== undefined) line += `; review ${verdictWords(verdict.verdict)}${verdict.final ? ' (final)' : ''}${verdict.head === undefined ? '' : ` at ${shortSha(verdict.head)}`}`
   return line
 }
 
 /** The final review's line. */
 function finalLine(final: VerdictView | undefined, head: string | undefined, now: number): string {
   if (final === undefined) return 'Final review: none yet: `delegate` a reviewer with `final: true`.'
-  if (final.verdict !== 'approved') return `Final review: changes requested at ${shortSha(final.head)} (child ${final.child}).`
+  if (final.verdict !== 'approved') return `Final review: changes requested${final.head === undefined ? '' : ` at ${shortSha(final.head)}`} (child ${final.child}).`
+  if (final.head === undefined) {
+    return `Final review: approved (child ${final.child}, ${age(final.at, now)}), but it gave no head: `
+      + '`open_pr` needs a final review that reports the full sha of the head it approved, or `reviewRuling`.'
+  }
+  const approvedHead = final.head
   const then = head === undefined
     ? '; the head can\'t be read now.'
-    : sameHead(final.head, head)
+    : sameHead(approvedHead, head)
       ? '; that is the head now.'
       : `; the head is now ${shortSha(head)}, so \`open_pr\` needs a new final review or \`reviewRuling\`.`
-  return `Final review: approved ${shortSha(final.head)} (child ${final.child}, ${age(final.at, now)})${then}`
+  return `Final review: approved ${shortSha(approvedHead)} (child ${final.child}, ${age(final.at, now)})${then}`
 }
 
 /** What `open_pr` would find now, on one line. */

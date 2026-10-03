@@ -166,6 +166,7 @@ function gatePhrase(gate: PrGate | null, gatesMissing: boolean): string {
 /** What the final review found, as one phrase after "no final review approved <head7>:". */
 function reviewPhrase(final: VerdictView | undefined): string {
   if (final === undefined) return 'there is none yet'
+  if (final.head === undefined) return `the latest final review (child ${final.child}) gave no head: the reviewer must report the full sha of the head it approved`
   return final.verdict === 'approved'
     ? `the latest final review (child ${final.child}) approved ${shortSha(final.head)}, not this head`
     : `the latest final review (child ${final.child}) requested changes at ${shortSha(final.head)}`
@@ -456,7 +457,7 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
     }
     const final = latestFinal(entries)
     const reviewOk = final?.verdict === 'approved' && sameHead(final.head, head)
-    const finalSeen: PrFinal | null = final === undefined ? null : { child: final.child, verdict: final.verdict, head: final.head, at: final.at }
+    const finalSeen: PrFinal | null = final === undefined ? null : { child: final.child, verdict: final.verdict, ...final.head === undefined ? {} : { head: final.head }, at: final.at }
     // A cancel during the reads since the gate: nothing is recorded, as for one during it.
     if (aborted(signal)) throw new Error(`open_pr was cancelled while the gate ran. ${NOTHING}`)
 

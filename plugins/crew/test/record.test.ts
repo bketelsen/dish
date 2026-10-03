@@ -1411,6 +1411,8 @@ test('reportProblem names each wrong field, and nothing for full and minimal rep
   assert.equal(reportProblem(reviewerReport()), undefined)
   assert.equal(reportProblem({ role: 'coder', turn: 0, at: 1, status: 'blocked', summary: '' }), undefined)
   assert.equal(reportProblem({ role: 'reviewer', turn: 0, at: 1, verdict: 'approved', head: 'HEAD', summary: ' ', findings: [] }), undefined)
+  // A reviewer of work outside git gives no head.
+  assert.equal(reportProblem({ role: 'reviewer', turn: 0, at: 1, verdict: 'approved', summary: 'Fine.', findings: [] }), undefined)
   // What the tool checks, the record doesn't: a blank blockedOn, the form of head, blank strings.
   assert.equal(reportProblem(coderReport({ status: 'needs_context', summary: '   ' })), undefined)
   for (const [path, value] of BAD_REPORTS) {
@@ -1677,6 +1679,16 @@ test('an old children.json, from before reports, run tags and gate heads, still 
   for (const field of ['structured', 'structuredFile', 'notice'] as const) assert.ok(!(field in child!.runs[0]!), field)
   assert.ok(!('head' in child!.runs[0]!.gates![0]!))
   assert.deepEqual(child!.gates, [gate({ turn: 2 })])
+})
+
+test('a reviewer\'s report without a head (work outside git) is kept, and read back, without one', async () => {
+  const { records, directory, corrupt } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  const { head: _head, ...headless } = reviewerReport()
+  assert.deepEqual(await records.setReport('c1', headless), headless)
+  const again = reopen(directory)
+  assert.deepEqual((await again.records.lookup('c1'))!.record.report, headless)
+  assert.deepEqual([...corrupt, ...again.corrupt], [])
 })
 
 test('a report\'s unknown fields, and a run\'s, are dropped when the record is read', async () => {

@@ -116,6 +116,10 @@ test('gates, verdicts and the ladder', () => {
   assertHas(lines.find(each => each.kind === 'review.verdict')!, 'approved', SHA_B.slice(0, 7), '0 blocking', '0 should fix', '1 nit')
   assertHas(line('review.verdict', { child: 'r1', verdict: 'changes_requested', head: SHA_B, final: false, findings: { blocking: 2, should_fix: 1, nit: 0 } }), 'changes requested', '2 blocking')
   assert.doesNotMatch(describeEntry(line('review.verdict', { child: 'r1', verdict: 'approved', head: SHA_B, final: false, findings: { blocking: 0, should_fix: 0, nit: 0 } })).label, /final/i)
+  // A review of work outside git gives no head.
+  const headless = describeEntry(line('review.verdict', { child: 'r1', verdict: 'approved', final: true, findings: { blocking: 0, should_fix: 0, nit: 0 } }))
+  assert.equal(headless.label, 'Final review')
+  assert.equal(headless.text[0], 'approved, no head given')
   assertHas(lines.find(each => each.kind === 'ladder.refused')!, 'round 5')
   assertHas(lines.find(each => each.kind === 'ladder.ruled')!, 'round 5', 'one more round — close — an hour')
 })
@@ -131,6 +135,11 @@ test('the pull request: checked, opened, and the main agent\'s rulings, deferred
   })
   assert.match(describeEntry(refused).label, /refused/i)
   assertHas(refused, 'flaky e2e — known — a broken main', 'no approved final review of this head', 'no gate')
+  // A final review that gave no head (a review of work outside git).
+  const headless = line('pr.checked', {
+    head: SHA_C, gate: null, final: { child: 'r1', verdict: 'approved', at: NOW }, gateOk: false, reviewOk: false, overrides: {}, result: 'refused',
+  })
+  assertHas(headless, 'final review: approved, no head given by r1')
   assertHas(lines.find(each => each.kind === 'pr.opened')!, '#7', 'https://github.com/Acme/widget/pull/7', 'dish/fix-login', SHA_B.slice(0, 7))
   assertHas(lines.find(each => each.kind === 'ruling')!, 'skip the e2e — flaky — a regression')
   assertHas(lines.find(each => each.kind === 'deferred')!, 'rename helper', 'src/a.ts', 'out of scope')

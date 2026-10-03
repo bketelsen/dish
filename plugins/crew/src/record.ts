@@ -193,8 +193,8 @@ export interface ReviewerReport {
   turn: number
   at: number
   verdict: Verdict
-  /** The full sha of the commit it reviewed. */
-  head: string
+  /** The full sha of the commit it reviewed; absent when the work it reviewed isn't in a git repository. */
+  head?: string
   summary: string
   findings: ReviewFinding[]
   checks?: ReviewCheck[]
@@ -544,9 +544,10 @@ export function reportProblem(value: unknown): string | undefined {
     }
     return undefined
   }
-  const problem = fieldProblem('verdict', value.verdict, VERDICTS) ?? fieldProblem('head', value.head, 'string') ?? fieldProblem('summary', value.summary, 'string')
+  const problem = fieldProblem('verdict', value.verdict, VERDICTS) ?? fieldProblem('summary', value.summary, 'string')
     ?? listProblem('findings', value.findings, FINDING_FIELDS)
   if (problem !== undefined) return problem
+  if (value.head !== undefined && !isText(value.head)) return 'head must be a string when it is given'
   for (const [name, fields] of [['checks', CHECK_FIELDS], ['addressed', ADDRESSED_FIELDS]] as const) {
     const listed = value[name] === undefined ? undefined : listProblem(name, value[name], fields)
     if (listed !== undefined) return listed

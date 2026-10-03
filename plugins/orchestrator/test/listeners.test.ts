@@ -147,6 +147,23 @@ test('review.verdict: the counts by severity, with final true and false; a coder
   ])
 })
 
+test('review.verdict without a head: a reviewer of work outside git gives none, and the entry has none', async () => {
+  const w = await world()
+  const run = await w.open()
+  const child = childRecord({ id: 'r1', role: 'reviewer', reviews: 'c1', final: true, run: w.runs.refOf(run), task: 'fix-login' })
+  const { head: _head, ...headless } = REVIEWER_REPORT
+  const ended = endedEntries(run, settled(child, { structured: headless }), null, NOW)
+  assert.deepEqual(ended[1], {
+    at: NOW, run: run.id, kind: 'review.verdict', by: 'harness', session: SESSION, child: 'r1', task: 'fix-login', verdict: 'changes_requested',
+    final: true, findings: { blocking: 1, should_fix: 0, nit: 2 },
+  })
+  const l = createListeners(w.runs)
+  l.settled(settled({ id: 'r1', role: 'reviewer', reviews: 'c1', final: true, run: w.runs.refOf(run), task: 'fix-login' }, { structured: headless }))
+  await w.ledger.flush()
+  const verdict = (await w.entries(run)).find(entry => entry.kind === 'review.verdict')
+  assert.ok(verdict !== undefined && !('head' in verdict), JSON.stringify(verdict))
+})
+
 test('gate.result: tags from the index; after a restart, through crew\'s lookup; an untagged child writes nothing', async () => {
   const w = await world()
   const run = await w.open()

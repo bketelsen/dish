@@ -137,7 +137,7 @@ export const REVIEWER_PARAMETERS = {
     type: 'string', enum: ['approved', 'changes_requested'], required: true,
     description: '`changes_requested` when any finding must be fixed before this can merge, else `approved`.',
   },
-  head: { type: 'string', required: true, description: 'The full sha of the commit you reviewed: `git rev-parse HEAD` in the worktree.' },
+  head: { type: 'string', description: 'The full sha of the commit you reviewed (`git rev-parse HEAD`), when the work is in a git repository.' },
   summary: { type: 'string', required: true, description: 'Your review, for a person: a few sentences.' },
   findings: { type: 'array', required: true, items: FINDING, description: 'Every finding; an empty list for a clean review.' },
   checks: { type: 'array', items: CHECK, description: 'The commands you ran, and their exit codes.' },
@@ -171,7 +171,7 @@ export const CODER_DESCRIPTION = 'Finish your work with this, as your last call:
 /** What a reviewer reads of `report`. */
 export const REVIEWER_DESCRIPTION = 'Finish your review with this, as your last call: it records your verdict for the main agent and ends your turn. '
   + 'The main agent reads this report, not your last message. '
-  + '`head` is the full sha of the commit you reviewed; `findings` lists every finding (an empty list for a clean review). '
+  + '`head` is the full sha of the commit you reviewed, when the work is in a git repository; `findings` lists every finding (an empty list for a clean review). '
   + 'A later call replaces an earlier one.'
 
 // --- the tool ----------------------------------------------------------------------------------------------------------
@@ -190,7 +190,7 @@ const SUMMARY_EMPTY: Readonly<Record<ReportRole, string>> = {
   reviewer: 'summary is empty: say what you found, for a person',
 }
 const BLOCKED_ON_REQUIRED = 'blockedOn is required when status is blocked or needs_context: say what you\'re blocked on, or what you need'
-const HEAD_NOT_FULL = 'head must be the full sha of the commit you reviewed (40 hex digits): run `git rev-parse HEAD` in the worktree you reviewed'
+const HEAD_NOT_FULL = 'head must be the full sha of the commit you reviewed (40 hex digits): run `git rev-parse HEAD` in the worktree you reviewed, or leave head out when the work isn\'t in a git repository'
 const NOT_A_CHILD = 'dish-crew has no record of you as a crew child, so the report wasn\'t recorded; end your turn with your report as your closing message'
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -286,20 +286,21 @@ function reviewerTool(deps: ReportToolDeps): ToolDefinition {
     parameters: REVIEWER_PARAMETERS,
     output: {
       schema: REVIEWER_OUTPUT,
-      render: (_args, value) => [{ type: 'text', text: `Report recorded: ${value.verdict} at ${value.head.slice(0, 12)}.` }],
+      render: (_args, value) => [{ type: 'text', text: `Report recorded: ${value.verdict}${value.head === undefined ? '' : ` at ${value.head.slice(0, 12)}`}.` }],
     },
     async execute(args, exec) {
       const problems: string[] = []
       if (blank(args.summary)) problems.push(SUMMARY_EMPTY.reviewer)
-      const head = args.head.trim().toLowerCase()
-      if (!FULL_SHA.test(head)) problems.push(HEAD_NOT_FULL)
+      // Optional: a review of work outside git (the scratch workspace, a writer's change) has no commit. Given, it is a full sha.
+      const head = blank(args.head) ? undefined : args.head!.trim().toLowerCase()
+      if (head !== undefined && !FULL_SHA.test(head)) problems.push(HEAD_NOT_FULL)
       if (problems.length > 0) throw new Error(problems.join('; '))
       const report: ReviewerReport = {
         role: 'reviewer',
         turn: deps.tracker.turnOf(deps.agent.session),
         at: now(),
         verdict: args.verdict,
-        head,
+        ...head === undefined ? {} : { head },
         summary: args.summary,
         findings: args.findings,
         ...given('checks', args.checks),

@@ -210,7 +210,7 @@ function outcomeOf(report: StructuredReport): string {
  * - A coder's: `Status: done` (or `blocked`, `needs context`); `Summary: …`, trimmed, its own line breaks kept; `Commits:`
  *   and the shas as code spans, joined by `, `; `Blocked on: …`; `Rulings:` and `- <what> — <why> — <cost if wrong>` for
  *   each; `Concerns:` and `- <concern>`; `Not fixed:` and `- <finding> — <why>`.
- * - A reviewer's: `Verdict: approved` (or `changes requested`) and `, at ` the head as a code span; `Summary: …`;
+ * - A reviewer's: `Verdict: approved` (or `changes requested`) and, when it gave one, `, at ` the head as a code span; `Summary: …`;
  *   `Findings (<n>): <k> blocking, <k> should_fix, <k> nit`, the counts above 0 only, or `Findings: none`; for each finding
  *   `- [<severity>] ` its file (and `:<line>`) as a code span, then `: <summary> Fix: <fix>`; `Checks:` and, for each, the
  *   command as a code span, then ` exit <code>: <summary>`; `Addressed:` and `- <finding>: addressed. <evidence>`, or
@@ -231,7 +231,7 @@ export function reportBlock(report: StructuredReport): string {
     list('Concerns:', report.concerns, folded)
     list('Not fixed:', report.notFixed, item => `${folded(item.finding)} — ${folded(item.why)}`)
   } else {
-    lines.push(`Verdict: ${outcomeOf(report)}, at ${code(report.head)}`, `Summary: ${kept(report.summary)}`)
+    lines.push(`Verdict: ${outcomeOf(report)}${report.head === undefined ? '' : `, at ${code(report.head)}`}`, `Summary: ${kept(report.summary)}`)
     const { findings } = report
     const counts = SEVERITIES.map(severity => [severity, findings.filter(finding => finding.severity === severity).length] as const)
       .filter(([, count]) => count > 0).map(([severity, count]) => `${count} ${severity}`)

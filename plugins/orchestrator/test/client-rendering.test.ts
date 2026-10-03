@@ -314,6 +314,14 @@ test('a run\'s view with nothing in its ledger yet says so, plainly', async () =
   assert.ok(html.includes('(live)'), html)
 })
 
+test('a final review without a head (work outside git) says so', async () => {
+  const { RunView } = await components()
+  const finalReview = { child: 'r1', verdict: 'approved' as const, final: true, at: NOW, findings: { blocking: 0, should_fix: 0, nit: 0 } }
+  const html = render(RunView({ detail: detail({ summary: { tasks: [], rulings: [], deferred: [], notes: [], finalReview } }), timeline: timeline([]), now: NOW, back: () => {}, loadOlder: () => {} }))
+  assertInert(html, [])
+  assert.ok(html.includes('final review: approved, no head given, by '), html)
+})
+
 test('the view\'s handlers are its Back button and the timeline\'s Load older, and each calls what it says', async () => {
   const { RunView } = await components()
   const called: string[] = []

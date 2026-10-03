@@ -100,6 +100,18 @@ test('latestFinal is the newest final verdict', () => {
   assert.equal(latestFinal([]), undefined)
 })
 
+test('latestFinal: a final verdict without a head (a review of work outside git) is the latest, and no head matches it', () => {
+  const { head: _head, ...headless } = verdict('r2', 'api', SHA_B, true, 3) as unknown as Record<string, unknown>
+  const entries = [verdict('r1', 'api', SHA_B, true, 2), headless as unknown as LedgerEntry]
+  const final = latestFinal(entries)
+  assert.deepEqual(final, { child: 'r2', verdict: 'approved', final: true, at: at(3), findings: { blocking: 0, should_fix: 1, nit: 2 } })
+  // The approval of SHA_B before it doesn't count: the latest final review is the one without a head.
+  assert.equal(sameHead(final!.head, SHA_B), false)
+  assert.equal(summarize(run(), entries).finalReview?.child, 'r2')
+  // A head that isn't a string is a malformed entry, passed over as before.
+  assert.equal(latestFinal([verdict('r1', 'api', SHA_B, true, 2), { ...headless, head: 5 } as unknown as LedgerEntry])!.child, 'r1')
+})
+
 test('gateAt is the newest gate.result at that head', () => {
   const entries = [gate('c1', 'api', SHA_A, 1), gate('c1', 'api', SHA_B, 2, 'failed'), gate('c1', 'api', SHA_B, 3), gate('c1', 'api', null, 4), gate('c1', 'api', SHA_A, 5, 'failed')]
   assert.deepEqual(gateAt(entries, SHA_B), { child: 'c1', outcome: 'passed', exitCode: 0, head: SHA_B, at: at(3), log: '/logs/3.log' })
