@@ -8,6 +8,7 @@ import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import { createScope } from '@deepseek-ai/dsh-scope'
+import { maskSecrets } from 'dish-kit'
 import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
 import * as row from '../src/delegate.ts'
 import type { DishCrew } from '../src/index.ts'
@@ -779,6 +780,16 @@ function runWith(gates?: GateResult[]): RunRecord {
 test('a pass: "Gate passed (round N)."', () => {
   assert.equal(gateLine(BOUND, runWith([gate({ round: 1 })])), 'Gate passed (round 1).')
   assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 1 }), gate({ round: 2 })])), 'Gate passed (round 2).')
+})
+
+test('a credential in the gate\'s command is masked in the gate line, for a record written before dish-gates masked it', () => {
+  const token = `ghs_${'A1b2C3d4E5'.repeat(4)}`
+  const command = `GH_TOKEN=${token} make test`
+  const line = gateLine(BOUND, runWith([gate({ outcome: 'failed', exitCode: 1, round: 3, command, excerpt: 'boom' })]))!
+  assert.ok(!line.includes(token), line)
+  assert.ok(line.startsWith(`Gate FAILED after 3 rounds (\`GH_TOKEN=${maskSecrets(token)} make test\`, exit 1); last lines:`), line)
+  const early = gateLine(BOUND, { ...runWith([gate({ outcome: 'failed', exitCode: 1, round: 1, command })]), stopReason: 'error' })!
+  assert.ok(!early.includes(token), early)
 })
 
 test('a pass in a run that then ended another way than completed says so: the work after the gate wasn\'t gated', () => {

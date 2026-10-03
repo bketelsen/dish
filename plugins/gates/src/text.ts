@@ -3,10 +3,13 @@
  * small formatters, and the message steered to a coder whose gate failed.
  *
  * Nothing here reads a file or a service, and nothing screens the output: it is the coder's own, from its own code, and its
- * secrets were masked where it was captured (`run.ts`).
+ * secrets were masked where it was captured (`run.ts`). The gate's command is masked again in the message, before it is cut:
+ * the listener passes it masked, and masking is idempotent.
  *
  * @module dish-gates/text
  */
+
+import { maskSecrets } from 'dish-kit'
 
 /** The most bytes of a gate's output shown to the coder. */
 export const TAIL_MAX_BYTES = 16_384
@@ -104,7 +107,7 @@ export function duration(ms: number): string {
 
 /** What the coder is told about a failed gate run. */
 export interface Failure {
-  /** The gate's command, as it ran. */
+  /** The gate's command, as it ran; shown masked. */
   command: string
   /** `null` when the run was killed and left no code. */
   exitCode: number | null
@@ -137,7 +140,7 @@ export function failureMessage(failure: Failure): string {
   if (!(round >= 1 && round < maxRounds)) {
     throw new RangeError(`the gate's failure message is for rounds 1 to maxRounds - 1; got round ${round} of ${maxRounds}`)
   }
-  const command = inlineCode(oneLine(failure.command, COMMAND_SHOWN, ' ↵ '))
+  const command = inlineCode(oneLine(maskSecrets(failure.command), COMMAND_SHOWN, ' ↵ '))
   const took = duration(failure.durationMs)
   const head = `The gate failed (round ${round} of ${maxRounds}): ${command}`
   const first = failure.timedOut ? `${head} was stopped at its time limit (${duration(failure.timeoutMs)}) after ${took}.`

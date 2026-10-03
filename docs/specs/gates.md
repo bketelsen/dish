@@ -273,6 +273,7 @@ What the build decided within this spec, or added to it, beyond the plan's corre
 
 **Running the gate.**
 - **A cut output** (over 4 MiB) loses its partial first line before it is masked: a secret cut at its start would no longer match its pattern.
+- **The gate's command is masked wherever it is shown** (found in the final review): in the recorded `GateResult.command`, the steer, crew's notice line and the gate sentence of a coder's brief (`gateFor` gives it masked, and crew masks it again). Only the run gets projects.yaml's gate as it is. The log already masked it.
 - **dsh's spill files.** For a cut run, dsh keeps the whole stream in a spill file in its temp directory, unmasked. dish-gates removes them; its own log has what it keeps.
 
 **Logs** are pruned at start and every day while dish-gates runs, not only at start: dsh web runs for days.

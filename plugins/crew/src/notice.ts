@@ -59,6 +59,7 @@ import { open } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
+import { maskSecrets } from 'dish-kit'
 import type { DishCrew } from './index.ts'
 import { closingOf, reportContent } from './record.ts'
 import type { ChildRecord, RunRecord } from './record.ts'
@@ -183,7 +184,8 @@ export function gateLine(child: Pick<ChildRecord, 'worktree'>, run: RunRecord, g
       return `Gate not run${because}.`
     case 'failed': {
       const ended = result.timedOut ? 'stopped at its time limit' : result.exitCode === null ? 'no exit code' : `exit ${result.exitCode}`
-      const what = `${result.command === '' ? '' : `${codeSpan(result.command)}, `}${ended}`
+      // Masked again: dish-gates records it masked, but a record from before it did holds it as projects.yaml had it.
+      const what = `${result.command === '' ? '' : `${codeSpan(maskSecrets(result.command))}, `}${ended}`
       const log = result.log === null ? undefined : `Full log: ${codeSpan(result.log)}.`
       if (result.round < result.maxRounds) {
         return `Gate failed in round ${result.round} of ${result.maxRounds} (${what}), and the run ended before the coder finished again.${log === undefined ? '' : ` ${log}`}`

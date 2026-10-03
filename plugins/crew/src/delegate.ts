@@ -80,7 +80,7 @@ import type {} from '@deepseek-ai/dsh-llm'
 import type { ContinuableStartSpec } from '@deepseek-ai/dsh-subagent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
-import { isTopLevelAgent } from 'dish-kit'
+import { isTopLevelAgent, maskSecrets } from 'dish-kit'
 import type { DishPrompts, Persona } from 'dish-prompts'
 import { allowList, visibleTools } from './allow.ts'
 import type { DishCrew, WorktreeBinding } from './index.ts'
@@ -496,12 +496,15 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     return { route: chosen.route, reviews: call.roleSettings.reviews ? call.reviews : undefined, reviewed: reviewed?.child }
   }
 
-  /** The gate dish-gates runs for `project`, for a bound coder's brief. `undefined` without dish-gates, without a gate, or when `gateFor` fails (logged). Never throws. */
+  /**
+   * The gate dish-gates runs for `project`, for a bound coder's brief, masked (dish-gates masks it too). `undefined` without
+   * dish-gates, without a gate, or when `gateFor` fails (logged). Never throws.
+   */
   async function gateOf(call: Call, project: string): Promise<string | undefined> {
     if (call.gates === undefined) return undefined
     try {
       const gate: unknown = await call.gates.gateFor(project)
-      return typeof gate === 'string' && gate.trim() !== '' ? gate : undefined
+      return typeof gate === 'string' && gate.trim() !== '' ? maskSecrets(gate) : undefined
     } catch (error) {
       warn('could not read the gate of project %s, so the coder\'s brief doesn\'t name it: %s', project, describe(error))
       return undefined

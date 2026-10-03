@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { CONTEXT_SUMMARY_MAX_CHARS } from '@deepseek-ai/dsh-llm'
+import { maskSecrets } from 'dish-kit'
 import {
   BLOCKED_REASON, DEFAULT_TAIL_LINES, EXCERPT_LINES, EXCERPT_MAX_CHARS, SUMMARY_MAX_CHARS, TAIL_MAX_BYTES,
   duration, excerptOf, failureMessage, failureSummary, fenced, tailOf,
@@ -188,6 +189,17 @@ test('failureMessage: the command is shown whole on one line, whatever is in it'
   const long = failureMessage(failure({ command: `make ${'x'.repeat(500)}` }))
   assert.ok(FIRST(long).length < 300, `${FIRST(long).length} characters`)
   assert.match(FIRST(long), /^The gate failed \(round 1 of 3\): `make x+…` exited 1 after 42 s\.$/)
+})
+
+test('failureMessage: a credential in the command is masked, before it is cut', () => {
+  const token = `ghs_${'A1b2C3d4E5'.repeat(4)}`
+  const message = failureMessage(failure({ command: `GH_TOKEN=${token} pnpm test` }))
+  assert.ok(!message.includes(token))
+  assert.ok(!message.includes('ghs_A1b2'))
+  assert.equal(FIRST(message), `The gate failed (round 1 of 3): \`GH_TOKEN=${maskSecrets(token)} pnpm test\` exited 1 after 42 s.`)
+  // Cut after masking: a cut in the token can't leave its start shown.
+  const long = failureMessage(failure({ command: `${'x'.repeat(190)} ${token}` }))
+  assert.ok(!long.includes('ghs_'), FIRST(long))
 })
 
 test('failureMessage: the output, fenced', () => {

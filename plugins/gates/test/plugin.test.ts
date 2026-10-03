@@ -32,6 +32,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { ShellExecRequest, ShellExecSpec, ShellExecution, ShellRunResult } from '@deepseek-ai/dsh-shell'
 import * as crewPlugin from 'dish-crew'
+import { maskSecrets } from 'dish-kit'
 import type { ChildRecord, CrewRecords, DishCrew } from 'dish-crew'
 import type { Project } from 'dish-projects'
 import type { Worktree } from 'dish-workspaces'
@@ -43,6 +44,7 @@ import { BLOCKED_REASON } from '../src/text.ts'
 import { tempDir, withEnv } from './helpers.ts'
 
 const SESSION = 'main-1'
+const TOKEN = `ghs_${'A1b2C3d4E5'.repeat(4)}`
 const CLONE = '/w/acme/widget'
 const FIX1 = `${CLONE}/.worktrees/fix-1`
 
@@ -300,6 +302,9 @@ test('gateFor gives projects.yaml\'s gate as it is now; none for a project that 
     w.project.current = { ...PROJECT, gate: 'make check' }
     assert.equal(await service.gateFor('acme/widget'), 'make check')
     assert.equal(await service.gateFor('acme/other'), undefined)
+    // A credential in it is masked: the gate is shown to agents (the coder's brief), never run from here.
+    w.project.current = { ...PROJECT, gate: `GH_TOKEN=${TOKEN} make check` }
+    assert.equal(await service.gateFor('acme/widget'), `GH_TOKEN=${maskSecrets(TOKEN)} make check`)
     await w.handles.projects.dispose()
     assert.equal(await service.gateFor('acme/widget'), undefined)
   } finally {
@@ -757,6 +762,28 @@ test('a real crew child cut at max-tokens: its stop is gated once, the tool-call
       assert.deepEqual(record.runs[0]!.gates?.map(result => [result.outcome, result.round, result.turn]), [['failed', 1, 1], ['passed', 2, 1]])
     } finally {
       await nudge.dispose()
+      await w.dispose()
+    }
+  })
+})
+
+test('a real crew child whose gate holds a credential: crew files it masked, which its notice shows; the gate ran as it is', async () => {
+  await withDsh(() => 'done', async (dsh) => {
+    const w = await world({ ctx: dsh.ctx, config: { maxRounds: 1 } })
+    try {
+      const gate = `GH_TOKEN=${TOKEN} pnpm test`
+      const shown = `GH_TOKEN=${maskSecrets(TOKEN)} pnpm test`
+      w.project.current = { ...PROJECT, gate }
+      w.shell.script.push(FAIL)
+      await dsh.delegate('child-4', 'create ok.txt')
+      const record = await settled(w, dsh, 'child-4')
+      assert.equal(w.shell.requests.length, 1)
+      assert.equal(w.shell.requests[0]!.command, `exec 2>&1\n${gate}`)
+      // What crew's finish notice reads for its gate line (crew's notice tests show it masks it again).
+      assert.deepEqual(record.runs[0]!.gates?.map(result => [result.outcome, result.command]), [['failed', shown]])
+      assert.ok(!JSON.stringify(record).includes(TOKEN))
+      assert.ok(!dsh.coderRequests.some(text => text.includes(TOKEN)))
+    } finally {
       await w.dispose()
     }
   })

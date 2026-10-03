@@ -55,8 +55,9 @@ export const Config: Schema<Config> = Schema.object({
 /** The `dishGates` service. */
 export interface DishGates {
   /**
-   * The gate dish-gates runs for a coder bound to a worktree of `project`: projects.yaml's `gate` as it is now;
-   * `undefined` for a project that isn't registered, or without dish-projects.
+   * The gate dish-gates runs for a coder bound to a worktree of `project`, to show it: projects.yaml's `gate` as it is now,
+   * with anything that looks like a credential masked (crew puts it in the coder's brief); `undefined` for a project that
+   * isn't registered, or without dish-projects.
    */
   gateFor(project: string): Promise<string | undefined>
 }
@@ -153,7 +154,8 @@ export function start(ctx: Context, config: Config, internals: GatesInternals): 
   const gateFor = async (project: string): Promise<string | undefined> => {
     const projects = ctx.get('dishProjects')
     if (projects === undefined) return undefined
-    return (await projects.get(project))?.gate
+    const gate = (await projects.get(project))?.gate
+    return gate === undefined ? undefined : maskSecrets(gate)
   }
   ctx.provide('dishGates', { gateFor } satisfies DishGates)
 }

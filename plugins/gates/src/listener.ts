@@ -36,7 +36,8 @@
  *
  * **Errors.** The listener never throws: a thrown listener fails the turn in dsh-agent-loop. A throw of dish's own code (or
  * of a service it calls) is logged once per distinct message, and, when crew and the child are known, recorded as an
- * `error`, "dish-gates failed: <message>". Every text that goes to the log or the record is masked and on one line.
+ * `error`, "dish-gates failed: <message>". Every text that goes to the log or the record is masked and on one line. The
+ * gate's command is masked wherever it is shown (the record, the steer); only the run gets it as it is.
  *
  * Nothing here runs a process or git: the run is `run.ts`'s, over dsh's sandboxed shell.
  *
@@ -312,15 +313,17 @@ export function gateListener(deps: GateDeps): (payload: StoppingPayload) => Prom
 
       const passed = result.exitCode === 0 && !result.timedOut
       const took = duration(result.durationMs)
+      // The gate as it is shown, never run: the record (and so crew's notice) and the steer carry it masked.
+      const shown = maskSecrets(project.gate)
       const kept = await record({
-        turn, round, maxRounds, outcome: passed ? 'passed' : 'failed', command: project.gate, exitCode: result.exitCode,
+        turn, round, maxRounds, outcome: passed ? 'passed' : 'failed', command: shown, exitCode: result.exitCode,
         timedOut: result.timedOut, durationMs: result.durationMs, log: result.log, excerpt: excerptOf(result.output), at: now(),
       }, passed ? `passed in ${took}` : `failed in ${took} (${ending(result)})`)
       // Only a failure that is on the record is sent back: each steer adds one, so the rounds always run out. The last
       // round's failure isn't sent back: the turn ends with it (the user's decision A, 2026-10-03).
       if (!kept || passed || round >= maxRounds || signal.aborted) return
       const failure = {
-        command: project.gate, exitCode: result.exitCode, timedOut: result.timedOut, timeoutMs: result.timeoutMs,
+        command: shown, exitCode: result.exitCode, timedOut: result.timedOut, timeoutMs: result.timeoutMs,
         durationMs: result.durationMs, tail: result.output, tailLines, log: result.log,
         ...result.logProblem === undefined ? {} : { logProblem: result.logProblem }, round, maxRounds, denied: result.denied,
       }

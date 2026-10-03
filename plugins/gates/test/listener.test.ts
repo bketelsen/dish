@@ -429,6 +429,28 @@ test('a failure is recorded and steered once, with the tail within its limits, t
   assert.deepEqual(w.infos, [`child c1, round 1, ${FIX1}: failed in 42 s (exit 2)`])
 })
 
+test('a credential in projects.yaml\'s gate is masked in the record and the steer; the run gets the gate as it is', async () => {
+  const w = await world()
+  await w.coder('c1')
+  const gate = `GH_TOKEN=${TOKEN} pnpm test`
+  w.project = { ...PROJECT, gate }
+  const c1 = w.agent('c1')
+  w.script.set('c1', [fail(), fail(), fail()])
+  for (let round = 0; round < 3; round++) await w.stop(c1)
+  // The run is the gate itself: masking it would break it.
+  assert.deepEqual(w.runs.map(run => run.command), [gate, gate, gate])
+  const gates = await w.gates('c1')
+  assert.deepEqual(gates.map(result => result.command), Array(3).fill(`GH_TOKEN=${MASKED} pnpm test`))
+  assert.equal(c1.steers.length, 2)
+  for (const steer of c1.steers) {
+    assert.ok(!textOf(steer).includes(TOKEN))
+    assert.ok(textOf(steer).includes(`GH_TOKEN=${MASKED} pnpm test`))
+    assert.ok(!JSON.stringify(steer).includes(TOKEN))
+  }
+  assert.ok(!JSON.stringify(gates).includes(TOKEN))
+  assert.ok(![...w.infos, ...w.warns].some(line => line.includes(TOKEN)))
+})
+
 test('the message keeps the settings\' tailLines', async () => {
   const w = await world()
   await w.coder('c1')

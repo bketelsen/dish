@@ -8,6 +8,7 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import { ToolRuntime, assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ContinuableStartSpec } from '@deepseek-ai/dsh-subagent'
+import { maskSecrets } from 'dish-kit'
 import * as promptsPlugin from 'dish-prompts'
 import * as row from '../src/delegate.ts'
 import { CrewRecords, isRunning } from '../src/record.ts'
@@ -1937,6 +1938,16 @@ test('a bound coder\'s brief names its project\'s gate while dish-gates runs: af
   await w.delegate({ ...CODER, title: 'unbound' })
   assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: CODER.task }, { type: 'text', text: CLOSING_NOTE }])
   assert.deepEqual(w.gateAsked, ['frostyard/snosi'])
+})
+
+test('a credential in the gate dish-gates gives is masked in the coder\'s brief', async () => {
+  const w = await world({ dishGates: true })
+  const token = `ghs_${'A1b2C3d4E5'.repeat(4)}`
+  w.gates.set('frostyard/snosi', `GH_TOKEN=${token} pnpm test`)
+  const tree = await w.makeWorktree('fix-1')
+  await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: brief(tree.path, 'dish/fix-1') + gateSentence(`GH_TOKEN=${maskSecrets(token)} pnpm test`) })
+  assert.ok(!JSON.stringify(w.starts[0]!.request.prompt).includes(token))
 })
 
 test('without a gate to name, the brief is 6b\'s: no dish-gates, a project it has no gate for, and a gateFor that throws', async () => {
