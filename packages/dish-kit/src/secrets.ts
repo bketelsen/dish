@@ -1,7 +1,8 @@
 /**
  * What looks like a credential, in one place: dish-config refuses to store a document that holds one (`secretKind`), and
  * dish-judge masks them out of its decision log (`maskSecrets`). Both start from the same patterns, so what the store
- * would refuse is what the log hides.
+ * would refuse is what the log hides. dish-judge's result screen also cuts a private key out of what it sends the judge
+ * (`privateKeyCuts`), from the same header and END patterns, without what is written around it.
  *
  * A known limit, which the guard and the mask share: a token that follows a letter or digit is not a match (that is what keeps
  * `risk-…` and `xghp_…` from matching), so a fragment that is too short to be a token on its own (`ghp_` and 29 letters),
@@ -83,6 +84,20 @@ const HEX = table(/[0-9a-fA-F]/)
  */
 const APIKEY_START = String.raw`apikey_[0-9a-fA-F]{32}`
 
+/** What `secretKind` and `maskSecrets` call a private key. */
+export const PRIVATE_KEY_KIND = 'a private key'
+
+/**
+ * The start of a PEM private key header: RSA, EC, OPENSSH, ENCRYPTED, and PGP's `PRIVATE KEY BLOCK`. The gaps are bounded so
+ * that a long near-miss (`-----BEGIN ` and a megabyte of `PRIVATE KEY`) takes a fixed time for each start, not time for every
+ * pair of positions in it. No real header has a word that long before `PRIVATE KEY`.
+ */
+const KEY_START = String.raw`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY`
+/** A whole private key header. */
+const KEY_HEADER = String.raw`${KEY_START}[A-Z ]{0,20}-----`
+/** A private key's END line. */
+const KEY_END = String.raw`-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----`
+
 // No `\b` anchors: `_` is a word character, so `\b` would let `TOKEN_ghp_...` and `_ghp_..._` through. A lookbehind
 // for a letter or digit still keeps `risk-...`, `task-...` and `xghp_...` from matching.
 const PATTERNS: readonly SecretPattern[] = [
@@ -139,11 +154,9 @@ const PATTERNS: readonly SecretPattern[] = [
     },
   },
   {
-    // Any PEM private key header: RSA, EC, OPENSSH, ENCRYPTED, and PGP's `PRIVATE KEY BLOCK`. The gaps are bounded so
-    // that a long near-miss (`-----BEGIN ` and a megabyte of `PRIVATE KEY`) takes a fixed time for each start, not time
-    // for every pair of positions in it. No real header has a word that long before `PRIVATE KEY`.
-    label: 'a private key',
-    body: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----/,
+    // Any PEM private key header (see `KEY_START`).
+    label: PRIVATE_KEY_KIND,
+    body: new RegExp(KEY_HEADER),
     // The key is the header and what follows it, up to 8 KB:
     // - to its END line, if there is one before another private key header (whatever is between: PGP armor has `Version:`
     //   and `Comment:` lines with dots and brackets in them, and a fake `-----BEGIN x.` line does not end it). The gap stops
@@ -159,7 +172,7 @@ const PATTERNS: readonly SecretPattern[] = [
     //   go with it), so that the token is at the end of the mask and is masked in its turn: the letters of `ghp`, `github`,
     //   `sk-` and `apikey` are among the characters, and it would otherwise run into the token and stop at its `_`, leaving
     //   the rest of the token. A prefix with no token behind it (`risk-free`) is not a place to stop.
-    mask: new RegExp(String.raw`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----(?:(?:(?!-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY)[\s\S]){0,8192}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,20}-----|(?:(?!-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|sk-[A-Za-z0-9_-]{32}|${APIKEY_START})[A-Za-z0-9+\/=:,\s\\.()@<>-]){0,8192})`),
+    mask: new RegExp(String.raw`${KEY_HEADER}(?:(?:(?!${KEY_START})[\s\S]){0,8192}?${KEY_END}|(?:(?!${KEY_START}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|sk-[A-Za-z0-9_-]{32}|${APIKEY_START})[A-Za-z0-9+\/=:,\s\\.()@<>-]){0,8192})`),
   },
   // AKIA is a long-term access key, ASIA a temporary one.
   { label: 'an AWS access key ID', before: NOT_AFTER_UPPER, body: /(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])/ },
@@ -351,4 +364,761 @@ export function maskSecrets(text: string): string {
     // The masking itself failed: the same, with nothing of the text kept.
     return maskFor(UNREADABLE)
   }
+}
+
+// --- a private key cut out of a text that a reader is to judge ------------------------------------------------------
+
+/**
+ * What stands for a secret of kind `kind` in a text that is sent on without it: `[a private key, left out]`. Plain words: no
+ * pattern finds anything in it, and it is not a mask, so the judge's client neither masks it nor refuses a request that holds it.
+ */
+export function leftOut(kind: string): string {
+  return `[${kind}, left out]`
+}
+
+/**
+ * The fewest base64 characters in a run that `privateKeyCuts` takes for a line of a key's body wherever it is: a line of a key is
+ * 64 (PEM, PGP), 70 (OpenSSH) or 76 characters, and no word of a sentence is 40. An escaped character (`\/`, `+`, `&#43;`)
+ * counts as one.
+ */
+export const KEY_LINE_MIN = 40
+
+/**
+ * The fewest characters in a run that `privateKeyCuts` takes for part of a key's line in its reach when it looks like data, not a
+ * word: it has a digit, a `+` or a `=`, or a capital after its first letter and a small letter. Of runs of random base64, 997 in
+ * 1000 of eight characters do, and all but 1 in 10,000 of twelve; a word in small letters, a Capitalised word or one in CAPITALS
+ * doesn't. It is what is left of a key's line that something else split (a page break, a command for each line).
+ */
+export const KEY_DATA_MIN = 8
+
+/**
+ * How far after a header the cut reads words: the rules that cut a run shorter than `KEY_LINE_MIN` (one that looks like data, a
+ * fold) apply this far and no further, so that one fake header can't take words from a whole page. Lines of a key are cut at any
+ * distance: to the END line, or, with none, for as long as rows have one (see `cutRegion`).
+ */
+export const KEY_REACH_CHARS = 16 * 1024
+
+/** A part of a text to leave out, from `start` to `end` in UTF-16 units, and what kind of secret it is. */
+export interface KeyCut {
+  start: number
+  end: number
+  kind: string
+}
+
+/** What `privateKeyCuts` found: how many private key headers, and what to leave out, in order, none touching the next. */
+export interface KeyCuts {
+  keys: number
+  spans: KeyCut[]
+}
+
+const BASE64 = table(/[A-Za-z0-9+\/=]/)
+/** ASCII punctuation that is not base64: what may stand around a line of a key (a quote, a `>`, a `#`, a bar, a comma). */
+const AFFIX = table(/(?![A-Za-z0-9+\/=])[!-~]/)
+/** What a filler is made of: printable ASCII that is not a letter (a line number, a quote, the `+` between two strings). */
+const FILLER = table(/(?![A-Za-z])[!-~]/)
+/** The most affix characters before or after a line of a key. */
+const MAX_AFFIX = 4
+/** The longest filler. */
+const MAX_FILLER = 8
+const BACKSLASH = 0x5c
+const SPACE = /\s/
+const LINE_BREAK = /[\n\r\u2028\u2029]/
+const BREAK_TAG = /<br\s{0,8}\/?>/iy
+const AFFIX_SOURCE = String.raw`(?:(?![A-Za-z0-9])[!-~])`
+/** A header or an END line at a place, after an affix (a `+` or `-` of a diff, a `>` of a mail, a quote). */
+const HEADER_AT = new RegExp(`${AFFIX_SOURCE}{0,${MAX_AFFIX}}?${KEY_HEADER}`, 'y')
+const END_AT = new RegExp(`${AFFIX_SOURCE}{0,${MAX_AFFIX}}?(${KEY_END})`, 'y')
+/** The name of a PEM or PGP armor header (`Proc-Type:`, `DEK-Info:`, `Version:`, `Comment:`). */
+const ARMOR_NAME = /[A-Za-z][A-Za-z0-9-]{0,63}:/y
+/** A PGP armor checksum: `=` and four base64 characters. */
+const CHECKSUM = /^=[A-Za-z0-9+\/]{4}$/
+/** A `+`, `/` or `=` written as an HTML entity or a URL escape: one character of a run of base64. (`\/` and `+` are read by hand.) */
+const ENTITY_UNIT = /&(?:#0{0,4}(?:43|47|61)|#[xX]0{0,4}(?:2[bBfF]|3[dD])|plus|sol|equals);/y
+const PERCENT_UNIT = /%(?:2[bBfF]|3[dD])/y
+const ESCAPED_UNIT = /^00(?:2[bBfF]|3[dD])$/
+/**
+ * What a page may put inside a word that shows as nothing: zero-width spaces and joiners, the word joiner, a byte-order mark, a
+ * soft hyphen, and a `<wbr>`. A run of base64 reads on through them: one every few characters would otherwise split a key's lines
+ * into runs too short to cut.
+ */
+const INVISIBLE = /[\u200b-\u200d\u2060\ufeff\u00ad]/
+const WORD_BREAK_TAG = /<wbr\s{0,8}\/?>/iy
+/** A line break written as an entity or a URL escape: `&#xD;`, `&#10;`, `%0A`. */
+const ENTITY_BREAK = /&#(?:[xX]0{0,4}[aAdD]|0{0,4}1[03]);/y
+const PERCENT_BREAK = /%0[aAdD]/y
+/** Any HTML entity, which is not read for base64 (`&amp;` is not the letters `amp`). */
+const ENTITY = /&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/y
+/** The start of an HTML tag, to its name, which is not read for base64. Its attributes are. */
+const TAG_NAME = /<\/?([A-Za-z][A-Za-z0-9]{0,15})/y
+/**
+ * How many rows down the row after a header or a key's lines may be: the next row that has runs, past blank rows. Markup makes
+ * two of them between two rows of a table (`</tr>`, a line break, `<tr>`); a row further down is not the row after.
+ */
+const NEXT_ROW_REACH = 4
+/** Tags that start a new line on a page: what a row of a key in markup ends at. */
+const BLOCK_TAGS = new Set(['br', 'p', 'div', 'li', 'tr', 'pre', 'table', 'tbody', 'thead', 'tfoot', 'ul', 'ol', 'dd', 'dt', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'section', 'article'])
+/** Tags with no attributes, which may stand between two cut parts and be cut with them. */
+const GAP_TAG = /<\/?(?:br|p|div|li|tr|td|th|pre|code|tt|span|table|tbody)\s{0,8}\/?>/iy
+/** The words a header or an END line may have that say what kind of key it is: cut with it. Any other word in one is kept. */
+const KEY_WORDS = new Set(['BEGIN', 'END', 'PRIVATE', 'KEY', 'RSA', 'DSA', 'EC', 'ECDSA', 'ED25519', 'ED448', 'X25519', 'X448', 'OPENSSH', 'SSH2', 'ENCRYPTED', 'PGP', 'BLOCK', 'ANY'])
+/** What the mask takes for a private key, from its header: to its END line, or the characters a key is made of. */
+const KEY_REACH = MASKERS.find(({ label }) => label === PRIVATE_KEY_KIND)!.glued
+/** Every pattern but a private key's. */
+const TOKEN_MASKERS = MASKERS.filter(({ label }) => label !== PRIVATE_KEY_KIND)
+/** How far back from a header a token that runs into it may start: the longest body a pattern takes, and its prefix. */
+const TOKEN_BACK = BODY_MAX + 16
+
+interface Line {
+  start: number
+  end: number
+}
+
+function isIn(taken: Uint8Array, text: string, index: number): boolean {
+  const code = text.charCodeAt(index)
+  return code < 128 && taken[code] === 1
+}
+
+/** Where `pattern` (sticky) matches at `index` ends, or `undefined`. */
+function stickyEnd(pattern: RegExp, text: string, index: number): number | undefined {
+  pattern.lastIndex = index
+  const match = pattern.exec(text)
+  return match === null ? undefined : index + match[0].length
+}
+
+/** Past the run of backslashes at `index`. */
+function pastBackslashes(text: string, index: number): number {
+  let after = index
+  while (text.charCodeAt(after) === BACKSLASH) after++
+  return after
+}
+
+/** The END line at `index` (after an affix): where its dashes start, and where it ends. */
+function endLineAt(text: string, index: number): Line | undefined {
+  END_AT.lastIndex = index
+  const match = END_AT.exec(text)
+  if (match === null) return undefined
+  const end = index + match[0].length
+  return { start: end - match[1]!.length, end }
+}
+
+/**
+ * Where one character of a run of base64 at `index` ends, or `undefined`: a base64 character, or one written escaped, as JSON,
+ * markup or a URL may write it (`\/`, `+`, `=`, `&#43;`, `&#x2F;`, `&equals;`, `%2B`). A run of backslashes is read once.
+ */
+function unitEnd(text: string, index: number): number | undefined {
+  const code = text.charCodeAt(index)
+  if (code < 128 && BASE64[code] === 1) return index + 1
+  if (code === BACKSLASH) {
+    const after = pastBackslashes(text, index)
+    if (text.charCodeAt(after) === 0x2f) return after + 1
+    if (text.charAt(after) === 'u' && ESCAPED_UNIT.test(text.slice(after + 1, after + 5))) return after + 5
+    return undefined
+  }
+  if (code === 0x26) return stickyEnd(ENTITY_UNIT, text, index)
+  if (code === 0x25) return stickyEnd(PERCENT_UNIT, text, index)
+  return undefined
+}
+
+/**
+ * Where a line break at `index` ends, or `undefined`: one in the text, one written out (`\n`, `\r`), as an entity or a URL escape
+ * (`&#xD;`, `%0A`), or a tag that starts a new line on a page (`<br>`, `<tr>`, `</p>`; to the end of its name).
+ */
+function breakEnd(text: string, index: number): number | undefined {
+  const char = text.charAt(index)
+  if (char === '\n' || char === '\u2028' || char === '\u2029') return index + 1
+  if (char === '\r') return text.charAt(index + 1) === '\n' ? index + 2 : index + 1
+  if (char === '\\') {
+    const after = pastBackslashes(text, index)
+    const letter = text.charAt(after)
+    return letter === 'n' || letter === 'r' ? after + 1 : undefined
+  }
+  if (char === '&') return stickyEnd(ENTITY_BREAK, text, index)
+  if (char === '%') return stickyEnd(PERCENT_BREAK, text, index)
+  if (char === '<') {
+    TAG_NAME.lastIndex = index
+    const tag = TAG_NAME.exec(text)
+    return tag !== null && BLOCK_TAGS.has(tag[1]!.toLowerCase()) ? index + tag[0].length : undefined
+  }
+  return undefined
+}
+
+/** Where something that shows as nothing (`INVISIBLE`, a `<wbr>`) at `index` ends, or `undefined`. */
+function invisibleEnd(text: string, index: number): number | undefined {
+  const char = text.charAt(index)
+  if (char === '<') return stickyEnd(WORD_BREAK_TAG, text, index)
+  return char !== '' && INVISIBLE.test(char) ? index + 1 : undefined
+}
+
+/** Past what is at `index` that is neither base64 nor a line break: a run of backslashes (and a `\t`), an entity, a tag's name, or one character. */
+function skipEnd(text: string, index: number): number {
+  const char = text.charAt(index)
+  if (char === '\\') {
+    const after = pastBackslashes(text, index)
+    return text.charAt(after) === 't' ? after + 1 : after
+  }
+  if (char === '&') return stickyEnd(ENTITY, text, index) ?? index + 1
+  if (char === '<') return stickyEnd(TAG_NAME, text, index) ?? index + 1
+  return index + 1
+}
+
+/** A run of base64 characters (escaped ones each counted as one, in `units`), and the row it starts on. */
+interface Run {
+  start: number
+  end: number
+  units: number
+  row: number
+  /** Whether it has a digit, a `+` or a `=` (written escaped or not), or a capital after its first character and a small letter. */
+  data: boolean
+}
+
+/** What one character of a run is, escaped or not: its own, or the `+`, `/` or `=` an escape stands for. */
+function unitChar(text: string, start: number, end: number): string {
+  if (end - start === 1) return text.charAt(start)
+  const escape = text.slice(start, end).toLowerCase()
+  return /2b|43;|plus/.test(escape) ? '+' : /3d|61;|equals/.test(escape) ? '=' : '/'
+}
+
+/**
+ * The runs of base64 in `text` from `from` to `to`, in order, each with its row (how many line breaks come before it), how many
+ * rows there are, and where the scan ended. Past `softEnd` it goes on only while rows have a run of `KEY_LINE_MIN` or more: it
+ * stops after the first row that has runs and none that long.
+ */
+function scanRuns(text: string, from: number, to: number, softEnd = Infinity): { runs: Run[], rows: number, end: number } {
+  const runs: Run[] = []
+  let row = 0
+  let rowStart = 0
+  let run: Run | undefined
+  let lower = false
+  let capitalLater = false
+  let at = from
+  while (at < to) {
+    if (run !== undefined) {
+      const invisible = invisibleEnd(text, at)
+      if (invisible !== undefined && invisible <= to) {
+        at = invisible
+        continue
+      }
+    }
+    const unit = unitEnd(text, at)
+    if (unit !== undefined && unit <= to) {
+      const char = unitChar(text, at, unit)
+      if (run === undefined) {
+        run = { start: at, end: unit, units: 1, row, data: false }
+        runs.push(run)
+        lower = false
+        capitalLater = false
+      } else {
+        run.end = unit
+        run.units++
+        if (char >= 'A' && char <= 'Z') capitalLater = true
+      }
+      if (char >= 'a' && char <= 'z') lower = true
+      if ((char >= '0' && char <= '9') || char === '+' || char === '=' || (lower && capitalLater)) run.data = true
+      at = unit
+      continue
+    }
+    run = undefined
+    const lineBreak = breakEnd(text, at)
+    if (lineBreak !== undefined) {
+      if (at >= softEnd && runs.length > rowStart && !runs.slice(rowStart).some(one => one.units >= KEY_LINE_MIN)) break
+      row++
+      rowStart = runs.length
+      at = lineBreak
+    } else {
+      at = skipEnd(text, at)
+    }
+  }
+  return { runs, rows: row, end: Math.min(at, to) }
+}
+
+/**
+ * The separator at `index`, if there is one: a whitespace character, a line break written out (`\n`, `\r`, `\t`, after any
+ * number of backslashes, as a string in JSON or code has it, or `&#xD;`), or a `<br>`. A run of backslashes is read once.
+ */
+function separatorAt(text: string, index: number): { end: number, lineBreak: boolean } | undefined {
+  const char = text.charAt(index)
+  if (char === '') return undefined
+  if (SPACE.test(char)) return { end: index + 1, lineBreak: LINE_BREAK.test(char) }
+  if (char === '\\') {
+    const after = pastBackslashes(text, index)
+    const letter = text.charAt(after)
+    return letter === 'n' || letter === 'r' || letter === 't' ? { end: after + 1, lineBreak: letter !== 't' } : undefined
+  }
+  if (char === '<') {
+    const end = stickyEnd(BREAK_TAG, text, index)
+    if (end !== undefined) return { end, lineBreak: true }
+  }
+  if (char === '&') {
+    const end = stickyEnd(ENTITY_BREAK, text, index)
+    if (end !== undefined) return { end, lineBreak: true }
+  }
+  return undefined
+}
+
+/** Past the separators at `index`, and whether there was a line break among them. */
+function skipSeparators(text: string, index: number): { end: number, lineBreak: boolean } {
+  let end = index
+  let lineBreak = false
+  for (let found = separatorAt(text, end); found !== undefined; found = separatorAt(text, end)) {
+    end = found.end
+    lineBreak ||= found.lineBreak
+  }
+  return { end, lineBreak }
+}
+
+/**
+ * A secret other than a private key that starts at `index`, whatever comes before it (the longest, as the mask takes it), or
+ * `undefined`. Only `g`, `s`, `a` and `A` start one.
+ */
+function tokenAt(text: string, index: number): Range | undefined {
+  const first = text.charAt(index)
+  if (first !== 'g' && first !== 's' && first !== 'a' && first !== 'A') return undefined
+  let best: Range | undefined
+  for (const { label, glued, more } of TOKEN_MASKERS) {
+    glued.lastIndex = index
+    const match = glued.exec(text)
+    if (match === null || match[0].length === 0) continue
+    const end = more(text, index + match[0].length, match[0])
+    if (best === undefined || end > best.end) best = { start: index, end, label }
+  }
+  return best
+}
+
+/** Whether a token that has a `_` or `-` in it starts at `index`: a line of a key stops before one, and never takes its prefix. */
+function tokenStarts(text: string, index: number): boolean {
+  const first = text.charAt(index)
+  return (first === 'g' || first === 's' || first === 'a') && tokenAt(text, index) !== undefined
+}
+
+/** Whether a word ends at `index`: the text ends, a separator, a header, an END line or a token starts there. */
+function boundaryAt(text: string, index: number): boolean {
+  return index >= text.length
+    || separatorAt(text, index) !== undefined
+    || stickyEnd(HEADER_AT, text, index) !== undefined
+    || endLineAt(text, index) !== undefined
+    || tokenAt(text, index) !== undefined
+}
+
+/** A filler at `index`, a word of up to `MAX_FILLER` characters with no letter in it (a line number, a quote, a bar): where it ends. */
+function fillerAt(text: string, index: number): number | undefined {
+  let end = index
+  while (end < text.length && end - index <= MAX_FILLER && isIn(FILLER, text, end)) end++
+  if (end === index || end - index > MAX_FILLER) return undefined
+  return boundaryAt(text, end) ? end : undefined
+}
+
+/**
+ * A run of base64 at `index`, after an affix of up to `MAX_AFFIX` characters: where it starts and ends, how many characters it
+ * has (an escaped one counted as one), and where the word it is in ends (`next`). `whole` is false when something else is glued
+ * to it, past an affix: the word goes on, and is not a key's.
+ */
+function runAt(text: string, index: number): { start: number, end: number, units: number, next: number, whole: boolean } | undefined {
+  let start = index
+  while (start < text.length && start - index < MAX_AFFIX && isIn(AFFIX, text, start) && unitEnd(text, start) === undefined) start++
+  let end = start
+  let units = 0
+  while (end < text.length) {
+    if (isIn(BASE64, text, end) && tokenStarts(text, end)) break
+    const invisible = units > 0 ? invisibleEnd(text, end) : undefined
+    if (invisible !== undefined && unitEnd(text, invisible) !== undefined) {
+      end = invisible
+      continue
+    }
+    const unit = unitEnd(text, end)
+    if (unit === undefined) break
+    end = unit
+    units++
+  }
+  if (units === 0) return undefined
+  if (boundaryAt(text, end)) return { start, end, units, next: end, whole: true }
+  let after = end
+  while (after < text.length && after - end < MAX_AFFIX && isIn(AFFIX, text, after)) after++
+  const whole = after > end && boundaryAt(text, after)
+  return { start, end, units, next: after, whole }
+}
+
+/** Whether a line ends after `index`: the text ends, or a line break or an END line comes, past the separators. */
+function endsLine(text: string, index: number): boolean {
+  const gap = skipSeparators(text, index)
+  return gap.end >= text.length || gap.lineBreak || endLineAt(text, gap.end) !== undefined
+}
+
+/**
+ * An armor header line at `index` (`Proc-Type: 4,ENCRYPTED`, `Version: GnuPG v2`): where the line ends. A run of backslashes
+ * is read once.
+ */
+function armorAt(text: string, index: number): number | undefined {
+  const name = stickyEnd(ARMOR_NAME, text, index)
+  if (name === undefined) return undefined
+  let end: number = name
+  const next = text.charAt(end)
+  if (next !== '' && next !== ' ' && next !== '\t' && separatorAt(text, end)?.lineBreak !== true) return undefined
+  while (end < text.length) {
+    const code = text.charCodeAt(end)
+    if (code === BACKSLASH) {
+      const after = pastBackslashes(text, end)
+      const letter = text.charAt(after)
+      if (letter === 'n' || letter === 'r') break
+      end = after
+      continue
+    }
+    if (LINE_BREAK.test(text.charAt(end)) || (code === 0x3c && stickyEnd(BREAK_TAG, text, end) !== undefined)) break
+    end++
+  }
+  return end
+}
+
+/**
+ * Cut, into `cuts`, a header or an END line (`start` to `end`), but for any word in it that doesn't say what kind of key it is
+ * (`KEY_WORDS`): such a word, and the spaces around it, are kept, since the patterns let a header carry about 60 characters of
+ * capitals and spaces, and the words of a sentence among them would otherwise be hidden from the judge.
+ */
+function cutLine(text: string, start: number, end: number, cuts: KeyCut[]): void {
+  let from = start
+  for (const word of text.slice(start, end).matchAll(/[A-Z0-9]+/g)) {
+    if (KEY_WORDS.has(word[0])) continue
+    const wordStart = start + word.index
+    const wordEnd = wordStart + word[0].length
+    const keepFrom = wordStart - 1 >= from && text.charAt(wordStart - 1) === ' ' ? wordStart - 1 : wordStart
+    if (keepFrom > from) cuts.push({ start: from, end: keepFrom, kind: PRIVATE_KEY_KIND })
+    from = wordEnd < end && text.charAt(wordEnd) === ' ' ? wordEnd + 1 : wordEnd
+  }
+  if (end > from) cuts.push({ start: from, end, kind: PRIVATE_KEY_KIND })
+}
+
+/**
+ * Cut, into `cuts`, what follows the header `header` for as long as it is a key's body, read as a key is written: any armor
+ * header lines (kept: they say how the key is kept, and hold nothing of it); then lines of `KEY_LINE_MIN` or more base64
+ * characters, apart from each other by whitespace, a line break written out, a `<br>`, or a filler (a line number, a quote, a `+`
+ * between two strings); then, at most, one shorter line that a line break, the text's end or the END line follows (the key's
+ * last), a PGP checksum, and the END line. It stops at anything else, and what it stops at is not cut. This is what reaches a key
+ * longer than `KEY_REACH_CHARS`; `cutRegion` cuts what it doesn't read.
+ */
+function walkKey(text: string, header: Line, cuts: KeyCut[]): void {
+  let open: number | undefined = header.end
+  let last = header.end
+  const cut = (start: number, end: number): void => {
+    open ??= start
+    last = end
+  }
+  const close = (): void => {
+    if (open !== undefined && last > open) cuts.push({ start: open, end: last, kind: PRIVATE_KEY_KIND })
+    open = undefined
+  }
+  let phase: 'start' | 'body' | 'tail' = 'start'
+  let checksum = false
+  let at = header.end
+  for (;;) {
+    at = skipSeparators(text, at).end
+    if (at >= text.length || stickyEnd(HEADER_AT, text, at) !== undefined) break
+    const endLine = endLineAt(text, at)
+    if (endLine !== undefined) {
+      if (open !== undefined) last = endLine.start
+      close()
+      cutLine(text, endLine.start, endLine.end, cuts)
+      break
+    }
+    if (phase === 'start') {
+      const line = armorAt(text, at)
+      if (line !== undefined) {
+        close()
+        at = line
+        continue
+      }
+    }
+    const filler = fillerAt(text, at)
+    if (filler !== undefined) {
+      at = filler
+      continue
+    }
+    const run = runAt(text, at)
+    if (run === undefined) break
+    if (phase !== 'tail' && run.units >= KEY_LINE_MIN) {
+      cut(run.start, run.end)
+      // Something glued to a line of a key that isn't one: the line is cut, and the walk goes no further.
+      if (!run.whole) break
+      phase = 'body'
+    } else if (phase !== 'start' && run.whole && !checksum && run.units === 5 && CHECKSUM.test(text.slice(run.start, run.end))) {
+      cut(run.start, run.end)
+      checksum = true
+      phase = 'tail'
+    } else if (phase === 'body' && run.whole && endsLine(text, run.next)) {
+      cut(run.start, run.end)
+      phase = 'tail'
+    } else {
+      break
+    }
+    at = run.next
+  }
+  close()
+}
+
+/** A cut, and whether it is of a word (`word`): a short run that a rule cuts because a key's line could be there. */
+interface Cut extends KeyCut {
+  word?: true
+}
+
+/**
+ * Cut, into `cuts`, what a key is made of after its header (`from`), however it is written: with a prefix on each line (`rg` and
+ * `grep -n`'s file and line number, a numbered file view, a log line's time, a table cell), escaped (`\/`, `+`, `&#43;`), with
+ * invisible characters in it, or cut off. Rows are what line breaks make (in the text, written out, as entities, or as tags that
+ * start a line on a page). The key's reach is its END line, if one comes before the next header (`endLine`), at any distance;
+ * or else the next header (`hardEnd`). Within `KEY_REACH_CHARS` of the header (`softEnd`) the rules for words apply too; past it,
+ * with no END line, the cut goes on for as long as rows have a line of a key.
+ *
+ * - every run of `KEY_LINE_MIN` or more base64 characters (an escaped one counted as one): a line of a key;
+ * - within `softEnd`, every run of `KEY_DATA_MIN` or more that looks like data, not a word (a digit, a `+` or `=`, a capital inside
+ *   it): what is left of a line that something else split; and rows that are each one run, three or more of one length of
+ *   `KEY_DATA_MIN` or more and none longer: a key folded narrower than a line;
+ * - the first and last runs of the row right after the header (past armor header lines that follow it directly; on the header's
+ *   own row, the first run after it), and of the row right after the last row that has a long run: a key's only line, or its last,
+ *   which is shorter, whatever stands before or after it on its row (a line number, a file name, `… [truncated]`). The next row
+ *   is the next that has runs, within `NEXT_ROW_REACH` rows;
+ * - with an END line: the last run on its row before it, the last run of the row before that, and the END line;
+ * - on the row after the last long row and the two by the END line, at any distance, the runs that look like data too: a key's
+ *   last line may stand in the middle of its row (`echo <line> >> key.pem`).
+ *
+ * What the rules for words cut is a word each (`word`): such cuts are not joined to others across a gap, so the judge sees a
+ * marker for each word that a fake header hides. Returns where it read to.
+ */
+function cutRegion(text: string, from: number, softEnd: number, hardEnd: number, endLine: Line | undefined, cuts: Cut[]): number {
+  const { runs, rows, end } = scanRuns(text, from, endLine?.start ?? hardEnd, endLine === undefined ? softEnd : Infinity)
+  const cut = (run: Run, word: boolean): void => {
+    cuts.push(word ? { start: run.start, end: run.end, kind: PRIVATE_KEY_KIND, word: true } : { start: run.start, end: run.end, kind: PRIVATE_KEY_KIND })
+  }
+  const rowsOf: Array<{ first: Run, last: Run, long: boolean, count: number, from: number }> = []
+  for (const [at, run] of runs.entries()) {
+    const long = run.units >= KEY_LINE_MIN
+    if (long) cut(run, false)
+    else if (run.start < softEnd && run.data && run.units >= KEY_DATA_MIN) cut(run, true)
+    const current = rowsOf.at(-1)
+    if (current !== undefined && current.first.row === run.row) {
+      current.last = run
+      current.long ||= long
+      current.count++
+    } else {
+      rowsOf.push({ first: run, last: run, long, count: 1, from: at })
+    }
+  }
+  /** Where a key's last line may be, at any distance: a row's first and last runs, and the runs on it that look like data. */
+  const cutLastLine = (row: { first: Run, last: Run, count: number, from: number }, first = true): void => {
+    if (first) cut(row.first, true)
+    cut(row.last, true)
+    for (let at = row.from; at < row.from + row.count; at++) if (runs[at]!.data && runs[at]!.units >= KEY_DATA_MIN) cut(runs[at]!, true)
+  }
+  // The header counts as a long row: the row right after it is a key's only line when it is short (an Ed25519 key's is 64
+  // characters, and cut off it is less). Armor header lines that follow the header directly are passed over: they hold nothing of
+  // a key, and the walk keeps them. A row further down is not the row after the header.
+  let index = 0
+  let adjacent = 0
+  while (index < rowsOf.length && !rowsOf[index]!.long && rowsOf[index]!.first.row === adjacent + 1 && armorAt(text, rowsOf[index]!.first.start) !== undefined) {
+    adjacent = rowsOf[index]!.first.row
+    index++
+  }
+  const afterHeader = rowsOf[index]
+  if (afterHeader !== undefined && !afterHeader.long && afterHeader.first.start < softEnd && afterHeader.first.row <= adjacent + NEXT_ROW_REACH) {
+    cut(afterHeader.first, true)
+    if (afterHeader.first.row > 0) cut(afterHeader.last, true)
+  }
+  // The row right after the last long one: a key's last line. Only after the last: a page that puts a line of base64 before each
+  // row of its words doesn't have each row's first and last words cut.
+  let lastLong = -1
+  for (const [at, row] of rowsOf.entries()) if (row.long) lastLong = at
+  const afterLines = rowsOf[lastLong + 1]
+  if (lastLong >= 0 && afterLines !== undefined && afterLines.first.row <= rowsOf[lastLong]!.last.row + NEXT_ROW_REACH) cutLastLine(afterLines)
+  // A key folded narrower than a line: rows that are each one run, three of them or more of one length, and none longer.
+  for (let at = 0; at < rowsOf.length;) {
+    let stop = at
+    while (stop < rowsOf.length && rowsOf[stop]!.count === 1 && !rowsOf[stop]!.long && rowsOf[stop]!.first.start < softEnd) stop++
+    if (stop - at >= 3) {
+      const lengths = new Map<number, number>()
+      let longest = 0
+      for (let k = at; k < stop; k++) {
+        const units = rowsOf[k]!.first.units
+        lengths.set(units, (lengths.get(units) ?? 0) + 1)
+        longest = Math.max(longest, units)
+      }
+      if (longest >= KEY_DATA_MIN && (lengths.get(longest) ?? 0) >= 3) for (let k = at; k < stop; k++) cut(rowsOf[k]!.first, true)
+    }
+    at = Math.max(stop, at + 1)
+  }
+  if (endLine === undefined) return end
+  // The last run on the END line's row (a prefix, or the last line of a key written on one line), then the last of the row before.
+  let last = rowsOf.length - 1
+  if (last >= 0 && rowsOf[last]!.first.row === rows) cutLastLine(rowsOf[last--]!, false)
+  if (last >= 0) cutLastLine(rowsOf[last]!, false)
+  cutLine(text, endLine.start, endLine.end, cuts)
+  return endLine.end
+}
+
+/**
+ * Cut, into `cuts`, every token (a secret that is not a private key) that the mask would take with the key whose header starts at
+ * `start`, whole: one up to `reach` (what the mask takes for the key, and what `cutRegion` reads), one glued to its end, and one
+ * that runs into its header. A cut that left part of a token, or a token glued to a letter that the mask's lookbehind then
+ * refuses, would leave it for the judge.
+ */
+function cutTokens(text: string, start: number, reach: number, cuts: KeyCut[]): void {
+  let from = start
+  while (from > 0 && start - from < TOKEN_BACK && /[A-Za-z0-9_-]/.test(text.charAt(from - 1))) from--
+  for (let at = from; at <= reach && at < text.length;) {
+    let token = tokenAt(text, at)
+    if (token === undefined || token.end <= start) {
+      at++
+      continue
+    }
+    while (token !== undefined) {
+      cuts.push({ start: token.start, end: token.end, kind: token.label })
+      at = token.end
+      // A token whose prefix this one's body took (`ghp_<A>ghp_<B>`), as `maskOnce` finds it: one that starts in its last few
+      // characters and runs past it.
+      let glued: Range | undefined
+      for (let back = 1; back <= GLUE_BACK && token.end - back > token.start; back++) {
+        const inside = tokenAt(text, token.end - back)
+        if (inside !== undefined && inside.end > token.end && (glued === undefined || inside.end > glued.end)) glued = inside
+      }
+      token = glued
+    }
+  }
+}
+
+/** Every match of `source` in `text`, also those that start inside another (a header can start in the dashes that end one). */
+function everyMatch(text: string, source: string): Line[] {
+  const found: Line[] = []
+  const pattern = new RegExp(source, 'g')
+  for (let match = pattern.exec(text); match !== null; match = pattern.exec(text)) {
+    found.push({ start: match.index, end: match.index + match[0].length })
+    pattern.lastIndex = match.index + 1
+  }
+  return found
+}
+
+/** The first of `lines` (in order) that starts at or after `index`. */
+function firstFrom(lines: readonly Line[], index: number): Line | undefined {
+  let low = 0
+  let high = lines.length
+  while (low < high) {
+    const middle = (low + high) >>> 1
+    if (lines[middle]!.start < index) low = middle + 1
+    else high = middle
+  }
+  return lines[low]
+}
+
+/**
+ * Whether what is between two cuts, from `from` to `to`, is nothing a reader needs: whitespace, ASCII that is not a letter
+ * (punctuation, a line number, the `+` between two strings), a line break written out (`\n`, `&#xD;`), or a tag with no
+ * attributes. Two cuts with that between them are one.
+ */
+function isGap(text: string, from: number, to: number): boolean {
+  let at = from
+  while (at < to) {
+    const code = text.charCodeAt(at)
+    if (code === BACKSLASH) {
+      const after = pastBackslashes(text, at)
+      const letter = text.charAt(after)
+      at = letter === 'n' || letter === 'r' || letter === 't' ? after + 1 : after
+      continue
+    }
+    if (code === 0x26) {
+      const end = stickyEnd(ENTITY_BREAK, text, at)
+      if (end !== undefined) {
+        at = end
+        continue
+      }
+    }
+    if (code === 0x3c) {
+      const end = stickyEnd(GAP_TAG, text, at)
+      if (end !== undefined) {
+        at = end
+        continue
+      }
+    }
+    if (isIn(FILLER, text, at) || SPACE.test(text.charAt(at))) {
+      at++
+      continue
+    }
+    return false
+  }
+  return true
+}
+
+/**
+ * The private keys in `text`, as what to cut out of it so that a reader (the judge) can be sent the rest: none of a key, and of
+ * what is written around it only what a key could be. The text is not changed; `withoutPrivateKeys` puts `leftOut` in each place.
+ * Where the cut can't tell, it cuts: a few words near a header cost the judge little, and a key's line sent costs the user its key.
+ *
+ * - **What is a key.** Each private key header (the patterns', at every place one starts, also in the dashes that end another).
+ *   The header is cut (`cutLine`), but for words in it that don't say what kind of key it is.
+ * - **What is cut after it** (`cutRegion`): every run of `KEY_LINE_MIN` or more base64 characters (an escaped one counted as one,
+ *   an invisible one not counted), to the END line if one comes before the next header, at any distance, or else for as long as
+ *   rows have such a run; within `KEY_REACH_CHARS`, runs of `KEY_DATA_MIN` or more that look like data, and a fold; the row
+ *   where a key's only or last line would be (after the header, and after the last row with a long run); the runs by the END
+ *   line; and the END line. And what follows the header for as long as it reads as a key's body (`walkKey`), however long.
+ * - **Tokens** that the mask would take with a key, or that are in its reach (`cutTokens`), are cut whole, so that no cut leaves
+ *   part of one.
+ * - **What one fake header can take from the judge:**
+ *   - runs of base64 of `KEY_LINE_MIN` or more with no space in them: instructions written as one long word (CamelCase, joined by
+ *     `+` or `/`, or by invisible characters), as a token-shaped word can be;
+ *   - within `KEY_REACH_CHARS`, words of `KEY_DATA_MIN` or more that look like data (a digit, a `+` or `=`, a capital inside),
+ *     and rows of one word each, three or more of one length;
+ *   - the first and last words of the row after it, of the row after the last line of base64, and, with an END line, the last
+ *     words of its row and the row before, with the words on those rows that look like data.
+ *
+ *   That is a few words at each edge of a key. A sentence written in words is read but for those, and each word taken is a
+ *   marker of its own (a word's cut is not joined to others across a gap), so the judge sees that something was taken, and
+ *   where. A page with a fake header for each word can hide each of those words, and shows the judge a marker for each.
+ *
+ * Linear in the length of the text.
+ */
+export function privateKeyCuts(text: string): KeyCuts {
+  if (!text.includes('-----BEGIN ')) return { keys: 0, spans: [] }
+  const headers = everyMatch(text, KEY_HEADER)
+  const endLines = text.includes('-----END ') ? everyMatch(text, KEY_END) : []
+  const cuts: Cut[] = []
+  /** Which key each cut is for: two cuts with only a gap between them are one if they are for the same key. */
+  const owners: number[] = []
+  for (const [index, header] of headers.entries()) {
+    const first = cuts.length
+    cutLine(text, header.start, header.end, cuts)
+    walkKey(text, header, cuts)
+    const hardEnd = Math.min(headers[index + 1]?.start ?? text.length, text.length)
+    const next = firstFrom(endLines, header.end)
+    const endLine = next !== undefined && next.start < hardEnd ? next : undefined
+    const softEnd = Math.min(header.end + KEY_REACH_CHARS, endLine?.start ?? hardEnd)
+    const read = hardEnd > header.end ? cutRegion(text, header.end, softEnd, hardEnd, endLine, cuts) : header.end
+    KEY_REACH.lastIndex = header.start
+    const taken = KEY_REACH.exec(text)
+    cutTokens(text, header.start, Math.max(taken === null ? header.end : header.start + taken[0].length, read), cuts)
+    for (let at = first; at < cuts.length; at++) owners[at] = index
+  }
+  const order = cuts.map((_cut, at) => at).sort((a, b) => cuts[a]!.start - cuts[b]!.start || cuts[b]!.end - cuts[a]!.end)
+  const spans: KeyCut[] = []
+  let owner = -1
+  let word = false
+  for (const at of order) {
+    const cut = cuts[at]!
+    const previous = spans.at(-1)
+    // Overlapping or touching cuts are one. So are a key's cuts with a gap between them, but not two keys', and not a word's: a
+    // page of fake keys shows the judge each of them, and each word a fake header hides is a marker of its own.
+    if (previous !== undefined && (cut.start <= previous.end || (owners[at] === owner && !word && cut.word !== true && isGap(text, previous.end, cut.start)))) {
+      previous.end = Math.max(previous.end, cut.end)
+      word &&= cut.word === true
+    } else {
+      spans.push({ start: cut.start, end: cut.end, kind: cut.kind })
+      word = cut.word === true
+    }
+    owner = owners[at]!
+  }
+  return { keys: headers.length, spans }
+}
+
+/** `text` with each of `privateKeyCuts`' spans replaced by `leftOut` of its kind. */
+export function withoutPrivateKeys(text: string): string {
+  let out = ''
+  let cursor = 0
+  for (const span of privateKeyCuts(text).spans) {
+    out += text.slice(cursor, span.start) + leftOut(span.kind)
+    cursor = span.end
+  }
+  return out + text.slice(cursor)
 }

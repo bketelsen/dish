@@ -89,7 +89,7 @@ import { createHash } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
-import { isTopLevelAgent, maskSecrets } from 'dish-kit'
+import { isTopLevelAgent, leftOut, maskSecrets } from 'dish-kit'
 import type { Decision, Judge, JudgeAgent, JudgeResult, JsonValue, Question } from './client.ts'
 import { ASK_JUDGE_TOOL } from './ask.ts'
 import { DEFAULT_SETTINGS } from './settings.ts'
@@ -526,13 +526,14 @@ const SECRET_MASK = /‹secret: ([^›]{0,64})›/g
  * - **Masked first.** `maskSecrets` finds a private key by its `-----BEGIN … PRIVATE KEY-----` header and a token by its
  *   prefix. A cut that took out the header, or went through a token, would leave the key's base64 and END line, or the
  *   token's other half, for the client's own mask to miss.
- * - **Each mask becomes a plain marker,** `[<kind>, left out]`. The client refuses a request that holds a private key's mask
- *   (or a scan's that failed) as opaque, because a key's mask can take in what is written around it. That is right for a
- *   command, whose text is what runs. The task is context, and its first prompt is always in it: one key there would make
- *   every later command in the session opaque. The marker says what was there, and it holds nothing the client masks.
+ * - **Each mask becomes a plain marker,** `[<kind>, left out]` (dish-kit's `leftOut`, as the result screen's cut of a private
+ *   key has it). The client refuses a request that holds a private key's mask (or a scan's that failed) as opaque, because a
+ *   key's mask can take in what is written around it. That is right for a command, whose text is what runs. The task is
+ *   context, and its first prompt is always in it: one key there would make every later command in the session opaque. The
+ *   marker says what was there, and it holds nothing the client masks.
  */
 function taskPart(text: string, max: number): string {
-  return clipMiddle(maskSecrets(text).replace(SECRET_MASK, '[$1, left out]'), max)
+  return clipMiddle(maskSecrets(text).replace(SECRET_MASK, (_mask, kind: string) => leftOut(kind)), max)
 }
 
 /**
