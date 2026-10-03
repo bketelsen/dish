@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -17,7 +17,7 @@ import { CrewRecords } from '../src/record.ts'
 import type { NewChild, RunEnd } from '../src/record.ts'
 import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from '../src/settings.ts'
 import {
-  captureStderr, dirs, mountConfig, mountCrew, seeded, shippedWith, tempDir, waitFor, watchLogs, withEnv,
+  captureStderr, dirs, mountConfig, mountCrew, provideStub, seeded, shippedWith, tempDir, waitFor, watchLogs, withEnv,
 } from './helpers.ts'
 import type { Dirs } from './helpers.ts'
 
@@ -71,7 +71,7 @@ test('dishCrew is provided when the plugin loads, with settings(), and goes when
   const handle = mountCrew(ctx, where.data)
   await handle
   const service: DishCrew = ctx.dishCrew
-  assert.deepEqual(Object.keys(service), ['settings', 'records', 'whenRecorded', 'subagentProvider'])
+  assert.deepEqual(Object.keys(service), ['settings', 'records', 'whenRecorded', 'subagentProvider', 'worktreeBindings'])
   await handle.dispose()
   assert.equal(ctx.get('dishCrew'), undefined)
 })
@@ -93,6 +93,73 @@ test('dishCrew gives the subagent provider setting to the preset row, which can\
   await last
   assert.equal(blank.dishCrew.subagentProvider, 'spawn')
   await last.dispose()
+})
+
+// --- worktree bindings ----------------------------------------------------------------------------
+
+const TREE = '/work/frostyard/snosi/.worktrees/fix-1'
+
+test('worktreeBindings names the children bound to a worktree, across sessions, and says which run by dsh\'s agent registry', async () => {
+  const where = await dirs()
+  const ctx = new Context()
+  const live = new Map<string, { status: 'running' | 'idle' }>()
+  // From a sibling plugin, as dsh provides it: the host reads it with ctx.get on each call.
+  const registry = await provideStub(ctx, 'agents', { get: (id: string) => live.get(id) })
+  const handle = mountCrew(ctx, where.data)
+  await handle
+  try {
+    const { records } = ctx.dishCrew
+    await records.addChild('s1', crewChild('stepping', { worktree: TREE, startedAt: 1 }))
+    live.set('stepping', { status: 'running' })
+    await records.addChild('s1', crewChild('done', { worktree: TREE, startedAt: 2, title: 'fix the bug' }))
+    await records.endRun('done', { stopReason: 'completed', closing: 'fixed' })
+    live.set('done', { status: 'idle' })
+    // The record says running, and no agent is there: a crash's record, not running.
+    await records.addChild('s2', crewChild('crashed', { worktree: TREE, startedAt: 3, role: 'ops' }))
+    await records.addChild('s2', crewChild('elsewhere', { worktree: `${TREE}-other`, startedAt: 4 }))
+    await records.addChild('s2', crewChild('unbound', { startedAt: 5 }))
+    live.set('elsewhere', { status: 'running' })
+    assert.deepEqual(await ctx.dishCrew.worktreeBindings(TREE), [
+      { child: 'stepping', sessionId: 's1', role: 'coder', title: 'add login', running: true },
+      { child: 'done', sessionId: 's1', role: 'coder', title: 'fix the bug', running: false },
+      { child: 'crashed', sessionId: 's2', role: 'ops', title: 'add login', running: false },
+    ])
+    // Accepted and not stepping yet: the record says running and the agent is there.
+    live.set('crashed', { status: 'idle' })
+    // A finished child that is woken again is running.
+    live.set('done', { status: 'running' })
+    assert.deepEqual((await ctx.dishCrew.worktreeBindings(TREE)).map(binding => [binding.child, binding.running]), [['stepping', true], ['done', true], ['crashed', true]])
+    assert.deepEqual(await ctx.dishCrew.worktreeBindings('/nowhere'), [])
+
+    // With no registry, the record's word.
+    await registry.dispose()
+    assert.equal(ctx.get('agents'), undefined)
+    assert.deepEqual((await ctx.dishCrew.worktreeBindings(TREE)).map(binding => [binding.child, binding.running]), [['stepping', true], ['done', false], ['crashed', true]])
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('worktreeBindings finds a binding by a path that reaches the worktree through a link, and takes a path that isn\'t there as it is', async () => {
+  const where = await dirs()
+  const real = join(where.root, 'work', 'o', 'r', '.worktrees', 'fix-1')
+  await mkdir(real, { recursive: true })
+  const canonical = await realpath(real)
+  await symlink(join(where.root, 'work'), join(where.root, 'linked-work'))
+  const linked = join(where.root, 'linked-work', 'o', 'r', '.worktrees', 'fix-1')
+  const ctx = new Context()
+  const handle = mountCrew(ctx, where.data)
+  await handle
+  try {
+    await ctx.dishCrew.records.addChild('s1', crewChild('c1', { worktree: canonical }))
+    assert.deepEqual((await ctx.dishCrew.worktreeBindings(linked)).map(binding => binding.child), ['c1'])
+    assert.deepEqual((await ctx.dishCrew.worktreeBindings(canonical)).map(binding => binding.child), ['c1'])
+    // Gone from disk: the path as given, which is what the record holds.
+    await rm(real, { recursive: true })
+    assert.deepEqual((await ctx.dishCrew.worktreeBindings(canonical)).map(binding => binding.child), ['c1'])
+  } finally {
+    await handle.dispose()
+  }
 })
 
 // --- with the store -------------------------------------------------------------------------------

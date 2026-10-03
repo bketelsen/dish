@@ -118,7 +118,8 @@ run_dsh() {
     pnpm exec dsh "$@"
 }
 
-bundles=(copilot config prompts skills crew judge web)
+# Each after what it builds on: projects after config (its store), workspaces after projects (whose types it imports).
+bundles=(copilot config prompts skills crew judge web projects workspaces)
 profile_dir="${DSH_HOME:-$HOME/.dsh}/profiles/$profile"
 patch="$profile_dir/cordis.patch.yml"
 changed=0

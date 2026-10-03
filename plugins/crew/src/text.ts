@@ -1,5 +1,6 @@
 /**
- * The two small things every refusal in dish-crew does to text it doesn't control: cut a name short, and list names.
+ * The text dish-crew writes: the two small things every refusal does to text it doesn't control (cut a name short, and list
+ * names), and the block a bound coder's brief gets (`worktreeBrief`).
  *
  * @module dish-crew/text
  */
@@ -23,4 +24,15 @@ export function listed(names: readonly string[], max = LISTED, cut?: number): st
   if (names.length === 0) return 'none'
   const head = names.slice(0, max).map(name => cut === undefined ? name : truncate(name, cut)).join(', ')
   return names.length > max ? `${head}, …` : head
+}
+
+/**
+ * The block added to a bound coder's prompt, after its task and before the closing note: where its worktree is, and that it
+ * works only there. dsh gives a child its parent's `cwd` (the chat's workspace, the clone), so this is what points it at the
+ * worktree. The one place the block is built: dish-gates (6c) appends its gate sentence here.
+ */
+export function worktreeBrief(worktree: { path: string, branch: string }): string {
+  const { path, branch } = worktree
+  return `Your worktree is \`${path}\` on branch \`${branch}\`. Work only there: use absolute paths, and \`git -C ${path}\` or \`cd ${path} &&\` in commands. `
+    + 'The main agent\'s own checkout is not yours to change.'
 }

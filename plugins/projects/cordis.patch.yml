@@ -1,0 +1,9 @@
+# The projects registry (the dishProjects service): projects.yaml in the config
+# store (claimed with the `propose` agent policy and seeded empty), and the
+# onboarding of each project, one at a time, in the background. It drives
+# dish-workspaces, which does the cloning. `dishConfig` is optional: without the
+# store the list is empty. Config has one row, `terminal` (print the plugin's
+# own log lines to the terminal).
+- insert:
+    - id: dish-projects
+      name: dish-projects

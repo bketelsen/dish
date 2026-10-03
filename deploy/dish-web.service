@@ -13,7 +13,7 @@ After=network-online.target
 # reads a project .env. update.sh creates it. Without it the start fails with 200/CHDIR, which is wanted: it says the
 # account was never set up, where a silent fallback to another directory would hand agents the wrong place. Keep it free
 # of a .env file: dsh reads one from here, and whatever it names reaches the service and so every agent shell (dsh
-# refuses only PATH, DSH_*, XDG_* and launch variables from it). The binary below finds its own files from its own path,
+# refuses only PATH, DSH_*, XDG_* and launch variables from it). dsh, below, finds its own files from its script's path,
 # so the working directory does not matter to it.
 WorkingDirectory=%h/work
 # Written by fleet. It holds one line, DISH_TRUSTED_HOST=dish.<tailnet>.ts.net, which ExecStart below reads, and nothing
@@ -30,7 +30,7 @@ EnvironmentFile=%h/.config/dish/deploy.env
 # read from git before the checkout moves, so an update installs with the tools of the service it starts. update.sh's
 # own commands (git, curl, systemctl) run with this line as checked out when the update starts. Agents' commands
 # inherit this PATH too (dsh keeps PATH and drops names that look like secrets), so it also says what a shell command
-# can run.
+# can run. ExecStart below runs that Node by its full path, /opt/dish/node/bin/node.
 #
 # A second contract with fleet: this unit sets none of HOME, XDG_DATA_HOME or PNPM_HOME, and pnpm works its store out
 # from them. install.sh pins the store that `pnpm store path` gives under its own environment into the profile, and
@@ -44,10 +44,14 @@ EnvironmentFile=%h/.config/dish/deploy.env
 # directories. Setting DISH_ENV=prod here would reach every agent shell, since dsh passes its environment on.
 Environment=PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin
 
-# The checkout's dsh binary, not `pnpm dsh`: root scripts are wrapped by the launcher, and the launcher would start the
-# VM on an empty dev store. --trusted-host takes any number of values, so it must stay last. DISH_TRUSTED_HOST is a bare
-# host name, no scheme.
-ExecStart=%h/dish/node_modules/.bin/dsh web --host 127.0.0.1 --port 3080 --no-open --trusted-host ${DISH_TRUSTED_HOST}
+# The checkout's dsh, not `pnpm dsh`: root scripts are wrapped by the launcher, and the launcher would start the VM on an
+# empty dev store. It is dsh's own script, run by the Node of the PATH line, and not its node_modules/.bin/dsh shim. The
+# shim exports a NODE_PATH that names the checkout's node_modules/.pnpm/node_modules, which dsh would pass on to every
+# agent shell, where every CommonJS program falls back to it: a module an agent planted there would load in a later
+# command, approved escalations outside the sandbox included. The shim also runs a node_modules/.bin/node in place of
+# Node when there is one. The script's path is the bin of the checkout's @deepseek-ai/dsh, which deploy/test checks.
+# --trusted-host takes any number of values, so it must stay last. DISH_TRUSTED_HOST is a bare host name, no scheme.
+ExecStart=/opt/dish/node/bin/node %h/dish/node_modules/@deepseek-ai/dsh/lib/bin.js web --host 127.0.0.1 --port 3080 --no-open --trusted-host ${DISH_TRUSTED_HOST}
 Restart=on-failure
 RestartSec=5
 
