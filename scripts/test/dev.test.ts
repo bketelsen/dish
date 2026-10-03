@@ -1,15 +1,17 @@
 /**
  * `pnpm dev` (`scripts/dev.ts`): its arguments, the install environment, the git identity, the sign-in link, and what
  * `main` does. Nothing here boots dsh or touches a real `.dev`, dsh home or XDG directory. Every `main` run uses a temp
- * `root` that holds stand-ins for the three programs `pnpm dev` starts: `deploy/install.sh`, `node_modules/.bin/dsh`
- * and `node_modules/.bin/pnpm` (the watchers). The stand-ins log what they are given and which signals reach them.
+ * `root` that holds stand-ins for two of the three programs `pnpm dev` starts, `deploy/install.sh` and dsh's script in
+ * `node_modules/@deepseek-ai/dsh`. The third, `pnpm` (the watchers), is the account's, found on `PATH`, so its stand-in
+ * is in a directory beside the root, on the `PATH` the test gives. The stand-ins log what they are given and which
+ * signals reach them.
  */
 
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { UsageError } from '../env.ts'
@@ -257,6 +259,16 @@ interface Stub {
   termMs?: number
   /** Start a child of its own that outlives this stand-in's exit, as pnpm's build scripts outlive pnpm's death. */
   grandchild?: boolean
+  /**
+   * Before logging its start, run `bash` found on its own PATH, as dsh-subprocess-local does for every agent command,
+   * and log what it printed: a real bash prints the path it runs from.
+   */
+  bash?: boolean
+  /**
+   * Before logging its start, run a CommonJS program with its own environment, as an agent's command would, that
+   * requires `dish-planted-probe`, and log whether it loaded. Only a `NODE_PATH` can find it: see the planted test.
+   */
+  probe?: boolean
 }
 
 /** The start line a stand-in logs. */
@@ -270,6 +282,15 @@ interface StubStart {
   DISH_ENV?: string
   DISH_REMOTE?: string
   dishNames: string[]
+  PATH?: string
+  NODE_PATH?: string
+  /** The node running the stand-in, and the script it was given. */
+  execPath: string
+  script: string
+  /** What `bash -c` printed, when the stub's `bash` is set. */
+  bash?: string
+  /** Whether `dish-planted-probe` loaded, when the stub's `probe` is set. */
+  probe?: string
 }
 
 const STUB_SOURCE = `
@@ -309,12 +330,23 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     else setTimeout(() => stop(stub.termCode ?? 0), stub.termMs ?? 0)
   })
 }
+let bash
+if (stub.bash) {
+  const ran = require('node:child_process').spawnSync('bash', ['-c', 'printf %s "$BASH"'], { encoding: 'utf8' })
+  bash = ran.error === undefined ? ran.stdout : String(ran.error)
+}
+let probe
+if (stub.probe) {
+  const ran = require('node:child_process').spawnSync(process.execPath, ['-e', 'require("dish-planted-probe"); process.stdout.write("loaded")'], { encoding: 'utf8' })
+  probe = ran.stdout === 'loaded' ? 'loaded' : 'not found'
+}
 // The tests signal a stand-in only once it has logged its start, so every handler is in place before that: a signal
 // that came first would kill it, with no exit recorded.
 log('start ' + JSON.stringify({
   argv: process.argv.slice(2), cwd: process.cwd(), pid: process.pid, pgrp,
   DSH_HOME: process.env.DSH_HOME, DSH_DISH_HOME: process.env.DSH_DISH_HOME, DISH_ENV: process.env.DISH_ENV,
   dishNames: Object.keys(process.env).filter(name => /^DISH_/.test(name)).sort(), DISH_REMOTE: process.env.DISH_REMOTE,
+  PATH: process.env.PATH, NODE_PATH: process.env.NODE_PATH, execPath: process.execPath, script: process.argv[1], bash, probe,
 }))
 for (const line of stub.print || []) console.log(line)
 for (const line of stub.printErr || []) console.error(line)
@@ -329,7 +361,7 @@ setInterval(() => {}, 1000)
 /** Logs the variables install.sh is told about, as `NAME=[value]`, or `NAME=` when unset, and exits `STUB_INSTALL_EXIT`. */
 const INSTALL_SOURCE = `
 const fs = require('node:fs')
-const names = ['DISH_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL', 'DISH_PROFILE', 'DSH_HOME', 'DSH_DISH_HOME', 'DISH_ENV']
+const names = ['DISH_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL', 'DISH_PROFILE', 'DSH_HOME', 'DSH_DISH_HOME', 'DISH_ENV', 'PATH', 'NODE_PATH']
 const seen = names.map(name => name + '=' + (process.env[name] === undefined ? '' : '[' + process.env[name] + ']'))
 fs.appendFileSync(process.env.STUB_LOG + '/install.log', seen.join(' ') + ' cwd=' + process.cwd() + '\\n')
 if (process.env.STUB_INSTALL_HOLD) {
@@ -352,28 +384,46 @@ interface Fixture {
   env: NodeJS.ProcessEnv
 }
 
-/** A temp root with stand-ins for deploy/install.sh, node_modules/.bin/dsh and node_modules/.bin/pnpm. */
+/**
+ * A temp root with stand-ins for deploy/install.sh and dsh's package (`node_modules/@deepseek-ai/dsh`, whose bin is the
+ * dsh stand-in), and one for the account's pnpm in a directory beside it. The PATH is the one `pnpm dev` gets from
+ * pnpm: the root's node_modules/.bin first. That directory has dsh's shim, as pnpm writes it, which sets a NODE_PATH
+ * into the root and leaves `shim-ran` in the logs: pnpm dev never runs it.
+ */
 async function makeFixture(stubs: { dsh?: Stub, pnpm?: Stub } = {}, extraEnv: NodeJS.ProcessEnv = {}): Promise<Fixture> {
   const root = join(dir, `root-${++counter}`)
   const logs = join(root, 'logs')
   const bin = join(root, 'node_modules', '.bin')
+  const dshPackage = join(root, 'node_modules', '@deepseek-ai', 'dsh')
+  const accountBin = `${root}-bin`
   await mkdir(join(root, 'deploy'), { recursive: true })
   await mkdir(bin, { recursive: true })
+  await mkdir(join(dshPackage, 'lib'), { recursive: true })
+  await mkdir(accountBin)
   await mkdir(logs)
   const node = JSON.stringify(process.execPath)
+  const stub = JSON.stringify(join(root, 'stub.js'))
   await writeFile(join(root, 'install.stub.js'), INSTALL_SOURCE)
   await writeFile(join(root, 'deploy', 'install.sh'), `#!/bin/sh\nSTUB_ROLE=install exec ${node} ${JSON.stringify(join(root, 'install.stub.js'))} "$@"\n`)
   await chmod(join(root, 'deploy', 'install.sh'), 0o755)
   await writeFile(join(root, 'stub.js'), STUB_SOURCE)
-  for (const role of ['dsh', 'pnpm']) {
-    await writeFile(join(bin, role), `#!/bin/sh\nSTUB_ROLE=${role} exec ${node} ${JSON.stringify(join(root, 'stub.js'))} "$@"\n`)
-    await chmod(join(bin, role), 0o755)
-  }
+  await writeFile(join(dshPackage, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', bin: { dsh: 'lib/bin.js' } }))
+  await writeFile(join(dshPackage, 'lib', 'bin.js'), `process.env.STUB_ROLE = 'dsh'\nrequire(${stub})\n`)
+  await writeFile(join(bin, 'dsh'), [
+    '#!/bin/sh',
+    `: > ${JSON.stringify(join(logs, 'shim-ran'))}`,
+    `export NODE_PATH=${JSON.stringify(join(root, 'node_modules', '.pnpm', 'node_modules'))}`,
+    `exec ${node} ${JSON.stringify(join(dshPackage, 'lib', 'bin.js'))} "$@"`,
+    '',
+  ].join('\n'))
+  await chmod(join(bin, 'dsh'), 0o755)
+  await writeFile(join(accountBin, 'pnpm'), `#!/bin/sh\nSTUB_ROLE=pnpm exec ${node} ${stub} "$@"\n`)
+  await chmod(join(accountBin, 'pnpm'), 0o755)
   return {
     root,
     logs,
     env: {
-      PATH: BASE_PATH,
+      PATH: [bin, accountBin, BASE_PATH].join(delimiter),
       // Nothing started from a fixture may find the real home: not a stand-in, not a shell on a pty.
       HOME: root,
       STUB_LOG: logs,
@@ -578,6 +628,88 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
   }
 })
 
+/** Whether the absolute `path` lies outside `root`. */
+function outside(path: string, root: string): boolean {
+  const rest = relative(root, path)
+  return rest === '..' || rest.startsWith(`..${sep}`)
+}
+
+/** Every entry of `path` is absolute and outside `root`, and none is a `node_modules/.bin` or a `node-gyp-bin`. */
+function assertNoAgentWritableEntry(path: string | undefined, root: string, label: string): void {
+  assert.ok(path !== undefined && path !== '', `${label}: a PATH`)
+  for (const entry of path.split(delimiter)) {
+    assert.ok(isAbsolute(entry), `${label}: ${JSON.stringify(entry)} is absolute (PATH: ${path})`)
+    assert.ok(outside(entry, root), `${label}: ${entry} is outside the checkout`)
+    assert.ok(!(basename(entry) === '.bin' && basename(dirname(entry)) === 'node_modules'), `${label}: ${entry}`)
+    assert.notEqual(basename(entry), 'node-gyp-bin', `${label}: ${entry}`)
+  }
+}
+
+test('main: nothing of the checkout is on the PATH of install.sh, the watchers or dsh, and dsh\'s bash is not one planted there', async () => {
+  // dsh hands its PATH to every agent shell and finds bash on it for every agent command, approved escalations outside
+  // the sandbox included. An agent whose workspace holds the checkout could plant this one.
+  const fixture = await makeFixture({ dsh: { bash: true, exitAfterMs: 300 } })
+  const marker = join(fixture.logs, 'planted-ran')
+  const planted = join(fixture.root, 'node_modules', '.bin', 'bash')
+  await writeFile(planted, `#!/bin/sh\n: > ${JSON.stringify(marker)}\nprintf planted\n`)
+  await chmod(planted, 0o755)
+  const run = await launch(fixture)
+  try {
+    const { code } = await finished(run)
+    assert.equal(code, 0, run.stderr())
+
+    const [install] = await readLog(fixture, 'install')
+    assertNoAgentWritableEntry(/ PATH=\[([^\]]*)\]/.exec(install!)?.[1], fixture.root, 'install.sh')
+    const [dshStart] = await readLog(fixture, 'dsh')
+    const dsh = JSON.parse(dshStart!.slice('start '.length)) as StubStart
+    assertNoAgentWritableEntry(dsh.PATH, fixture.root, 'dsh')
+    const [pnpmStart] = await readLog(fixture, 'pnpm')
+    assertNoAgentWritableEntry((JSON.parse(pnpmStart!.slice('start '.length)) as StubStart).PATH, fixture.root, 'the watchers')
+
+    assert.notEqual(dsh.bash, 'planted', 'dsh\'s bash is not the planted one')
+    assert.ok(dsh.bash !== undefined && isAbsolute(dsh.bash), `bash ran from ${JSON.stringify(dsh.bash)}`)
+    assert.ok(outside(dsh.bash, fixture.root), `${dsh.bash} is not the checkout's`)
+    assert.equal(await exists(marker), false, 'the planted bash never ran')
+  } finally {
+    await reap(fixture, run)
+  }
+})
+
+test('main: dsh is dsh\'s own script under this node, never its shim, and no NODE_PATH reaches it, the watchers or install.sh', async () => {
+  // pnpm's shim for dsh sets a NODE_PATH that names the checkout's node_modules/.pnpm/node_modules, and dsh hands it to
+  // every agent shell, where any CommonJS program falls back to it: an agent whose workspace holds the checkout could
+  // plant a module there for later commands to load, approved escalations outside the sandbox included. The inherited
+  // NODE_PATH here is the one an agent's `pnpm dev` would get from a dsh started through that shim.
+  const store = (root: string): string => join(root, 'node_modules', '.pnpm', 'node_modules')
+  const fixture = await makeFixture({ dsh: { probe: true, exitAfterMs: 300 }, pnpm: { probe: true } })
+  fixture.env.NODE_PATH = store(fixture.root)
+  const marker = join(fixture.logs, 'planted-module-ran')
+  await mkdir(join(store(fixture.root), 'dish-planted-probe'), { recursive: true })
+  await writeFile(join(store(fixture.root), 'dish-planted-probe', 'index.js'), `require('node:fs').writeFileSync(${JSON.stringify(marker)}, '')\n`)
+  const run = await launch(fixture)
+  try {
+    const { code } = await finished(run)
+    assert.equal(code, 0, run.stderr())
+
+    const [install] = await readLog(fixture, 'install')
+    assert.ok(install!.includes(' NODE_PATH= '), `install.sh has no NODE_PATH: ${install}`)
+    const [dshStart] = await readLog(fixture, 'dsh')
+    const dsh = JSON.parse(dshStart!.slice('start '.length)) as StubStart
+    assert.equal(dsh.execPath, process.execPath, 'dsh runs under pnpm dev\'s node')
+    assert.equal(dsh.script, join(fixture.root, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'), 'dsh\'s own script')
+    assert.equal(await exists(join(fixture.logs, 'shim-ran')), false, 'the shim never ran')
+    const [pnpmStart] = await readLog(fixture, 'pnpm')
+    const watchers = JSON.parse(pnpmStart!.slice('start '.length)) as StubStart
+    for (const [name, seen] of [['dsh', dsh], ['the watchers', watchers]] as const) {
+      assert.equal(seen.NODE_PATH, undefined, `${name}: no NODE_PATH`)
+      assert.equal(seen.probe, 'not found', `${name}: a CommonJS program it runs does not find the planted module`)
+    }
+    assert.equal(await exists(marker), false, 'the planted module never loaded')
+  } finally {
+    await reap(fixture, run)
+  }
+})
+
 test('main: a failing install.sh returns 1, says so, and starts neither dsh nor the watchers', async () => {
   const fixture = await makeFixture({}, { STUB_INSTALL_EXIT: '9' })
   const run = await launch(fixture)
@@ -633,14 +765,33 @@ test('main: the first non-zero code wins, not the one of the child that was stop
 })
 
 test('main: a child that cannot be started gives 127 for it, and the other is stopped', async () => {
+  // The watchers' pnpm is the account's, found on PATH. Here PATH is only its stand-in's directory, so that no real
+  // pnpm further along it can run, and the stand-in is not executable. Nothing else pnpm dev starts needs PATH.
   const fixture = await makeFixture()
-  await rm(join(fixture.root, 'node_modules', '.bin', 'dsh'))
+  await chmod(join(`${fixture.root}-bin`, 'pnpm'), 0o644)
+  fixture.env.PATH = `${fixture.root}-bin`
+  const run = await launch(fixture)
+  try {
+    const { code } = await finished(run)
+    assert.equal(code, 127, run.stderr())
+    assert.match(run.stderr(), /^dev: cannot start the watchers: /m)
+    assert.deepEqual((await readLog(fixture, 'dsh')).slice(1), ['SIGTERM'], 'dsh was stopped')
+  } finally {
+    await reap(fixture, run)
+  }
+})
+
+test('main: no dsh in the checkout gives 127 and starts neither child, and never falls back to the shim', async () => {
+  const fixture = await makeFixture()
+  await rm(join(fixture.root, 'node_modules', '@deepseek-ai', 'dsh'), { recursive: true })
   const run = await launch(fixture)
   try {
     const { code } = await finished(run)
     assert.equal(code, 127)
-    assert.match(run.stderr(), /^dev: cannot start dsh: /m)
-    assert.deepEqual((await readLog(fixture, 'pnpm')).slice(1), ['SIGTERM'], 'the watchers were stopped')
+    assert.equal(run.stderr(), `dev: cannot start dsh: no dsh script in ${join(fixture.root, 'node_modules', '@deepseek-ai', 'dsh')}\n`)
+    assert.deepEqual(await readLog(fixture, 'dsh'), [])
+    assert.deepEqual(await readLog(fixture, 'pnpm'), [])
+    assert.equal(await exists(join(fixture.logs, 'shim-ran')), false, 'the shim did not run')
   } finally {
     await reap(fixture, run)
   }

@@ -2,7 +2,11 @@
  * `pnpm dev`: dish in dev, from this checkout: `node scripts/dev.ts [--port <n>]`.
  *
  * 1. Refuse `DISH_ENV=prod` (prod is the `dish-web` service, which never goes through here), then make the checkout's
- *    `.dev/` and take the launcher's dev environment (`scripts/env.ts`): `DSH_HOME`, `DSH_DISH_HOME` and `DISH_ENV=dev`.
+ *    `.dev/` and take the launcher's dev environment (`scripts/env.ts`): `DSH_HOME`, `DSH_DISH_HOME` and `DISH_ENV=dev`,
+ *    and a `PATH` without the checkout's `node_modules/.bin` (which `pnpm dev` puts first) or any other directory an
+ *    agent could write (`agentPath`), and no `NODE_PATH`. dsh is started as its own script (`dshEntry`) by the node
+ *    that runs this, not through its `node_modules/.bin` shim, which would set a `NODE_PATH` naming the checkout. `pnpm`
+ *    and install.sh's tools are the account's, from that `PATH`.
  * 2. Run `deploy/install.sh` under that environment, with `DISH_REMOTE=''` whatever the environment says (dev's config
  *   store never has a remote, so it can never push over prod's) and the checkout's git identity. It is idempotent, so
  *   every run does it: the install, the build, and on the first run the profile, then any new bundle.
@@ -57,7 +61,7 @@ import type { Readable } from 'node:stream'
 import { constants } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
-import { devEnvironment, ensureDevDirectories, resolveMode, ROOT, UsageError } from './env.ts'
+import { devEnvironment, dshEntry, ensureDevDirectories, resolveMode, ROOT, UsageError } from './env.ts'
 
 export const DEFAULT_PORT = 3090
 
@@ -344,6 +348,12 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
     }
     const received = guard.received()
     if (received !== undefined) return 128 + (constants.signals[received] ?? 0)
+    // dsh's own script, which install.sh's `pnpm install` has put in place. Without it neither child is started.
+    const entry = await dshEntry(root)
+    if (entry === undefined) {
+      console.error(`dev: cannot start dsh: no dsh script in ${join(root, 'node_modules', '@deepseek-ai', 'dsh')}`)
+      return 127
+    }
 
     const watchers = start('the watchers', 'pnpm', ['--filter', './plugins/*', '--parallel', '--if-present', 'run', 'dev'], {
       cwd: root,
@@ -351,8 +361,8 @@ export async function main(argv: string[], options: { root?: string, env?: NodeJ
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
     }, { forwarding: WATCHER_SIGNALS, group: true })
-    const server = start('dsh', join(root, 'node_modules', '.bin', 'dsh'), [
-      'web', '--host', '127.0.0.1', '--port', String(port), '--no-open',
+    const server = start('dsh', process.execPath, [
+      entry, 'web', '--host', '127.0.0.1', '--port', String(port), '--no-open',
     ], { cwd: root, env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true }, { forwarding: DSH_SIGNALS })
     children.push(watchers, server)
 
