@@ -11,8 +11,8 @@ import type { ContinuableStartSpec } from '@deepseek-ai/dsh-subagent'
 import * as promptsPlugin from 'dish-prompts'
 import * as row from '../src/delegate.ts'
 import { CrewRecords, isRunning } from '../src/record.ts'
-import type { ChildRecord } from '../src/record.ts'
-import { worktreeBrief } from '../src/text.ts'
+import type { ChildRecord, GateResult } from '../src/record.ts'
+import { gateOverrideBrief, worktreeBrief } from '../src/text.ts'
 import { DEFAULT_SETTINGS, parseSettings } from '../src/settings.ts'
 import type { CrewSettings } from '../src/settings.ts'
 import { provideStub, shippedWith, tempDir, watchLogs } from './helpers.ts'
@@ -58,6 +58,8 @@ interface Options {
   withoutTools?: string[]
   /** Whether dish-workspaces' service is there (a stub that resolves what `makeWorktree` made). */
   workspaces?: boolean
+  /** Whether dish-gates' service is there (a stub whose `gateFor` gives what `World.gates` has for a project). */
+  dishGates?: boolean
 }
 
 /** A worktree as dish-workspaces' `resolve` gives one. */
@@ -94,6 +96,10 @@ interface World {
   resolveAsked: string[]
   /** What `dishWorkspaces.resolveProblem` says, by ref: why a worktree dish made doesn't resolve. */
   problems: Map<string, string>
+  /** What the `dishGates` stub's `gateFor` gives, by project. */
+  gates: Map<string, string>
+  /** What `dishGates.gateFor` was asked, in order. */
+  gateAsked: string[]
   stub: {
     /** An error `startContinuable` throws instead of starting. */
     startFails: Error | undefined
@@ -111,6 +117,8 @@ interface World {
     resolveWorktreeFails: Error | undefined
     /** An error `dishWorkspaces.resolveProblem` throws instead of answering. */
     resolveProblemFails: Error | undefined
+    /** An error `dishGates.gateFor` throws instead of answering. */
+    gateForFails: Error | undefined
   }
   main: Agent
   /** A scoped agent as dsh makes one under the preset. */
@@ -158,12 +166,14 @@ async function world(options: Options = {}): Promise<World> {
   const recordedAtStart = new Map<string, ChildRecord | undefined>()
   const stub: World['stub'] = {
     startFails: undefined, sendFails: undefined, resolveFails: undefined, startMs: 0, noPrompt: new Set(), promptFails: undefined, startedStatus: 'running',
-    resolveWorktreeFails: undefined, resolveProblemFails: undefined,
+    resolveWorktreeFails: undefined, resolveProblemFails: undefined, gateForFails: undefined,
   }
   const workspace = await realpath(await tempDir())
   const worktrees = new Map<string, Worktree>()
   const resolveAsked: string[] = []
   const problems = new Map<string, string>()
+  const gates = new Map<string, string>()
+  const gateAsked: string[] = []
 
   if (options.agents !== false) await provide(ctx, 'agents', { get: (id: string) => agents.get(id) })
   await provide(ctx, 'llm', {
@@ -214,6 +224,15 @@ async function world(options: Options = {}): Promise<World> {
       },
     })
   }
+  if (options.dishGates === true) {
+    await provide(ctx, 'dishGates', {
+      async gateFor(project: string) {
+        gateAsked.push(project)
+        if (stub.gateForFails !== undefined) throw stub.gateForFails
+        return gates.get(project)
+      },
+    })
+  }
   if (options.realPrompts === true) {
     disposables.push(await ctx.plugin(promptsPlugin, { terminal: false, stateDirectory: await tempDir() } as promptsPlugin.Config))
   } else if (options.dishPrompts !== false) {
@@ -251,7 +270,7 @@ async function world(options: Options = {}): Promise<World> {
 
   return {
     ctx, settings, records, directory, mainModel, agents, starts, sends, resolves, personaAsked, recordedAtStart, stub, main, agent, exec, tool,
-    workspace, worktrees, resolveAsked, problems,
+    workspace, worktrees, resolveAsked, problems, gates, gateAsked,
     delegate: (args, who = exec()) => tool.execute(args, who),
     async makeWorktree(slug, root = workspace) {
       const path = join(root, '.worktrees', slug)
@@ -316,7 +335,7 @@ test('it registers delegate with a schema the tool registry accepts, and the out
   assert.deepEqual(Object.keys(schema.properties).sort(), ['child', 'label', 'model', 'role'])
   assert.deepEqual([...schema.required].sort(), ['child', 'label', 'model', 'role'])
   const parameters = w.tool.parameters as { properties: Record<string, unknown>, required: string[] }
-  assert.deepEqual(Object.keys(parameters.properties).sort(), ['model', 'reviews', 'role', 'task', 'title', 'to', 'worktree'])
+  assert.deepEqual(Object.keys(parameters.properties).sort(), ['gateOverride', 'model', 'reviews', 'role', 'task', 'title', 'to', 'worktree'])
   assert.deepEqual([...parameters.required].sort(), ['role', 'task', 'title'])
 })
 
@@ -1824,4 +1843,303 @@ test('a follow-up to a bound child is refused while another running child is bou
   w.agents.set(mine.child, { status: 'running' })
   await w.delegate({ ...CODER, task: 'One more thing.', to: mine.child })
   assert.equal(w.sends.length, 1)
+})
+
+// --- gates (6c): the brief's gate sentence, and a review that waits for the coder's gate ----------------------------
+
+const GATE = 'pnpm typecheck && pnpm test'
+/** How every refusal of the review check says to override it. */
+const RULING_HINT = '`gateOverride: "Ruling: what — why — cost if wrong"`'
+const LOG_3 = '/state/gates/frostyard/snosi/fix-1/c1-1-3.log'
+
+/** The sentence a bound coder's brief gains while dish-gates runs, as the plan words it. */
+function gateSentence(gate: string): string {
+  return ` When you finish, dish runs this project's gate (\`${gate}\`) in your worktree, and a failure comes back to you. `
+    + 'If you\'re blocked, start your closing message with `BLOCKED: <question>` or `NEEDS CONTEXT: <what you need>`, and the gate is skipped.'
+}
+
+/** A gate result as dish-gates records one: a pass in round 1 unless `over` says otherwise. */
+function gateResult(over: Partial<GateResult> = {}): GateResult {
+  return {
+    turn: 1, round: 1, maxRounds: 3, outcome: 'passed', command: GATE, exitCode: 0, timedOut: false, durationMs: 4200,
+    log: `/state/gates/frostyard/snosi/fix-1/c1-1-${over.round ?? 1}.log`, excerpt: '', at: 1, ...over,
+  }
+}
+
+/** Every round of a turn failed: the last one is recorded and not steered, and the run ends with it. */
+const FAILED_3 = [1, 2, 3].map(round => gateResult({ round, outcome: 'failed', exitCode: 1, excerpt: 'FAIL login.test.ts' }))
+const SKIPPED = gateResult({ outcome: 'skipped', command: '', exitCode: null, durationMs: 0, log: null, reason: 'the coder reported BLOCKED / NEEDS CONTEXT' })
+
+/** How the reviewer's block names the work it reviews. */
+const REVIEWED = 'coder «add login», child c1'
+
+/**
+ * Put coder `id` of this session in the record, bound to a worktree, with `gates` recorded during its run. With `ended`
+ * (the default) its run is filed and its agent is idle; without, it is still running.
+ */
+async function boundCoder(w: World, id: string, gates: readonly GateResult[], ended = true): Promise<ChildRecord> {
+  const record = await w.records.addChild(SESSION, {
+    id, role: 'coder', title: 'add login', model: 'claude-sonnet-5.5', family: 'anthropic', worktree: join(w.workspace, '.worktrees', 'fix-1'),
+  })
+  for (const result of gates) assert.equal(await w.records.addGate(id, result), true)
+  w.agents.set(id, { status: ended ? 'idle' : 'running' })
+  if (ended) await w.records.endRun(id, { stopReason: 'completed', closing: 'done' })
+  return record
+}
+
+/** The refusal of a review start whose reviewed coder c1's gate stands at `standing`, when it isn't running. */
+function gateRefusal(standing: string): string {
+  return `coder «add login» (child c1)'s gate hasn't passed (${standing}). Send it a fix round with \`to\`, or start the review anyway with ${RULING_HINT}.`
+}
+
+test('worktreeBrief with a gate is 6b\'s block and then the gate sentence; without one it is 6b\'s, byte for byte', () => {
+  const tree = { path: '/work/o/r/.worktrees/fix-1', branch: 'dish/fix-1' }
+  assert.equal(worktreeBrief(tree), brief(tree.path, tree.branch))
+  assert.equal(worktreeBrief(tree, undefined), brief(tree.path, tree.branch))
+  assert.equal(worktreeBrief(tree, GATE), brief(tree.path, tree.branch) + gateSentence(GATE))
+  // A gate with nothing in it is none.
+  assert.equal(worktreeBrief(tree, ' '), brief(tree.path, tree.branch))
+})
+
+test('gateOverrideBrief tells the reviewer the gate hasn\'t passed, and the main agent\'s ruling', () => {
+  assert.equal(gateOverrideBrief(REVIEWED, 'skipped: the coder reported BLOCKED / NEEDS CONTEXT', 'Ruling: x — y — z'),
+    'The harness\'s gate for the work you review (coder «add login», child c1) hasn\'t passed: skipped: the coder reported BLOCKED / NEEDS CONTEXT. '
+    + 'The main agent started this review anyway, with this ruling: Ruling: x — y — z')
+})
+
+test('the gateOverride parameter and the description say what the review check is and how to override it', async () => {
+  const w = await world()
+  const parameters = w.tool.parameters as { properties: Record<string, { type: string, description: string }>, required: string[] }
+  assert.equal(parameters.properties.gateOverride!.type, 'string')
+  assert.ok(!parameters.required.includes('gateOverride'))
+  assert.equal(parameters.properties.gateOverride!.description, 'Only after `delegate` refused a review because the reviewed coder\'s gate hasn\'t passed: '
+    + 'your ruling, on one line, as `Ruling: what — why — cost if wrong`. It is recorded, and the reviewer is told. Leave empty otherwise.')
+  assert.match(w.tool.description, /gated when it finishes/)
+  assert.match(w.tool.description, /finish notice says how/)
+  assert.match(w.tool.description, /refused until the gate passes, unless `gateOverride` carries your ruling/)
+})
+
+test('a bound coder\'s brief names its project\'s gate while dish-gates runs: after the block, before the closing note', async () => {
+  const w = await world({ dishGates: true })
+  w.gates.set('frostyard/snosi', GATE)
+  const tree = await w.makeWorktree('fix-1')
+  await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  assert.deepEqual(w.gateAsked, ['frostyard/snosi'])
+  assert.deepEqual(w.starts[0]!.request.prompt, [
+    { type: 'text', text: CODER.task },
+    { type: 'text', text: brief(tree.path, 'dish/fix-1') + gateSentence(GATE) },
+    { type: 'text', text: CLOSING_NOTE },
+  ])
+  // An unbound coder gets no block, and dish-gates isn't asked.
+  await finish(w, String(w.starts[0]!.childId))
+  await w.delegate({ ...CODER, title: 'unbound' })
+  assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: CODER.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.deepEqual(w.gateAsked, ['frostyard/snosi'])
+})
+
+test('without a gate to name, the brief is 6b\'s: no dish-gates, a project it has no gate for, and a gateFor that throws', async () => {
+  const without = await world()
+  const tree = await without.makeWorktree('fix-1')
+  await without.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  assert.deepEqual(without.starts[0]!.request.prompt[1], { type: 'text', text: brief(tree.path, 'dish/fix-1') })
+
+  const w = await world({ dishGates: true })
+  const other = await w.makeWorktree('fix-1')
+  const first = await w.delegate({ ...CODER, worktree: 'frostyard/snosi/fix-1' })
+  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: brief(other.path, 'dish/fix-1') })
+  await finish(w, first.child)
+  const logs = watchLogs(w.ctx)
+  w.gates.set('frostyard/snosi', GATE)
+  w.stub.gateForFails = new Error('projects.yaml is unreadable')
+  const second = await w.delegate({ ...CODER, title: 'again', worktree: 'frostyard/snosi/fix-1' })
+  assert.deepEqual(w.starts[1]!.request.prompt, [
+    { type: 'text', text: CODER.task },
+    { type: 'text', text: brief(other.path, 'dish/fix-1') },
+    { type: 'text', text: CLOSING_NOTE },
+  ])
+  assert.equal((await w.records.lookup(second.child))?.record.worktree, other.path)
+  assert.ok(logs.some(line => /projects\.yaml is unreadable/.test(line)), logs.join('\n'))
+})
+
+test('a review of a bound coder whose gate hasn\'t passed is refused, saying why and how to go on, and nothing starts', async () => {
+  const cases: Array<[string, GateResult[], string]> = [
+    ['failed in its last round', FAILED_3, `failed, round 3 of 3; log ${LOG_3}`],
+    ['failed with rounds to spare: the run ended another way', [FAILED_3[0]!], 'failed, round 1 of 3; log /state/gates/frostyard/snosi/fix-1/c1-1-1.log'],
+    ['failed with no log', [gateResult({ outcome: 'failed', exitCode: 2, round: 3, log: null })], 'failed, round 3 of 3'],
+    ['skipped', [SKIPPED], 'skipped: the coder reported BLOCKED / NEEDS CONTEXT'],
+    ['not run', [gateResult({ outcome: 'error', command: '', exitCode: null, durationMs: 0, log: null, reason: 'dsh\'s shell here doesn\'t sandbox commands, so dish won\'t run the gate' })],
+      'error: dsh\'s shell here doesn\'t sandbox commands, so dish won\'t run the gate'],
+    ['no result: the run ended before its turn could', [], 'no gate result: it didn\'t run'],
+  ]
+  for (const [what, gates, standing] of cases) {
+    const w = await world({ dishGates: true })
+    await boundCoder(w, 'c1', gates)
+    assert.equal(await refusal(w.delegate({ ...REVIEW, reviews: 'c1' })), gateRefusal(standing), what)
+    // An empty override is none, as for every optional parameter.
+    assert.equal(await refusal(w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: ' \n ' })), gateRefusal(standing), what)
+    assert.equal(w.starts.length, 0, what)
+    assert.deepEqual((await w.records.children(SESSION)).map(child => child.id), ['c1'], what)
+  }
+})
+
+test('a review of a bound coder that is still running is refused, saying to wait for its notice or rule', async () => {
+  const w = await world({ dishGates: true })
+  // Its gate has passed, and its turn hasn't closed yet: the run isn't over, so it can still change the work.
+  await boundCoder(w, 'c1', [gateResult()], false)
+  assert.equal(await refusal(w.delegate({ ...REVIEW, reviews: 'c1' })),
+    'coder «add login» (child c1)\'s gate hasn\'t passed (it is still running). Wait for its finish notice, which says how its gate ended, '
+    + `and delegate the review then, or start the review anyway with ${RULING_HINT}.`)
+  assert.equal(w.starts.length, 0)
+  // With a ruling it starts, and the reviewer is told the coder was still running.
+  const ruling = 'Ruling: review the plan so far — it is a draft — findings on code that changes'
+  const result = await w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: ruling })
+  assert.deepEqual(w.starts[0]!.request.prompt[1], { type: 'text', text: gateOverrideBrief(REVIEWED, 'it is still running', ruling) })
+  assert.equal((await w.records.lookup(result.child))?.record.gateOverride, ruling)
+})
+
+test('the latest run is what counts: an older run\'s pass doesn\'t cover a newer run, even one dsh stopped before it ended', async () => {
+  const w = await world({ dishGates: true })
+  await boundCoder(w, 'c1', [gateResult()])
+  // A fix round whose gate failed in every round.
+  await w.records.addFollowUp('c1')
+  for (const result of FAILED_3) await w.records.addGate('c1', { ...result, turn: 2 })
+  await w.records.endRun('c1', { stopReason: 'completed', closing: 'done' })
+  assert.equal(await refusal(w.delegate({ ...REVIEW, reviews: 'c1' })), gateRefusal(`failed, round 3 of 3; log ${LOG_3}`))
+
+  // Another, and dsh stopped mid-run (a restart): the record says running, there is no agent, and nothing was recorded for it.
+  const restarted = await world({ dishGates: true })
+  await boundCoder(restarted, 'c1', [gateResult()])
+  await restarted.records.addFollowUp('c1')
+  restarted.agents.delete('c1')
+  assert.equal(await refusal(restarted.delegate({ ...REVIEW, reviews: 'c1' })), gateRefusal('no gate result: it didn\'t run'))
+  // What was recorded of that run before it stopped is its result.
+  await restarted.records.addGate('c1', { ...FAILED_3[0]!, turn: 2 })
+  assert.equal(await refusal(restarted.delegate({ ...REVIEW, reviews: 'c1' })), gateRefusal('failed, round 1 of 3; log /state/gates/frostyard/snosi/fix-1/c1-1-1.log'))
+  assert.equal(w.starts.length + restarted.starts.length, 0)
+})
+
+test('a review after the gate passed starts as before, and an override given is ignored and not recorded', async () => {
+  const w = await world({ dishGates: true })
+  // Failed once, fixed, passed: the latest result is the one that counts.
+  await boundCoder(w, 'c1', [FAILED_3[0]!, gateResult({ round: 2 })])
+  const result = await w.delegate({ ...REVIEW, reviews: 'c1' })
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.ok(!('gateOverride' in (await w.records.lookup(result.child))!.record))
+  // Not even a ruling with nothing in it is refused when there is nothing to override.
+  await finish(w, result.child)
+  const again = await w.delegate({ ...REVIEW, title: 'again', reviews: 'c1', gateOverride: 'Ruling:' })
+  assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.ok(!('gateOverride' in (await w.records.lookup(again.child))!.record))
+})
+
+test('a review with a ruling starts: the ruling, on one line, is recorded and told to the reviewer before the closing note', async () => {
+  const w = await world({ dishGates: true })
+  await boundCoder(w, 'c1', FAILED_3)
+  const result = await w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: '  Ruling: review it anyway —\n  the failure is a flaky\ttest —\r\n a missed bug  ' })
+  const ruling = 'Ruling: review it anyway — the failure is a flaky test — a missed bug'
+  assert.deepEqual(w.starts[0]!.request.prompt, [
+    { type: 'text', text: REVIEW.task },
+    { type: 'text', text: gateOverrideBrief(REVIEWED, `failed, round 3 of 3; log ${LOG_3}`, ruling) },
+    { type: 'text', text: CLOSING_NOTE },
+  ])
+  const recorded = (await w.records.lookup(result.child))!.record
+  assert.equal(recorded.gateOverride, ruling)
+  assert.equal(recorded.reviews, 'c1')
+  // Recorded before the start, as the rest of the child is.
+  assert.equal(w.recordedAtStart.get(result.child)?.gateOverride, ruling)
+  // The word "Ruling:" isn't required: the ruling is.
+  await finish(w, result.child)
+  const plain = await w.delegate({ ...REVIEW, title: 'again', reviews: 'c1', gateOverride: 'the failure is a flaky test — a missed bug' })
+  assert.equal((await w.records.lookup(plain.child))!.record.gateOverride, 'the failure is a flaky test — a missed bug')
+})
+
+test('an override with no ruling in it is refused, with what a ruling is and how to go on', async () => {
+  const w = await world({ dishGates: true })
+  await boundCoder(w, 'c1', [SKIPPED])
+  for (const blank of ['Ruling:', '  ruling:  ', 'Ruling: — —', 'RULING:\n']) {
+    assert.equal(await refusal(w.delegate({ ...REVIEW, reviews: 'c1', gateOverride: blank })),
+      `gateOverride needs the ruling itself: what — why — cost if wrong. ${gateRefusal('skipped: the coder reported BLOCKED / NEEDS CONTEXT')}`, JSON.stringify(blank))
+  }
+  assert.equal(w.starts.length, 0)
+})
+
+test('not checked: an unbound coder, reviews "main", any review while dish-gates isn\'t running, and a role that doesn\'t review', async () => {
+  const w = await world({ dishGates: true })
+  // An unbound coder has no gate.
+  await w.seed({ id: 'u1', role: 'coder', last: 'finished' }, 'idle')
+  const unbound = await w.delegate({ ...REVIEW, reviews: 'u1', gateOverride: 'Ruling: x — y — z' })
+  assert.deepEqual(w.starts[0]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.ok(!('gateOverride' in (await w.records.lookup(unbound.child))!.record))
+  await finish(w, unbound.child)
+  // The main agent's own work.
+  const main = await w.delegate({ ...REVIEW, title: 'review mine', reviews: 'main', gateOverride: 'Ruling: x — y — z' })
+  assert.deepEqual(w.starts[1]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.ok(!('gateOverride' in (await w.records.lookup(main.child))!.record))
+  // A coder's start with an override: there is no review to override.
+  await finish(w, main.child)
+  const coder = await w.delegate({ ...CODER, gateOverride: 'Ruling: x — y — z' })
+  assert.ok(!('gateOverride' in (await w.records.lookup(coder.child))!.record))
+  assert.equal(w.gateAsked.length, 0)
+
+  // Without dish-gates nothing is gated, so nothing is checked: a bound coder whose gate failed, or that is running, is reviewed.
+  const off = await world()
+  await boundCoder(off, 'c1', FAILED_3)
+  const failed = await off.delegate({ ...REVIEW, reviews: 'c1', gateOverride: 'Ruling:' })
+  assert.deepEqual(off.starts[0]!.request.prompt, [{ type: 'text', text: REVIEW.task }, { type: 'text', text: CLOSING_NOTE }])
+  assert.ok(!('gateOverride' in (await off.records.lookup(failed.child))!.record))
+  await boundCoder(off, 'c2', [], false)
+  await off.delegate({ ...REVIEW, title: 'review c2', reviews: 'c2' })
+  assert.equal(off.starts.length, 2)
+})
+
+test('a re-review (a follow-up to a reviewer, with to) is checked the same way: refused, then sent with a ruling', async () => {
+  const w = await world({ dishGates: true })
+  await boundCoder(w, 'c1', [gateResult()])
+  const reviewer = await w.delegate({ ...REVIEW, reviews: 'c1' })
+  await finish(w, reviewer.child)
+  // The coder's fix round, whose gate then failed in every round.
+  await w.records.addFollowUp('c1')
+  for (const result of FAILED_3) await w.records.addGate('c1', { ...result, turn: 2 })
+  await w.records.endRun('c1', { stopReason: 'completed', closing: 'done' })
+
+  const standing = `failed, round 3 of 3; log ${LOG_3}`
+  const body = `coder «add login» (child c1)'s gate hasn't passed (${standing}). Send that coder a fix round with \`to\`, or send this follow-up anyway with ${RULING_HINT}.`
+  const lead = `can't send a follow-up to reviewer child ${reviewer.child}:`
+  const again = { ...REVIEW, task: 'Review the fix.', to: reviewer.child }
+  assert.equal(await refusal(w.delegate(again)), `${lead} ${body}`)
+  assert.equal(await refusal(w.delegate({ ...again, gateOverride: '' })), `${lead} ${body}`)
+  assert.equal(await refusal(w.delegate({ ...again, gateOverride: 'Ruling:' })), `gateOverride needs the ruling itself: what — why — cost if wrong. ${lead} ${body}`)
+  assert.equal(w.sends.length, 0)
+  assert.equal((await w.records.lookup(reviewer.child))!.record.followUps, 0)
+
+  const ruling = 'Ruling: re-review anyway — the failing test is unrelated — a missed regression'
+  await w.delegate({ ...again, gateOverride: `${ruling}\n` })
+  assert.equal(w.sends.length, 1)
+  assert.deepEqual(w.sends[0]!.content, [{ type: 'text', text: 'Review the fix.' }, { type: 'text', text: gateOverrideBrief(REVIEWED, standing, ruling) }])
+  const record = (await w.records.lookup(reviewer.child))!.record
+  assert.equal(record.gateOverride, ruling)
+  assert.equal(record.followUps, 1)
+
+  // Once the coder's gate passes, a re-review is sent as before: the override is ignored, and the ruling on record stays.
+  await finish(w, reviewer.child)
+  await w.records.addFollowUp('c1')
+  await w.records.addGate('c1', gateResult({ turn: 3 }))
+  await w.records.endRun('c1', { stopReason: 'completed', closing: 'done' })
+  await w.delegate({ ...again, task: 'Once more.', gateOverride: 'Ruling: a — b — c' })
+  assert.deepEqual(w.sends[1]!.content, [{ type: 'text', text: 'Once more.' }])
+  assert.equal((await w.records.lookup(reviewer.child))!.record.gateOverride, ruling)
+})
+
+test('a re-review of the main agent\'s own work, or of an unbound coder, is not checked', async () => {
+  const w = await world({ dishGates: true })
+  const mine = await w.delegate({ ...REVIEW, reviews: 'main' })
+  await finish(w, mine.child)
+  await w.delegate({ ...REVIEW, task: 'Again.', to: mine.child, gateOverride: 'Ruling:' })
+  assert.deepEqual(w.sends[0]!.content, [{ type: 'text', text: 'Again.' }])
+  await w.seed({ id: 'u1', role: 'coder', last: 'finished' }, 'idle')
+  const theirs = await w.delegate({ ...REVIEW, title: 'review u1', reviews: 'u1' })
+  await finish(w, theirs.child)
+  await w.delegate({ ...REVIEW, task: 'Again.', to: theirs.child })
+  assert.equal(w.sends.length, 2)
+  assert.ok(!('gateOverride' in (await w.records.lookup(theirs.child))!.record))
 })
