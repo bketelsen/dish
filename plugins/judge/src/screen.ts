@@ -14,11 +14,12 @@
  * anywhere. If it is images or files, it is marked "Not screened: the judge reads text only"; if it is empty, it is left alone.
  *
  * **A private key is cut out of what the judge reads** (dish-kit's `privateKeyCuts`), and the rest is screened: its header, its
- * base64 lines, its last line and its END line become `[a private key, left out]`, and nothing written around it is cut, so a
- * fake header (and END line) around a page's instructions can't keep them from the judge. The client refuses a request that
- * holds a private key's mask, which would take in what is written around the key, so without the cut such a result was not
- * screened at all. Only what is sent is cut: chunks are spans of the text as it is, and the result the agent gets is unchanged.
- * The line's subject says how many keys were left out.
+ * lines and its END line become `[a private key, left out]`, however the result shows them (escaped, numbered, prefixed, cut
+ * off), and of what is written around it only a few words where its last line would be, so a fake header (and END line) around
+ * a page's instructions can't keep them from the judge. The client refuses a request that holds a private key's mask, which
+ * would take in what is written around the key, so without the cut such a result was not screened at all. Only what is sent is
+ * cut: chunks are spans of the text as it is, and the result the agent gets is unchanged. The line's subject says how many keys
+ * were left out.
  *
  * **Chunks and calls.** Text longer than `chunkChars` is chunks (each overlapping the one before by `OVERLAP_CHARS`, and ending at
  * a line break near its end when there is one). Each chunk is a noul of its own, `injected_<i>`, asking the spec's question
