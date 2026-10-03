@@ -6,7 +6,7 @@
  * - **create** passes the calling chat's workspace (`exec.agent.session.header.cwd`) and the call's signal to
  *   `dishWorkspaces.createWorktree`, which refuses a project that isn't ready, a chat with no workspace, and a worktree
  *   outside it (a coder of that chat works in its sandbox, which is its workspace). Its answer is the path, the branch,
- *   the base commit and what setup did: in 6b setup doesn't run in a worktree (default A), so the answer gives the
+ *   the base commit and what setup did: in 6b setup doesn't run in a worktree (the user's A, 2026-10-02), so the answer gives the
  *   command for the agent to run in it.
  * - **list** shows each worktree with the crew children bound to it (`dishCrew.worktreeBindings`); **remove** refuses
  *   one a running coder is bound to, even with `force`.

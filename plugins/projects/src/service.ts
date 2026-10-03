@@ -35,7 +35,8 @@ export interface DishProjects {
   status(name: string): ProjectStatus
   /**
    * Onboard `name` again. Refused (throws) only while its onboarding is queued or running. On a ready project it
-   * onboards again: it adopts the clone, runs setup (on merged code) and registers the workspace again.
+   * onboards again: it adopts the clone, skips setup (an existing checkout; the status gives the command) and registers
+   * the workspace again.
    */
   retry(name: string): Promise<void>
   /** Why the stored `projects.yaml` doesn't parse, or `undefined` when it does (or there is no store). */

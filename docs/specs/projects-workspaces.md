@@ -1,11 +1,11 @@
 # Spec: projects and workspaces (`dish-projects`, `dish-workspaces`)
 
-Status: approved 2026-10-02; revised before the plan by its checks (what changed, and the evidence, is under [Checks](#checks-2026-10-02)). Two findings were then decided by you, both as recommended ([Decided after the checks](#decided-after-the-checks)). This is roadmap step 6b. It builds on [ops](ops.md) (step 6a: prod and dev, and the `~/work` root), the [config store](config-store.md), [crew](crew.md) and the [design](../design.md) ("Project families", "Plugins and contracts"). The plan is [docs/plans/2026-10-02-projects.md](../plans/2026-10-02-projects.md).
+Status: built on branch `projects` (2026-10-02), awaiting review and the rollout. Approved 2026-10-02; revised before the plan by its checks (what changed, and the evidence, is under [Checks](#checks-2026-10-02)). Two findings were then decided by you, both as recommended ([Decided after the checks](#decided-after-the-checks)), and the build's reviews narrowed the first further. What the build changed is under [Notes from the build](#notes-from-the-build), and the [known limits](#known-limits) are gathered at the end. This is roadmap step 6b. It builds on [ops](ops.md) (step 6a: prod and dev, and the `~/work` root), the [config store](config-store.md), [crew](crew.md) and the [design](../design.md) ("Project families", "Plugins and contracts"). The plan is [docs/plans/2026-10-02-projects.md](../plans/2026-10-02-projects.md).
 
 ## Summary
 
 You register repos as **projects**, and dish gets them ready to work on.
-- **Onboarding.** For each project, dish clones the repo under `~/work/<owner>/<repo>`, or adopts a clone already there. Then it runs the project's `setup` and registers the clone as a **dsh workspace**, so it appears in the sidebar for chats.
+- **Onboarding.** For each project, dish clones the repo under `~/work/<owner>/<repo>`, or adopts a clone already there. Then it runs the project's `setup` (in its own fresh clone only) and registers the clone as a **dsh workspace**, so it appears in the sidebar for chats.
 - **A scratch workspace.** dish also registers `~/work/scratch` once, for general chats: dsh's web UI starts every chat in a workspace, and `~/work` itself shouldn't be one.
 - **Worktrees.** Task worktrees live inside each clone, one branch each. The main agent makes them with a tool, and `delegate` binds a coder to one. They're removed automatically once their branch is merged.
 - **GitHub access.** A GitHub App. Agents' git gets read-only tokens, and only the harness will push (step 7).
@@ -24,7 +24,7 @@ You register repos as **projects**, and dish gets them ready to work on.
 | 7 | GitHub | A GitHub App, read-only in 6b (Contents, Pull requests and Metadata read; write comes in step 7, [below](#decided-after-the-checks)), installed on `bketelsen` (selected repos) and `frostyard`. Dev uses a separate dish-dev App, installed only on test repos. |
 | 8 | Where the App key lives | dsh's credential store, entered on a settings card (like the TypeSafe key). Dev has its own card and its own App. |
 | 9 | Who can push | Only the harness (step 7). Agents' git gets read-only tokens. |
-| 10 | `setup` | Runs as `dish` outside dsh's sandbox, like a CI job (the command is yours, from the registry), with a timeout and saved output, but only on code a human merged ([below](#decided-after-the-checks)). |
+| 10 | `setup` | Runs as `dish` outside dsh's sandbox, like a CI job (the command is yours, from the registry), with a timeout and saved output, but only on code a human merged, in dish's own fresh clone ([below](#decided-after-the-checks)). |
 | 11 | Cleanup | Automatic: a sweep on every fetch and hourly removes worktrees whose branch is merged, along with their local branches. GitHub's "automatically delete head branches" setting handles the remote branch. |
 | 12 | Plugins | Two: `dish-projects` (registry, page, onboarding) and `dish-workspaces` (clones, worktrees, credentials, the tool, the sweep). |
 | 13 | Projects page | List with clone status; add, edit and remove; retry a failed clone. A per-project worktree view may come with step 7. |
@@ -81,8 +81,8 @@ A project is onboarded when it appears in `projects.yaml`, at startup for each p
    - `user.name` and `user.email` set to the App's bot identity (`<app-slug>[bot]` and `<bot-id>+<app-slug>[bot]@users.noreply.github.com`);
    - `.worktrees/` added to `.git/info/exclude`.
 
-   This step runs again at every start for each ready project, so the helper's path follows the checkout and a changed key is put back.
-4. **Setup:** run `setup` in the clone, if there is one. It runs as `dish` with `setupTimeout`, outside dsh's sandbox, in the environment described under [Setup](#setup). The last 64 KB of its output is saved to `$XDG_STATE_HOME/dish/workspaces/<owner>/<repo>/setup.log`. A failed setup fails the project, and the page shows the tail. It runs only on code a human merged ([Decided after the checks](#decided-after-the-checks)).
+   This step runs again at every start for each ready project (with a fetch, and the workspace if it has none), so the helper's path follows the checkout and a changed key is put back.
+4. **Setup:** run `setup` in the clone, if there is one. It runs as `dish` with `setupTimeout`, outside dsh's sandbox, in the environment described under [Setup](#setup). The last 64 KB of its output is saved to `$XDG_STATE_HOME/dish/workspaces/<owner>/<repo>/setup.log`. A failed setup fails the project, and the page shows the tail. It runs only in a clone dish has just made: an adopted clone (adopting, or Retry) skips it, and the page gives the command to run ([Decided after the checks](#decided-after-the-checks)).
 5. **Register the workspace:** create it with `ctx.workspaceRegistry.create(<clone path>, "<owner>/<repo>")`. dsh reuses an existing record for the path and keeps its title. dish records that it registered the project's workspace, so one you remove stays removed until you press Retry. In a profile without a workspace registry (anything but `web`), the project is ready with no workspace, and is registered when a registry appears.
 
 A project is **ready** once all five succeed, and dish records that in its state directory: a ready project isn't onboarded again at the next start, only configured (step 3) and fetched. Onboarding runs one project at a time and never blocks dsh's start.
@@ -100,20 +100,21 @@ dsh's web UI has no chat without a workspace: every chat it creates names one, a
 ## Setup
 
 `setup` is your command from the registry, run by dish (not by an agent) like a CI job:
-- **Where:** the clone, or a new worktree, as its working directory. `bash -c <setup>`, with stdin closed.
-- **When:** only on merged code ([Decided after the checks](#decided-after-the-checks), 1), and never in a tree with a nested repository or a submodule: edits inside one are invisible to dish's `status`, so its contents count as unmerged. Setup is then skipped with the command to run instead.
-- **The environment:** dsh's own, with the scrub dsh gives every agent shell (no name containing `KEY`, `PASSWORD`, `SECRET` or `TOKEN`, and no `DSH_*` name), every `GIT_*` name removed, and `GIT_TERMINAL_PROMPT=0` added. Under the service that is the unit's `PATH` and the account's `HOME`; in dev it is `pnpm dev`'s environment, whose `DSH_*` names the scrub removes.
+- **Where:** dish's own fresh clone, at onboarding, as its working directory. `bash -c <setup>`, with stdin closed.
+- **When:** only there ([Decided after the checks](#decided-after-the-checks), 1): a fresh clone is GitHub's default branch, merged by a human, with no ignored files yet. An adopted clone (adopting, or Retry) and a new worktree skip it, and the page or the tool's answer gives the command to run instead. The main agent runs a worktree's setup itself, with dsh's escalation, which asks you.
+- **The environment:** dsh's own, with the scrub dsh gives every agent shell (no name containing `KEY`, `PASSWORD`, `SECRET` or `TOKEN`, and no `DSH_*` name), every `GIT_*` name and `SSH_ASKPASS` removed, and `GIT_TERMINAL_PROMPT=0` added. dish's git settings ([below](#dishs-own-git-commands)) are added as `GIT_CONFIG_COUNT` pairs, which git ranks with `-c`, and `GIT_GRAFT_FILE=/dev/null`, so the git that setup runs has hooks off too. Under the service that is the unit's `PATH` and the account's `HOME`; in dev it is `pnpm dev`'s environment, whose `DSH_*` names the scrub removes.
 - **Its own process group,** killed (TERM, then KILL after 5 seconds) when `setupTimeout` passes, when the project is removed, or when dish stops.
-- **The log:** its last 64 KB, with anything that looks like a credential masked (dish-kit's `maskSecrets`), in `setup.log` (onboarding) or `worktrees/<slug>.setup.log` (a worktree).
+- **The log:** its last 64 KB, with anything that looks like a credential masked (dish-kit's `maskSecrets`), in `setup.log`.
 
 ## dish's own git commands
 
 Agents in a project's workspace can write anything inside the clone, `.git` included, so dish never lets a clone's own files choose what dish's git runs:
-- every git command dish runs passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c fetch.recurseSubmodules=false -c submodule.recurse=false`, with no `GIT_*` name inherited and `GIT_TERMINAL_PROMPT=0`. Its `status` and `diff` also pass `--ignore-submodules=dirty`: a nested repository an agent makes inside the clone has its own config, which the clone check never sees, and git would otherwise run its filters (`status`, `diff`) or its `uploadpack` (`fetch`, through an agent's `.gitmodules`). Setup treats a tree with a nested repository as unmerged ([Setup](#setup));
-- before working in a clone, dish checks it: `.git` is a directory, its local config has only keys git never runs a program from (an allowlist: core basics, `remote.*` URLs and refspecs, `branch.*`, `user.*`, and the credential keys dish writes, with the values dish wrote), no `extensions.worktreeConfig`, and each worktree's administrative files point where git put them. A clone that fails is refused with the key or file named, and the page shows it; dish changes nothing in it;
+- every git command dish runs passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c fetch.recurseSubmodules=false -c submodule.recurse=false -c core.useReplaceRefs=false -c safe.bareRepository=explicit -c advice.graftFileDeprecated=false -c credential.interactive=false -c core.commitGraph=false` (`SAFE_FLAGS`), with `GIT_GRAFT_FILE=/dev/null`, no other `GIT_*` name inherited, and `GIT_TERMINAL_PROMPT=0`: no hooks, no fsmonitor, no submodule recursion, and no replace refs, grafts or commit-graph file, which an agent could plant to change what a commit or an ancestry check says. Its `status` and `diff` also pass `--ignore-submodules=dirty`, and dish's `git()` refuses one that doesn't: a nested repository an agent makes inside the clone has its own config, which the clone check never sees, and git would otherwise run its filters (`status`, `diff`) or its `uploadpack` (`fetch`, through an agent's `.gitmodules`);
+- before working in a clone, dish checks it: `.git` is a directory, its local config has only keys git never runs a program from (an allowlist: core basics and `core.hooksPath`, which dish's flags override, `remote.*` URLs and refspecs, `submodule.<name>.url` and `.active`, `branch.*` tracking keys, `user.*`, and the credential keys dish writes, with the values dish wrote), no `extensions.worktreeConfig`, and each worktree's administrative files point where git put them. A clone that fails is refused with the key or file named, and the page shows it; dish changes nothing in it;
+- dish writes a clone's `.git/config` without following a link: a private copy edited under dish's state directory, git's own `config.lock`, and a rename, after checking that `.git` and the file are still the ones it read;
 - a token is never in an argument, a URL, an environment variable or a config value: git gets it from the credential helper, which reads the token file.
 
-**A known limit:** the clone check and dish's next git command are two steps, and an agent can rewrite `.git/config` between them. The flags above can't be raced, but the allowlist can, so a determined agent racing dish could get a filter or driver run once by dish's git, outside the sandbox. It holds against mistakes and planted files, not against a race: the same footing as the App key (Decided after the checks, 2) and forged objects (Decided after the checks, 1). Closing it means running dish's working-tree commands (`status`, `diff`, `worktree add`) inside dsh's sandbox, which 6c's sandboxed runner makes possible.
+**A known limit** (with the others under [Known limits](#known-limits)): the clone check and dish's next git command are two steps, and an agent can rewrite `.git/config` between them. The flags above can't be raced, but the allowlist can, so a determined agent racing dish could get a filter or driver run once by dish's git, outside the sandbox. It holds against mistakes and planted files, not against a race: the same footing as the App key (Decided after the checks, 2) and forged objects (Decided after the checks, 1). Closing it means running dish's working-tree commands (`status`, `diff`, `worktree add`) inside dsh's sandbox, which 6c's sandboxed runner makes possible.
 
 ## Credentials
 
@@ -123,7 +124,7 @@ Agents in a project's workspace can write anything inside the clone, `.git` incl
   - The card shows the bot identity, the installations it can see, and a Test button.
   - The key is never shown again or logged, and dish-kit's secret guard masks it everywhere.
 - **Read tokens:** an installation token with `permissions: { contents: read, metadata: read }`, for the repos of that installation's projects (one token for all of them; GitHub takes up to 500 names). It's refreshed 10 minutes before its hour runs out, and written to `$XDG_STATE_HOME/dish/workspaces/tokens/<owner>` (mode 0600; an installation belongs to one owner, and the helper sees only the owner in the URL). The files are removed when dish stops, and rewritten at the next start.
-- **dish's own API reads** (pull request state for the sweep, the bot user) use a second installation token with `{ metadata: read, pull_requests: read }`, kept in memory only. The file token stays as narrow as above.
+- **dish's own API reads** (pull request state for the sweep) use a second installation token with `{ metadata: read, pull_requests: read }`, kept in memory only. The file token stays as narrow as above. The bot user (`GET /users/<slug>[bot]`) is public, and is read without a credential, so an installation that hasn't accepted Pull requests read still onboards.
 - **The credential helper:** each clone's helper is a small `sh` script shipped with `dish-workspaces`, configured in the clone as `credential.https://github.com.helper` (after an empty entry that drops any helper from your global config for that URL), with `useHttpPath=true` and two arguments: the token directory and `https://github.com`. The script's path and the token directory are absolute, and rewritten at every start. It answers git's `get` for `https://github.com` with `username=x-access-token` and the current read token for the URL's owner, says `quit=true` when it has none, and ignores `store` and `erase`. Agents' `fetch` and `pull` therefore work, and `push` fails (403).
 - **Write tokens:** made in memory by the harness for its own pushes, in step 7. They never touch disk.
 - **Exposure:** agents can read any file the `dish` account can, including the read-token file. That's accepted: it's read-only, lasts an hour, and covers only the projects' repos. They can also read dsh's credential file, which holds the App's private key, so the Apps are read-only in 6b ([Decided after the checks](#decided-after-the-checks)).
@@ -136,7 +137,7 @@ It's a global tool, like the config tools: it refuses any caller that isn't a to
 
 | Action | Input | What it does |
 |---|---|---|
-| `create` | `project`, `slug`, optional `base` | Refused unless the project is ready and the calling chat's workspace is that project's clone: crew's children work in the chat's sandbox, which is its workspace, so a coder of another chat couldn't write there. Fetches the clone. Makes `<clone>/.worktrees/<slug>` on a new branch `dish/<slug>` from `base`, which defaults to `origin/<default branch>`, and records it (its base commit included) in dish's state directory. Runs `setup` in it if its base is on `origin/<default>` ([Decided after the checks](#decided-after-the-checks)). Returns the absolute path, the branch, the base commit, and what setup did. Refuses a slug that's in use or isn't `[a-z0-9][a-z0-9-]*` (at most 40 characters). |
+| `create` | `project`, `slug`, optional `base` | Refused unless the project is ready and the calling chat's workspace is that project's clone: crew's children work in the chat's sandbox, which is its workspace, so a coder of another chat couldn't write there. Fetches the clone. Makes `<clone>/.worktrees/<slug>` on a new branch `dish/<slug>` from `base`, which defaults to `origin/<default branch>`, and records it (its base commit included) in dish's state directory. Doesn't run `setup` in it: the answer gives the command, which the main agent runs in the worktree with dsh's escalation ([Decided after the checks](#decided-after-the-checks)). Returns the absolute path, the branch, the base commit, and the setup command. Refuses a slug that's in use or isn't `[a-z0-9][a-z0-9-]*` (at most 40 characters). |
 | `list` | optional `project` | Each worktree: path, branch, ahead and behind the default branch, dirty or clean, merged or not, whether dish made it, and the crew child bound to it, if any. |
 | `remove` | `project`, `slug`, optional `force` | Removes a worktree dish made, and its local branch. Refuses one that's unmerged or dirty unless `force`. `force` is refused while a running coder is bound to it. Never touches a worktree dish didn't make. |
 
@@ -158,10 +159,10 @@ It's a global tool, like the config tools: it refuses any caller that isn't a to
 - **Which worktrees:** only those dish made (it has their record), on `dish/<slug>`. Anything else under `.worktrees/` (6c's `.worktrees/.cache`, a plan's ledger, a worktree you made by hand) is never touched.
 - **Merged means:**
   - the pull request that holds the branch's tip is merged: `GET /repos/{o}/{r}/commits/{tip}/pulls` lists a pull request with `merged_at` set whose `head.sha` is the tip. This covers squash merges, which leave no ancestry, and a branch that gained commits after its pull request merged is not merged (those commits would be lost). A tip GitHub doesn't have isn't merged;
-  - or the branch has commits of its own (its tip isn't the base commit `create` recorded) and its tip is an ancestor of `origin/<default>`. Without the first condition, a new worktree, whose tip is its base on `origin/<default>`, would count as merged and be swept (checked).
-- **What it removes:** the worktrees whose branch is merged (`git worktree remove`, never `--force`), their local branches (`git branch -D`, since a squash-merged branch isn't merged in git's terms) and their records.
+  - or the branch has commits of its own (its tip isn't the base commit `create` recorded) and its tip is an ancestor of the default branch as GitHub reports it (`git ls-remote`, right after the fetch; the clone's own `origin/*` refs, which agents can write, are never read for it). Without the first condition, a new worktree, whose tip is its base on `origin/<default>`, would count as merged and be swept (checked).
+- **What it removes:** the worktrees whose branch is merged (`git worktree remove` on the worktree's own path, never `--force` and never `git worktree prune`), their local branches (`git branch -D`, since a squash-merged branch isn't merged in git's terms, and only while the branch is still the tip found merged and checked out nowhere else) and their records.
 - **What it never removes:**
-  - a dirty worktree: modified or untracked files, ignored ones (such as `node_modules`) aside. It's listed as "merged but dirty", and left for you or the main agent;
+  - a dirty worktree: modified or untracked files, a gitlink, a nested repository or another worktree inside it, ignored files (such as `node_modules`) aside. It's listed as "merged but dirty", and left for you or the main agent;
   - one bound to a running coder;
   - one resolved for a `delegate` in the last 5 minutes, so a coder about to start doesn't lose its worktree.
 
@@ -194,10 +195,11 @@ interface DishWorkspaces {
   prepare(project: Project): Promise<void>                    // step 3 again, and the safety check, for a ready project at start
   describe(name: string): CloneInfo | undefined               // clone path, workspace, last fetch, for the page
   createWorktree(project: string, slug: string, base?: string, options?: { cwd?: string, signal?: AbortSignal }): Promise<CreatedWorktree>
-  listWorktrees(project?: string): Promise<Worktree[]>
+  listWorktrees(project?: string): Promise<WorktreeInfo[]>   // Worktree plus ahead, behind, dirty, merged, managed, bound
   removeWorktree(project: string, slug: string, force?: boolean): Promise<void>
   resolve(pathOrRef: string): Promise<Worktree | undefined>   // for delegate and gates: a worktree dish made, of a registered project
   sweep(project?: string): Promise<SweepResult>
+  appStatus(test: boolean): Promise<AppStatus>                // for Settings → GitHub App (added by the plan's Task 13)
 }
 interface Worktree {
   project: string            // owner/name, as in projects.yaml
@@ -206,7 +208,6 @@ interface Worktree {
   path: string               // <clone>/.worktrees/<slug>, absolute and canonical
   clone: string              // absolute and canonical
   base: string               // the commit it was cut from
-  // list() adds: ahead, behind, dirty, merged, managed, bound
 }
 ```
 
@@ -235,7 +236,7 @@ interface Worktree {
 - **Worktree tool:**
   - the slug grammar;
   - create from the default branch and from a given base;
-  - setup in the worktree;
+  - setup skipped in a worktree, with the command;
   - list fields;
   - remove refusals (unmerged, dirty, bound to a running coder).
 - **The sweep:** a squash-merged PR, an ancestry merge, a new worktree with no commits kept, a branch with commits after its PR merged kept, dirty kept, bound kept, a worktree dish didn't make kept, and local branch removal.
@@ -261,7 +262,7 @@ Two findings of the checks changed what decisions 7, 9 and 10 promise. You decid
    - Retry, or adopting a clone, runs it in a main checkout that agents in that workspace can change without asking.
 
    An agent that wanted out of the sandbox would only need to commit a `preinstall` script and ask for a worktree from its branch.
-   - **Decided:** run setup outside the sandbox only on code a human merged, in a checkout dish has just made: its own fresh clone, or a new worktree whose base is on `origin/<default>`. Adopting a clone and Retry don't run it (see Hardened, below). Anywhere else the step is skipped, and the page or the tool's answer says so and gives the command, for the agent to run in its own sandbox. 6c builds a sandboxed runner (dsh's shell service, caches inside the clone) for the gate, and can take over this case.
+   - **Decided:** run setup outside the sandbox only on code a human merged, in a checkout dish has just made. This first named dish's own fresh clone and a new worktree whose base is on `origin/<default>`; the two bullets after Hardened narrowed it to the fresh clone alone. Anywhere else the step is skipped, and the page or the tool's answer says so and gives the command, for the agent to run in its own sandbox. 6c builds a sandboxed runner (dsh's shell service, caches inside the clone) for the gate, and can take over this case.
    - **Hardened (2026-10-02, your option A, after Task 3a's review).** "On `origin/<default>`" means on the sha GitHub reports (`git ls-remote`, right after a fetch), never a local ref, which an agent can write; dish's git also ignores replace refs and grafts and fetches with a fixed refspec. What's left is a forged object: an agent can overwrite a stored git object under its real hash, and git doesn't re-check it when checking out, so a determined agent could get its content into an unsandboxed setup. That's a known limit, on the same footing as the App key (2) and the config race ([dish's own git commands](#dishs-own-git-commands)). 6c's sandboxed runner removes it, by letting setup run inside the sandbox.
    - **Fresh checkouts only (Task 6's review).** An existing checkout can't be trusted even when it's clean and merged: an agent can hide files from `status` (`.git/info/exclude`, a `.gitignore` that ignores itself) or change ignored ones (`node_modules/.bin/*`, a `.pnpmfile.cjs`), and `pnpm install` would run them. So setup runs outside the sandbox only in a checkout dish has just made, which has no ignored files yet; adopting a clone and Retry skip it and give the command. dish's git also ignores commit-graph files, which an agent can forge to fake ancestry.
    - **Worktrees skip setup (Task 6's review; you chose A, 2026-10-02).** A worktree lives inside the clone, and tools read config from parent directories (`pnpm-workspace.yaml` with a `.pnpmfile.cjs`, npm workspaces, `node_modules` resolution, `.cargo/config.toml`, `go.work`), which agents can write: a planted pnpmfile ran under `pnpm install` in a new worktree. So only onboarding's fresh clone runs setup outside the sandbox. `worktree create` skips it and gives the command, and the main agent runs it in the worktree with dsh's escalation, which asks you, before it delegates. You are the gate for each worktree's install; the branch's own install scripts run outside the sandbox when you approve. 6c's sandboxed runner (caches inside the clone) lets setup run sandboxed and removes both the approval and the exposure.
@@ -301,4 +302,75 @@ These replace the open items. Each was read from dsh 0.2.0-rc.2's code under `no
 - **The work root.** dish-kit gains `workRoot()`: `$DSH_DISH_HOME/work` when that is set and absolute, else `<home>/work`. The unit's `WorkingDirectory` is `%h/work` and `update.sh` makes it (6a). `pnpm dev` sets `DSH_DISH_HOME=<checkout>/.dev`, so dev's clones are under `<checkout>/.dev/work`, which `.gitignore` covers.
 - **Timers and load.** Nothing in either plugin's `apply` is awaited: the onboarding queue (one project at a time), the start-up preparation of ready projects, and the hourly round (fetch, then sweep, project by project) run in the background. Timers are `unref`'d and cleared by an effect when the plugin goes; a running setup is killed then too. Token refreshes are timers per owner, 10 minutes before expiry. A per-project lock keeps onboarding, fetches, `create`, `remove` and the sweep of one clone from overlapping.
 - **What 6c needs.** `dishWorkspaces.resolve`, `ChildRecord.worktree`, `gateEnv` in the registry's validation, and the brief block as one function 6c extends. The interfaces under [Services](#services) match [gates.md](gates.md)'s reads.
-- **The design doc** puts clones under `$XDG_DATA_HOME/dish/workspaces/`; decision 2 moved them to the work root. The plan updates `docs/design.md`.
+- **The design doc** put clones under `$XDG_DATA_HOME/dish/workspaces/`; decision 2 moved them to the work root, and the plan's last task updated `docs/design.md`.
+
+## Notes from the build
+
+Built on branch `projects` on 2026-10-02, in the plan's waves (Tasks 0 to 15), each task reviewed, most with a fix round. The plan records each task's interfaces as built. What differs from the spec above, or what the build added, by area:
+
+**dish's own git** (Tasks 3a and 3b, and their reviews)
+- **`SAFE_FLAGS`** grew from the four settings the spec first named to nine, as [dish's own git commands](#dishs-own-git-commands) now lists: `core.useReplaceRefs=false` (a planted `refs/replace/<sha>` made `rev-parse` and `worktree add <sha>` resolve to an agent's tree), `safe.bareRepository=explicit`, `credential.interactive=false`, `core.commitGraph=false` (a forged commit-graph fakes ancestry), and `advice.graftFileDeprecated=false`, which keeps git's hint from pushing the real `fatal:` line out of an error. `GIT_GRAFT_FILE=/dev/null` goes in git's environment, since no `-c` key turns grafts off (a planted `.git/info/grafts` turned an ancestry check from false to true). `childEnvironment` drops `SSH_ASKPASS` too.
+- **The submodule guard.** Task 3a's review found that a repository an agent makes inside the clone runs its own config's filters under `status` and `diff`, and its `uploadpack` under `fetch`. Besides the two submodule flags, `git()` refuses `status`, `diff`, `diff-index` and `diff-files` without `--ignore-submodules=dirty` (or `=all`).
+- **The allowlist** gained `core.hooksPath` (any value: a husky-style `prepare` writes it into the clone, and dish's git and setup's override it) and `submodule.<name>.url` and `.active` (`git submodule update --init` writes them). With the expected URL, `remote.origin.fetch` must be exactly `+refs/heads/*:refs/remotes/origin/*`. A refusal masks a password in a URL, even in a key's name. A worktree's directory is checked with `lstat`, after `path.resolve`, so a link swapped in or a trailing slash can't pass.
+- **Fetch** passes its refspec on the command line, so a refspec written into the config can't keep a hand-written `origin` ref alive, fetches `origin` by name only (never `--all`), and runs `git remote set-head origin --auto` every time, since an agent can repoint `origin/HEAD`.
+- **The credential keys are written again before the check** at each configure, so a helper path from an older checkout passes after an update.
+
+**Setup** (Task 6's review, and two decisions of yours)
+- **Option A (yours, 2026-10-02):** "on `origin/<default>`" means on the sha GitHub reports, from `git ls-remote --symref origin HEAD` right after a fetch, never a local ref. What's left, a forged object, is a known limit until 6c.
+- **Fresh checkouts only.** The plan's `{ checkout }` mode (a clean main checkout on `origin/<default>`) was dropped: an existing checkout's ignored files can't be trusted. Adopting a clone and Retry skip setup and give the command.
+- **Worktrees skip setup (yours, A, 2026-10-02).** A planted `.pnpmfile.cjs` in the clone ran under `pnpm install` in a new worktree, in the review's test. So only onboarding's fresh clone runs setup outside the sandbox, and the main agent runs a worktree's setup with dsh's escalation.
+- **`onMergedCode` isn't called in 6b.** A fresh clone is GitHub's default branch by construction, and nothing else runs setup. The check stays (`setup.ts`) for 6c or a sandboxed worktree setup, and its rule against gitlinks went: a commit can't hold a nested repository, and `git submodule update` fetches into a module directory git makes new.
+- **Setup's own git** gets `SAFE_FLAGS` as `GIT_CONFIG_COUNT` pairs and `GIT_GRAFT_FILE`: a hook planted in the clone's shared `.git/hooks` otherwise ran on a `git checkout` that setup made.
+
+**Clones and tokens** (Tasks 4 and 7a)
+- **`.git/config` is written by lock and rename.** git's own `git config --file` writes through a link, which an agent can put in place of the file or of `.git`. So dish edits a private copy under its state directory (`git config --file <copy>`, from `/`), takes git's `config.lock` (an agent's `git config` then fails, and dish tries once more while an agent's holds it), writes the new file beside the old, never through a link and checked through `/proc/self/fd`, then checks that `.git` and the old file are the ones it read and unchanged, renames, and syncs the directory. A crash leaves the old file whole. A second change meanwhile, a link, or another hard link (only when dish has something to write) is refused. The exclude file and adopt's switch of `origin` are written the same way.
+- **The owner directory** must be the work root's own: one that leads elsewhere through a link is refused before anything else.
+- **The bot identity** is `GET /app`'s slug and the bot's id from the public `GET /users/<slug>[bot]`, asked without a credential (`botUser(slug, token?)`), so an installation that hasn't accepted Pull requests read still onboards. It is looked up once per service life (GitHub allows 60 an hour per address without a credential), and again when either credential changes.
+- **Tokens:** redirects are never followed; a 403 with `retry-after` counts as rate-limited; a token GitHub granted more than read is refused and not used; a token is minted again when an owner's repos change; the token directory is made 0700 by the token manager itself; `prune` at start skips owners it already holds; `close` removes the files.
+- **The fake smart-HTTP server** answers 401 to any user but `x-access-token`, and the helper reads only the token file's first line.
+
+**The registry and the scratch workspace** (Tasks 2 and 7b)
+- **`tokens` is a reserved owner** besides `scratch`: `<state>/workspaces/tokens/<repo>` would collide with the token files.
+- Values are trimmed, NUL is refused, and an empty `gateEnv` is left out when written.
+- `registerWorkspace` returns dsh's canonical path, which dish records. The scratch workspace's log-once set belongs to the service, and goes with the plugin.
+
+**Worktrees and the sweep** (Task 8)
+- **Ancestry asks GitHub too:** the default branch's sha from `ls-remote`, once per sweep and once per `remove` without `force` (which fetches under the project's lock first). The clone's `origin/*` refs are never read for it. `isMerged` takes it as an `AncestryTarget`.
+- **Removal** is `git worktree remove` on the worktree's own path, never `git worktree prune`, which would also drop the entries of worktrees you made by hand. A worktree holding another worktree is never removed, even with `force`. A branch is deleted only while it is still the tip found merged and no other worktree has it checked out. A `create` that fails after `git worktree add` undoes it where git actually put it.
+- **Dirty** includes a gitlink, a nested repository, or another worktree inside it.
+
+**The services** (Tasks 9 and 10)
+- **`prepare` stays ready without a bot identity.** When GitHub can't give it at start, the clone keeps the identity it has, and the rest of step 3 is done.
+- **`registerIfMissing`:** a workspace registry that appears between onboarding's last step and dish-projects recording the project ready is caught on `dish-projects/status`. Every registration checks, inside the project's lock, that the project is still ready, so a removed project never gets a workspace.
+- `prepare` also fetches, then sweeps in the background. `close()` rejects work in flight with an `AbortError`, which dish-projects records as pending, never failed.
+- **Onboarding's queue:** a job aborted by a removal that hasn't settled after 30 seconds is logged and left behind; dish-workspaces going away leaves an onboarding pending and a prepare ready; Retry on a ready project onboards it again.
+- **A race the last task found.** A flaky test hid it: a job that found no dish-workspaces was still the running job while it saved "pending", and if dish-workspaces appeared then, the onboarding asked for was dropped as a duplicate, leaving the project pending until the next start. A job whose end is decided no longer counts as one.
+
+**The pages** (Tasks 11 to 13)
+- **`removeProject`, not `remove`.** `remove` is one of dish-kit's reserved remote method names: the browser's namespace service owns it, and the gateway can't mount a method with it.
+- **`hide`, not `close`.** The Projects controller's face calls it `hide`: the settings shell gives every section a `close` prop of its own (it closes Settings), and the shell's props win.
+- Settings → Projects polls only while it is shown, asks about a removal inline, and edits `setup` in a text area. The GitHub App's status leaves out the App's numeric ID, so no answer holds either credential, and its texts have the ID and the key's lines taken out as well as masked.
+
+**Crew** (Task 5): crew records the worktree's canonical (`realpath`'d) path, `worktreeBindings` canonicalises its argument, and a follow-up to a bound child is refused while another running child is bound to its worktree. crew's never-list has `worktree` ([crew spec](crew.md)).
+
+## Known limits
+
+Gathered from the sections above and the modules' own notes.
+- **Check, then act.** The clone check and dish's next git command are two steps, as are the last checks and the rename of `.git/config`: an agent racing dish could get a filter or driver run once by dish's git, outside the sandbox, or swap `.git` for a link in between. It holds against mistakes and planted files, not a race. Closing it means running dish's working-tree git inside the sandbox, which 6c's sandboxed runner makes possible.
+- **Forged objects.** An agent can overwrite a stored git object under its real hash, and git doesn't re-check it on checkout. Only dish's fresh clone runs setup unsandboxed, and that has no objects an agent wrote.
+- **The App's key is readable by agents,** in dsh's credential file. Hence read-only Apps in 6b ([Decided after the checks](#decided-after-the-checks), 2); step 7 adds write with a way to keep the key from agents.
+- **The read-token file is readable by agents.** It's read-only, lasts an hour, and covers only the projects' repos.
+- **A worktree's install needs you:** setup is skipped there, and the main agent's escalated run asks you. 6c's sandboxed runner can take it over.
+- **Setup's git protections reach the git binary only,** and only through its environment: a tool that builds its own environment or passes its own `-c` or `GIT_CONFIG_COUNT`, a tool that uses libgit2, and config outside `SAFE_FLAGS` in the shared `.git/config` (read for the whole run, vouched for only when the check ran) aren't covered. `safe.bareRepository=explicit` breaks a tool that runs git in a bare repository by its working directory.
+- **Setup's group kill** misses a process that calls `setsid` or daemonizes. An onboarding that still hasn't stopped 30 seconds after a removal is left behind; the project's lock keeps anything else out of its clone.
+- **A nested repository inside an ignored folder** (a clone under `node_modules/`) is an ignored file to git, so removing its worktree, by the sweep or `remove`, deletes it with its history and edits.
+- **The sweep's checks and its removal are two steps.** An agent writing in the worktree between them can lose what it writes, except what `git worktree remove`'s own clean check catches.
+- **`.worktrees` swapped for a link** between `create`'s check and `git worktree add` makes git put the worktree where the link points. `create` sees it afterwards, removes what git made there, and refuses.
+- **A coder is kept to its worktree by its brief,** not by the sandbox: it can write anywhere in the chat's workspace (crew's non-goal).
+- **After a crash:** a temporary clone directory (`.<repo>.cloning-<hex>`) and a `.git/config.lock` stay for you to remove (the project's message says so), and the token files stay until the next start prunes and rewrites them.
+- **Linux only** for writing a clone's config: the location checks read `/proc/self/fd`, and elsewhere dish configures no clone.
+- **GitHub's commit-to-pull-request listing** is relied on for squash merges. It is documented, and the rollout's checks include a squash merge.
+- **The gate's 10-minute cap** is dsh's cap on a shell run (6c).
+- **Comments in `projects.yaml`** don't survive a save from the page.
+- **A clone with an SSH alias origin** (`git@github-dish:…`, from 6a's deploy keys) isn't adopted: onboarding names it, and you move it aside.
+- **`registerWorkspace`'s `created`** may be said by both of two calls made at once for one new path (one record, one id). dish makes its registrations one at a time.

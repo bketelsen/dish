@@ -13,7 +13,7 @@
  *   project's expectations: its origin, its credential helper) or `-C <worktree>` after `checkWorktree` passes. A failed
  *   check refuses the operation with the finding. A `status` in a worktree takes no optional lock, so it never gets in
  *   the way of a coder's own git there.
- * - **Setup is not run in a worktree** (`worktreeSetup`): default A of a decision the user hasn't made yet.
+ * - **Setup is not run in a worktree** (`worktreeSetup`): the user chose A on 2026-10-02.
  * - **Removal touches one worktree:** `git worktree remove` on its own path (a missing directory included, for its
  *   administrative entry), never `git worktree prune`, which would also drop the entries of hand-made worktrees whose
  *   directories are gone (and leave their commits unreachable). A worktree holding another worktree is never removed,
@@ -149,12 +149,12 @@ export interface WorktreeState {
 /**
  * Setup in a new worktree: not run, with the command to run instead.
  *
- * This is default A of a decision the user hasn't made yet. A worktree sits inside the clone, and tools read config
+ * This is A, which the user chose on 2026-10-02. A worktree sits inside the clone, and tools read config
  * from parent directories (`pnpm-workspace.yaml`, `.pnpmfile.cjs`, `.npmrc`, a parent `package.json`'s workspaces,
  * `.cargo/config.toml`, `go.work`, …), which agents in the project's workspace can write: merged code in the worktree
  * could still run code an agent wrote, outside the sandbox (setup.ts's known limits). Only a fresh clone is free of it.
  *
- * If the user picks B instead, this becomes, right after `create`'s fetch: `checkClone(clone, deps.cloneExpectations(
+ * Option B (not chosen) would make this, right after `create`'s fetch: `checkClone(clone, deps.cloneExpectations(
  * project))`, then `onMergedCode(clone, { commit: base }, defaultBranch, signal)`, and when that's ok `runSetup({
  * command: project.setup, cwd: path, timeoutMs: project.setupTimeoutMs, log: worktreeSetupLogFile(…), signal })`;
  * else `skipReason(check.reason, path, command)`.

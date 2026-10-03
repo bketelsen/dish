@@ -28,12 +28,13 @@ Status: draft, from the brainstorm on 2026-09-30. It records what we decided and
 
 | Kind | Default | Holds | Versioned |
 |---|---|---|---|
-| Config | `$XDG_CONFIG_HOME/dish/` | `crew.yaml` (roles, model tiers, tools), `prompts/<role>.md`, `skills/<name>/SKILL.md`, `families/<family>/` (direction, repos and gates, approved initiatives) | git repo; every UI save is a commit; history, diff and revert in the UI |
-| Data | `$XDG_DATA_HOME/dish/` | `vault/` (memory, its own git repo pushed to a private GitHub repo), `ledgers/` (until `orchestrator` (step 7) owns the ledger, the shipped skills keep a plan's ledger at `.worktrees/<plan>-ledger.md` in the repo, git-ignored), initiative status, `workspaces/<org>/<repo>` clones and their worktrees | the vault via git; ledgers append-only |
-| State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs | no |
+| Config | `$XDG_CONFIG_HOME/dish/` | `crew.yaml` (roles, model tiers, tools), `prompts/<role>.md`, `skills/<name>/SKILL.md`, `projects.yaml` (the repo registry: family, role, gate, setup), `families/<family>/` (direction, approved initiatives) | git repo; every UI save is a commit; history, diff and revert in the UI |
+| Data | `$XDG_DATA_HOME/dish/` | `vault/` (memory, its own git repo pushed to a private GitHub repo), `ledgers/` (until `orchestrator` (step 7) owns the ledger, the shipped skills keep a plan's ledger at `.worktrees/<plan>-ledger.md` in the repo, git-ignored), initiative status, crew's records | the vault via git; ledgers append-only |
+| Work | the work root: `~/work` (the service's working directory) | the projects' clones, `<owner>/<repo>`, each with its task worktrees in `.worktrees/<slug>`, and the `scratch` workspace for general chats. Not under `$XDG_DATA_HOME`: these are dsh workspaces, where agents write | each clone is its repo's git |
+| State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs; the projects' onboarding status, each clone's and worktree's record, setup logs, and the read-token files (`workspaces/`) | no |
 | Cache | `$XDG_CACHE_HOME/dish/` | Copilot model catalog cache (currently in `~/.dsh`; it will move), fetched pages | no |
 
-One instance's dish directories move together: when `DSH_DISH_HOME` is set to an absolute path, dish-kit's `xdgPaths` puts all four at `$DSH_DISH_HOME/{config,state,data,cache}/dish`, ahead of the XDG variables. Dev, the default for everything but the VM's service, sets it to `<checkout>/.dev`; prod uses the defaults above. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands. See the [ops spec](specs/ops.md).
+One instance's dish directories move together: when `DSH_DISH_HOME` is set to an absolute path, dish-kit's `xdgPaths` puts all four at `$DSH_DISH_HOME/{config,state,data,cache}/dish`, ahead of the XDG variables, and `workRoot()` puts the work root at `$DSH_DISH_HOME/work`. Dev, the default for everything but the VM's service, sets it to `<checkout>/.dev`; prod uses the defaults above. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands. See the [ops spec](specs/ops.md).
 
 dsh keeps its own home, `~/.dsh` (dev's is `<checkout>/.dev/dsh`), for sessions, profiles and credentials. dish doesn't write there except through dsh services.
 
@@ -129,8 +130,8 @@ Each is its own bundle. "Provides" names its Cordis service; plugins depend only
 | `prompts` | `dishPrompts` | `dishConfig` | role prompts plus the editor page (edit, history, diff, revert) |
 | `skills` | `dishSkills` | `dishConfig` (optional); reads `dishCrew` and `agentPresets` when present | dish's own skills (the pipeline's brainstorm, plan, test-first and review procedures, and others), stored and versioned in the config store; offering each agent its role's skills through dsh's skill registry; Settings → Skills. See the [skills spec](specs/skills.md) |
 | `crew` | `crew` | `prompts`, `dishConfig` | roles, model tiers, the model-family rule, giving each delegated child its role's identity and tools, the `delegate` tool. On dsh-subagent, not dsh's agent teams: see [the research note](research/2026-10-01-dsh-agent-team.md) |
-| `projects` | `projects` | `dishConfig` | the repo registry: family, role, clone path, gate command |
-| `workspaces` | `workspaces` | `projects` | clones on the VM, one worktree per task, cleanup |
+| `projects` | `dishProjects` | `dishConfig` (optional); drives `dishWorkspaces`, read with `ctx.get` | the repo registry `projects.yaml` (family, role, gate and its timeout and environment, setup), each project's onboarding status and the queue that drives it, Settings → Projects. See the [projects and workspaces spec](specs/projects-workspaces.md) |
+| `workspaces` | `dishWorkspaces` | nothing at load; reads `dishProjects`, `dishCrew` and `credentials` with `ctx.get`, waits for `workspaceRegistry` and `tools` | clones in the work root, the GitHub App (read tokens and the credential helper), setup on its own fresh clone, workspace registration and the scratch workspace, task worktrees with the `worktree` tool, the sweep of merged ones, Settings → GitHub App |
 | `gates` | — | `projects` | gate execution at turn-stop, retry rounds |
 | `orchestrator` | — | `crew`, `skills`, `workspaces`, `families` | the main-agent preset and the pipeline as prompts, skills and ledger tools |
 | `families` | `families` | `dishConfig`, `projects` | direction, initiatives, ledger, the Families page |
