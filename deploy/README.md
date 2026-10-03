@@ -99,7 +99,7 @@ incus exec minideb:dish --project dish -- su - dish -c 'cd ~/dish && env -i HOME
 
 Then roll back with `dish-update --apply <ref>`. The clones under `~/work` and dish's records stay, and a later update to a commit with the two plugins links them again. Until then, the clones' credential helper (`~/dish/plugins/workspaces/bin/git-credential-dish`) is gone, so agents' git can't fetch a private repo in them.
 
-`minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`. The scripts' own hints, such as `run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)`, give that form for Minideb itself; from the desktop, add the `minideb:` remote.
+`minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh <you>@<minideb-host> incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`. The scripts' own hints, such as `run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)`, give that form for Minideb itself; from the desktop, add the `minideb:` remote.
 
 ### Who runs it
 
@@ -183,7 +183,7 @@ Done on 2026-10-02. Until 6a, fleet's guest play updated the checkout, ran `inst
    ```sh
    incus exec minideb:dish --project dish -- su - dish -c 'test -z "$(git -C ~/dish status --porcelain)" && git -C ~/dish pull --ff-only origin main'
    # or, through Minideb:
-   ssh bjk@10.0.1.175 "incus exec dish --project dish -- su - dish -c 'test -z \"\$(git -C ~/dish status --porcelain)\" && git -C ~/dish pull --ff-only origin main'"
+   ssh <you>@<minideb-host> "incus exec dish --project dish -- su - dish -c 'test -z \"\$(git -C ~/dish status --porcelain)\" && git -C ~/dish pull --ff-only origin main'"
    ```
 
    The single quotes keep `$(…)` and `~` for `dish`'s shell to expand. If it prints nothing and fails, run `git -C ~/dish status` as `dish` (`incus exec minideb:dish --project dish -- su - dish -c 'git -C ~/dish status'`), clear what it lists, and run it again. Missed, the failure is harmless: step 4 then stops at once with `env: '/home/dish/dish/deploy/update.sh': No such file or directory` (exit 127), and nothing changes.
@@ -217,7 +217,7 @@ dsh makes a new random access token each time it starts, and prints the URL with
 incus exec minideb:dish --project dish -- dish-url
 ```
 
-Through Minideb, it's `ssh bjk@10.0.1.175 incus exec dish --project dish -- dish-url`.
+Through Minideb, it's `ssh <you>@<minideb-host> incus exec dish --project dish -- dish-url`.
 
 - **What it prints.** Exactly one line on stdout, `https://<DISH_TRUSTED_HOST>/?token=<token>`, and nothing else. The host comes from `deploy.env`. The token comes from the last `dsh web:` line in the service's journal since its current start, which `systemctl --user show` gives.
 - **When it can't,** it says why on stderr, never with the token, and exits 1: the service isn't running (`url: dish-web.service isn't running; start it with dish-update --apply`), dsh hasn't printed its sign-in line since it started (`url: dsh hasn't printed its sign-in line since it started at <time>; try again in a few seconds`), or `deploy.env` is missing or unusable.
@@ -240,8 +240,8 @@ It allows no request that was refused before: anyone who passes the Host check w
 If Settings → Models still says "settings are unavailable in this browser" on the tailnet name, or Work details doesn't survive a reload, `dish-web` isn't marking the page. It is turned off (`enabled: false` on its row of the profile), its `hosts` list leaves the tailnet name out, or a dsh upgrade changed what it relies on (its pin test is there to catch that first). Until that's fixed, open a tunnel from your desktop to the VM's `127.0.0.1:3080`, through Minideb, as fleet's `docs/dish.md` reaches the guest:
 
 ```sh
-ssh -i ~/.ssh/semaphore-fleet-hosts \
-  -o ProxyCommand="ssh -i ~/.ssh/semaphore-fleet-hosts -W %h:%p bjk@10.0.1.175" \
+ssh -i ~/.ssh/<fleet-host-key> \
+  -o ProxyCommand="ssh -i ~/.ssh/<fleet-host-key> -W %h:%p <you>@<minideb-host>" \
   -N -L 127.0.0.1:3081:127.0.0.1:3080 fleet@<the guest's address>
 ```
 
@@ -293,8 +293,8 @@ dish has two configurations. Only the VM's service is prod; everything else is d
 - **Dev on the VM** listens on the VM's loopback, like the service. Reach it with a tunnel to `127.0.0.1:3090`, the same way as the [fallback tunnel](#fallback-a-tunnel), then open the link `pnpm dev` printed:
 
   ```sh
-  ssh -i ~/.ssh/semaphore-fleet-hosts \
-    -o ProxyCommand="ssh -i ~/.ssh/semaphore-fleet-hosts -W %h:%p bjk@10.0.1.175" \
+  ssh -i ~/.ssh/<fleet-host-key> \
+    -o ProxyCommand="ssh -i ~/.ssh/<fleet-host-key> -W %h:%p <you>@<minideb-host>" \
     -N -L 127.0.0.1:3090:127.0.0.1:3090 fleet@<the guest's address>
   ```
 

@@ -9,8 +9,8 @@ import * as plugin from '../src/index.ts'
 
 test('trustedPageHosts keeps DNS names and drops IPv4, IPv6 and bracketed IPv6 entries', () => {
   assert.deepEqual(
-    plugin.trustedPageHosts(['10.0.1.175', '192.168.0.2:3080', '::1', 'fe80::1', '[::1]', '[fe80::1]:3080', 'dish.goat-snake.ts.net'], []),
-    ['dish.goat-snake.ts.net'],
+    plugin.trustedPageHosts(['10.0.0.5', '192.168.0.2:3080', '::1', 'fe80::1', '[::1]', '[fe80::1]:3080', 'dish.example-tailnet.ts.net'], []),
+    ['dish.example-tailnet.ts.net'],
   )
 })
 
@@ -34,7 +34,7 @@ test('trustedPageHosts: with an override, the override is the list, and the deri
 })
 
 test('trustedPageHosts: an override entry that is not a bare DNS name is a clear error, naming the entry', () => {
-  for (const bad of ['10.0.1.175', '::1', '[::1]', 'a.example:3080', 'https://a.example', 'a b', '', 'a..example', '*.example', 'a.example/x', '1.2.3']) {
+  for (const bad of ['10.0.0.5', '::1', '[::1]', 'a.example:3080', 'https://a.example', 'a b', '', 'a..example', '*.example', 'a.example/x', '1.2.3']) {
     assert.throws(() => plugin.trustedPageHosts(['derived.example'], ['ok.example', bad]), (error: Error) => {
       assert.match(error.message, /dish-web: hosts entry /)
       assert.ok(error.message.includes(JSON.stringify(bad)), `${error.message} names ${JSON.stringify(bad)}`)
@@ -80,7 +80,7 @@ test('flipScript folds the page hostname to lower case', () => {
 })
 
 test('flipScript leaves an unlisted host alone', () => {
-  for (const hostname of ['evil.example', '127.0.0.1', 'localhost', 'dish.ts.net.evil.example', 'xdish.ts.net', '10.0.1.175', '']) {
+  for (const hostname of ['evil.example', '127.0.0.1', 'localhost', 'dish.ts.net.evil.example', 'xdish.ts.net', '10.0.0.5', '']) {
     const page = runOn(plugin.flipScript(['dish.ts.net']), hostname)
     assert.equal('__DSH_TRANSPORT__' in page, false, JSON.stringify(hostname))
   }
@@ -146,7 +146,7 @@ function mount(ctx: Context, config: Partial<plugin.Config> = {}) {
 
 test('with a webRuntime, the plugin adds exactly one script row to the head, for the non-IP trusted hosts', async () => {
   const ctx = new Context()
-  await provideStub(ctx, 'webRuntime', webRuntime(['10.0.1.175', 'Dish.TS.net:443', 'dish.ts.net']))
+  await provideStub(ctx, 'webRuntime', webRuntime(['10.0.0.5', 'Dish.TS.net:443', 'dish.ts.net']))
   await mount(ctx)
   const rows = collect(ctx)
   assert.equal(rows.length, 1)
@@ -202,7 +202,7 @@ test('with enabled: false, nothing is added', async () => {
 })
 
 test('with no non-IP trusted host, and none configured, nothing is added', async () => {
-  for (const trusted of [[], ['10.0.1.175'], ['[::1]:3080'], ['10.0.1.175', '192.168.1.9']]) {
+  for (const trusted of [[], ['10.0.0.5'], ['[::1]:3080'], ['10.0.0.5', '192.168.1.9']]) {
     const ctx = new Context()
     await provideStub(ctx, 'webRuntime', webRuntime(trusted))
     await mount(ctx)
@@ -223,7 +223,7 @@ test('hosts replaces the derived list, and can supply one when there is none', a
 })
 
 test('a hosts entry that is an IP or has a port fails the plugin to load, and adds nothing', async () => {
-  for (const bad of ['10.0.1.175', 'dish.ts.net:3080']) {
+  for (const bad of ['10.0.0.5', 'dish.ts.net:3080']) {
     const ctx = new Context()
     await provideStub(ctx, 'webRuntime', webRuntime(['dish.ts.net']))
     const handle = mount(ctx, { hosts: [bad] })

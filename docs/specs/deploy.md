@@ -40,7 +40,7 @@ dish moves from your desktop to a dedicated VM on Minideb, reachable only on you
 
 ## The VM (fleet)
 
-Ownership follows the nsl builder's split ([fleet's nsl builder doc](../../../fleet/docs/nsl-builder.md)):
+Ownership follows the nsl builder's split (fleet's `docs/nsl-builder.md`, in the private `bketelsen/fleet`):
 
 | Owner | What it configures |
 |---|---|
@@ -146,7 +146,7 @@ Once the VM is up and its first fleet run has passed, in this order:
 
 ## Notes from the rollout
 
-dish runs on Minideb as of 2026-10-01, at `https://dish.goat-snake.ts.net`. What the rollout taught, beyond what the sections above say:
+dish runs on Minideb as of 2026-10-01, at `https://dish.<tailnet>.ts.net`. What the rollout taught, beyond what the sections above say:
 - **Host settings need a loopback page.** dsh lets a browser change host settings (models, provider sign-ins, presets) only from `localhost` or `127.x`, as judged by the address in the browser. Through the tailnet name, chats, Prompts, History and the Judge thresholds work, but Settings → Models fails with "settings are unavailable in this browser". The fix is an SSH tunnel to the VM's `127.0.0.1:3080`; see `deploy/README.md`.
 - **The first Copilot sign-in goes through the terminal.** On a fresh profile there is no `github-copilot` route, so no provider card to carry dish-copilot's sign-in. dish-copilot's `terminalSignIn` starts the device flow at startup and logs the code; after approval the plugin adds the route. A follow-up could let the card appear without a route.
 - **The `dish` project blocks VM nesting, and Incus then wants `security.nesting=false` set explicitly** on the VM; an unset value is refused at creation (fleet PR #36).

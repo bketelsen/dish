@@ -51,8 +51,8 @@ A change to `deploy/update.sh` itself takes two applies: the first one runs the 
 ```bash
 cd ~/projects/fleet && git pull --ff-only
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt   # once; see fleet's README
-.venv/bin/ansible-playbook ansible/playbooks/minideb-dish-guest.yml --private-key ~/.ssh/semaphore-fleet-hosts -e fleet_dish_approved=true --check --diff   # preview
-.venv/bin/ansible-playbook ansible/playbooks/minideb-dish-guest.yml --private-key ~/.ssh/semaphore-fleet-hosts -e fleet_dish_approved=true             # apply
+.venv/bin/ansible-playbook ansible/playbooks/minideb-dish-guest.yml --private-key ~/.ssh/<fleet-host-key> -e fleet_dish_approved=true --check --diff   # preview
+.venv/bin/ansible-playbook ansible/playbooks/minideb-dish-guest.yml --private-key ~/.ssh/<fleet-host-key> -e fleet_dish_approved=true             # apply
 ```
 A rerun right after an apply should report `changed=0`.
 
@@ -85,17 +85,13 @@ Sessions are `session.v4.jsonl.zstd` under the workspace's directory, and a crew
 1. **6c `gates`** ([spec](docs/specs/gates.md), approved 2026-10-02): plan, then build. The spec predates sandbox-home, #10 and #11, so check it against them first. For example, a gate that installs things now runs in the sandbox.
 2. **6b's last check:** the squash-merge sweep check in the [plan's rollout](docs/plans/2026-10-02-projects.md#the-rollout-for-you), step 8.
 3. **The prod App decision** (above).
-4. **Prompt texts that sandbox-home and #11 made slightly stale.** They're small, but each change needs `previous.json` regenerated:
-   - `plugins/prompts/defaults/main.md:14`: "each command you run may wait for the user's approval" no longer holds for read-only checks.
-   - `main.md:15`: the judge reads a child's brief to decide whether its commands serve its task. That now applies only to commands that may write.
-   - `main.md:18`: the hand-off for installs a child couldn't run now applies to far fewer installs, mostly `sudo` and protected paths.
-   - `common.md:22`: "Node, pnpm, Go and Python are preinstalled" holds only on dish's VM.
-   - `README.md:19` says Settings → GitHub App takes dev's own App, which waits on the prod App decision.
-5. **[ROADMAP.md](ROADMAP.md)'s backlog.** The items that matter most in daily use:
+4. **`README.md:19`** says Settings → GitHub App takes dev's own App, which waits on the prod App decision.
+5. **Going public.** An audit on 2026-10-03 found no real secret anywhere in the history. Before flipping the repo to public, run, with direnv loaded, `git log --all --format=%h -S"${TYPESAFE_API_KEY:8:16}"`: no output means the key was never committed. The two `apikey_…` values in `packages/dish-kit/test/secrets.test.ts` should be the fakes their comment says they are. Also: delete the merged branches, turn off the wiki if unused, and skim the PR descriptions. Links to `bketelsen/fleet` go to a private repository.
+6. **[ROADMAP.md](ROADMAP.md)'s backlog.** The items that matter most in daily use:
    - crew's own `send_message`, so children stop sending a "done" message before their report;
    - Chromium and `libxml2-utils` on the VM;
    - dev-server previews.
-6. **dsh issues worth filing upstream**, seen in sessions:
+7. **dsh issues worth filing upstream**, seen in sessions:
    - `{{model}}` shows the preset's model, not the session's;
    - the child "send your result" note can't be turned off;
    - a provider without a key fails the first turn and the title;
