@@ -122,7 +122,7 @@ screening:
   chunkChars: 24000        # longer content is screened in chunks, in one call
 tools:
   gated: [bash, pwsh]
-  screened: [web_search, web_fetch, read_mcp_resource, "mcp__*"]
+  screened: [web_search, web_fetch, read_mcp_resource, "mcp__*", pr_feedback]
 ```
 
 **Validation:**

@@ -308,6 +308,11 @@ test('tools.screened entries are exact names, or a prefix ending in *', () => {
   assert.equal(isScreened('a*b', ['a*b']), true, 'a star that is not at the end is a character like any other')
 })
 
+test('the shipped default screens pr_feedback, whose answer is what people and checks wrote on GitHub', () => {
+  assert.equal(isScreened('pr_feedback', DEFAULT_SETTINGS.tools.screened), true)
+  assert.equal(DEFAULT_SETTINGS.tools.screened.at(-1), 'pr_feedback')
+})
+
 // --- the text the judge reads --------------------------------------------------------------------------
 
 test('the text of a result is its text blocks, joined; other blocks are left out', () => {

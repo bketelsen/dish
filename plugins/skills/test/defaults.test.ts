@@ -109,9 +109,13 @@ const sha256 = (text: string): string => createHash('sha256').update(text).diges
 /** The skills whose shipped text moved to the `worktree` tool (docs/specs/projects-workspaces.md, "The shipped skills"). */
 const WORKTREE_SKILLS = ['finishing-a-development-branch', 'subagent-driven-development', 'using-git-worktrees']
 
-test('PREVIOUS lists the earlier texts of exactly the three skills that moved to the worktree tool', () => {
-  assert.deepEqual(Object.keys(PREVIOUS).sort(), WORKTREE_SKILLS.map(pathFor).sort())
-  for (const name of WORKTREE_SKILLS) {
+/** The other skills whose shipped text changed in step 7, for runs, `report` and `open_pr` (docs/specs/orchestrator.md, "Prompts and skills"). */
+const STEP7_SKILLS = ['executing-plans', 'requesting-code-review', 'reviewing-work', 'test-driven-development', 'verification-before-completion', 'receiving-code-review', 'systematic-debugging', 'changing-infrastructure']
+
+test('PREVIOUS lists the earlier texts of exactly the skills whose shipped text changed', () => {
+  const changed = [...WORKTREE_SKILLS, ...STEP7_SKILLS]
+  assert.deepEqual(Object.keys(PREVIOUS).sort(), changed.map(pathFor).sort())
+  for (const name of changed) {
     const hashes = PREVIOUS[pathFor(name)]!
     assert.ok(hashes.length > 0, name)
     // The shipped text is never its own predecessor, or an unedited copy would be "upgraded" to itself forever.
@@ -156,7 +160,7 @@ test('the worktree skills use the worktree tool in a registered project and keep
   assert.match(finishing, /`force` it only when the user says to discard it/)
   assert.match(finishing, /through a coder in a new worktree from the plan branch, bound with `delegate`'s `worktree`/)
   // Agents' git is read-only in a registered project: no push, no hunting for other credentials.
-  assert.match(finishing, /in a registered project \(.*\), don't push\. Agents' git there is read-only/)
+  assert.match(finishing, /In a registered project \(.*\), never `git push` or `gh pr create`: agents' git there is read-only by design, and only `open_pr` pushes/)
   // One checkable test for "a registered project" (every top-level agent has the worktree tool whenever dish-workspaces is loaded).
   for (const text of [using, driven, finishing]) {
     assert.match(text, /your chat's workspace is a clone dish set up: `git config --get-regexp '\^credential\\\..\*\\\.helper\$'` names `git-credential-dish`/)
@@ -166,6 +170,93 @@ test('the worktree skills use the worktree tool in a registered project and keep
   assert.match(finishing, /never look for other credentials/)
   // Git's own remove stays for a worktree dish didn't make, never forced.
   assert.match(finishing, /plain git.*`git worktree remove`, never `--force`/s)
+})
+
+/** The section of `text` under the heading line `heading`, up to the next heading of the same level or above. */
+function section(text: string, heading: string): string {
+  const lines = text.split('\n')
+  const start = lines.indexOf(heading)
+  assert.ok(start >= 0, `no "${heading}" section`)
+  const level = /^#+/.exec(heading)![0].length
+  const end = lines.findIndex((line, index) => index > start && /^#+ /.test(line) && /^#+/.exec(line)![0].length <= level)
+  return lines.slice(start + 1, end < 0 ? undefined : end).join('\n')
+}
+
+/** The sentences of `text`: split at line breaks, and after a `.`, `!` or `?` that ends one. */
+function sentences(text: string): string[] {
+  return text.split(/\n+|(?<=[.!?])\s+/).filter(sentence => sentence.trim() !== '')
+}
+
+/** How many times `pattern` (global) matches `text`. */
+function count(text: string, pattern: RegExp): number {
+  return [...text.matchAll(pattern)].length
+}
+
+test('the pipeline skills use the run, report and open_pr (step 7)', () => {
+  const driven = DEFAULTS['subagent-driven-development']!
+  for (const pattern of [/`run` with action `open`/, /action `status`/, /`final: true`/, /`delegate`'s `ruling`/, /`report`/, /`notFixed`/, /review feedback/]) {
+    assert.match(driven, pattern)
+  }
+
+  // Outside a registered project there is no run: the ledger file is kept there, and only there.
+  const executing = DEFAULTS['executing-plans']!
+  const file = '.worktrees/<plan file name>-ledger.md'
+  const lines = driven.split('\n').filter(line => line.includes(file))
+  assert.equal(lines.length, 1, 'driven names the ledger file on one line')
+  assert.match(lines[0]!, /^\s*- \*\*Elsewhere\*\*/, 'the ledger file is the Elsewhere line\'s')
+  assert.equal(count(driven, new RegExp(file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')), 1)
+  assert.doesNotMatch(driven.split('\n').filter(line => !line.includes(file)).join('\n'), /ledger\.md/)
+  assert.doesNotMatch(executing, /ledger\.md/)
+
+  const finishing = DEFAULTS['finishing-a-development-branch']!
+  for (const pattern of [/`open_pr`/, /`gateRuling` or `reviewRuling`/, /never look for other credentials/]) assert.match(finishing, pattern)
+  const feedback = section(finishing, '## Review feedback on the pull request')
+  for (const pattern of [/`pr_feedback`/, /action `resume` with its id/, /`origin\/dish\/<slug>`/, /Never rebase, amend or squash/, /`reviewRuling`/]) {
+    assert.match(feedback, pattern)
+  }
+  assert.doesNotMatch(finishing, /push the branch/i)
+  assert.doesNotMatch(finishing, /a new run, with `base`/)
+
+  const using = DEFAULTS['using-git-worktrees']!
+  assert.match(using, /`run` action `open`/)
+  assert.match(using, /`run` action `goal`/)
+
+  const requesting = DEFAULTS['requesting-code-review']!
+  for (const pattern of [/`final: true`/, /`report`/, /`should_fix`/]) assert.match(requesting, pattern)
+  assert.doesNotMatch(requesting, /ADDRESSED/)
+
+  const reviewing = DEFAULTS['reviewing-work']!
+  for (const pattern of [/Finish by calling `report`/, /`verdict`/, /`head`/, /`addressed`/]) assert.match(reviewing, pattern)
+  assert.doesNotMatch(reviewing, /ADDRESSED/)
+})
+
+test('the coder\'s skills leave the gate to dish when the brief says so', () => {
+  for (const name of ['test-driven-development', 'verification-before-completion', 'receiving-code-review', 'systematic-debugging']) {
+    assert.match(DEFAULTS[name]!, /dish runs it when you `report` `done`/, name)
+  }
+})
+
+test('no shipped skill tells an agent to push', () => {
+  const having: string[] = []
+  for (const [name, text] of Object.entries(DEFAULTS)) {
+    const never = count(text, /never `git push` or `gh pr create`/g)
+    assert.equal(count(text, /`git push`/g), never, `${name} names \`git push\` outside "never \`git push\` or \`gh pr create\`"`)
+    assert.equal(count(text, /gh pr create/g), never, `${name} names gh pr create outside "never \`git push\` or \`gh pr create\`"`)
+    if (never > 0) having.push(name)
+  }
+  assert.deepEqual(having, ['finishing-a-development-branch'])
+  assert.equal(count(DEFAULTS['finishing-a-development-branch']!, /never `git push` or `gh pr create`/g), 1)
+})
+
+test('no shipped skill tells an agent to rebase: each rebase, amend or squash is in a sentence that says never', () => {
+  // The prompts' side is plugins/prompts/test/pipeline-texts.test.ts: common.md and main.md say it too.
+  const having: string[] = []
+  for (const [name, text] of Object.entries(DEFAULTS)) {
+    const found = sentences(text).filter(sentence => /\b(rebase|amend|squash)/i.test(sentence))
+    for (const sentence of found) assert.match(sentence, /never/i, `${name}: ${sentence}`)
+    if (found.length > 0) having.push(name)
+  }
+  assert.deepEqual(having, ['finishing-a-development-branch'])
 })
 
 test('replaceMap keeps the earlier hashes of the shipped paths and drops the rest', () => {

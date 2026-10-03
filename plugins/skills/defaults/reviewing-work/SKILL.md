@@ -23,15 +23,15 @@ A task's commits (`BASE..HEAD`) against its task in the plan; a whole branch aga
    - extra: not asked for;
    - wrong: asked for, built another way.
 5. Second verdict, quality: edge cases and errors, tests that would fail if the behavior broke (not tests of mocks), the repo's conventions, docs that no longer match.
-6. Write each finding with its severity (blocking, should fix, or nit), the file and line, a concrete failure (the inputs or state, then the wrong result), and the fix. If you can't name a failure, it's a nit or nothing.
-7. Rank the findings, most severe first. When there are none, say "No findings."
+6. Write each finding with its severity (`blocking`, `should_fix` or `nit`), the file and line, a concrete failure (the inputs or state, then the wrong result), and the fix. If you can't name a failure, it's a nit or nothing.
+7. Rank the findings, most severe first. When there are none, `findings` is empty and your summary says so.
 
 ## Re-review mode
 
 Your scope is the earlier findings (yours, or the ones the brief lists) and the fix diff, from the head that was reviewed to the new one. Run the gate again.
-- Mark each finding ADDRESSED or NOT ADDRESSED, with a file and line. An attempt isn't ADDRESSED: the failure must be gone.
+- Mark each finding in `addressed`: whether it is addressed, with the evidence (a file and line). An attempt isn't addressed: the failure must be gone.
 - Flag anything the fix broke, with a severity.
-- List anything outside the fix diff under "Out of scope". It doesn't block.
+- Name anything outside the fix diff as out of scope in your summary. It doesn't block.
 
 ## Specs, plans and documents
 
@@ -45,4 +45,4 @@ The same steps, without the diff. A spec: every decision has a reason, and nothi
 
 ## Hand back
 
-The spec-compliance verdict, the quality verdict, the overall verdict (approve, or changes needed), the findings ranked, and the gate command with its exit code and summary line. No preamble.
+Finish by calling `report`: `verdict` `approved` only when no finding is `blocking` or `should_fix`, else `changes_requested`; `head`, the full sha of the commit you reviewed (`git rev-parse HEAD`), when the work is in a git repository (a review without one never counts as a run's final approval); a `summary` with the spec-compliance and quality verdicts; the `findings`, ranked; the gate and the other commands you ran in `checks`, each with its exit code and summary line; and in a re-review, `addressed`. No preamble.

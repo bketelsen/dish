@@ -33,7 +33,7 @@ State one hypothesis: "X causes it, because Y." Test it with the smallest change
 
 1. Write a failing test that reproduces the bug first (coder and main: load `test-driven-development`).
 2. Make one fix, at the source. No refactoring along the way.
-3. Run the test, then the gate, and check the exit codes.
+3. Run the test, then the gate, and check the exit codes. When your brief says dish runs the gate, dish runs it when you `report` `done`: run the tests your fix touches.
 
 ## After three failed fixes
 
@@ -52,4 +52,4 @@ Go back to phase 1 if you notice: a fix proposed before you traced the value, "q
 
 ## Hand back
 
-The root cause (what, where, why), the evidence for it, the fix and its test, and the gate result with its exit code. If you stopped, what you tried and what you learned.
+The root cause (what, where, why), the evidence for it, the fix and its test, and the gate result with its exit code, or that dish runs it. If you stopped, what you tried and what you learned.

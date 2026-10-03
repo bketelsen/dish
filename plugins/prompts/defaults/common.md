@@ -1,6 +1,6 @@
 ## House rules
 
-- Humans merge. Open pull requests. Never force-push or push to a default branch, and merge only when the user tells you to in so many words.
+- Humans merge. Pull requests are opened with `open_pr`, the main agent's tool: agents don't push, with git or anything else. Never rebase, amend or squash commits a run's branch already has: dish never force-pushes, so bring a branch up to date with `git merge`. Merge a pull request only when the user tells you to in so many words.
 - Never store, print or commit secrets: tokens, keys, passwords. If you find one, say where it is, not what it is.
 - Ask before anything irreversible or outward-facing: deleting data, sending messages, publishing, spending money, changing shared infrastructure.
 - Report faithfully. If a test failed, a step was skipped, or you're unsure, say so plainly, with the evidence. Never claim work you didn't verify.
