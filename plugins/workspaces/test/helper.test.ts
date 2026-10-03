@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto'
 import { access, appendFile, chmod, copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { helperValue, tokensDir, writeFileAtomic } from '../src/paths.ts'
+import { helperValue, pushHelperValue, tokensDir, writeFileAtomic } from '../src/paths.ts'
 import { checkClone } from '../src/safety.ts'
 import { TOKEN_USER, startFakeGit } from './fake-git-http.ts'
 import type { FakeGitServer } from './fake-git-http.ts'
@@ -13,6 +13,7 @@ import { dishHome, makeBare, run, runOk, scratchGitEnv, tempDir, withEnv } from 
 import type { RunResult } from './helpers.ts'
 
 const HELPER = fileURLToPath(new URL('../bin/git-credential-dish', import.meta.url))
+const PUSH_HELPER = fileURLToPath(new URL('../bin/git-credential-dish-push', import.meta.url))
 const GITHUB = 'https://github.com'
 const QUIT = 'quit=true\n'
 /** How long a credential request that can't be answered may take: it must fail, not wait on a prompt. */
@@ -561,4 +562,148 @@ test('the fake asks for x-access-token and a known token, refuses a read token\'
     assert.ok(!JSON.stringify(server.requests).includes(read) && !JSON.stringify(server.requests).includes(write))
     await assertNoPrompt(fx)
   })
+})
+
+// --- The push helper: one line from fd 3 --------------------------------------------------------------------------
+
+/**
+ * Run `cmd` with `args` and, on fd 3, a socket holding `fd3` and then EOF (`''`: EOF at once), or no fd 3 at all
+ * (`null`). Its stdin is `input`.
+ */
+function runWithFd3(cmd: string, args: readonly string[], options: { cwd: string, env: Record<string, string>, input: string, fd3: string | null }): Promise<RunResult> {
+  assert.ok(options.env.HOME, 'a scratch HOME')
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, [...args], {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: options.fd3 === null ? ['pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout!.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk })
+    child.stderr!.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
+    child.stdin!.on('error', () => {})
+    child.stdin!.end(options.input)
+    if (options.fd3 !== null) {
+      const channel = child.stdio[3] as NodeJS.WritableStream & { on(event: 'error', listener: () => void): unknown }
+      channel.on('error', () => {})
+      channel.end(options.fd3)
+    }
+    child.on('error', reject)
+    child.on('close', code => resolve({ code: code ?? -1, stdout, stderr }))
+  })
+}
+
+/** Run the push helper as git does (`/bin/sh <helper> <web> <action>`), from an empty directory, with `fd3` on fd 3. */
+async function askPush(fx: Fixture, input: string, options: { fd3: string | null, action?: string[], web?: string, shell?: Shell }): Promise<RunResult> {
+  const shell = options.shell ?? { name: '/bin/sh', cmd: '/bin/sh', args: [] }
+  const cwd = join(fx.dir, 'cwd')
+  await mkdir(cwd, { recursive: true })
+  return runWithFd3(shell.cmd, [...shell.args, PUSH_HELPER, ...(options.web === undefined ? [GITHUB] : options.web === '' ? [] : [options.web]), ...(options.action ?? ['get'])], {
+    cwd, env: fx.env, input, fd3: options.fd3,
+  })
+}
+
+test('the push helper answers get for its web origin with the line on fd 3, then quit=true, in every POSIX shell here', async () => {
+  const fx = await fixture()
+  for (const shell of await shells(fx.env)) {
+    const token = newToken()
+    const asked = request([['protocol', 'https'], ['host', 'github.com'], ['path', 'acme/widget.git']])
+    assert.deepEqual(await askPush(fx, asked, { fd3: `${token}\n`, shell }), { code: 0, stdout: answer(token), stderr: '' }, shell.name)
+    // Only the first line; one without its newline; what git 2.47 sends besides (never echoed), and no blank line before EOF.
+    assert.deepEqual(await askPush(fx, asked, { fd3: `${token}\nsecond-line\n`, shell }), { code: 0, stdout: answer(token), stderr: '' }, shell.name)
+    assert.deepEqual(await askPush(fx, asked, { fd3: token, shell }), { code: 0, stdout: answer(token), stderr: '' }, shell.name)
+    const busy = request([
+      ['capability[]', 'authtype'], ['capability[]', 'state'], ['protocol', 'https'], ['host', 'github.com'],
+      ['username', 'someone'], ['password', 'not-this-one'], ['wwwauth[]', 'Basic realm="GitHub"'],
+    ], '')
+    const result = await askPush(fx, busy, { fd3: `${token}\n`, shell })
+    assert.deepEqual(result, { code: 0, stdout: answer(token), stderr: '' }, shell.name)
+    assert.ok(!result.stdout.includes('not-this-one'))
+  }
+  // A port is part of the host; a fake's http origin works the same.
+  const token = newToken()
+  const local = await askPush(fx, request([['protocol', 'http'], ['host', '127.0.0.1:8123']]), { fd3: `${token}\n`, web: 'http://127.0.0.1:8123' })
+  assert.deepEqual(local, { code: 0, stdout: answer(token), stderr: '' })
+})
+
+test('the push helper: another origin, and an empty or closed fd 3, get quit=true alone; store, erase and anything else print nothing; it writes nothing', async () => {
+  const fx = await fixture()
+  await mkdir(join(fx.dir, 'cwd'), { recursive: true })
+  const before = await listing(fx.dir)
+  const token = newToken()
+  const asked = request([['protocol', 'https'], ['host', 'github.com'], ['path', 'acme/widget.git']])
+  for (const other of [
+    request([['protocol', 'https'], ['host', 'example.invalid']]),
+    request([['protocol', 'http'], ['host', 'github.com']]),
+    request([['protocol', 'https'], ['host', 'github.com:443']]),
+    request([['host', 'github.com']]),
+    '',
+  ]) {
+    assert.deepEqual(await askPush(fx, other, { fd3: `${token}\n` }), { code: 0, stdout: QUIT, stderr: '' }, JSON.stringify(other))
+  }
+  assert.deepEqual(await askPush(fx, asked, { fd3: '' }), { code: 0, stdout: QUIT, stderr: '' }, 'an empty fd 3')
+  assert.deepEqual(await askPush(fx, asked, { fd3: '\n' }), { code: 0, stdout: QUIT, stderr: '' }, 'a blank line on fd 3')
+  assert.deepEqual(await askPush(fx, asked, { fd3: null }), { code: 0, stdout: QUIT, stderr: '' }, 'no fd 3')
+  const full = request([['protocol', 'https'], ['host', 'github.com'], ['username', TOKEN_USER], ['password', token]])
+  for (const action of [['store'], ['erase'], [''], ['GET'], ['get2'], ['capability'], []]) {
+    assert.deepEqual(await askPush(fx, full, { fd3: `${token}\n`, action }), { code: 0, stdout: '', stderr: '' }, JSON.stringify(action))
+  }
+  // No web origin: nothing either.
+  assert.deepEqual(await askPush(fx, asked, { fd3: `${token}\n`, web: '', action: [] }), { code: 0, stdout: '', stderr: '' })
+  assert.deepEqual(await askPush(fx, asked, { fd3: `${token}\n`, web: '', action: ['get'] }), { code: 0, stdout: '', stderr: '' })
+  // An answered get changes nothing on disk either (its cwd, the home).
+  assert.deepEqual(await askPush(fx, asked, { fd3: `${token}\n` }), { code: 0, stdout: answer(token), stderr: '' })
+  assert.deepEqual(await listing(fx.dir), before)
+  assert.deepEqual(await filesHolding(fx.dir, token), [])
+})
+
+test('the push helper is POSIX sh, runs by path through /bin/sh without an exec bit, and passes shellcheck', async (t) => {
+  const text = await readFile(PUSH_HELPER, 'utf8')
+  assert.equal(text.split('\n')[0], '#!/bin/sh')
+  assert.match(text, /^set -u$/m)
+  assert.match(text, /^LC_ALL=C$/m)
+
+  const fx = await fixture()
+  const token = newToken()
+  const copy = join(fx.dir, 'git-credential-dish-push')
+  await copyFile(PUSH_HELPER, copy)
+  await chmod(copy, 0o644)
+  const result = await runWithFd3('git', ['-c', 'credential.helper=', '-c', `credential.helper=${pushHelperValue(copy, GITHUB)}`, 'credential', 'fill'], {
+    cwd: fx.dir, env: fx.env, input: request([['url', `${GITHUB}/acme/widget.git`]]), fd3: `${token}\n`,
+  })
+  assert.equal(result.code, 0, result.stderr)
+  assert.ok(result.stdout.includes(`username=${TOKEN_USER}\npassword=${token}\n`), result.stdout)
+
+  if ((await run('/bin/sh', ['-c', 'command -v shellcheck'], { env: fx.env })).code !== 0) {
+    t.skip('shellcheck is not on PATH')
+    return
+  }
+  const checked = await run('shellcheck', [PUSH_HELPER], { env: fx.env })
+  assert.deepEqual(checked, { code: 0, stdout: '', stderr: '' })
+})
+
+test('git credential fill with only the push helper gets the token from fd 3, and a second fill gets quit=true', async () => {
+  const fx = await fixture()
+  const token = newToken()
+  // The global config's store helper, and one for the origin: the empty entry on the command line drops both.
+  await runOk('git', ['config', '--global', '--add', 'credential.helper', 'store'], { env: fx.env })
+  await runOk('git', ['config', '--global', '--add', `credential.${GITHUB}.helper`, `!echo password=from-the-global-config; :`], { env: fx.env })
+  const req = join(fx.dir, 'request')
+  await writeFile(req, request([['url', `${GITHUB}/acme/widget.git`]]))
+  const flags = `-c credential.helper= -c "credential.helper=${pushHelperValue(PUSH_HELPER, GITHUB).replace(/"/g, '\\"')}"`
+  // Two fills in one shell, sharing the fd 3 git inherits: the first takes the line, the second finds EOF.
+  const script = `git ${flags} credential fill < '${req}'; echo "first $?"; git ${flags} credential fill < '${req}'; echo "second $?"`
+  const result = await runWithFd3('/bin/sh', ['-c', script], { cwd: fx.dir, env: withoutPromptGuard(fx.env), input: '', fd3: `${token}\n` })
+  const [first, second] = result.stdout.split(/^first \d+$/m)
+  assert.ok(first!.includes(`username=${TOKEN_USER}\npassword=${token}\n`), result.stdout)
+  assert.match(result.stdout, /^first 0$/m)
+  assert.ok(!second!.includes('password='), result.stdout)
+  assert.match(result.stdout, /^second [1-9]\d*$/m)
+  assert.match(result.stderr, /quit/)
+  assert.ok(!result.stdout.includes('from-the-global-config'))
+  // git tells its helpers nothing to keep: no ~/.git-credentials.
+  assert.equal(await exists(join(fx.home, '.git-credentials')), false)
+  assert.deepEqual(await filesHolding(fx.dir, token), [])
+  await assertNoPrompt(fx)
 })

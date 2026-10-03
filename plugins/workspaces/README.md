@@ -2,7 +2,7 @@
 
 The mechanics behind dish's [projects](../projects/): the clones, the GitHub App that gives them read access, setup, the dsh workspaces, the scratch workspace, task worktrees and the sweep that removes merged ones.
 - **Onboarding.** For each project [`dish-projects`](../projects/) hands it, this plugin finds the App's installation, clones the repo under the work root (or adopts a clone already there), configures it, runs `setup` on dish's own fresh clone, and registers the clone as a dsh workspace.
-- **GitHub access.** A GitHub App, read-only in 6b. Agents' git gets a read token through a credential helper, so `fetch` works and `push` is refused.
+- **GitHub access.** A GitHub App. Agents' git gets a read token through a credential helper, so `fetch` works and `push` is refused. Since step 7, only the main agent's `open_pr` (dish-orchestrator) pushes a run's branch and opens its pull request, through this plugin's `pushBranch` and `openPull`, with a write token minted in memory for that one call.
 - **Worktrees.** The `worktree` tool, for the main agent: one worktree per task, inside the clone, on `dish/<slug>`. Crew's `delegate` binds a coder to one. Merged ones are swept away.
 - **Settings → GitHub App** takes the App's ID and private key, and tests them.
 
@@ -69,8 +69,9 @@ A skip says why, and gives the command to run and where. In a fresh clone, setup
 
 - **The App's ID and private key** are two references in dsh's credential store, read with `ctx.get('credentials')?.resolve(ref)` for each request that needs the JWT, and never kept. The card sets them through dsh's own `credentials` remote, in the browser, so dish's server never receives them from the page.
 - **The file token** has `contents: read` and `metadata: read`, for the repos of that owner's projects (one installation per owner). It is minted again 10 minutes before its hour runs out. A failed refresh is logged once per distinct error and tried again after a minute, and the old file stays until it expires.
-- **dish's own API reads** (pull requests for the sweep) use a second token, `metadata: read` and `pull_requests: read`, kept in memory only. The bot's profile (`GET /users/<slug>[bot]`) is public and is read without a credential, once per App slug in the service's life (a changed credential asks only `GET /app` again), so an installation that hasn't accepted Pull requests read still onboards.
-- **Read-only, enforced.** `createToken` refuses anything but `read` before it sends a request, and refuses a token GitHub granted more than read.
+- **dish's own API reads** (pull requests for the sweep, and `readPull`) use a second token, `metadata: read` and `pull_requests: read`, kept in memory only. Since step 7 it also asks for `checks: read` and `statuses: read`, for `readPull` (`API_PERMISSIONS`). An installation that hasn't accepted those two yet gets the narrower token instead (`API_BASE_PERMISSIONS`: today's two), logged once, so the sweep's reads keep working; each new mint asks for the wide set again. The bot's profile (`GET /users/<slug>[bot]`) is public and is read without a credential, once per App slug in the service's life (a changed credential asks only `GET /app` again), so an installation that hasn't accepted Pull requests read still onboards.
+- **Write tokens** (step 7). `pushBranch` mints `contents: write`, and `openPull`, `updatePull` and `commentPull` mint `pull_requests: write`, each with `metadata: read`, for the one repository and the one call, in memory: never cached, and never in a file, an argument, the environment or a log. `createWriteToken` takes only those two sets (`PUSH_PERMISSIONS`, `PULL_PERMISSIONS`), and refuses a token GitHub granted more than asked, or for another repository. A 422 says what the App needs: "The dish App needs Contents (or Pull requests) read and write, and each installation must accept it (Settings → GitHub App)".
+- **Agents' tokens are read-only, enforced.** `createToken` (the file token and the API token) still refuses anything but `read` before it sends a request, and refuses a token GitHub granted more than read.
 - **No token on disk but its file.** Never in an argument, a URL, an environment variable, a config value or a log. Errors are masked with dish-kit's `maskSecrets`, and the card's texts also have the App ID and the key's lines taken out.
 
 ### The helper
@@ -82,6 +83,16 @@ credential.https://github.com.helper = !/bin/sh '<checkout>/plugins/workspaces/b
 ```
 
 It answers git's `get` for `https://github.com` only, with `username=x-access-token` and the first line of `<tokens dir>/<owner>` (the URL's first path segment, lower-cased), then `quit=true`. An owner that isn't a GitHub login, or one with no token file, gets `quit=true` alone, so git never prompts. Another origin gets nothing. `store` and `erase` are ignored, so git's own credential is never kept. It writes no file and reaches no network.
+
+### The push helper
+
+`bin/git-credential-dish-push` is the one-shot helper of dish's own push. No clone's config names it: only `pushBranch`'s git does, on its command line, after an empty `credential.helper=` that drops every other helper:
+
+```
+credential.helper = !/bin/sh '<checkout>/plugins/workspaces/bin/git-credential-dish-push' 'https://github.com'
+```
+
+POSIX `sh`, `set -u`, `LC_ALL=C`, shellcheck clean, run through `/bin/sh` by its absolute path. Its arguments are the web origin and git's action. On `get` for exactly that origin (`<protocol>://<host>`) it reads one line from fd 3, where dish wrote the write token, and answers `username=x-access-token`, `password=<the line>` and `quit=true`. Another origin, or nothing to read on fd 3 (closed, empty, or read already by an earlier `get`), gets `quit=true` alone. `store`, `erase` and anything else, or no origin, print nothing. It never echoes its input, writes no file, and runs no external command on the token (`printf` is the shell's builtin).
 
 ## dish's own git
 
@@ -102,7 +113,7 @@ For the main agent only: it refuses any other caller, and it is on crew's never-
 
 | Action | Input | What it does |
 |---|---|---|
-| `create` | `project`, `slug`, optional `base` | Fetches, then makes `<clone>/.worktrees/<slug>` on a new branch `dish/<slug>` (`--quiet --no-track`), cut from `base` or `origin/<default branch>`, and records it. Answers the path, the branch, the base commit and setup: "Setup didn't run outside the sandbox: … Run it in <path> in the sandbox before the work starts (yourself, or tell the coder to run it first): <command>. If it fails with "Read-only file system", run it again escalated (`sandbox_permissions: "danger-full-access"`), so the judge allows it or asks the user; a coder can't escalate, and reports it instead." A slug is `[a-z0-9][a-z0-9-]*`, at most 40 characters, and not in use. A `worktree add` that fails or is stopped removes the branch it made (when no worktree has it) and the record, so the slug stays free; the error carries git's `fatal:` line. |
+| `create` | `project`, `slug`, optional `base` | Fetches, then makes `<clone>/.worktrees/<slug>` on a new branch `dish/<slug>` (`--quiet --no-track`), cut from `base` or `origin/<default branch>`, and records it. Answers the path, the branch, the base commit and setup: "Setup didn't run outside the sandbox: … Run it in <path> in the sandbox before the work starts (yourself, or tell the coder to run it first): <command>. If it fails with "Read-only file system", run it again escalated (`sandbox_permissions: "danger-full-access"`), so the judge allows it or asks the user; a coder can't escalate, and reports it instead." A slug is `[a-z0-9][a-z0-9-]*`, at most 40 characters, and not in use. A `worktree add` that fails or is stopped removes the branch it made (when no worktree has it) and the record, so the slug stays free; the error carries git's `fatal:` line. When dish keeps runs (dish-orchestrator), the worktree joins the run this chat drives, or opens one, and the answer ends with one of: "Opened run `<id>` for this worktree; `run` with `action: goal` names it, and `open_pr` ends it.", "It is task `<slug>` of run `<id>`, which this chat drives.", or "dish couldn't add it to a run: <why>." (the worktree stays either way). |
 | `list` | optional `project` | Each worktree: ahead and behind the default branch, dirty or clean, merged or not, whether dish made it, and the crew children bound to it. |
 | `remove` | `project`, `slug`, optional `force` | Removes a worktree dish made, its branch and its record. Without `force`, only a merged and clean one (it fetches first, and doesn't sweep). Never one a running coder is bound to, even with `force`. |
 
@@ -122,6 +133,23 @@ A worktree whose directory and branch you removed by hand has its record dropped
 
 First 5 minutes after start, then every hour: for each ready project, one at a time, under its lock, the read token, a fetch and the sweep. A round never overlaps the one before. A failure is logged once per project and error.
 
+## Pushes and pull requests
+
+Step 7's methods, for dish-orchestrator's `open_pr`, `run` and `pr_feedback`. Only `open_pr` calls `pushBranch`, `openPull`, `updatePull` and `commentPull`.
+
+- **`pushBranch(project, slug, { head, signal? })`**, under the project's lock. The project must be registered and ready, the slug one dish made (`resolve` must answer for `<project>/<slug>`, else `resolveProblem`'s reason), and `head` a full commit id: the commit `open_pr` checked. It refuses, with nothing pushed and no token minted, unless `refs/heads/dish/<slug>` is at `head` ("dish/<slug> is at <tip>, not <head> (the commit the checks ran on); nothing was pushed"). Then it mints the write token and pushes, and logs "pushed dish/<slug> of <project> at <tip> (created | updated | up-to-date)". It gives `{ head }`.
+  - **From an isolated repository.** A bare repository dish makes under `<state>/workspaces/<owner>/<repo>/push-<random>/` (0700, `git init --bare --template=`), whose objects come from the clone through `objects/info/alternates`, with `refs/heads/dish/<slug>` set to the tip. Every git of the push runs with no system or global config (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`), so nothing in the clone's config (which agents can write between the check and the push), or in yours, can steer it: `url.*.insteadOf`, `remote.*`, `http.*`, `credential.*`, `push.*`, the hooks.
+  - **What it runs:** `git --git-dir <it> -c credential.helper= -c credential.helper=<the push helper> -c http.followRedirects=false push --porcelain <https URL> refs/heads/dish/<slug>:refs/heads/dish/<slug>`. To the project's HTTPS URL, never `origin`; one explicit refspec; never forced, never a delete. A redirect is a failure, not a second host asking for the credential. It may take 10 minutes.
+  - **A refusal** reads "GitHub refused the push of dish/<slug>: " and GitHub's reason: the porcelain summary, the first five `remote:` lines, or git's last `fatal:` line, masked and cut to 600 characters. A branch that moved on GitHub (`fetch first`, `non-fast-forward`) adds: "The branch on GitHub has commits this one doesn't: have a coder merge `origin/dish/<slug>` into the run's worktree, then call `open_pr` again. dish never forces a push."
+  - **The repository is removed** after success, failure or abort.
+- **Why fd 3.** The token reaches git on its fd 3, a socket git and its children inherit (`git()`'s `secret`): dish writes the one line and closes its end, and the push helper reads it. Not the environment: an env-reading helper, `GIT_ASKPASS` or `http.extraHeader` through `GIT_CONFIG_COUNT` could be read by any process of the same account through `/proc/<pid>/environ`, for the whole push, and dsh's agents run as that account. A socket can't be opened again through `/proc/<pid>/fd/3`, and its line is gone once read, so a thief that reads it first leaves the push without it, which shows. Only `ptrace` reaches it, and that reads dsh's credential store anyway. The token is never on disk, in an argument, in the environment or in a log.
+- **`openPull(project, { head, title, body })`**, no lock. `head` must be `dish/<slug>` of a worktree dish made. The base is the clone's default branch (`origin/HEAD`). The title is masked, folded to one line, and at most 256 characters; the body masked, without NUL, at most 65 536. All of that is checked before the token is minted. It gives `{ url, number, existing }`: when a pull request for the branch is open already (GitHub's 422), it reports that one with `existing: true`, and changes nothing of it.
+- **`updatePull(project, number, { title?, body? })`**, no lock: only the fields given (at least one), checked and masked as `openPull`'s, with `PATCH /repos/{o}/{r}/pulls/{n}`.
+- **`commentPull(project, number, body)`**, no lock: a comment on the pull request's issue (`POST /repos/{o}/{r}/issues/{n}/comments`), masked, not blank, at most 65 536 characters. `open_pr` posts its override lines there when the pull request was open already.
+- **`readPull(project, number)`**, no lock, with the in-memory API token: the pull request's state, mergeability, head and base; its reviews (a `PENDING` one, its author's unsent draft, skipped), review comments (`outdated` when GitHub cleared their line; a comment on a whole file has none, and isn't), issue comments, and the checks on its head (check runs, and the combined status's statuses). The first page (100) of each, and `more` says which was full. **What it reads is untrusted:** anyone can write a review or a comment. Each item is read field by field with a type check (one that doesn't fit is skipped), and every string is masked (`maskSecrets`, URL passwords), its control characters made spaces (bodies keep `\n` and `\t`), and cut: bodies to 4000 characters, the rest to 200. Nothing of it is logged. The checks are the part it can do without: when the check runs or the combined status can't be read, `checksUnavailable` says why (an installation that hasn't accepted Checks and Commit statuses read, whose token gets a 403 or 404 there; or GitHub's failure, masked), `checks` holds what the other source gave, and the reviews and comments still come. A failure to read those rejects.
+- **`headOf(pathOrRef)`** is the worktree's `HEAD` commit, or `undefined` for one dish didn't make; **`isClean(pathOrRef)`** is `{ clean: true }`, or `{ clean: false, why }` when anything is uncommitted or untracked, another branch (or a detached `HEAD`) is checked out, or it holds a nested worktree or repository. Neither locks.
+- **`compareBranch(project, slug)`**, under the project's lock: a fetch (as the sweep's, recorded in `lastFetch`), then `{ behindDefault, aheadOfDefault, remoteAhead }`: the branch against `origin/<default>`, and the commits on GitHub's `dish/<slug>` the branch lacks (`null` when GitHub has no such branch). Read-only on the worktree. dish brings a branch up to date only by a coder's merge in its worktree (`origin/<default>`, and `origin/dish/<slug>` when GitHub's moved), never a rebase, an amend or a squash: it never force-pushes.
+
 ## The service
 
 ```ts
@@ -129,21 +157,31 @@ interface DishWorkspaces {
   onboard(project, options?): Promise<OnboardResult>        // steps 1 to 5; dish-projects drives it
   prepare(project): Promise<void>                           // for a ready project at start
   describe(name): CloneInfo | undefined                     // synchronous: clone, adopted, workspace, last fetch, worktrees
-  createWorktree(project, slug, base?, options?): Promise<CreatedWorktree>
+  createWorktree(project, slug, base?, options?): Promise<CreatedWorktree>   // its result's baseRef: origin/<default>, or the base given
   listWorktrees(project?): Promise<WorktreeInfo[]>
   removeWorktree(project, slug, force?): Promise<void>
   resolve(pathOrRef): Promise<Worktree | undefined>         // for delegate and dish-gates
   resolveProblem(pathOrRef): Promise<string | undefined>    // why resolve gave undefined: a worktree dish made whose clone or own check fails, or whose branch is gone
   sweep(project?): Promise<SweepResult>                     // empty for a project that isn't ready once locked
   appStatus(test): Promise<AppStatus>                       // for Settings → GitHub App
+  headOf(pathOrRef): Promise<string | undefined>            // step 7: a worktree's HEAD
+  isClean(pathOrRef): Promise<{ clean: true } | { clean: false, why: string }>
+  compareBranch(project, slug): Promise<BranchComparison>   // fetches, then behindDefault, aheadOfDefault, remoteAhead
+  pushBranch(project, slug, { head, signal? }): Promise<{ head }>
+  openPull(project, { head, title, body }): Promise<{ url, number, existing }>
+  updatePull(project, number, { title?, body? }): Promise<void>
+  commentPull(project, number, body): Promise<void>
+  readPull(project, number): Promise<PullFeedback>          // untrusted: masked and capped
 }
 ```
 
-Every operation on one project (onboarding, prepare, create, remove, a fetch, a sweep, a late workspace registration) runs under that project's lock; `resolve`, `listWorktrees` and `describe` don't lock. When the plugin goes, every timer is cleared, the work in flight is aborted and waited for (its processes killed), and the token files are removed.
+Every operation on one project (onboarding, prepare, create, remove, a fetch, a sweep, a late workspace registration, `pushBranch` and `compareBranch`) runs under that project's lock; `resolve`, `listWorktrees`, `describe`, `headOf`, `isClean`, `openPull`, `updatePull`, `commentPull` and `readPull` don't lock. When the plugin goes, every timer is cleared, the work in flight is aborted and waited for (its processes killed), and the token files are removed.
+
+**dish-orchestrator's hooks.** dish-workspaces reads `dishRuns` with `ctx.get` on each use, and works as before without it. The `worktree` tool calls `worktreeCreated(sessionId, { project, slug, branch, path, clone, base, baseRef })` after `createWorktree` returned, and `worktreeRemoved(project, slug)` after its remove; the sweep calls `worktreeRemoved` for each worktree it removed, one after the other, once its lock is released (in the background; `close` waits for it). None is called, or awaited, while a project's lock is held: `open_pr` holds a run's lock while `pushBranch` waits for the project's, so a hook awaited inside that lock would deadlock. dish-orchestrator's hooks call no locking method of dish-workspaces (`createWorktree`, `removeWorktree`, `pushBranch`, `compareBranch`, `sweep`, `prepare`, `onboard`). `createWorktree` itself calls no hook: `run open` makes its run's worktree through it and records it itself. A hook that throws is logged once, and the worktree, or its removal, stands.
 
 ## Settings → GitHub App
 
-Between Projects and History in Settings' nav.
+Between Projects and History in Settings' nav. Its intro says what the App needs since step 7: read and write access to Contents and Pull requests, and read access to Metadata, Checks and Commit statuses (no webhook); that each installation's owner accepts the new permissions on GitHub when the App was read-only before; and that each repository's default branch wants a ruleset (require a pull request with an approval, block force pushes and deletions, never the App on its bypass list).
 - **The App ID** (digits, as GitHub shows it) and **the private key** (the whole `.pem`, line breaks and all), each with its own Save button (**Save App ID**, **Save private key**) and a Remove that asks first. Neither is ever shown again: the card says only whether each is set and where it comes from. A field is cleared the moment it is sent.
 - **Test** asks GitHub for the App's name and slug, its bot (`<slug>[bot]` and its noreply email) and every installation (the account, and whether it has all repositories or chosen ones).
 - The card says the pair lives in dsh's credential store, and that dev's store, and dev's App, are separate. It reads everything again when dsh says either credential changed.
@@ -164,7 +202,7 @@ Both names must be environment-variable names; the plugin refuses to load otherw
 
 Two decisions, both yours on 2026-10-02 (the spec's "Decided after the checks"):
 1. **Setup runs outside the sandbox only on code a human merged,** and, after the reviews, only in dish's own fresh clone. Adopted clones, Retry and worktrees give the command instead.
-2. **Both Apps are read-only for now** (Contents, Pull requests and Metadata read). An agent can read dsh's credential file, so with a write App it could mint a token that pushes. Step 7 adds write, with a way to keep the key from agents.
+2. **The App can push since step 7** (Contents and Pull requests read and write; Metadata, Checks and Commit statuses read). Agents' git keeps read-only tokens. Only `pushBranch`, `openPull`, `updatePull` and `commentPull`, which `open_pr` calls, mint a write token, in memory, for one call. An agent can read dsh's credential file, so it could mint one itself: GitHub rulesets on each default branch (require a pull request with an approval, block force pushes and deletions, the App never on the bypass list) keep anything from reaching it without your merge (the orchestrator spec's question 1, A).
 
 Known limits (the spec's [list](../../docs/specs/projects-workspaces.md#known-limits) has them all):
 - **Check, then act.** The clone check and dish's next git command are two steps, as are the last checks and the rename of `.git/config`, and the last look at `.worktrees` and `git worktree remove`. An agent racing dish could slip a key past the check once, or swap `.git` or `.worktrees` for a link in between. Closing it means running dish's working-tree git inside the sandbox, which 6c didn't take on: [dish-gates](../gates/) runs the project's gate in the sandbox, and no git of its own.
@@ -176,3 +214,6 @@ Known limits (the spec's [list](../../docs/specs/projects-workspaces.md#known-li
 - **After a crash:** a `.git/config.lock` stays for you to remove (the project's message names it). A temporary clone directory (`.<repo>.cloning-<hex>`) stays too, and no message names it: look for one beside the clone. Token files stay until the next start prunes and rewrites them.
 - **Agents can read the token file.** It's read-only, lasts an hour and covers only the projects' repos.
 - **A clone with an SSH alias origin** (`git@github-dish:…`, 6a's deploy-key days) isn't adopted. Move it aside.
+- **A crash mid-push** leaves `<state>/workspaces/<owner>/<repo>/push-<random>/`, a small bare repository with no token in it, for you to remove.
+- **A shallow clone** (an adopted one) may fail to push from the isolated repository, with git's message. dish's own clones are full.
+- **A push doesn't follow redirects,** so pushing to a GitHub repository that was renamed or transferred fails ("The requested URL returned error: 301") while fetches still work: fix the project's repo name on Settings → Projects.

@@ -36,6 +36,14 @@
  * - **`close`:** no more work is taken; every timer is cleared; everything in flight is aborted and awaited (its children
  *   dead), and rejects with an Error named `AbortError` (dish-projects leaves such a project pending, never failed); then
  *   the token files are removed (`TokenManager.close`).
+ * - **Step 7, for dish-orchestrator:** `headOf` and `isClean` (no lock); `pushBranch` and `compareBranch` (under the
+ *   project's lock: a push, and a fetch); `openPull`, `updatePull` and `commentPull` (no lock; each mints a write token
+ *   in memory for its one call, as `pushBranch` does); `readPull` (no lock; the in-memory API token). What `readPull`
+ *   brings from GitHub is untrusted: every string is masked and capped where it is read.
+ * - **The run hooks** (`dishRuns`, read with `ctx.get` on each use; everything works as before without it): the sweep
+ *   tells `worktreeRemoved` of each worktree it removed, once the project's lock is released; the `worktree` tool (not
+ *   the service) tells `worktreeCreated` and `worktreeRemoved` of its own. No hook is called, or awaited, while a
+ *   project's lock is held: `open_pr` holds a run's lock while `pushBranch` waits for the project's.
  *
  * @module dish-workspaces/service
  */
@@ -49,18 +57,19 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import type { DishProjects } from 'dish-projects'
 import type { Project } from 'dish-projects/registry'
-import { workRoot as defaultWorkRoot, xdgPaths } from 'dish-kit'
+import { maskSecrets, workRoot as defaultWorkRoot, xdgPaths } from 'dish-kit'
 import { configureClone, defaultBranch, fetchClone, httpsUrl } from './clone.ts'
 import type { CloneDeps } from './clone.ts'
-import { shown } from './git.ts'
-import { GITHUB_API, GITHUB_WEB, GitHubApp, GitHubError, botIdentity } from './github.ts'
-import type { AppCredentials, GitHubClientOptions, PullSummary } from './github.ts'
+import { SHA, maskUrlPasswords, shown } from './git.ts'
+import { GITHUB_API, GITHUB_WEB, GitHubApp, GitHubError, PULL_PERMISSIONS, PUSH_PERMISSIONS, botIdentity } from './github.ts'
+import type { AppCredentials, GitHubClientOptions, PullDetails, PullSummary, RawList } from './github.ts'
 import { hiding } from './hiding.ts'
 import { KeyedLock } from './locks.ts'
 import { appIdentity, onboardProject } from './onboard.ts'
 import type { OnboardDeps, OnboardResult, OnboardStep } from './onboard.ts'
 import { cloneStateFile, clonePath, helperValue, projectStateDir, scratchRecordFile, tokensDir } from './paths.ts'
 import type { AppStatus } from './protocol.ts'
+import { pushIsolated } from './push.ts'
 import { registerWorkspace } from './registry.ts'
 import type { WorkspaceRegistryLike } from './registry.ts'
 import { ensureScratch } from './scratch.ts'
@@ -71,7 +80,7 @@ import type { SweepResult } from './sweep.ts'
 import { TokenManager } from './tokens.ts'
 import type { OwnerRepos, TokenManagerOptions } from './tokens.ts'
 import { SLUG, Worktrees } from './worktrees.ts'
-import type { Binding, CreatedWorktree, Worktree, WorktreeDeps, WorktreeInfo } from './worktrees.ts'
+import type { Binding, BranchComparison, CreatedWorktree, Worktree, WorktreeDeps, WorktreeInfo } from './worktrees.ts'
 
 /** The first hourly round runs this long after `start`. */
 export const FIRST_ROUND_MS = 300_000
@@ -89,6 +98,64 @@ export interface CloneInfo {
   /** How many worktrees dish made in it (their records). */
   worktrees: number
 }
+
+/**
+ * What dish-workspaces reads of dish-orchestrator (dishRuns), structurally: neither package depends on the other. The
+ * `worktree` tool calls worktreeCreated after createWorktree returned, and worktreeRemoved after its remove; the sweep calls
+ * worktreeRemoved for each worktree it removed. None is called, or awaited, while a project's lock is held.
+ */
+export interface CreatedForRun {
+  project: string
+  slug: string
+  branch: string
+  path: string
+  clone: string
+  /** The commit it was cut from. */
+  base: string
+  /** The base as asked for (`origin/<default>`, or the `base` given). */
+  baseRef: string
+}
+
+export interface RunsHooks {
+  worktreeCreated(sessionId: string, created: CreatedForRun): Promise<{ id: string, opened: boolean } | undefined>
+  worktreeRemoved(project: string, slug: string): Promise<void>
+}
+
+/** What openPull gives: the pull request, and whether it was open already (and so left as it was). */
+export interface OpenedPull {
+  url: string
+  number: number
+  existing: boolean
+}
+
+/** What readPull gives: every string masked and capped (masked, control characters made spaces, bodies 4000, the rest 200). */
+export interface PullFeedback {
+  number: number
+  url: string
+  title: string
+  state: 'open' | 'closed'
+  merged: boolean
+  draft: boolean
+  /** null: GitHub hasn't computed it yet. */
+  mergeable: boolean | null
+  /** GitHub's mergeable_state: clean, dirty, behind, blocked, unstable, unknown, … */
+  mergeableState: string
+  head: { ref: string, sha: string }
+  base: { ref: string }
+  reviews: Array<{ author: string, state: string, body: string, at: string | null, commit: string | null }>
+  reviewComments: Array<{ path: string, line: number | null, author: string, body: string, outdated: boolean, at: string | null }>
+  issueComments: Array<{ author: string, body: string, at: string | null }>
+  checks: Array<{ name: string, source: 'check-run' | 'status', status: string, conclusion: string | null }>
+  /**
+   * Why the checks couldn't be read (wholly or in part: `checks` holds what the other source gave): the token lacks
+   * Checks or Commit statuses read, or GitHub failed ("could not read the checks: …", masked and cut).
+   */
+  checksUnavailable?: string
+  /** Which lists filled a page of 100 (GitHub may have more). */
+  more: { reviews: boolean, reviewComments: boolean, issueComments: boolean, checks: boolean }
+}
+
+export type { BranchComparison }
 
 export interface DishWorkspaces {
   /** Onboarding's steps 1 to 5 (onboard.ts), under the project's lock. */
@@ -123,6 +190,31 @@ export interface DishWorkspaces {
    * but for a service that has stopped.
    */
   appStatus(test: boolean): Promise<AppStatus>
+  /** HEAD's commit in the worktree; undefined when resolve gives none. Rejects when git can't say. No lock. */
+  headOf(pathOrRef: string): Promise<string | undefined>
+  /**
+   * Whether the worktree has nothing a commit would lose, on its own branch: nothing uncommitted or untracked, `dish/<slug>`
+   * checked out, no nested worktree or repository. Rejects when resolve gives none, or git can't say. No lock.
+   */
+  isClean(pathOrRef: string): Promise<{ clean: true } | { clean: false, why: string }>
+  /**
+   * Push dish/<slug> of a worktree dish made, at `head` only, to the project's HTTPS URL, with a write token minted for
+   * this call, from an isolated repository, never forced. Under the project's lock. Rejects with GitHub's reason, masked.
+   */
+  pushBranch(project: string, slug: string, options: { head: string, signal?: AbortSignal }): Promise<{ head: string }>
+  /** Open the pull request from `head` (dish/<slug>) to the project's default branch, or report the open one, unchanged. No lock. */
+  openPull(project: string, pull: { head: string, title: string, body: string }): Promise<OpenedPull>
+  /** Comment on pull request `number` of the project (its issue comments), with a write token minted for this call. No lock. */
+  commentPull(project: string, number: number, body: string): Promise<void>
+  /** Change pull request `number`'s title, body or both (at least one), with a write token minted for this call. No lock. */
+  updatePull(project: string, number: number, fields: { title?: string, body?: string }): Promise<void>
+  /**
+   * Fetch (dish's own git, as the sweep's), then compare dish/<slug> with origin/<default> and origin/dish/<slug>. Under
+   * the project's lock. Read-only on the worktree.
+   */
+  compareBranch(project: string, slug: string): Promise<BranchComparison>
+  /** Pull request `number`'s feedback, read with the in-memory API token. Untrusted: masked and capped here. No lock. */
+  readPull(project: string, number: number): Promise<PullFeedback>
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -191,6 +283,19 @@ const MAX_BOTS = 16
 
 /** The longest error text a log line carries. */
 const LOGGED_CHARS = 300
+/** The longest error text from GitHub or git an error of the step-7 calls carries. */
+const MESSAGE_CHARS = 400
+/** A pull request's head branch: `dish/<slug>`. */
+const PULL_HEAD = /^dish\/([a-z0-9][a-z0-9-]{0,39})$/
+/** GitHub's limits on a pull request's title and on a body or a comment, in characters. */
+const MAX_TITLE = 256
+const MAX_BODY = 65_536
+/** The largest pull request number taken (GitHub's are 32-bit). */
+const MAX_PULL_NUMBER = 2 ** 31 - 1
+/** What readPull keeps of what GitHub says: bodies, and every other string, in characters; and items per list. */
+const FEEDBACK_BODY_CHARS = 4000
+const FEEDBACK_TEXT_CHARS = 200
+const FEEDBACK_ITEMS = 100
 
 const defaultTimers: NonNullable<TokenManagerOptions['timers']> = {
   set(fn, ms) {
@@ -206,6 +311,135 @@ const defaultTimers: NonNullable<TokenManagerOptions['timers']> = {
 /** dish's credential helper: `bin/git-credential-dish` beside this plugin's `src`, by its real path. */
 function defaultHelper(): string {
   return realpathSync(fileURLToPath(new URL('../bin/git-credential-dish', import.meta.url)))
+}
+
+/** dish's push helper: `bin/git-credential-dish-push` beside this plugin's `src`, by its real path. */
+function pushHelper(): string {
+  return realpathSync(fileURLToPath(new URL('../bin/git-credential-dish-push', import.meta.url)))
+}
+
+/** Refuse a slug that can't name a worktree. */
+function checkSlug(slug: string): void {
+  if (typeof slug !== 'string' || !SLUG.test(slug)) {
+    throw new Error(`${JSON.stringify(shown(String(slug), 80))} can't name a worktree: use 1 to 40 of a-z, 0-9 and "-", starting with a letter or a digit`)
+  }
+}
+
+/** Refuse a number that can't be a pull request's. */
+function checkPullNumber(number: number): void {
+  if (!Number.isSafeInteger(number) || number <= 0 || number > MAX_PULL_NUMBER) throw new Error('a pull request number is a positive whole number')
+}
+
+/** A pull request's title as dish sends it: masked, on one line, not empty, at most 256 characters. */
+function pullTitle(title: unknown): string {
+  const text = maskSecrets(maskUrlPasswords(typeof title === 'string' ? title : '')).replace(/[\s\x00-\x1f\x7f]+/g, ' ').trim()
+  if (text === '') throw new Error('a pull request needs a title')
+  const length = Array.from(text).length
+  if (length > MAX_TITLE) throw new Error(`the title is ${length} characters; GitHub takes at most 256`)
+  return text
+}
+
+/** A pull request's body, or a comment, as dish sends it: masked, without NUL, at most 65 536 characters. */
+function pullText(text: unknown, what: 'body' | 'comment'): string {
+  const masked = maskSecrets(maskUrlPasswords(typeof text === 'string' ? text : '')).replace(/\x00/g, '')
+  const length = Array.from(masked).length
+  if (length > MAX_BODY) throw new Error(`the ${what} is ${length} characters; GitHub takes at most 65 536`)
+  return masked
+}
+
+/**
+ * Text GitHub gave (anyone can write a review or a comment): masked (`maskSecrets`, URL passwords), control characters
+ * made spaces (but `\n` and `\t` in a body), and cut to `max` characters with `…`. Masked before the cut and after.
+ */
+function untrusted(value: string, max: number, body = false): string {
+  const mask = (text: string): string => maskSecrets(maskUrlPasswords(text))
+  const plain = value.slice(0, 64 * 1024).replace(body ? /[\x00-\x08\x0b-\x1f\x7f]/g : /[\x00-\x1f\x7f]/g, ' ')
+  const chars = Array.from(mask(plain))
+  return chars.length > max ? mask(`${chars.slice(0, max - 1).join('')}…`) : chars.join('')
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** A short string field of GitHub's, untrusted; `fallback` when it isn't a string. */
+function textOf(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? untrusted(value, FEEDBACK_TEXT_CHARS) : fallback
+}
+
+/** A timestamp or an id GitHub may leave null: the string, untrusted, else null. */
+function optionalText(value: unknown): string | null {
+  return typeof value === 'string' ? untrusted(value, FEEDBACK_TEXT_CHARS) : null
+}
+
+/** The author of an item: `user.login`, else `unknown` (a deleted account). */
+function authorOf(item: Record<string, unknown>): string {
+  return isRecord(item.user) && typeof item.user.login === 'string' ? untrusted(item.user.login, FEEDBACK_TEXT_CHARS) : 'unknown'
+}
+
+/** A body GitHub may leave null (a review with no text): '' then. Undefined (the item doesn't fit) for anything else. */
+function bodyOf(value: unknown): string | undefined {
+  if (value === null) return ''
+  return typeof value === 'string' ? untrusted(value, FEEDBACK_BODY_CHARS, true) : undefined
+}
+
+/** Reviews, as readPull gives them: a PENDING review (its author's unsent draft), and one that doesn't fit, skipped. */
+function reviewsOf(list: RawList): PullFeedback['reviews'] {
+  return list.items.slice(0, FEEDBACK_ITEMS).flatMap((item) => {
+    if (!isRecord(item) || typeof item.state !== 'string' || item.state === 'PENDING') return []
+    const body = bodyOf(item.body)
+    if (body === undefined) return []
+    return [{ author: authorOf(item), state: untrusted(item.state, FEEDBACK_TEXT_CHARS), body, at: optionalText(item.submitted_at), commit: optionalText(item.commit_id) }]
+  })
+}
+
+/**
+ * Review comments: `outdated` when GitHub cleared `line` (the diff moved past the comment). A comment on a whole file
+ * (`subject_type: 'file'`) has no line and isn't outdated.
+ */
+function reviewCommentsOf(list: RawList): PullFeedback['reviewComments'] {
+  return list.items.slice(0, FEEDBACK_ITEMS).flatMap((item) => {
+    if (!isRecord(item) || typeof item.path !== 'string' || typeof item.body !== 'string') return []
+    const line = typeof item.line === 'number' && Number.isFinite(item.line) ? item.line : null
+    return [{
+      path: untrusted(item.path, FEEDBACK_TEXT_CHARS), line, author: authorOf(item),
+      body: untrusted(item.body, FEEDBACK_BODY_CHARS, true), outdated: line === null && item.subject_type !== 'file', at: optionalText(item.created_at),
+    }]
+  })
+}
+
+function issueCommentsOf(list: RawList): PullFeedback['issueComments'] {
+  return list.items.slice(0, FEEDBACK_ITEMS).flatMap((item) => {
+    if (!isRecord(item) || typeof item.body !== 'string') return []
+    return [{ author: authorOf(item), body: untrusted(item.body, FEEDBACK_BODY_CHARS, true), at: optionalText(item.created_at) }]
+  })
+}
+
+function checkRunsOf(list: RawList): PullFeedback['checks'] {
+  return list.items.slice(0, FEEDBACK_ITEMS).flatMap((item) => {
+    if (!isRecord(item) || typeof item.name !== 'string' || typeof item.status !== 'string') return []
+    if (item.conclusion !== null && item.conclusion !== undefined && typeof item.conclusion !== 'string') return []
+    return [{
+      name: untrusted(item.name, FEEDBACK_TEXT_CHARS), source: 'check-run' as const, status: untrusted(item.status, FEEDBACK_TEXT_CHARS),
+      conclusion: typeof item.conclusion === 'string' ? untrusted(item.conclusion, FEEDBACK_TEXT_CHARS) : null,
+    }]
+  })
+}
+
+/** A combined status's statuses: `pending` is pending; any other state is a completed check with that conclusion. */
+function statusesOf(list: RawList): PullFeedback['checks'] {
+  return list.items.slice(0, FEEDBACK_ITEMS).flatMap((item): PullFeedback['checks'] => {
+    if (!isRecord(item) || typeof item.context !== 'string' || typeof item.state !== 'string') return []
+    const name = untrusted(item.context, FEEDBACK_TEXT_CHARS)
+    return item.state === 'pending'
+      ? [{ name, source: 'status' as const, status: 'pending', conclusion: null }]
+      : [{ name, source: 'status' as const, status: 'completed', conclusion: untrusted(item.state, FEEDBACK_TEXT_CHARS) }]
+  })
+}
+
+/** Whether a failure of the check runs or the combined status means the token can't read them: a 403 or a 404. */
+function cantReadChecks(error: unknown): boolean {
+  return error instanceof GitHubError && ((error.kind === 'auth' && error.status === 403) || error.kind === 'not-found')
 }
 
 function messageOf(error: unknown): string {
@@ -273,6 +507,8 @@ class Service implements WorkspacesService {
   readonly #state: string
   readonly #web: string
   readonly #helper: string
+  /** bin/git-credential-dish-push, by its real path. */
+  readonly #pushHelper: string
   readonly #timers: NonNullable<TokenManagerOptions['timers']>
   readonly #firstRoundMs: number
   readonly #roundEveryMs: number
@@ -323,6 +559,7 @@ class Service implements WorkspacesService {
     this.#state = internals.state ?? xdgPaths('dish').state
     this.#web = (internals.web ?? GITHUB_WEB).replace(/\/+$/, '')
     this.#helper = internals.helper ?? defaultHelper()
+    this.#pushHelper = pushHelper()
     this.#timers = internals.timers ?? defaultTimers
     this.#firstRoundMs = internals.firstRoundMs ?? FIRST_ROUND_MS
     this.#roundEveryMs = internals.roundEveryMs ?? ROUND_EVERY_MS
@@ -602,6 +839,8 @@ class Service implements WorkspacesService {
     for (const project of targets) {
       try {
         const result = await this.#locked(project, undefined, signal => this.#fetchAndSweep(project, signal, true))
+        // Out of the lock now: dish-orchestrator hears of each removal, in the background.
+        this.#runsRemoved(result.removed)
         total.removed.push(...result.removed)
         total.kept.push(...result.kept)
       } catch (error) {
@@ -617,6 +856,203 @@ class Service implements WorkspacesService {
     if (this.#closed) throw stopped()
     if (!test && this.#lastApp !== undefined) return structuredClone(this.#lastApp)
     return structuredClone(await this.#testApp())
+  }
+
+  // --- step 7: the head, cleanliness, the push, the pull request ------------------------------------------------------
+
+  async headOf(pathOrRef: string): Promise<string | undefined> {
+    const worktree = await this.resolve(pathOrRef)
+    if (worktree === undefined) return undefined
+    return this.#worktrees.head(worktree.clone, worktree.path)
+  }
+
+  async isClean(pathOrRef: string): Promise<{ clean: true } | { clean: false, why: string }> {
+    const worktree = await this.resolve(pathOrRef)
+    if (worktree === undefined) throw new Error(`no worktree ${shown(String(pathOrRef), 200)} that dish made`)
+    const why = await this.#worktrees.dirty(worktree.clone, worktree.path, worktree.branch)
+    return why === undefined ? { clean: true } : { clean: false, why }
+  }
+
+  async pushBranch(name: string, slug: string, options: { head: string, signal?: AbortSignal }): Promise<{ head: string }> {
+    const project = await this.#readyProject(name)
+    checkSlug(slug)
+    const head = options?.head
+    // No push without the commit open_pr checked: the push is of that commit or of nothing.
+    if (typeof head !== 'string' || !SHA.test(head)) throw new Error('head must be a full commit id: the commit open_pr checked')
+    const pushed = await this.#locked(project, options.signal, async (signal) => {
+      const worktree = await this.#managed(project, slug, 'pushed')
+      const tip = await this.#worktrees.tip(worktree.clone, worktree.branch)
+      if (tip === undefined) throw new Error(`its branch ${worktree.branch} is gone`)
+      if (tip !== head) throw new Error(`${worktree.branch} is at ${tip}, not ${head} (the commit the checks ran on); nothing was pushed`)
+      // Minted for this push, held by this call only, and dropped with it.
+      const token = await this.#tokens.writeToken(project.owner, project.repo, PUSH_PERMISSIONS)
+      return pushIsolated({
+        clone: worktree.clone, branch: worktree.branch, tip, url: httpsUrl(this.#web, project.owner, project.repo), web: this.#web,
+        helper: this.#pushHelper, parent: projectStateDir(this.#state, project.owner, project.repo), token, signal,
+      })
+    })
+    this.#logger.info('pushed %s of %s at %s (%s)', pushed.branch, project.name, pushed.head.slice(0, 12), pushed.result)
+    return { head: pushed.head }
+  }
+
+  async openPull(name: string, pull: { head: string, title: string, body: string }): Promise<OpenedPull> {
+    const project = await this.#readyProject(name)
+    const head = typeof pull?.head === 'string' ? pull.head : ''
+    const slug = PULL_HEAD.exec(head)?.[1]
+    const worktree = slug === undefined ? undefined : await this.resolve(`${project.name}/${slug}`)
+    if (worktree === undefined || worktree.branch !== head) {
+      throw new Error('dish opens pull requests only from the dish/<slug> branch of a worktree it made')
+    }
+    const base = await defaultBranch(worktree.clone)
+    if (base === undefined) throw new Error(`dish doesn't know ${project.name}'s default branch (origin/HEAD isn't set); the next fetch sets it`)
+    const title = pullTitle(pull.title)
+    const body = pullText(pull.body, 'body')
+    const token = await this.#tokens.writeToken(project.owner, project.repo, PULL_PERMISSIONS)
+    try {
+      try {
+        const opened = await this.#app.createPull(project.owner, project.repo, { title, head, base, body }, token)
+        return { url: opened.url, number: opened.number, existing: false }
+      } catch (error) {
+        // GitHub's 422 when one is open for the branch already: that one is reported, and nothing of it is changed.
+        if (!(error instanceof GitHubError && error.kind === 'unprocessable')) throw error
+        const found = await this.#app.findOpenPull(project.owner, project.repo, head, token)
+        if (found === undefined) throw error
+        return { url: found.url, number: found.number, existing: true }
+      }
+    } catch (error) {
+      throw new Error(`could not open the pull request for ${head}: ${shown(messageOf(error), MESSAGE_CHARS)}`)
+    }
+  }
+
+  async commentPull(name: string, number: number, body: string): Promise<void> {
+    const project = await this.#readyProject(name)
+    checkPullNumber(number)
+    const text = pullText(body, 'comment')
+    if (text.trim() === '') throw new Error('a comment needs a body')
+    const token = await this.#tokens.writeToken(project.owner, project.repo, PULL_PERMISSIONS)
+    try {
+      await this.#app.createComment(project.owner, project.repo, number, text, token)
+    } catch (error) {
+      throw new Error(`could not comment on pull request #${number}: ${shown(messageOf(error), MESSAGE_CHARS)}`)
+    }
+  }
+
+  async updatePull(name: string, number: number, fields: { title?: string, body?: string }): Promise<void> {
+    const project = await this.#readyProject(name)
+    checkPullNumber(number)
+    const given = fields ?? {}
+    if (given.title === undefined && given.body === undefined) throw new Error('updatePull needs a title or a body')
+    const changed: { title?: string, body?: string } = {}
+    if (given.title !== undefined) changed.title = pullTitle(given.title)
+    if (given.body !== undefined) changed.body = pullText(given.body, 'body')
+    const token = await this.#tokens.writeToken(project.owner, project.repo, PULL_PERMISSIONS)
+    try {
+      await this.#app.updatePull(project.owner, project.repo, number, changed, token)
+    } catch (error) {
+      throw new Error(`could not update pull request #${number}: ${shown(messageOf(error), MESSAGE_CHARS)}`)
+    }
+  }
+
+  async compareBranch(name: string, slug: string): Promise<BranchComparison> {
+    const project = await this.#readyProject(name)
+    checkSlug(slug)
+    const comparison = await this.#locked(project, undefined, async (signal) => {
+      const worktree = await this.#managed(project, slug, 'compared')
+      try {
+        await this.#fetch(project, signal)
+      } finally {
+        await this.#reload(project)
+      }
+      const base = await defaultBranch(worktree.clone)
+      if (base === undefined) throw new Error(`dish doesn't know ${project.name}'s default branch (origin/HEAD isn't set); the next fetch sets it`)
+      return this.#worktrees.compare(worktree.clone, worktree.branch, base)
+    })
+    this.#sweepLater(project)
+    return comparison
+  }
+
+  async readPull(name: string, number: number): Promise<PullFeedback> {
+    const project = await this.#readyProject(name)
+    checkPullNumber(number)
+    const { owner, repo } = project
+    const token = await this.#tokens.apiToken(owner)
+    let details: PullDetails
+    try {
+      details = await this.#app.pullDetails(owner, repo, number, token)
+    } catch (error) {
+      if (error instanceof GitHubError && error.kind === 'not-found') throw new Error(`no pull request #${number} in ${project.name}`)
+      throw new Error(`could not read pull request #${number}: ${shown(messageOf(error), MESSAGE_CHARS)}`)
+    }
+    const sha = details.head.sha
+    const [reviews, reviewComments, issueComments, runs, statuses] = await Promise.allSettled([
+      this.#app.pullReviews(owner, repo, number, token),
+      this.#app.pullReviewComments(owner, repo, number, token),
+      this.#app.issueComments(owner, repo, number, token),
+      this.#app.checkRuns(owner, repo, sha, token),
+      this.#app.combinedStatus(owner, repo, sha, token),
+    ])
+    const needed = (settled: PromiseSettledResult<RawList>, what: string): RawList => {
+      if (settled.status === 'fulfilled') return settled.value
+      throw new Error(`could not read pull request #${number}'s ${what}: ${shown(messageOf(settled.reason), MESSAGE_CHARS)}`)
+    }
+    const reviewList = needed(reviews, 'reviews')
+    const reviewCommentList = needed(reviewComments, 'review comments')
+    const issueCommentList = needed(issueComments, 'comments')
+    // The checks are a part pr_feedback can do without: a source that fails leaves them unavailable, with why, and the
+    // other source's checks, the reviews and the comments still come.
+    const unavailable: string[] = []
+    const checks: PullFeedback['checks'] = []
+    let moreChecks = false
+    for (const [settled, read] of [[runs, checkRunsOf], [statuses, statusesOf]] as const) {
+      if (settled.status === 'fulfilled') {
+        checks.push(...read(settled.value))
+        moreChecks ||= settled.value.full
+        continue
+      }
+      const why = cantReadChecks(settled.reason)
+        ? `the dish App can't read checks of ${project.name}: it needs Checks and Commit statuses read (accept them on GitHub; Settings → GitHub App)`
+        : `could not read the checks: ${shown(messageOf(settled.reason), MESSAGE_CHARS)}`
+      if (!unavailable.includes(why)) unavailable.push(why)
+    }
+    return {
+      number: details.number,
+      url: untrusted(details.url, FEEDBACK_TEXT_CHARS),
+      title: untrusted(details.title, FEEDBACK_TEXT_CHARS),
+      state: details.state,
+      merged: details.merged,
+      draft: details.draft,
+      mergeable: details.mergeable,
+      mergeableState: untrusted(details.mergeableState, FEEDBACK_TEXT_CHARS),
+      head: { ref: untrusted(details.head.ref, FEEDBACK_TEXT_CHARS), sha: untrusted(sha, FEEDBACK_TEXT_CHARS) },
+      base: { ref: untrusted(details.base.ref, FEEDBACK_TEXT_CHARS) },
+      reviews: reviewsOf(reviewList),
+      reviewComments: reviewCommentsOf(reviewCommentList),
+      issueComments: issueCommentsOf(issueCommentList),
+      checks: checks.slice(0, 2 * FEEDBACK_ITEMS),
+      ...(unavailable.length > 0 ? { checksUnavailable: unavailable.join('; ') } : {}),
+      more: { reviews: reviewList.full, reviewComments: reviewCommentList.full, issueComments: issueCommentList.full, checks: moreChecks },
+    }
+  }
+
+  /** `name`, registered and ready now; a closed service is `stopped()`. */
+  async #readyProject(name: string): Promise<Project> {
+    if (this.#closed) throw stopped()
+    const project = await this.#registered(name)
+    const state = this.#projects()?.status(project.name).state ?? 'unknown'
+    if (state !== 'ready') throw new Error(`${project.name} isn't ready (${state}); see Settings → Projects`)
+    return project
+  }
+
+  /** The worktree dish made at `<project>/<slug>`, or why there is none to be `what`. */
+  async #managed(project: Project, slug: string, what: 'pushed' | 'compared'): Promise<Worktree> {
+    const ref = `${project.name}/${slug}`
+    const worktree = await this.resolve(ref)
+    if (worktree !== undefined) return worktree
+    const problem = await this.resolveProblem(ref)
+    if (problem !== undefined) throw new Error(`${ref} can't be ${what}: ${problem}`)
+    throw new Error(what === 'pushed'
+      ? `no worktree ${ref} that dish made; dish pushes only the dish/<slug> branch of a worktree it made`
+      : `no worktree ${ref} that dish made`)
   }
 
   // --- the lock and the work in flight -------------------------------------------------------------------------------
@@ -742,9 +1178,37 @@ class Service implements WorkspacesService {
   #sweepLater(project: Project): void {
     if (this.#closed) return
     const topic = `project ${project.name.toLowerCase()}`
-    this.#locked(project, undefined, signal => this.#fetchAndSweep(project, signal, false)).catch((error: unknown) => {
+    this.#locked(project, undefined, signal => this.#fetchAndSweep(project, signal, false)).then((result) => {
+      this.#runsRemoved(result.removed)
+    }).catch((error: unknown) => {
       if (!this.#closed && !isAbort(error)) this.#warnOnce(topic, logged(error), 'could not sweep %s: %s', project.name, logged(error))
     })
+  }
+
+  /** dish-orchestrator's hooks, if it is there (read on each use). */
+  #runs(): RunsHooks | undefined {
+    return (this.#ctx as unknown as { get(name: string): unknown }).get('dishRuns') as RunsHooks | undefined
+  }
+
+  /**
+   * Tell dish-orchestrator of each worktree a sweep removed, one after the other, once that sweep's lock is released.
+   * Tracked, so `close` waits for it; never rejects: a failure is logged once per project and error.
+   */
+  #runsRemoved(removed: SweepResult['removed']): void {
+    if (removed.length === 0) return
+    this.#track((async () => {
+      for (const item of removed) {
+        const runs = this.#runs()
+        if (runs === undefined) return
+        const topic = `runs ${item.project.toLowerCase()}`
+        try {
+          await runs.worktreeRemoved(item.project, item.slug)
+          this.#clearTrouble(topic)
+        } catch (error) {
+          this.#warnOnce(topic, logged(error), 'dish-orchestrator could not note that worktree %s/%s was removed: %s', item.project, item.slug, logged(error))
+        }
+      }
+    })())
   }
 
   // --- the hourly round --------------------------------------------------------------------------------------------------
@@ -779,7 +1243,8 @@ class Service implements WorkspacesService {
       if (this.#closed) return
       const topic = `project ${project.name.toLowerCase()}`
       try {
-        await this.#locked(project, undefined, signal => this.#fetchAndSweep(project, signal, true))
+        const result = await this.#locked(project, undefined, signal => this.#fetchAndSweep(project, signal, true))
+        this.#runsRemoved(result.removed)
         this.#clearTrouble(topic)
       } catch (error) {
         if (this.#closed) return
