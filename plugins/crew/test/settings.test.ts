@@ -1,8 +1,11 @@
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { computePrevious, readPrevious } from 'dish-kit'
 import { load } from 'js-yaml'
-import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from '../src/settings.ts'
+import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, PREVIOUS_HASHES, parseSettings } from '../src/settings.ts'
 import type { CrewSettings } from '../src/settings.ts'
 import { render, shippedDocument, shippedWith } from './helpers.ts'
 
@@ -36,6 +39,22 @@ test('the shipped crew.yaml is the one in the spec, and DEFAULT_TEXT is that fil
   const spec = readFileSync(new URL('../../../docs/specs/crew.md', import.meta.url), 'utf8')
   const block = /^## `crew\.yaml`[\s\S]*?```yaml\n([\s\S]*?)```/m.exec(spec)?.[1]
   assert.equal(DEFAULT_TEXT, block)
+})
+
+test('previous.json is what git history says, and never lists the text shipped now', async (t) => {
+  const current = createHash('sha256').update(DEFAULT_TEXT, 'utf8').digest('hex')
+  assert.ok(PREVIOUS_HASHES.length > 0)
+  assert.ok(!PREVIOUS_HASHES.includes(current), 'previous.json lists the current crew.yaml')
+  const directory = fileURLToPath(new URL('../defaults/', import.meta.url))
+  let computed: Record<string, string[]>
+  try {
+    computed = await computePrevious(directory, '')
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'NO_HISTORY') return t.skip((error as Error).message)
+    throw error
+  }
+  assert.deepEqual(await readPrevious(directory), computed,
+    'run: node packages/dish-kit/scripts/previous-defaults.mjs plugins/crew/defaults \'\'')
 })
 
 /** The yaml blocks of the spec's `crew.yaml` section, in order: the shipped file first, then the examples after it. */
@@ -87,7 +106,7 @@ test('the default has the models, limits and roles of the spec', () => {
   assert.equal(coder.family, 'anthropic')
   assert.equal(coder.writes, true)
   assert.equal(coder.reviews, false)
-  assert.deepEqual([...coder.tools], ['read', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message', 'ask_judge'])
+  assert.deepEqual([...coder.tools], ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message', 'ask_judge'])
   assert.equal(settings.roles.architect!.tier, 'strong')
   // writes and reviews are false unless the file says so.
   const researcher = settings.roles.researcher!
@@ -546,12 +565,13 @@ test('every shipped role lists ask_judge, last, and the tools it had before are 
     assert.equal(settings.tools.at(-1), JUDGE_TOOL, role)
     assert.equal(settings.tools.filter(tool => tool === JUDGE_TOOL).length, 1, role)
   }
-  // The tools before it are the spec's roles from before dish-judge: the lists only gained one name.
+  // The tools before it are the spec's roles from before dish-judge: the lists only gained one name, and (2026-10-03)
+  // read_image for the roles that check what they or others made.
   const before = (role: string) => DEFAULT_SETTINGS.roles[role]!.tools.slice(0, -1)
   assert.deepEqual(before('architect'), ['read', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
-  assert.deepEqual(before('reviewer'), ['read', 'glob', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('reviewer'), ['read', 'read_image', 'glob', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message'])
   assert.deepEqual(before('researcher'), ['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
-  assert.deepEqual(before('writer'), ['read', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('writer'), ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
 })
 
 test('a tool name is only a name: a file that lists ask_judge is valid whether or not dish-judge is installed', () => {

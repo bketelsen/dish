@@ -103,8 +103,8 @@ export const EFFECT_QUESTION: Question = {
   instructions: 'What would running `command` from `cwd` do to files, systems and data?',
   criteria: {
     read_only: 'it only reads or reports',
-    reversible: 'it changes files inside `workspace` in a way git or rerunning can undo',
-    irreversible: 'it deletes or overwrites data that can\'t be recovered, changes things outside `workspace`, publishes, pushes, merges, deploys, sends, or spends',
+    reversible: 'it changes files inside `workspace` or scratch files in `/tmp`, in a way git or rerunning can undo',
+    irreversible: 'it deletes or overwrites data that can\'t be recovered, changes things outside `workspace` and `/tmp`, publishes, pushes, merges, deploys, sends, or spends',
     other: null,
   },
 }
@@ -712,13 +712,19 @@ export function decideCommand(result: JudgeResult, settings: JudgeSettings, topL
 
   const label = EFFECT_WORDS[seen.choice] ?? seen.choice
   const chosen = p2(seen.probabilities[seen.choice] ?? 0)
+  // The likeliest reading can be `reversible` while read-only and reversible together still fall short of the bar, the
+  // rest going to `irreversible` or `other`. "It reads as reversible" doesn't say why that was stopped, so the words then
+  // give the sum instead.
+  const unsure = !effectOk && seen.choice !== 'irreversible'
+  const undoable = `p ${p2(pRead + pReversible)} that it only reads or can be undone`
   if (topLevel) {
+    const effect = unsure ? `isn't sure this can be undone (${undoable})` : `reads this as ${label} (p ${chosen})`
     const task = serves ? `as serving the task (p ${p2(seen.serves)})` : `as unlikely to serve the task (p ${p2(seen.serves)})`
-    const reason = `The judge reads this as ${label} (p ${chosen}), and ${task}.`
+    const reason = unsure ? `The judge ${effect}, and reads it ${task}.` : `The judge ${effect}, and ${task}.`
     return { decision: 'ask', pre: { kind: 'ask', reason, displayReason: { en: reason } } }
   }
   const causes: string[] = []
-  if (!effectOk) causes.push(`it reads as ${label} (p ${chosen})`)
+  if (!effectOk) causes.push(unsure ? `it may not be undoable (${undoable})` : `it reads as ${label} (p ${chosen})`)
   if (!serves) causes.push(`it doesn't look like it serves the task (p ${p2(seen.serves)})`)
   const way = !effectOk && !serves ? 'a reversible way that serves the task' : !effectOk ? 'a reversible way' : 'a step that serves the task'
   return { decision: 'deny', pre: { kind: 'deny', reason: `The judge didn't let this run: ${causes.join(', and ')}. Report it to the main agent instead, or find ${way}.` } }

@@ -31,10 +31,12 @@ Everything below is merged and running on the VM.
 | `sandbox-home` | #9 | The writable home is live, less a protected list (spec: [sandbox-home](docs/specs/sandbox-home.md)). |
 | The judge's read-only rule | #11 | A read-only command runs without the task check. |
 | The account's mise config and toolchains | fleet #40 and #41 | Node 24.21.0, pnpm 11.25.0, Go 1.27.1, Python 3.14.8. Configs under `~/work` are trusted. |
+| The private-key screen fix | #15 | A fake `BEGIN … PRIVATE KEY` header no longer hides a page from the injection screen. |
+| 6c `gates` | #16 | See Next, item 1. |
 
 **Shelved:** mise approvals (the `dish-mise` wrapper, the judge's trusted rule and its checkbox). The work sits on the local branches `mise-approvals`, `mise-t1`, `mise-t2` and `mise-t3` in `~/projects/dish`, and was never pushed. sandbox-home replaced it: plain `mise install` works in the sandbox. Delete those branches when you're sure.
 
-**The GitHub App:** the VM uses `bketelsen-dish-dev` (read-only: Contents and Pull requests). The plan assumed a second App, `bketelsen-dish`, for prod. Either make it and switch keys on Settings → GitHub App, or decide the one App is enough and say so in the 6b spec.
+**The GitHub App:** the VM uses `bketelsen-dish-dev` (read-only: Contents and Pull requests). The plan assumed a second App, `bketelsen-dish`, for prod. On 2026-10-03 the user decided to make the prod App, with write access, and switch keys on Settings → GitHub App. Until then an agent's `git push` gets 403, though the prompts already tell agents to open pull requests.
 
 ## Running it
 
@@ -84,31 +86,38 @@ Sessions are `session.v4.jsonl.zstd` under the workspace's directory, and a crew
 
 1. **6c `gates`** ([spec](docs/specs/gates.md), [plan](docs/plans/2026-10-03-gates.md)): merged and deployed to the VM on 2026-10-03, and checked end to end in a scratch dsh (the spec's "Notes from the build"). When a crew coder bound to a worktree is about to finish, `dish-gates` runs the project's gate there in the sandbox, sends a failure back (at most 3 gate runs a turn; the third failure ends the turn), and records the result in crew's record. The finish notice says how the gate ended, and a review of work whose gate didn't pass needs the main agent's `gateOverride` ruling. The rollout is the plan's [last section](docs/plans/2026-10-03-gates.md#the-rollout-for-you):
    - done: the deploy (`dish-update --apply` added the `dish-gates` bundle and restarted);
-   - `bketelsen/clippy`'s gate is `go build` (10m). It works as is: a gate's `PATH` ends with mise's shims, so bare `go` resolves through mise. Consider `go vet ./... && go test ./...` with `5m`;
-   - the live check: a failing gate fixed in round 2, a review, and a blocked coder whose review needs a ruling.
+   - done: `bketelsen/clippy`'s gate is `go vet ./... && go test ./...` with `5m`;
+   - seen in a real session (clippy README, 2026-10-03, 10:48–11:05 UTC): a coder that reported BLOCKED had its gate skipped, and the commit run's gate passed in 0.3 s (Go's test cache was warm). The coder also ran `go test` itself, because the main agent's brief told it to;
+   - still to see live: a failing gate fixed in round 2, and a review that needs a ruling.
+2. **Friction fixes from that clippy session** (branch `friction`). In it, the judge stopped 24 of 66 commands, 15 of them for writing to `/tmp`, which dsh also emptied after every call. The branch:
+   - gives sandboxed commands the VM's own `/tmp`, the one dsh's file tools and `workdir` see, by moving dsh's own temp files to `~/.cache/dish/tmp` (the unit's `TMPDIR`); and puts mise's shims at the end of their `PATH` (`deploy/dish-sandbox`);
+   - has the judge count `/tmp` with the workspace, and word a refusal as what fell short;
+   - lets `delegate` follow-ups go without a `title`;
+   - gives the coder, reviewer and writer `read_image`, and moves an unedited `crew.yaml` to the new default at start.
 
-   Then tell the next session how long each gate took, and whether the coder also ran the gate itself: until step 7 drops the coder's own run, a gate runs twice.
-2. **6b's last check:** the squash-merge sweep check in the [plan's rollout](docs/plans/2026-10-02-projects.md#the-rollout-for-you), step 8.
-3. **The prod App decision** (above).
-4. **`README.md:19`** says Settings → GitHub App takes dev's own App, which waits on the prod App decision.
-5. **Going public.** An audit on 2026-10-03 found no real secret anywhere in the history. Before flipping the repo to public, run, with direnv loaded, `git log --all --format=%h -S"${TYPESAFE_API_KEY:8:16}"`: no output means the key was never committed. The two `apikey_…` values in `packages/dish-kit/test/secrets.test.ts` should be the fakes their comment says they are. Also: delete the merged branches, turn off the wiki if unused, and skim the PR descriptions. Links to `bketelsen/fleet` go to a private repository.
-6. **[ROADMAP.md](ROADMAP.md)'s backlog.** The items that matter most in daily use:
+   After it deploys, check the config store's History: `crew.yaml` should show "updated to the new defaults" (an edited `crew.yaml` keeps its text, and gets no `read_image`). The judge's `reversible: 0.80` and `servesTask: 0.40` are the user's `judge.yaml` on the VM (Settings → Judge), not the shipped default; the judge spec has the replay behind them.
+3. **6b's last check:** the squash-merge sweep check in the [plan's rollout](docs/plans/2026-10-02-projects.md#the-rollout-for-you), step 8.
+4. **The prod App:** the user is making it (above). Then switch keys on Settings → GitHub App, and check that an agent can push a branch.
+5. **`README.md:19`** says Settings → GitHub App takes dev's own App, which waits on the prod App decision.
+6. **Going public.** An audit on 2026-10-03 found no real secret anywhere in the history. Before flipping the repo to public, run, with direnv loaded, `git log --all --format=%h -S"${TYPESAFE_API_KEY:8:16}"`: no output means the key was never committed. The two `apikey_…` values in `packages/dish-kit/test/secrets.test.ts` should be the fakes their comment says they are. Also: delete the merged branches, turn off the wiki if unused, and skim the PR descriptions. Links to `bketelsen/fleet` go to a private repository.
+7. **[ROADMAP.md](ROADMAP.md)'s backlog.** The items that matter most in daily use:
    - crew's own `send_message`, so children stop sending a "done" message before their report;
    - Chromium and `libxml2-utils` on the VM;
    - dev-server previews.
-7. **dsh issues worth filing upstream**, seen in sessions:
+8. **dsh issues worth filing upstream**, seen in sessions:
    - `{{model}}` shows the preset's model, not the session's;
    - the child "send your result" note can't be turned off;
    - a provider without a key fails the first turn and the title;
    - there's no setting for extra writable roots (dish uses `runnerCommand` instead);
    - a message typed mid-turn waits for the whole turn;
    - `bash` without `description` is refused;
-   - `edit` refuses a file seen only through `cat`.
+   - `edit` refuses a file seen only through `cat`, and a file read in an earlier turn of a follow-up (a writer's 8 edits failed that way);
+   - a `workdir` that doesn't exist is reported as `spawn <runner> ENOENT`, which reads as the sandbox runner missing.
 
 ## Known limits to keep in mind
 
 - **The sandbox guards against accidents, not a determined agent.** The D-Bus session bus and the systemd user manager are reachable from inside it, which is left open on purpose. Reads were never confined: an agent's shell can read `~/.dsh/.credentials.yaml` and `~/.ssh`.
-- **The GitHub App is read-only, so agents never push.** A `git push` from an agent is refused with 403, by design (decision 2A).
+- **The GitHub App is read-only, so agents never push,** until the prod App (above). A `git push` from an agent is refused with 403 (decision 2A).
 - **The writable home's residual risks:** sandboxed code can leave things in the home directory (caches, `~/go/bin`, mise installs) that an approved escalation later runs. The protected list covers what runs without anyone acting.
 - **The judge's read-only rule:** a command that reads and sends in one step depends on the judge reading it as `irreversible`.
 - **The judge's ask counts:** read-only commands no longer ask. The judge still asks about writes that it scores as not serving the task, such as tests an agent runs on its own initiative.

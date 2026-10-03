@@ -762,7 +762,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
   }
 
   /** The `call` for the arguments, after the checks that need no one's state: who is calling, the services, the role, the task. */
-  async function prepare(args: { role: string, title: string, task: string, to?: string, reviews?: string, model?: string, worktree?: string, gateOverride?: string }, agent: Agent | undefined, signal: AbortSignal): Promise<Call> {
+  async function prepare(args: { role: string, title?: string, task: string, to?: string, reviews?: string, model?: string, worktree?: string, gateOverride?: string }, agent: Agent | undefined, signal: AbortSignal): Promise<Call> {
     if (agent === undefined || !isTopLevelAgent(agent)) {
       throw new Error('delegate is for the main agent only: a crew child can\'t delegate. Do the work yourself, or send_message the main agent if you need something done.')
     }
@@ -825,7 +825,9 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
         + 'a refusal says who is running and what to do. Returns the child\'s id, role, model and label.',
       parameters: {
         role: { type: 'string', required: true, description: `A role in crew.yaml: ${roleList(settings)}.` },
-        title: { type: 'string', required: true, description: '3 to 6 words naming the work. It is in the child\'s label and in its finish notice. Not used for a follow-up.' },
+        // Not required in the schema: a follow-up has no use for one, and dsh refused a follow-up without it before
+        // `execute` ran (a wasted call in the clippy session of 2026-10-03). A start without one is refused below.
+        title: { type: 'string', description: '3 to 6 words naming the work, needed to start a child. It is in the child\'s label and in its finish notice. Leave empty for a follow-up.' },
         task: { type: 'string', required: true, description: 'The complete, self-contained brief. For a follow-up, the new instructions: the findings to fix, say.' },
         to: { type: 'string', description: 'The id of a crew child this session started, in the same role, to send `task` to as a follow-up (a fix round) instead of starting a new child. Leave empty to start a new one.' },
         reviews: { type: 'string', description: 'Reviewer role only, and required for it: the id of the crew child whose work is reviewed, or "main" for your own work. Leave empty for any other role.' },

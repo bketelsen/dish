@@ -11,7 +11,9 @@
  * @module dish-crew/settings
  */
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import type { NamespaceSpec } from 'dish-config'
+import { parsePrevious } from 'dish-kit'
 import { JSON_SCHEMA, load, YAMLException } from 'js-yaml'
 import { LISTED, SHOWN, listed as listNames, truncate } from './text.ts'
 
@@ -319,6 +321,15 @@ export function parseSettings(text: string): ParseResult {
 
 /** The shipped `crew.yaml`, as a file in the store. A missing file is a broken install, so it throws when this module loads. */
 export const DEFAULT_TEXT: string = readFileSync(new URL('../defaults/crew.yaml', import.meta.url), 'utf8')
+
+/**
+ * The earlier shipped texts of `crew.yaml`, as sha256 hashes (`defaults/previous.json`, written from git history by
+ * dish-kit's `previous-defaults.mjs`). A stored `crew.yaml` that still hashes to one of them is an unedited default,
+ * and the seed moves it to `DEFAULT_TEXT`; an edited one stays. A missing or malformed file is a broken install.
+ */
+export const PREVIOUS_HASHES: readonly string[] = Object.freeze(parsePrevious(
+  readFileSync(new URL('../defaults/previous.json', import.meta.url), 'utf8'),
+  fileURLToPath(new URL('../defaults/previous.json', import.meta.url)))['crew.yaml'] ?? [])
 
 /** The shipped file as settings. A shipped file that doesn't pass its own check is a broken install too. */
 export const DEFAULT_SETTINGS: CrewSettings = (() => {

@@ -1,8 +1,10 @@
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, readdir, readFile, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
@@ -10,12 +12,12 @@ import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SubagentRunEndInfo, SubagentRunInfo } from '@deepseek-ai/dsh-subagent'
 import type { DishConfigService } from 'dish-config'
-import { xdgPaths } from 'dish-kit'
+import { computePrevious, xdgPaths } from 'dish-kit'
 import * as plugin from '../src/index.ts'
 import type { DishCrew } from '../src/index.ts'
 import { CrewRecords } from '../src/record.ts'
 import type { NewChild, RunEnd } from '../src/record.ts'
-import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, parseSettings } from '../src/settings.ts'
+import { CREW_SPEC, DEFAULT_SETTINGS, DEFAULT_TEXT, PREVIOUS_HASHES, parseSettings } from '../src/settings.ts'
 import {
   captureStderr, dirs, mountConfig, mountCrew, provideStub, seeded, shippedWith, tempDir, waitFor, watchLogs, withEnv,
 } from './helpers.ts'
@@ -186,6 +188,51 @@ test('with the store there, crew.yaml is seeded as the shipped default; a second
     const store = ctx.dishConfig
     assert.equal(await store.head(), first.head)
     assert.deepEqual((await store.history({ path: 'crew.yaml' })).map(commit => commit.id), [first.commit])
+  })
+})
+
+const DEFAULTS_DIRECTORY = fileURLToPath(new URL('../defaults/', import.meta.url))
+
+/** A shipped crew.yaml from git history whose sha256 is `hash`, or `undefined` (and `t` skipped) with no history here. */
+async function earlierDefault(t: TestContext, hash: string): Promise<string | undefined> {
+  try {
+    await computePrevious(DEFAULTS_DIRECTORY, '')
+  } catch (error) {
+    if ((error as { code?: unknown }).code !== 'NO_HISTORY') throw error
+    t.skip((error as Error).message)
+    return undefined
+  }
+  // A scratch HOME, never the runner's, and no global git config.
+  const env = { PATH: process.env.PATH, HOME: await tempDir(), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }
+  const git = (...args: string[]): string => execFileSync('git', ['-C', DEFAULTS_DIRECTORY, ...args], { encoding: 'utf8', env })
+  for (const commit of git('log', '--full-history', '--format=%H', '--', 'crew.yaml').split('\n').filter(Boolean)) {
+    const text = git('show', `${commit}:./crew.yaml`)
+    if (createHash('sha256').update(text, 'utf8').digest('hex') === hash) return text
+  }
+  throw new Error(`no earlier crew.yaml has the hash ${hash}`)
+}
+
+test('at start, a crew.yaml that is an earlier shipped default becomes the current one; an edited one stays', async (t) => {
+  const earlier = await earlierDefault(t, PREVIOUS_HASHES[0]!)
+  if (earlier === undefined) return
+  assert.notEqual(earlier, DEFAULT_TEXT)
+  const unedited = await dirs()
+  const edited = await dirs()
+  const mine = `${earlier}# mine\n`
+  await withBoth(unedited, async (ctx) => { assert.ok(await ctx.dishConfig.write([{ path: 'crew.yaml', text: earlier }], { author: USER })) })
+  await withBoth(edited, async (ctx) => { assert.ok(await ctx.dishConfig.write([{ path: 'crew.yaml', text: mine }], { author: USER })) })
+
+  await withBoth(unedited, async (ctx) => {
+    // The seed isn't awaited by start-up, so the upgrade lands a moment after the plugin is up.
+    await waitFor('the earlier default to be replaced', async () => (await ctx.dishConfig.read('crew.yaml')) === DEFAULT_TEXT || undefined)
+    const [latest] = await ctx.dishConfig.history({ path: 'crew.yaml' })
+    assert.deepEqual(latest!.author, { kind: 'system' })
+    assert.equal(latest!.note, 'updated to the new defaults')
+  })
+  await withBoth(edited, async (ctx) => {
+    // The plugin's own seed isn't awaited: seeding again as it does shows there is nothing to replace.
+    await ctx.dishConfig.seed({ 'crew.yaml': DEFAULT_TEXT }, 'dish-crew', { replace: { 'crew.yaml': [...PREVIOUS_HASHES] } })
+    assert.equal(await ctx.dishConfig.read('crew.yaml'), mine)
   })
 })
 

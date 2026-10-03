@@ -337,7 +337,7 @@ test('it registers delegate with a schema the tool registry accepts, and the out
   assert.deepEqual([...schema.required].sort(), ['child', 'label', 'model', 'role'])
   const parameters = w.tool.parameters as { properties: Record<string, unknown>, required: string[] }
   assert.deepEqual(Object.keys(parameters.properties).sort(), ['gateOverride', 'model', 'reviews', 'role', 'task', 'title', 'to', 'worktree'])
-  assert.deepEqual([...parameters.required].sort(), ['role', 'task', 'title'])
+  assert.deepEqual([...parameters.required].sort(), ['role', 'task'], 'title is checked in execute: a follow-up needs none')
 })
 
 test('the description names the roles of crew.yaml and tells the model how to work', async () => {
@@ -1071,6 +1071,20 @@ test('a follow-up sends the task to the child, counts it, and starts nothing', a
   assert.equal(record!.last, 'running')
   assert.equal(record!.title, 'add login')
   assert.equal(w.resolves.length, 1, 'no route check for a follow-up: the child keeps its route')
+})
+
+test('a follow-up needs no title, and keeps its child\'s', async () => {
+  const w = await world()
+  const started = await w.delegate(CODER)
+  w.agents.set(started.child, { status: 'idle' })
+  await w.records.endRun(started.child, { stopReason: 'completed', closing: 'done' })
+  const result = await w.delegate({ role: 'coder', task: 'Fix the review findings.', to: started.child })
+  assert.equal(result.label, 'coder · claude-sonnet-5.5 · add login')
+  assert.equal(w.sends.length, 1)
+  // A start still needs one.
+  const { title: _title, ...untitled } = CODER
+  assert.match(await refusal(w.delegate(untitled)), /title is empty/)
+  assert.equal(w.starts.length, 1)
 })
 
 test('a follow-up is refused for a child that is not one of this session\'s, naming the session\'s children', async () => {

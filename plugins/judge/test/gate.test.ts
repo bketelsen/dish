@@ -484,6 +484,29 @@ test('a child\'s denial is written for the model, with the spec\'s wording', asy
   })
 })
 
+test('a likeliest reading that is not irreversible, under the bar with read-only, is worded as the sum, not as the reading', async () => {
+  // The clippy run of 2026-10-03: "it reads as reversible (p 0.73) … find a reversible way" left the coder retrying.
+  const short = { read_only: 0.01, reversible: 0.72, irreversible: 0.25, other: 0.02 }
+  const ask = await run(gateOf(() => answers(short, 0.56)).gate)
+  assert.equal(ask.decision.kind === 'ask' && ask.decision.displayReason?.en,
+    'The judge isn\'t sure this can be undone (p 0.73 that it only reads or can be undone), and reads it as serving the task (p 0.56).')
+  const offTask = await run(gateOf(() => answers(short, 0.42)).gate)
+  assert.equal(offTask.decision.kind === 'ask' && offTask.decision.displayReason?.en,
+    'The judge isn\'t sure this can be undone (p 0.73 that it only reads or can be undone), and reads it as unlikely to serve the task (p 0.42).')
+  const child = agentOf({ child: true, cwd: '/work/app', events: [userEvent(1, 'add a test')] })
+  const denied = await run(gateOf(() => answers(short, 0.56)).gate, { agent: child })
+  assert.deepEqual(denied.decision, {
+    kind: 'deny',
+    reason: 'The judge didn\'t let this run: it may not be undoable (p 0.73 that it only reads or can be undone). Report it to the main agent instead, or find a reversible way.',
+  })
+  const other = { read_only: 0.22, reversible: 0.33, irreversible: 0.09, other: 0.36 }
+  const both = await run(gateOf(() => answers(other, 0.3)).gate, { agent: child })
+  assert.deepEqual(both.decision, {
+    kind: 'deny',
+    reason: 'The judge didn\'t let this run: it may not be undoable (p 0.55 that it only reads or can be undone), and it doesn\'t look like it serves the task (p 0.30). Report it to the main agent instead, or find a reversible way that serves the task.',
+  })
+})
+
 test('decideCommand gives the log line its word: allow, ask or deny', () => {
   assert.equal(decideCommand(answers(READ_ONLY, 0.9), DEFAULT_SETTINGS, true).decision, 'allow')
   assert.equal(decideCommand(answers(IRREVERSIBLE, 0.9), DEFAULT_SETTINGS, true).decision, 'ask')
@@ -581,8 +604,8 @@ test('the questions are the spec\'s, word for word', () => {
     instructions: 'What would running `command` from `cwd` do to files, systems and data?',
     criteria: {
       read_only: 'it only reads or reports',
-      reversible: 'it changes files inside `workspace` in a way git or rerunning can undo',
-      irreversible: 'it deletes or overwrites data that can\'t be recovered, changes things outside `workspace`, publishes, pushes, merges, deploys, sends, or spends',
+      reversible: 'it changes files inside `workspace` or scratch files in `/tmp`, in a way git or rerunning can undo',
+      irreversible: 'it deletes or overwrites data that can\'t be recovered, changes things outside `workspace` and `/tmp`, publishes, pushes, merges, deploys, sends, or spends',
       other: null,
     },
   })

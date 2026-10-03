@@ -3,7 +3,8 @@
  *
  * - **Only a sandboxing shell.** The gate runs only when the shell sandboxes (`sandboxMode` is set), and always with an
  *   explicit `workspace-write` policy whose workspace root is the clone: the worktree and the clone's `.git` are
- *   writable, and so is the call's own `/tmp`. dsh's local bash ignores a policy, so with it the gate isn't run at all.
+ *   writable, and so is `/tmp` (the call's own, or on dish's VM the machine's: `deploy/dish-sandbox`). dsh's local bash
+ *   ignores a policy, so with it the gate isn't run at all.
  *   When no sandbox runner works, dsh refuses to run unconfined (`SANDBOX_UNAVAILABLE`): that is an `error` here, and
  *   never a retry. dish-gates runs no process of its own.
  * - **One stream of output.** dsh collects stdout and stderr apart, and the 4 MiB budget is stdout's alone (stderr keeps

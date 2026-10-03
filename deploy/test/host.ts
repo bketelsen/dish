@@ -118,6 +118,9 @@ export interface Install {
   env: Record<string, string>
   /** The name of every variable install.sh saw, sorted. */
   names: string[]
+  /** install.sh's TMPDIR, and its mode when it is a directory (null when it isn't one). */
+  tmpdir: string | undefined
+  tmpdirMode: number | null
 }
 
 export interface Host {
@@ -274,7 +277,10 @@ const fs = process.getBuiltinModule('node:fs')
 const dir = ${JSON.stringify(dir)}
 const env = {}
 for (const [name, value] of Object.entries(process.env)) if (name.startsWith('DISH_')) env[name] = value
-fs.appendFileSync(dir + '/calls/install.jsonl', JSON.stringify({ env, names: Object.keys(process.env).sort() }) + '\\n')
+const tmpdir = process.env.TMPDIR
+let tmpdirMode = null
+try { const stat = fs.statSync(tmpdir); if (stat.isDirectory()) tmpdirMode = stat.mode & 0o777 } catch {}
+fs.appendFileSync(dir + '/calls/install.jsonl', JSON.stringify({ env, names: Object.keys(process.env).sort(), tmpdir, tmpdirMode }) + '\\n')
 const config = JSON.parse(fs.readFileSync(dir + '/config.json', 'utf8'))
 console.log('install: pnpm install --frozen-lockfile')
 for (const line of config.installOutput) console.log(line)

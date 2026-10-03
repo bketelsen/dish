@@ -16,7 +16,9 @@
 #   which runs this script as the account through runuser with a minimal environment and does nothing else. Run as
 #   root, or as anyone but the account, it refuses with exit 2.
 # - It runs itself again with a clean environment (env -i): HOME, USER, LOGNAME, XDG_RUNTIME_DIR=/run/user/<uid>, the
-#   PATH of the checkout's unit, TMPDIR, LANG and update.sh's own DISH_UPDATE_* names, and nothing else. No XDG_*
+#   PATH of the checkout's unit, TMPDIR=~/.cache/dish/tmp, LANG and update.sh's own DISH_UPDATE_* names, and nothing
+#   else. TMPDIR is not /tmp: a sandboxed command can write the machine's /tmp (deploy/dish-sandbox), and install.sh
+#   keeps pnpm's and git's config in its throwaway directory there while it runs them outside the sandbox. No XDG_*
 #   directories, PNPM_HOME, DSH_* or NODE_ENV, as for the unit, so the store `pnpm store path` gives install.sh is the
 #   store the unit's plugin manager works out again (the store-pin contract, in install.sh and the unit).
 # - PATH: update.sh's own commands (git, curl, systemctl) use the PATH it starts with, the checkout's unit's as it is
@@ -267,9 +269,12 @@ run_clean() {
   step="reading PATH from $checkout/deploy/$UNIT"
   local path
   path=$(unit_path "the checkout's deploy/$UNIT" <"$checkout/deploy/$UNIT")
+  # dsh's own temp directory (the unit's TMPDIR), which dish-sandbox protects: not /tmp, which sandboxed commands write.
+  step="making $home/.cache/dish/tmp"
+  (umask 077 && mkdir -p -- "$home/.cache/dish/tmp")
   clean=(
     "HOME=$home" "USER=$account" "LOGNAME=$account" "XDG_RUNTIME_DIR=/run/user/$uid" "PATH=$path"
-    TMPDIR=/tmp LANG=C.UTF-8 DISH_UPDATE_CLEAN=1
+    "TMPDIR=$home/.cache/dish/tmp" LANG=C.UTF-8 DISH_UPDATE_CLEAN=1
   )
   if [ -n "${DISH_UPDATE_WAIT+x}" ]; then clean+=("DISH_UPDATE_WAIT=$DISH_UPDATE_WAIT"); fi
   step="moving to $home"

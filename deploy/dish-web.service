@@ -43,6 +43,18 @@ EnvironmentFile=%h/.config/dish/deploy.env
 # dev environment; the service is prod because it never goes through the launcher, so it gets the account's own
 # directories. Setting DISH_ENV=prod here would reach every agent shell, since dsh passes its environment on.
 Environment=PATH=/opt/dish/node/bin:/usr/local/bin:/usr/bin:/bin
+# Where dsh keeps its own temp files: spill files, launch requests, an interactive shell's rc file, some of them read or
+# run outside the sandbox. It is under ~/.cache/dish, on deploy/dish-sandbox's protected list, so no sandboxed command
+# can write there, and dish-sandbox can give those commands the machine's own /tmp, writable and lasting: the same /tmp
+# dsh's file tools and a call's workdir see (since 2026-10-03; before, a command's /tmp was empty on every call). It is
+# made before each start, 0700. An escalated command, which dish-sandbox never runs, inherits it as its TMPDIR. Nothing
+# ages it as systemd-tmpfiles ages /tmp, and dsh keeps a process's full outputs until "an external cleanup", so before
+# each start, while dsh is stopped, each file untouched for 10 days goes, and then each directory left empty and as old
+# (per file, as /tmp's rule ages it, so a spill root that dsh kept using keeps its recent files); `-` so a failure there
+# never stops the start. update.sh gives install.sh the same TMPDIR.
+Environment=TMPDIR=%h/.cache/dish/tmp
+ExecStartPre=/usr/bin/mkdir -p -m 0700 %h/.cache/dish %h/.cache/dish/tmp
+ExecStartPre=-/usr/bin/find %h/.cache/dish/tmp -mindepth 1 -depth -mtime +10 ( ! -type d -o -empty ) -delete
 
 # The checkout's dsh, not `pnpm dsh`: root scripts are wrapped by the launcher, and the launcher would start the VM on an
 # empty dev store. It is dsh's own script, run by the Node of the PATH line, and not its node_modules/.bin/dsh shim. The

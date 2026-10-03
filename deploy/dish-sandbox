@@ -5,7 +5,9 @@
 #
 # Why it exists. dsh's sandbox lets an agent's shell write only the workspace and a /tmp that starts empty on every
 # call, so everyday work that writes the home directory fails with "Read-only file system": `go mod download`,
-# `pnpm install`, `cargo build`, `pip install --user`, `mise install`, and most tools' caches. On the VM, the VM is the
+# `pnpm install`, `cargo build`, `pip install --user`, `mise install`, and most tools' caches. And a file an agent
+# puts in /tmp is gone by its next command: agents build to /tmp/x and run /tmp/x a call later, and a main agent and
+# its crew children can't hand each other one (a clippy session of 2026-10-03 lost a dozen calls to it). On the VM, the VM is the
 # security boundary. Inside it, the sandbox only has to keep an agent from taking over dish itself, and from planting
 # code that runs later outside the sandbox. So this runner lets a command write the account's home, except for the
 # protected list below. dsh calls it through its own hook: the `sandbox` row (`@deepseek-ai/dsh-sandbox-local`) with
@@ -21,6 +23,19 @@
 #   so it wins over both, and the workspace stays writable, since it is the same directory. The protections come last,
 #   so a workspace at or under a protected path (the checkout, say) is read-only. The home is bound by its real path
 #   (`pwd -P`), since bwrap can't mount on a symbolic link.
+# - workspace-write mode, too: the machine's own /tmp, in place of dsh's `--tmpfs /tmp` (at the same place in the
+#   arguments, so dsh's workspace bind still comes after it), and TMPDIR=/tmp for the command. So /tmp lasts from one
+#   command to the next, and every agent and tool sees the same one: dsh's file tools (`read`, `write`, `read_image`)
+#   and a call's `workdir` are on the host, where /tmp was never the per-call one. That is only safe when dsh keeps its
+#   own temp files (spill files, launch requests, an interactive shell's rc file, some read or run outside the sandbox)
+#   somewhere else: so only when $TMPDIR, as dsh passes it, is at or under a protected path in the home. dish's unit
+#   sets TMPDIR=~/.cache/dish/tmp for that. Then any protected path under /tmp is protected too, since /tmp is
+#   writable. With no such TMPDIR (dev, tests), the command gets dsh's empty /tmp, as before. On the VM, /tmp is a
+#   tmpfs that systemd-tmpfiles ages out after 10 days; a full one no longer stops dsh, whose files are elsewhere.
+# - workspace-write mode, too: mise's shims directory, ${XDG_DATA_HOME:-~/.local/share}/mise/shims (XDG_DATA_HOME
+#   when it is absolute), goes at the end of the command's PATH, when it exists and isn't on PATH already. So a bare
+#   `go` or `cargo` runs mise's, while dish's own node and the system's tools, earlier on PATH, still come first. It is
+#   set for the sandboxed command only (bwrap's --setenv), never for dish's service: a shim lives in the writable home.
 #
 # The protected list. These stay read-only, whether they exist yet or not:
 # - dish and dsh themselves: $DSH_HOME (dsh gives every shell call its own), and ~/.dsh, dsh's default home, wherever
@@ -65,7 +80,8 @@
 # This file runs outside the sandbox, before every sandboxed command, with the environment dsh gives the command.
 # So it looks nothing up on PATH (a directory on it may be writable now): bwrap is /usr/bin/bwrap or
 # /usr/local/bin/bwrap, mkdir is /usr/bin/mkdir or /bin/mkdir, and everything else is a bash builtin. `bash -p` keeps
-# bash from reading BASH_ENV or importing functions, and the environment reaches the command unchanged.
+# bash from reading BASH_ENV or importing functions, and the environment reaches the command unchanged but for PATH
+# and TMPDIR, in workspace-write mode (above).
 #
 # Its own failures print `dish-sandbox: <reason>` on stderr and exit 1: no HOME, a relative HOME (or /, or one that
 # is not a directory), no `--`, a --protect that is not absolute or ~/..., a protected path that is a symbolic link or
@@ -133,11 +149,13 @@ fi
 bwrap=$(first_executable /usr/bin/bwrap /usr/local/bin/bwrap)
 if [ -z "$bwrap" ]; then fail 'no bwrap at /usr/bin/bwrap or /usr/local/bin/bwrap'; fi
 
-# dsh's profile has `--tmpfs /tmp` in workspace-write mode only.
+# dsh's profile has `--tmpfs /tmp` in workspace-write mode only. `tmpfs_at` is where, for the machine's /tmp to take.
 workspace_write=0
+tmpfs_at=-1
 for ((i = 0; i + 1 < ${#profile[@]}; i++)); do
   if [ "${profile[i]}" = --tmpfs ] && [ "${profile[i + 1]}" = /tmp ]; then
     workspace_write=1
+    tmpfs_at=$i
     break
   fi
 done
@@ -221,6 +239,19 @@ for path in "${protect_args[@]}"; do
   esac
 done
 
+# --- /tmp: the machine's own, when dsh keeps its own files in a protected TMPDIR. ------------------------------
+
+shared_tmp=0
+if [[ ${TMPDIR-} == /* ]] && [ -d /tmp ] && [ ! -L /tmp ]; then
+  normalize "$TMPDIR"
+  dsh_tmp=$normalized
+  for path in "${paths[@]}"; do
+    normalize "$path"
+    if [[ $normalized != "$home"/* && $normalized != "$home_real"/* ]]; then continue; fi
+    if [ "$dsh_tmp" = "$normalized" ] || [[ $dsh_tmp == "$normalized"/* ]]; then shared_tmp=1; fi
+  done
+fi
+
 # --- Make what is missing, outside the sandbox. ----------------------------------------------------------------
 
 mkdir_tool=''
@@ -270,6 +301,9 @@ for i in "${!paths[@]}"; do
     top=$home
   elif [[ $path == "$home_real"/* ]]; then
     top=$home_real
+  elif [ "$shared_tmp" -eq 1 ] && [[ $path == /tmp/* ]]; then
+    # The machine's /tmp is writable in the sandbox now, so a protected path there needs its own read-only bind.
+    top=/tmp
   else
     continue
   fi
@@ -309,5 +343,17 @@ for i in "${!paths[@]}"; do
   fi
 done
 
+# --- The machine's /tmp, and mise's shims. ---------------------------------------------------------------------
+
+setenv=()
+if [ "$shared_tmp" -eq 1 ]; then
+  profile=("${profile[@]:0:tmpfs_at}" --bind /tmp /tmp "${profile[@]:tmpfs_at+2}")
+  setenv+=(--setenv TMPDIR /tmp)
+fi
+
+if [[ ${XDG_DATA_HOME-} == /* ]]; then normalize "$XDG_DATA_HOME/mise/shims"; else normalize "$home/.local/share/mise/shims"; fi
+shims=$normalized
+if [ -n "${PATH-}" ] && [ -d "$shims" ] && [[ ":$PATH:" != *":$shims:"* ]]; then setenv+=(--setenv PATH "$PATH:$shims"); fi
+
 # The home by its real path: bwrap can't mount on a symbolic link, and the other paths reach it through theirs.
-run_bwrap "${profile[@]}" --bind "$home_real" "$home_real" "${pins[@]}" "${protections[@]}" -- "$@"
+run_bwrap "${profile[@]}" --bind "$home_real" "$home_real" "${pins[@]}" "${protections[@]}" "${setenv[@]}" -- "$@"

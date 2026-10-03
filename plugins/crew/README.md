@@ -17,7 +17,7 @@ The design and its reasoning are in the [spec](../../docs/specs/crew.md). Why th
 pnpm dsh plugin --profile web add ./plugins/crew
 ```
 
-It needs `dish-config` and `dish-prompts` in the same profile. On its first start with the store, it seeds `crew.yaml`.
+It needs `dish-config` and `dish-prompts` in the same profile. On its first start with the store, it seeds `crew.yaml`. On later starts, a `crew.yaml` that is still an earlier shipped default moves to the current one (one commit, note "updated to the new defaults"); an edited one stays. After changing `defaults/crew.yaml`, run `node packages/dish-kit/scripts/previous-defaults.mjs plugins/crew/defaults ''`.
 
 **Choose the preset:** on **Settings → Agent presets**, use **Set as new task default** on **dish**. The mode picker on a new chat switches per chat.
 

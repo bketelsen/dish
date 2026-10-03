@@ -7,6 +7,9 @@
  *
  * The script binds $HOME writable, so every run here has a HOME of the test's own: a fresh directory under the test's
  * temp directory, never the runner's home (checked before every run). The whole environment is the test's own making.
+ * Its TMPDIR is unset, so a run gets dsh's empty /tmp, except in the tests of the machine's /tmp: those set TMPDIR under
+ * the box's protected ~/.cache/dish, and the sandbox can then write the runner's /tmp, so their commands write only
+ * inside the box (which is under it).
  * The tests are skipped when there is no bwrap at /usr/bin/bwrap or /usr/local/bin/bwrap, or it can't make a sandbox
  * (no user namespaces).
  */
@@ -115,6 +118,8 @@ function assertScratch(box: Box, env: NodeJS.ProcessEnv): void {
   }
   assert.notEqual(box.home, REAL_HOME)
   assert.ok(!REAL_HOME.startsWith(`${box.home}/`), 'the real home is under the scratch home')
+  // An absolute TMPDIR must be the box's: it is where dsh would keep its own files, and it can share /tmp.
+  assert.ok(env.TMPDIR?.startsWith('/') !== true || env.TMPDIR.startsWith(`${box.dir}/`), `TMPDIR ${env.TMPDIR} is not the box's`)
 }
 
 interface Result {
@@ -347,13 +352,88 @@ test('workspace-write: a protected directory cannot be moved out of the way, nor
   assert.ok(lstatSync(join(box.home, '.profile')).isFile())
 })
 
-test('workspace-write: the workspace stays writable, inside the home or outside it, and /tmp is the call\'s own', { skip: SKIP }, async () => {
+test('workspace-write: the workspace stays writable, inside the home or outside it, and /tmp is writable', { skip: SKIP }, async () => {
   for (const where of ['home', 'outside'] as const) {
     const box = await makeBox({ workspace: where })
     const result = await bash(box, 'touch file && touch /tmp/scratch && echo ok')
     assert.equal(result.code, 0, `${where}: ${result.stderr}`)
     assert.ok(existsSync(join(box.workspace, 'file')), where)
   }
+})
+
+/** The box's environment with TMPDIR where dish's unit puts dsh's: under the protected ~/.cache/dish. */
+function sharedEnv(box: Box): NodeJS.ProcessEnv {
+  return { ...box.env, TMPDIR: join(box.home, '.cache', 'dish', 'tmp') }
+}
+
+// These write through the runner's own /tmp, so only under the box, which must be there.
+const UNDER_TMP = TMP.startsWith('/tmp/') || TMP === '/tmp' ? false : `the test's temp directory ${TMP} is not under /tmp`
+
+test('workspace-write: with dsh\'s TMPDIR protected, /tmp is the machine\'s own: it lasts, the host sees it, and TMPDIR is /tmp', { skip: SKIP || UNDER_TMP }, async () => {
+  const box = await makeBox()
+  const env = sharedEnv(box)
+  const shared = join(box.dir, 'shared')
+  const first = await bash(box, `mkdir ${shared} && echo kept > ${shared}/a.txt && printf "%s" "$TMPDIR"`, { env })
+  assert.equal(first.code, 0, first.stderr)
+  assert.equal(first.stdout, '/tmp')
+  // What a command wrote is on the host, where dsh's file tools and a call's workdir look.
+  assert.equal(readFileSync(join(shared, 'a.txt'), 'utf8'), 'kept\n')
+  const second = await bash(box, `cat ${shared}/a.txt`, { env })
+  assert.equal(second.stdout, 'kept\n', second.stderr)
+  // dsh's own temp directory stays read-only. dish's unit makes it; here the test does.
+  await mkdir(env.TMPDIR!, { recursive: true })
+  const dsh = await bash(box, `touch ${env.TMPDIR}/planted`, { env })
+  assert.match(dsh.stderr, /Read-only file system/)
+  assert.ok(!existsSync(join(env.TMPDIR!, 'planted')))
+})
+
+test('workspace-write: with /tmp shared, a protected path under /tmp gets its own read-only bind', { skip: SKIP || UNDER_TMP }, async () => {
+  const box = await makeBox()
+  const dshHome = join(box.dir, 'dsh-home')
+  const env = { ...sharedEnv(box), DSH_HOME: dshHome }
+  const result = await bash(box, `${tryWrites([dshHome], [])}\ntouch ${join(box.dir, 'free')} && echo free`, { env })
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(result.stdout, 'free\n')
+  assert.equal(mode(dshHome), 0o700)
+  assert.ok(existsSync(join(box.dir, 'free')))
+})
+
+test('workspace-write: without a protected TMPDIR, /tmp is dsh\'s empty one, every call', { skip: SKIP }, async () => {
+  const box = await makeBox()
+  const cases: Array<[string, NodeJS.ProcessEnv]> = [
+    ['no TMPDIR', box.env],
+    ['a TMPDIR that is not protected', { ...box.env, TMPDIR: join(box.dir, 'tmp') }],
+    ['a relative TMPDIR', { ...box.env, TMPDIR: 'home/.cache/dish/tmp' }],
+  ]
+  for (const [why, env] of cases) {
+    const first = await bash(box, 'echo kept > /tmp/a.txt && printf "%s" "${TMPDIR-unset}"', { env })
+    assert.equal(first.code, 0, `${why}: ${first.stderr}`)
+    assert.equal(first.stdout, env.TMPDIR ?? 'unset', `${why}: TMPDIR is as it came`)
+    const second = await bash(box, 'cat /tmp/a.txt 2>/dev/null || echo gone', { env })
+    assert.equal(second.stdout, 'gone\n', why)
+  }
+})
+
+test('workspace-write: mise\'s shims go at the end of PATH when the directory exists, once; read-only mode leaves PATH alone', { skip: SKIP }, async () => {
+  const box = await makeBox()
+  const shims = join(box.home, '.local', 'share', 'mise', 'shims')
+  const before = await bash(box, 'printf "%s" "$PATH"')
+  assert.equal(before.stdout, '/usr/bin:/bin', 'no shims directory: PATH as it came')
+  await mkdir(shims, { recursive: true })
+  await writeFile(join(shims, 'fakego'), '#!/bin/sh\necho "shim $*"\n')
+  await chmod(join(shims, 'fakego'), 0o755)
+  const found = await bash(box, 'printf "%s\\n" "$PATH" && fakego version')
+  assert.equal(found.code, 0, found.stderr)
+  assert.equal(found.stdout, `/usr/bin:/bin:${shims}\nshim version\n`)
+  const already = await bash(box, 'printf "%s" "$PATH"', { env: { ...box.env, PATH: `/usr/bin:${shims}:/bin` } })
+  assert.equal(already.stdout, `/usr/bin:${shims}:/bin`, 'on PATH already: not added twice')
+  const read = await bash(box, 'printf "%s" "$PATH"', { mode: 'read-only' })
+  assert.equal(read.stdout, '/usr/bin:/bin')
+  // XDG_DATA_HOME, when absolute, says where mise keeps them.
+  const data = join(box.home, 'data')
+  await mkdir(join(data, 'mise', 'shims'), { recursive: true })
+  const moved = await bash(box, 'printf "%s" "$PATH"', { env: { ...box.env, XDG_DATA_HOME: data } })
+  assert.equal(moved.stdout, `/usr/bin:/bin:${join(data, 'mise', 'shims')}`)
 })
 
 test('workspace-write: --protect adds a path, absolute or ~/, made as a directory when missing; one outside the home is left alone', { skip: SKIP }, async () => {
