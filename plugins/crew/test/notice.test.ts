@@ -837,7 +837,7 @@ test('a failure with a round to spare: the run ended before the coder finished a
 
 test('a skip says why; an opt-out is the spec\'s sentence', () => {
   assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'skipped', command: '', exitCode: null, log: null, reason: 'the coder reported BLOCKED / NEEDS CONTEXT' })])), 'Gate skipped: the coder reported BLOCKED / NEEDS CONTEXT.')
-  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'skipped', command: '', exitCode: null, log: null, reason: 'not gated: its worktree is gone.' })])), 'Gate skipped: not gated: its worktree is gone.')
+  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'skipped', command: '', exitCode: null, log: null, reason: 'its worktree is gone' })])), 'Gate skipped: its worktree is gone.')
   assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'skipped', command: '', exitCode: null, log: null })])), 'Gate skipped.')
 })
 
@@ -850,6 +850,9 @@ test('an error says it didn\'t run, and why', () => {
 test('a bound child\'s run with no gate result: "Gate not run."', () => {
   assert.equal(gateLine(BOUND, runWith()), 'Gate not run.')
   assert.equal(gateLine(BOUND, runWith([])), 'Gate not run.')
+  // dish-gates isn't running: no gate was going to run, so a run with no result says nothing. A recorded result still shows.
+  assert.equal(gateLine(BOUND, runWith(), false), undefined)
+  assert.equal(gateLine(BOUND, runWith([gate({ outcome: 'passed', exitCode: 0 })]), false), 'Gate passed (round 1).')
 })
 
 test('an unbound child has no gate line, whatever its run holds', () => {

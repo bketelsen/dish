@@ -159,12 +159,13 @@ function fenced(text: string): string {
  * The fence is written here, and is longer than any run of backticks in the excerpt: crew doesn't import dish-gates.
  * @param child - the child the notice is of.
  * @param run - the run the notice is of.
+ * @param gatesOn - whether dish-gates is running. Off, a run with no result says nothing: no gate was going to run.
  * @returns `undefined` for a child that isn't bound to a worktree, which no gate ran for.
  */
-export function gateLine(child: Pick<ChildRecord, 'worktree'>, run: RunRecord): string | undefined {
+export function gateLine(child: Pick<ChildRecord, 'worktree'>, run: RunRecord, gatesOn = true): string | undefined {
   if (child.worktree === undefined) return undefined
   const result = run.gates?.at(-1)
-  if (result === undefined) return 'Gate not run.'
+  if (result === undefined) return gatesOn ? 'Gate not run.' : undefined
   const reason = oneLine(result.reason)
   const because = reason === undefined ? '' : `: ${reason}`
   switch (result.outcome) {
@@ -218,10 +219,11 @@ export function noticeSummary(child: Child, run: RunRecord | undefined, lead: st
  * @param lead - dsh's own opening line.
  * @param label - what dsh put after its opening line: `Its closing message:` or `It left no closing message.`. Left out if
  * the message has no such block.
+ * @param gatesOn - whether dish-gates is running (`gateLine`).
  */
-export function noticeText(child: Child, run: RunRecord | undefined, lead: string, label?: string): string {
+export function noticeText(child: Child, run: RunRecord | undefined, lead: string, label?: string, gatesOn = true): string {
   const head = noticeSummary(child, run, lead)
-  const gate = run === undefined ? undefined : gateLine(child, run)
+  const gate = run === undefined ? undefined : gateLine(child, run, gatesOn)
   const reported = run === undefined ? head : `${head} Report: \`${run.report}\`.${gate === undefined ? '' : ` ${gate}`}`
   return label === undefined ? reported : `${reported} ${label}`
 }
@@ -308,8 +310,8 @@ async function runOf(parts: Parts, runs: readonly RunRecord[], claimed: Set<RunR
 }
 
 /** `message` with the text that leads it and its source's summary replaced. */
-function rewritten(message: UserMessage, child: ChildRecord, parts: Parts, run: RunRecord | undefined): UserMessage {
-  const text: ContentBlock = Object.freeze({ type: 'text', text: noticeText(child, run, parts.lead, parts.label) })
+function rewritten(message: UserMessage, child: ChildRecord, parts: Parts, run: RunRecord | undefined, gatesOn: boolean): UserMessage {
+  const text: ContentBlock = Object.freeze({ type: 'text', text: noticeText(child, run, parts.lead, parts.label, gatesOn) })
   // The blocks that stay are dsh's own, frozen already.
   const content = Object.freeze([text, ...message.content.slice(parts.label === undefined ? 1 : 2)])
   const source = Object.freeze({ ...message.source, summary: bounded(noticeSummary(child, run, parts.lead)) })
@@ -349,6 +351,8 @@ export interface NoticeContext {
   waitMs?: number
   /** The turn's signal. A step that is cancelled isn't rewritten, and doesn't wait. */
   signal?: AbortSignal
+  /** Whether dish-gates is running. Defaults to `true`. Off, a bound child's run with no gate result gets no gate line. */
+  gatesOn?: boolean
 }
 
 function tell(context: NoticeContext, format: string, ...args: unknown[]): void {
@@ -386,7 +390,7 @@ async function rewriteChild(id: string, indexes: readonly number[], messages: re
       try {
         const parts = partsOf(message, id)
         if (parts === undefined) continue
-        out[index] = rewritten(message, record, parts, await runOf(parts, record.runs, claimed, unreadable))
+        out[index] = rewritten(message, record, parts, await runOf(parts, record.runs, claimed, unreadable), context.gatesOn ?? true)
       } catch (error) {
         tell(context, 'could not rewrite a finish notice of child %s, which is left as dsh wrote it: %s', id, describe(error))
       }
@@ -425,7 +429,8 @@ export function noticeListener(ctx: Context, warn: Warn) {
       const crew = ctx.get('dishCrew')
       if (crew === undefined) return decision
       const messages = await rewriteNotices(decision.messages, {
-        crew, sessionId: String(payload.agent.id), warn, ...payload.signal === undefined ? {} : { signal: payload.signal },
+        crew, sessionId: String(payload.agent.id), warn, gatesOn: ctx.get('dishGates' as never) !== undefined,
+        ...payload.signal === undefined ? {} : { signal: payload.signal },
       })
       return messages === decision.messages ? decision : { ...decision, messages }
     } catch (error) {
