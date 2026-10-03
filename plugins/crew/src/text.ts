@@ -55,8 +55,9 @@ export function worktreeBrief(worktree: { path: string, branch: string }, gate?:
 
 /**
  * The block a reviewer's brief, or a follow-up to it, gets after its task when the main agent overrode the gate of the work
- * it reviews (`delegate`'s `gateOverride`): whose work it is, where its gate stands, and the main agent's ruling.
+ * it reviews (`delegate`'s `gateOverride`): whose work it is, where its gate stands, and the main agent's ruling, without
+ * the `Ruling:` it usually starts with ("with this ruling: Ruling: …" says it twice). The record keeps the ruling as given.
  */
 export function gateOverrideBrief(reviewed: string, standing: string, ruling: string): string {
-  return `The harness's gate for the work you review (${reviewed}) hasn't passed: ${standing}. The main agent started this review anyway, with this ruling: ${ruling}`
+  return `The harness's gate for the work you review (${reviewed}) hasn't passed: ${standing}. The main agent started this review anyway, with this ruling: ${ruling.replace(/^\s*ruling\s*:\s*/i, '')}`
 }

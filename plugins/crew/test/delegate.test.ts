@@ -1883,7 +1883,7 @@ const SKIPPED = gateResult({ outcome: 'skipped', command: '', exitCode: null, du
 /** How the reviewer's block names the work it reviews. */
 const REVIEWED = 'coder «add login», child c1'
 /** Where the gate of a coder with no gate result stands. */
-const NO_RESULT = 'no gate result: it didn\'t run (for example, the coder ran before dish-gates was on)'
+const NO_RESULT = 'no gate result: it didn\'t run (for example, the coder ran before gates were on)'
 
 /**
  * Put coder `id` of this session in the record, bound to a worktree, with `gates` recorded during its run. With `ended`
@@ -1913,10 +1913,15 @@ test('worktreeBrief with a gate is 6b\'s block and then the gate sentence; witho
   assert.equal(worktreeBrief(tree, ' '), brief(tree.path, tree.branch))
 })
 
-test('gateOverrideBrief tells the reviewer the gate hasn\'t passed, and the main agent\'s ruling', () => {
+test('gateOverrideBrief tells the reviewer the gate hasn\'t passed, and the main agent\'s ruling, without its "Ruling:"', () => {
   assert.equal(gateOverrideBrief(REVIEWED, 'skipped: the coder reported BLOCKED / NEEDS CONTEXT', 'Ruling: x — y — z'),
     'The harness\'s gate for the work you review (coder «add login», child c1) hasn\'t passed: skipped: the coder reported BLOCKED / NEEDS CONTEXT. '
-    + 'The main agent started this review anyway, with this ruling: Ruling: x — y — z')
+    + 'The main agent started this review anyway, with this ruling: x — y — z')
+  for (const ruling of ['ruling: x — y — z', '  RULING :x — y — z', 'x — y — z']) {
+    assert.ok(gateOverrideBrief(REVIEWED, 'failed', ruling).endsWith('with this ruling: x — y — z'), ruling)
+  }
+  // Only a leading one.
+  assert.ok(gateOverrideBrief(REVIEWED, 'failed', 'x — Ruling: y — z').endsWith('with this ruling: x — Ruling: y — z'))
 })
 
 test('the gateOverride parameter and the description say what the review check is and how to override it', async () => {
@@ -1929,6 +1934,9 @@ test('the gateOverride parameter and the description say what the review check i
   assert.match(w.tool.description, /gated when it finishes/)
   assert.match(w.tool.description, /finish notice says how/)
   assert.match(w.tool.description, /refused until the gate passes, unless `gateOverride` carries your ruling/)
+  // Agent-facing text names no plugin.
+  assert.match(w.tool.description, /While gates are on, a bound coder's work is gated/)
+  assert.doesNotMatch(w.tool.description, /dish-gates/)
 })
 
 test('a bound coder\'s brief names its project\'s gate while dish-gates runs: after the block, before the closing note', async () => {

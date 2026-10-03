@@ -343,16 +343,16 @@ interface Override {
  * Why `child`'s gate counts as not passed, for the review check, or `undefined` when it passed or isn't checked: dish-gates
  * isn't running, or the child isn't bound to a worktree. Not passed is: the child is still running; the latest result of its
  * latest run isn't a pass; that run has none (an error or an abort ended it before its turn could, dsh stopped mid-gate,
- * or it ran before dish-gates was on); or it is a pass, but the run didn't end `completed` after it. A follow-up steered
- * into the turn the gate passed in has the coder go on in that turn; when the turn then ends normally the gate runs again,
- * but when it is aborted or fails, or dsh stops it (the pass is still on the run in progress), the work after the pass was
- * never gated.
+ * or it ran before dish-gates was on; the text says "gates", as agent-facing text names no plugin); or it is a pass, but
+ * the run didn't end `completed` after it. A follow-up steered into the turn the gate passed in has the coder go on in that
+ * turn; when the turn then ends normally the gate runs again, but when it is aborted or fails, or dsh stops it (the pass is
+ * still on the run in progress), the work after the pass was never gated.
  */
 function gateStanding(call: Call, child: ChildRecord): string | undefined {
   if (call.gates === undefined || child.worktree === undefined) return undefined
   if (isRunning(child, call.agents)) return STILL_RUNNING
   const latest = latestGate(child)
-  if (latest === undefined) return `no gate result: it didn't run (for example, the ${child.role} ran before dish-gates was on)`
+  if (latest === undefined) return `no gate result: it didn't run (for example, the ${child.role} ran before gates were on)`
   if (latest.outcome === 'passed') {
     // `latestGate` reads the run in progress first: a pass there is on a run that never ended.
     if (child.gates?.at(-1) !== undefined) return 'dsh stopped the run after its gate passed, so any work after the gate wasn\'t gated'
@@ -819,7 +819,7 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
         + 'To have work reviewed, delegate to the reviewer role with `reviews` set to the id of the child whose work it reviews, or "main" for your own work; '
         + 'the harness picks a model from a different family than the work was done on, and refuses one that is not. '
         + 'To have a coder (a role that writes) work in a worktree you made with the `worktree` tool, pass it as `worktree`: its brief names it, and its follow-ups stay bound to it. '
-        + 'While dish-gates runs, a bound coder\'s work is gated when it finishes, and its finish notice says how the gate ended; '
+        + 'While gates are on, a bound coder\'s work is gated when it finishes, and its finish notice says how the gate ended; '
         + 'a review of that work is refused until the gate passes, unless `gateOverride` carries your ruling. '
         + 'crew.yaml limits how many children run at once, how many write files at once (one by default; read-only roles run in parallel) and how many delegations a session makes; '
         + 'a refusal says who is running and what to do. Returns the child\'s id, role, model and label.',
