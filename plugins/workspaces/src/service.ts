@@ -152,7 +152,10 @@ export interface PullFeedback {
    * Checks or Commit statuses read, or GitHub failed ("could not read the checks: …", masked and cut).
    */
   checksUnavailable?: string
-  /** Which lists filled a page of 100 (GitHub may have more). */
+  /**
+   * Which lists GitHub has more of: the reviews and the comments are each the newest 100 (GitHub's last pages), so for them
+   * older ones weren't read; the checks are the first 100, so for them a page was full.
+   */
   more: { reviews: boolean, reviewComments: boolean, issueComments: boolean, checks: boolean }
 }
 
@@ -230,7 +233,10 @@ export interface DishWorkspaces {
    * the project's lock. Read-only on the worktree.
    */
   compareBranch(project: string, slug: string): Promise<BranchComparison>
-  /** Pull request `number`'s feedback, read with the in-memory API token. Untrusted: masked and capped here. No lock. */
+  /**
+   * Pull request `number`'s feedback, read with the in-memory API token: its newest 100 reviews, review comments and
+   * comments (GitHub's last pages), and the first 100 checks of each source. Untrusted: masked and capped here. No lock.
+   */
   readPull(project: string, number: number): Promise<PullFeedback>
 }
 

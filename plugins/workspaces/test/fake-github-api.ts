@@ -99,7 +99,11 @@ export interface FakePullEdit {
   body?: string
 }
 
-/** What `GET …/reviews`, `…/pulls/{n}/comments` and `…/issues/{n}/comments` serve: GitHub's JSON, as given. */
+/**
+ * What `GET …/reviews`, `…/pulls/{n}/comments` and `…/issues/{n}/comments` serve: GitHub's JSON, as given, oldest first, a
+ * page at a time (`per_page`, `page`), with GitHub's `Link` header when there is more than one page. Its URLs point at
+ * `LINK_ORIGIN` (`/repositories/1/…`, as GitHub's do), which nothing listens on: a client must take only the page number.
+ */
 export interface FakeFeedback {
   reviews?: unknown[]
   reviewComments?: unknown[]
@@ -110,6 +114,18 @@ export interface FakeFeedback {
 export interface FakeChecks {
   checkRuns?: unknown[]
   statuses?: unknown[]
+}
+
+/** Where the fake's `Link` URLs point: a port nothing listens on, so a client that followed one would fail. */
+export const LINK_ORIGIN = 'http://127.0.0.1:9'
+
+/** GitHub's `Link` header for page `page` of `last`, at `path` (its own form: `next` and `last`, then `prev` and `first`). */
+function pageLinks(path: string, perPage: number, page: number, last: number): Record<string, string> {
+  const at = (n: number): string => `<${LINK_ORIGIN}${path}?per_page=${perPage}&page=${n}>`
+  const links: string[] = []
+  if (page < last) links.push(`${at(page + 1)}; rel="next"`, `${at(last)}; rel="last"`)
+  if (page > 1) links.push(`${at(page - 1)}; rel="prev"`, `${at(1)}; rel="first"`)
+  return links.length === 0 ? {} : { link: links.join(', ') }
 }
 
 export interface FakeRequest {
@@ -518,8 +534,12 @@ export async function startFakeGitHub(options: { publicKey: KeyObject, appId?: n
           return
         }
         const stored = feedbackStore.get(`${key}#${rest[1]}`)
-        const items = rest[0] === 'issues' ? stored?.issueComments : rest[2] === 'reviews' ? stored?.reviews : stored?.reviewComments
-        send(res, request, 200, (items ?? []).slice(0, perPage))
+        const items = (rest[0] === 'issues' ? stored?.issueComments : rest[2] === 'reviews' ? stored?.reviews : stored?.reviewComments) ?? []
+        const page = Math.max(1, Number(url.searchParams.get('page') ?? '1') || 1)
+        const last = Math.max(1, Math.ceil(items.length / perPage))
+        // GitHub's own links name the repository by its id.
+        const linked = `/repositories/1/${rest.join('/')}`
+        send(res, request, 200, items.slice((page - 1) * perPage, page * perPage), pageLinks(linked, perPage, page, last))
         return
       }
       // POST /repos/{o}/{r}/issues/{n}/comments

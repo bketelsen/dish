@@ -1037,6 +1037,34 @@ test('readPull: with 100 review comments, more.reviewComments is true', async ()
   }
 })
 
+test('readPull on a busy pull request: the newest 100 of each list, the comment just left among them, and more saying older ones weren\'t read', async () => {
+  const run = await setup()
+  try {
+    await run.service.openPull('acme/widget', { head: 'dish/fix-1', title: 'Fix', body: '' })
+    Object.assign(run.world.github.pullRequests[0]!, { headSha: HEAD_SHA })
+    const at = (index: number): string => new Date(Date.UTC(2026, 9, 1) + index * 60_000).toISOString()
+    run.world.github.feedback('acme/widget', 1, {
+      issueComments: Array.from({ length: 130 }, (_, index) => ({ user: { login: 'ann' }, body: `comment ${index}`, created_at: at(index) })),
+      reviews: Array.from({ length: 130 }, (_, index) => ({ user: { login: 'bob' }, state: 'COMMENTED', body: `review ${index}`, submitted_at: at(index) })),
+      reviewComments: Array.from({ length: 130 }, (_, index) => ({ path: 'a.ts', line: index + 1, user: { login: 'cy' }, body: `note ${index}`, created_at: at(index) })),
+    })
+    // The comment just left, the newest, holds a token: masked as before.
+    run.world.github.feedback('acme/widget', 1, { issueComments: [{ user: { login: 'dee' }, body: `Please fix ${LEAK}\x00 now`, created_at: at(130) }] })
+    const feedback = await run.service.readPull('acme/widget', 1)
+    assert.equal(feedback.issueComments.length, 100)
+    assert.equal(feedback.issueComments[0]!.body, 'comment 31')
+    assert.equal(feedback.issueComments.at(-1)!.author, 'dee')
+    assert.ok(feedback.issueComments.at(-1)!.body.startsWith('Please fix ') && !feedback.issueComments.at(-1)!.body.includes(LEAK), feedback.issueComments.at(-1)!.body)
+    assert.ok(!feedback.issueComments.at(-1)!.body.includes('\x00'))
+    assert.deepEqual([feedback.reviews.length, feedback.reviews[0]!.body, feedback.reviews.at(-1)!.body], [100, 'review 30', 'review 129'])
+    assert.deepEqual([feedback.reviewComments.length, feedback.reviewComments[0]!.body, feedback.reviewComments.at(-1)!.body], [100, 'note 30', 'note 129'])
+    assert.deepEqual(feedback.more, { reviews: true, reviewComments: true, issueComments: true, checks: false })
+    assert.ok(run.world.github.requests.every(request => !request.path.includes('/repositories/')), 'only the page number of a Link is used')
+  } finally {
+    await teardown(run)
+  }
+})
+
 test('readPull: an App without Checks or Commit statuses read: checksUnavailable says so, and the reviews and comments still come', async () => {
   const run = await setup({ installation: { contents: 'write', metadata: 'read', pull_requests: 'write' } })
   try {
