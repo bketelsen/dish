@@ -30,7 +30,7 @@ You are the controller. You don't write the code: you brief, check, rule, and ke
 
 ### Each task
 
-1. **Record BASE** and make the task's worktree with `worktree` (action `create`, a slug for the task, `base` the plan branch). `worktree` doesn't run setup in a worktree: run the command from its answer yourself, in the worktree, escalated (`sandbox_permissions: "danger-full-access"`, a `justification` saying it runs the branch's install scripts outside the sandbox), so the user approves it, before you delegate. That needs a registered project (your chat's workspace is a clone dish set up: `git config --get-regexp '^credential\..*\.helper$'` names `git-credential-dish`); in any other repo, `using-git-worktrees` has the git steps.
+1. **Record BASE** and make the task's worktree with `worktree` (action `create`, a slug for the task, `base` the plan branch). `worktree` doesn't run setup in a worktree: run the command from its answer yourself, in the worktree, escalated (`sandbox_permissions: "danger-full-access"`, a `justification` saying it runs the branch's install scripts outside the sandbox), so the judge allows it or asks the user, before you delegate. That needs a registered project (your chat's workspace is a clone dish set up: `git config --get-regexp '^credential\..*\.helper$'` names `git-credential-dish`); in any other repo, `using-git-worktrees` has the git steps.
 2. **Delegate to a fresh `coder`,** with `delegate`'s `worktree` set to that path: it binds the coder, and crew adds the path and branch to its prompt. It can't see this conversation, so the brief stands alone:
    - where the task fits in the project;
    - the task's full text, pasted, plus the plan and spec paths;

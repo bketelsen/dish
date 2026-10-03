@@ -44,7 +44,7 @@ projects:
 | `role` | required | One line on what the repo is. |
 | `gate` | required | The command 6c's gates run. |
 | `gateTimeout` | required | `<n>s`, `<n>m` or `<n>h`, from 10s to 10m (dsh's shell caps a run at 10 minutes). |
-| `setup` | optional | A command run once, in dish's own fresh clone, outside the sandbox (see [dish-workspaces](../workspaces/README.md#setup)). |
+| `setup` | optional | A command run once, in dish's own fresh clone, outside the sandbox (see [dish-workspaces](../workspaces/README.md#setup)). It gets dish's own Node and pnpm (the unit's `PATH`), so a repo whose tools come from mise needs it to go through mise, such as `mise exec -- pnpm install --frozen-lockfile`. |
 | `setupTimeout` | optional | From 10s to 1h; 15m when absent. |
 | `gateEnv` | optional | Variables for the gate: names like `FOO_BAR`, never `DSH_*` or a name with `KEY`, `TOKEN`, `SECRET` or `PASSWORD` in it. Values are one line, and may use `<clone>` and `<worktree>`, which 6c expands. |
 
@@ -62,7 +62,9 @@ A project's status is one of `pending`, `cloning`, `setup`, `ready` and `failed`
 - **A ready project whose fields change** is left ready. Its next fetch, worktree and gate read the new fields; setup doesn't run again.
 - **dish-workspaces going away** is never a project's failure. An onboarding it abandons leaves the project pending, waiting for it, and a prepare leaves it ready. Both run again when it comes back.
 - **Ready means ready across restarts.** Each status is kept in `<state>/projects/status.json`. A project that was cloning or in setup when dish stopped loads as pending and is onboarded again, which adopts its clone. A status file that doesn't parse is set aside as `status.json.corrupt-<ms>`, and every project is onboarded again.
-- **Setup skipped** is recorded with the reason and the command to run. That's the case for any clone dish adopted, including on Retry.
+- **Setup skipped** is recorded with the reason and the command to run. That's the case for any clone dish adopted, including on Retry, and for a fresh clone that a dsh workspace other than the project's own points at.
+- **A failed setup isn't run again.** Retry, a restart and an edit of the project each onboard it again, which adopts the clone dish made, so setup is skipped and the project goes ready with the command to run. The failure's message says so: "Retry won't run setup again in this clone: remove the clone and press Retry, or run it yourself in <clone>". Remove the clone (dish never does) and press Retry for a fresh clone and setup, or run the command in the clone yourself.
+- **A failure's message says what to do next.** Setting the GitHub App, installing it on the owner, giving it the repo, and a path dish won't adopt each end ", then press Retry on Settings → Projects". A ready project whose clone was deleted by hand fails at the next start, at configure: "the clone at <path> is gone; press Retry on Settings → Projects to clone it again". Retry clones it afresh, and setup runs.
 
 Status messages are masked (dish-kit's `maskSecrets`) and cut to 1000 characters.
 
@@ -70,9 +72,9 @@ Status messages are masked (dish-kit's `maskSecrets`) and cut to 1000 characters
 
 Between Skills and the GitHub App card, in Settings' nav.
 - **The list:** each project with its family, role and a status chip, "setup skipped" with its reason, the last fetch (and its error), and its workspace. A broken `projects.yaml` (a hand edit in the store's repository) shows its problem above the list, pointing at History. In a narrow window the list becomes a dropdown.
-- **Add and edit:** the six text fields (`setup` is a text area), rows for `gateEnv`, and a note for the commit. The form is checked 300 ms after you stop typing, with the same sentence the store would refuse it with. **Save** (Ctrl/Cmd+S) writes as you. If the file changed after you opened it, your edits stay, with **Reload** and **Keep mine**. The name is fixed once a project exists.
+- **Add and edit:** the six text fields (`setup` is a text area, whose hint says it runs with dish's own Node and pnpm, and to go through mise for a mise repo: `mise exec -- pnpm install --frozen-lockfile`, after `mise trust` if mise asks), rows for `gateEnv`, and a note for the commit. The form is checked 300 ms after you stop typing, with the same sentence the store would refuse it with. **Save** (Ctrl/Cmd+S) writes as you. If the file changed after you opened it, your edits stay, with **Reload** and **Keep mine**. The name is fixed once a project exists.
 - **Remove** asks inline: "Remove <name> from projects.yaml? Its clone at <path> and its workspace stay; dish stops fetching, sweeping and gating it."
-- **Retry** is offered on any project that isn't queued or onboarding. On a ready one it onboards again: it adopts the clone, skips setup with the command to run, and registers the workspace again, which brings back one you removed.
+- **Retry** is offered on a ready or failed project, never one queued or onboarding. On a ready one it onboards again: it adopts the clone, skips setup with the command to run, and registers the workspace again, which brings back one you removed. On a failed one it adopts dish's clone too, so a failed setup isn't run again (above).
 - **Proposals:** "N proposals for projects.yaml: review them on History". You accept them there.
 - **Live:** while the page is shown and a project is pending, cloning or in setup, the list is read every 5 seconds. With dish-config's client loaded, it also follows the store's changes.
 
@@ -116,5 +118,6 @@ The clones, their state and the token files are dish-workspaces'.
 
 - **Comments in `projects.yaml`** are lost when the page saves it.
 - **A changed `setup`** doesn't run on a ready project: setup runs only in dish's own fresh clone. Run it yourself in the clone, or remove the clone (dish never does) and press Retry.
+- **A failed setup isn't run again** by Retry, a restart or an edit, since each adopts dish's own clone and the project goes ready with setup skipped. Remove the clone and press Retry, or run the command yourself.
 - **`gateTimeout` stops at 10 minutes,** dsh's cap on a shell run. A long build isn't a gate until 6c finds a way past it; use its lint or validate step.
 - **An aborted onboarding that never stops** (a setup that ignores its signals and escapes its process group) is left behind after 30 seconds. The project's lock in dish-workspaces still keeps anything else out of its clone.
