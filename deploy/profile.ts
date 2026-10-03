@@ -6,7 +6,12 @@
  *   the UI's "Set as new task default" makes. A patch replaces a row's whole `config`, and `default` is required, so it
  *   is restated: the row's own `default` when it has one, else `standard`. A row that already has a `selectedDefault`,
  *   whatever its value, is a choice (made in the UI, or by hand) and is left exactly as it is, `default` included. So
- *   `--preset` is the default to set when none is chosen yet, and a later run never resets it.
+ *   `--preset` is the default to set when none is chosen yet, and a later run never resets it;
+ * - the `sandbox` row (`@deepseek-ai/dsh-sandbox-local`), with `--sandbox-runner <path>`: `runnerCommand: [<path>]` and
+ *   `runnerFailureSignatures: ['bwrap: ', 'dish-sandbox: ']` on its config, so that dsh runs every sandboxed command
+ *   through `deploy/dish-sandbox` (docs/specs/sandbox-home.md). `--protect <path>` pairs added after the path by hand
+ *   are kept. `--no-sandbox-runner` takes those two keys away again, and the row with them when nothing else is left in
+ *   it. With neither, the row is left as it is. Its other keys are kept either way.
  *
  * Everything else in the file stays as it is: other rows, comments, key order and `!!js` tags. That is the reason for
  * the `yaml` Document API, and for parsing the `!!js` tag the way dsh's config editor does. A row that is already right
@@ -17,6 +22,7 @@
  * the same `name`.
  *
  *   node deploy/profile.ts --patch <path> (--remote <url> | --no-remote) --user-name <name> --user-email <email> [--preset dish]
+ *     [--sandbox-runner <absolute path> | --no-sandbox-runner]
  *
  * `--preset` is the default preset to set when none is chosen yet (default `dish`); a default already chosen is kept.
  *
@@ -26,6 +32,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { chmod, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { isAbsolute } from 'node:path'
 import { parseArgs } from 'node:util'
 import { isCollection, isMap, isScalar, isSeq, parseDocument } from 'yaml'
 import type { Document, ParsedNode, YAMLMap, YAMLSeq } from 'yaml'
@@ -40,6 +47,13 @@ export const PRESET_ROW_NAME = '@deepseek-ai/dsh-agent-preset-registry'
 export const FALLBACK_DEFAULT = 'standard'
 /** The dish preset's id. */
 export const DEFAULT_PRESET = 'dish'
+/** The row dsh-base mounts its sandbox provider with. Its `runnerCommand` hook is how dish gives the sandbox a home. */
+export const SANDBOX_ROW_ID = 'sandbox'
+export const SANDBOX_ROW_NAME = '@deepseek-ai/dsh-sandbox-local'
+/** What bwrap and deploy/dish-sandbox print when they fail themselves: dsh then reports a command that did not run. */
+export const RUNNER_FAILURE_SIGNATURES: readonly string[] = ['bwrap: ', 'dish-sandbox: ']
+/** The keys of the `sandbox` row's config that are dish's. */
+const RUNNER_KEYS = ['runnerCommand', 'runnerFailureSignatures'] as const
 
 export interface DishRowsOptions {
   /** The store's git remote, set on the `dish-config` row. `''` keeps the store local (the schema's default). */
@@ -48,7 +62,14 @@ export interface DishRowsOptions {
   userEmail: string
   /** The preset id made the default for new tasks when none is chosen yet. Defaults to `dish`. A chosen one is kept. */
   preset?: string
+  /**
+   * The sandbox runner: an absolute path sets the `sandbox` row's `runnerCommand` to it, `null` takes dish's keys off
+   * that row, and `undefined` (the default) leaves the row alone.
+   */
+  sandboxRunner?: string | null
 }
+
+type Normalized = Required<Omit<DishRowsOptions, 'sandboxRunner'>> & Pick<DishRowsOptions, 'sandboxRunner'>
 
 export type Outcome = 'unchanged' | 'updated'
 
@@ -72,12 +93,17 @@ function requireLine(name: string, value: unknown): string {
 }
 
 /** The options, checked, with the preset's default filled in. */
-function normalize(options: DishRowsOptions): Required<DishRowsOptions> {
+function normalize(options: DishRowsOptions): Normalized {
+  const runner = options.sandboxRunner
+  if (typeof runner === 'string' && !isAbsolute(requireLine('sandboxRunner', runner))) {
+    throw new Error('sandboxRunner must be an absolute path')
+  }
   return {
     remote: options.remote === '' ? '' : requireLine('remote', options.remote),
     userName: requireLine('userName', options.userName),
     userEmail: requireLine('userEmail', options.userEmail),
     preset: requireLine('preset', options.preset ?? DEFAULT_PRESET),
+    ...runner === undefined ? {} : { sandboxRunner: runner },
   }
 }
 
@@ -141,6 +167,35 @@ class Editor {
     this.changed = true
   }
 
+  /** Set `key` to a list of plain strings. A list that already holds exactly these is left as it is. */
+  setList(row: YAMLMap, map: YAMLMap, key: string, values: readonly string[]): void {
+    const previous = map.get(key, true)
+    const same = isSeq(previous) && previous.items.length === values.length &&
+      previous.items.every((item, index) => isScalar(item) && item.tag === undefined && item.value === values[index])
+    if (same) return
+    unshared(row, map, previous)
+    if (map.items.length === 0) map.flow = false
+    map.set(key, this.doc.createNode([...values]))
+    this.changed = true
+  }
+
+  /** Take `keys` off `map`, when it has them. */
+  remove(row: YAMLMap, map: YAMLMap, keys: readonly string[]): void {
+    for (const key of keys) {
+      if (!map.has(key)) continue
+      unshared(row, map, map.get(key, true))
+      map.delete(key)
+      this.changed = true
+    }
+  }
+
+  /** Take a whole row out of the sequence. */
+  drop(seq: YAMLSeq, row: YAMLMap): void {
+    unshared(row)
+    seq.items.splice(seq.items.indexOf(row), 1)
+    this.changed = true
+  }
+
   /** Add a whole row at the end of the sequence. */
   append(seq: YAMLSeq, row: Record<string, unknown>): void {
     seq.flow = false
@@ -150,13 +205,31 @@ class Editor {
 }
 
 /**
+ * The `--protect <path>` pairs after the runner in a `runnerCommand` list: added to the row by hand, they add to
+ * dish-sandbox's protected list, and a later install keeps them. Anything else after the runner is dropped with it.
+ */
+function protectPairs(node: unknown): string[] {
+  if (!isSeq(node)) return []
+  const rest = node.items.slice(1).map((item) => isScalar(item) && item.tag === undefined && typeof item.value === 'string' ? item.value : undefined)
+  const pairs = rest.length % 2 === 0 && rest.every((value, index) => value !== undefined && (index % 2 === 1 || value === '--protect'))
+  return pairs ? rest as string[] : []
+}
+
+/** Whether a row holds nothing but its id, its name and an empty (or no) config. */
+function emptyRow(row: YAMLMap): boolean {
+  const config = row.get('config', true)
+  const emptyConfig = config === undefined || (isScalar(config) && config.value === null) || (isMap(config) && config.items.length === 0)
+  return emptyConfig && row.items.every((pair) => isScalar(pair.key) && ['id', 'name', 'config'].includes(String(pair.key.value)))
+}
+
+/**
  * Return `text` with dish's rows in place.
  * @param text The patch file's current content: empty when there is no file, or a YAML sequence of loader patch rows.
  * @returns The new content, which is `text` itself when nothing needed to change.
  * @throws When `text` is not valid YAML, or is not a sequence, or a dish row has a config that is not a mapping.
  */
 export function writeDishRows(text: string, options: DishRowsOptions): string {
-  const { remote, userName, userEmail, preset } = normalize(options)
+  const { remote, userName, userEmail, preset, sandboxRunner } = normalize(options)
   const doc = parse(text)
   const editor = new Editor(doc)
 
@@ -193,6 +266,29 @@ export function writeDishRows(text: string, options: DishRowsOptions): string {
     }
   }
 
+  if (sandboxRunner !== undefined) {
+    const sandboxRow = findRow(seq, SANDBOX_ROW_ID, SANDBOX_ROW_NAME)
+    if (sandboxRunner === null) {
+      // Only dish's keys go. A row that held nothing else goes with them; one with more (a probeTimeoutMs set by hand)
+      // keeps the rest.
+      const config = sandboxRow?.get('config', true)
+      if (sandboxRow !== undefined && isMap(config)) {
+        editor.remove(sandboxRow, config, RUNNER_KEYS)
+        if (emptyRow(sandboxRow)) editor.drop(seq, sandboxRow)
+      }
+    } else if (sandboxRow === undefined) {
+      editor.append(seq, {
+        id: SANDBOX_ROW_ID,
+        name: SANDBOX_ROW_NAME,
+        config: { runnerCommand: [sandboxRunner], runnerFailureSignatures: [...RUNNER_FAILURE_SIGNATURES] },
+      })
+    } else {
+      const config = editor.config(sandboxRow, SANDBOX_ROW_ID)
+      editor.setList(sandboxRow, config, 'runnerCommand', [sandboxRunner, ...protectPairs(config.get('runnerCommand', true))])
+      editor.setList(sandboxRow, config, 'runnerFailureSignatures', RUNNER_FAILURE_SIGNATURES)
+    }
+  }
+
   return editor.changed ? String(doc) : text
 }
 
@@ -225,7 +321,10 @@ export async function updatePatchFile(path: string, options: DishRowsOptions): P
 
 const USAGE = [
   'usage: node deploy/profile.ts --patch <path> (--remote <url> | --no-remote) --user-name <name> --user-email <email> [--preset dish]',
-  '  --preset  the default preset to set when none is chosen yet (default dish); a default already chosen is kept',
+  '         [--sandbox-runner <absolute path> | --no-sandbox-runner]',
+  '  --preset             the default preset to set when none is chosen yet (default dish); a default already chosen is kept',
+  '  --sandbox-runner     run sandboxed commands through this runner (deploy/dish-sandbox): the sandbox row\'s runnerCommand',
+  '  --no-sandbox-runner  take dish\'s runner off the sandbox row; with neither, the row is left as it is',
 ].join('\n')
 
 /** The CLI. Returns the exit code: 0 done, 1 the file could not be read or written, 2 the arguments are wrong. */
@@ -242,6 +341,8 @@ export async function main(argv: string[]): Promise<number> {
         'user-name': { type: 'string' },
         'user-email': { type: 'string' },
         preset: { type: 'string' },
+        'sandbox-runner': { type: 'string' },
+        'no-sandbox-runner': { type: 'boolean' },
       },
     }))
     for (const name of ['patch', 'user-name', 'user-email'] as const) {
@@ -250,6 +351,9 @@ export async function main(argv: string[]): Promise<number> {
     // `--no-remote` says on purpose what an empty `--remote "$UNSET"` would say by accident.
     if ((values.remote === undefined) === (values['no-remote'] !== true)) throw new Error('give one of --remote or --no-remote')
     if (values.remote === '') throw new Error('--remote must not be empty; use --no-remote to keep the store local')
+    if (values['sandbox-runner'] !== undefined && values['no-sandbox-runner'] === true) {
+      throw new Error('give one of --sandbox-runner or --no-sandbox-runner, not both')
+    }
   } catch (error) {
     console.error(`profile.ts: ${(error as Error).message}\n${USAGE}`)
     return 2
@@ -259,6 +363,8 @@ export async function main(argv: string[]): Promise<number> {
     userName: values['user-name'] as string,
     userEmail: values['user-email'] as string,
     ...values.preset === undefined ? {} : { preset: values.preset },
+    ...values['no-sandbox-runner'] === true ? { sandboxRunner: null } : {},
+    ...values['sandbox-runner'] === undefined ? {} : { sandboxRunner: values['sandbox-runner'] },
   }
   try {
     normalize(options)

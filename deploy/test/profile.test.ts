@@ -540,3 +540,123 @@ test('a parse error names the position, not the file\'s lines', async () => {
   assert.match(result.stderr, /Map keys must be unique at line 4, column 5/)
   assert.doesNotMatch(result.stderr, /fake-not-a-secret|again/)
 })
+
+// --- the sandbox row ---------------------------------------------------------------------------------------------
+
+const RUNNER = '/home/dish/dish/deploy/dish-sandbox'
+
+/** The sandbox row as dish writes it, with `runner` as its runnerCommand. */
+function sandboxRow(runner = RUNNER): string {
+  return `- id: sandbox
+  name: "@deepseek-ai/dsh-sandbox-local"
+  config:
+    runnerCommand:
+      - ${runner}
+    runnerFailureSignatures:
+      - "bwrap: "
+      - "dish-sandbox: "
+`
+}
+
+/** The sandbox row of a patch file's text. */
+function sandboxOf(text: string): Record<string, any> | undefined {
+  return rows(text).find((row) => row.id === 'sandbox')
+}
+
+test('--sandbox-runner adds the sandbox row after dish\'s other rows; a second run changes nothing', async () => {
+  const out = writeDishRows('', { ...OPTIONS, sandboxRunner: RUNNER })
+  assert.equal(out, DISH_ROWS + sandboxRow())
+  assert.equal(writeDishRows(out, { ...OPTIONS, sandboxRunner: RUNNER }), out)
+  assert.equal(writeDishRows(FIXTURE, { ...OPTIONS, sandboxRunner: RUNNER }), FIXTURE + DISH_ROWS + sandboxRow(), "dsh's rows are kept byte for byte")
+
+  const path = await patchFile(HEADER)
+  const first = await cli(path, [`--sandbox-runner=${RUNNER}`])
+  assert.deepEqual({ code: first.code, stdout: first.stdout.trim() }, { code: 0, stdout: 'updated' })
+  assert.equal(await readFile(path, 'utf8'), HEADER + '\n' + DISH_ROWS + sandboxRow())
+  const past = new Date(Date.now() - 3_600_000)
+  await utimes(path, past, past)
+  const before = await stat(path)
+  const second = await cli(path, ['--sandbox-runner', RUNNER])
+  assert.deepEqual({ code: second.code, stdout: second.stdout.trim() }, { code: 0, stdout: 'unchanged' })
+  assert.equal((await stat(path)).mtimeMs, before.mtimeMs, 'not written')
+})
+
+test('--no-sandbox-runner removes the row dish wrote; with no row there it changes nothing', async () => {
+  const on = DISH_ROWS + sandboxRow()
+  assert.equal(writeDishRows(on, { ...OPTIONS, sandboxRunner: null }), DISH_ROWS)
+  assert.equal(writeDishRows(DISH_ROWS, { ...OPTIONS, sandboxRunner: null }), DISH_ROWS)
+  assert.equal(writeDishRows(FIXTURE + DISH_ROWS + sandboxRow(), { ...OPTIONS, sandboxRunner: null }), FIXTURE + DISH_ROWS)
+
+  const path = await patchFile(on)
+  const off = await cli(path, ['--no-sandbox-runner'])
+  assert.deepEqual({ code: off.code, stdout: off.stdout.trim() }, { code: 0, stdout: 'updated' })
+  assert.equal(await readFile(path, 'utf8'), DISH_ROWS)
+  const again = await cli(path, ['--no-sandbox-runner'])
+  assert.deepEqual({ code: again.code, stdout: again.stdout.trim() }, { code: 0, stdout: 'unchanged' })
+})
+
+test('with neither flag, the sandbox row is left as it is', async () => {
+  for (const text of [DISH_ROWS, DISH_ROWS + sandboxRow(), DISH_ROWS + sandboxRow('/elsewhere/runner')]) {
+    assert.equal(writeDishRows(text, OPTIONS), text)
+  }
+  const path = await patchFile(DISH_ROWS + sandboxRow())
+  assert.equal((await cli(path)).stdout.trim(), 'unchanged')
+})
+
+test('a sandbox row with keys of its own keeps them: --sandbox-runner adds dish\'s two, --no-sandbox-runner takes only those', () => {
+  const own = `- id: sandbox\n  name: "@deepseek-ai/dsh-sandbox-local"\n  config:\n    probeTimeoutMs: 9000 # set by hand\n`
+  const on = writeDishRows(DISH_ROWS + own, { ...OPTIONS, sandboxRunner: RUNNER })
+  assert.deepEqual(sandboxOf(on)?.config, { probeTimeoutMs: 9000, runnerCommand: [RUNNER], runnerFailureSignatures: ['bwrap: ', 'dish-sandbox: '] })
+  assert.ok(on.includes('probeTimeoutMs: 9000 # set by hand\n'), on)
+  assert.equal(writeDishRows(on, { ...OPTIONS, sandboxRunner: null }), DISH_ROWS + own)
+
+  // A row with other keys beside its config, such as `disabled`, stays with them.
+  const disabled = `- id: sandbox\n  name: "@deepseek-ai/dsh-sandbox-local"\n  disabled: false\n`
+  const withRunner = writeDishRows(DISH_ROWS + disabled, { ...OPTIONS, sandboxRunner: RUNNER })
+  assert.equal(sandboxOf(withRunner)?.disabled, false)
+  assert.deepEqual(sandboxOf(writeDishRows(withRunner, { ...OPTIONS, sandboxRunner: null })), { id: 'sandbox', name: '@deepseek-ai/dsh-sandbox-local', disabled: false, config: {} })
+})
+
+test('another runner path replaces the old one; --protect pairs added after it by hand are kept, anything else is not', () => {
+  assert.equal(writeDishRows(DISH_ROWS + sandboxRow('/old/deploy/dish-sandbox'), { ...OPTIONS, sandboxRunner: RUNNER }), DISH_ROWS + sandboxRow())
+
+  const pairs = DISH_ROWS + sandboxRow('/old/deploy/dish-sandbox').replace('      - /old/deploy/dish-sandbox\n', '      - /old/deploy/dish-sandbox\n      - --protect\n      - ~/precious\n')
+  assert.deepEqual(sandboxOf(writeDishRows(pairs, { ...OPTIONS, sandboxRunner: RUNNER }))?.config.runnerCommand, [RUNNER, '--protect', '~/precious'])
+  const settled = writeDishRows(pairs, { ...OPTIONS, sandboxRunner: RUNNER })
+  assert.equal(writeDishRows(settled, { ...OPTIONS, sandboxRunner: RUNNER }), settled, 'and then nothing changes')
+
+  for (const tail of [['--other'], ['--protect'], ['--protect', '~/a', 'stray']]) {
+    const text = DISH_ROWS + sandboxRow().replace(`      - ${RUNNER}\n`, `      - ${RUNNER}\n${tail.map((arg) => `      - "${arg}"\n`).join('')}`)
+    assert.deepEqual(sandboxOf(writeDishRows(text, { ...OPTIONS, sandboxRunner: RUNNER }))?.config.runnerCommand, [RUNNER], tail.join(' '))
+  }
+  const flow = DISH_ROWS + `- id: sandbox\n  name: "@deepseek-ai/dsh-sandbox-local"\n  config: { runnerCommand: [${RUNNER}], runnerFailureSignatures: ["bwrap: ", "dish-sandbox: "] }\n`
+  assert.equal(writeDishRows(flow, { ...OPTIONS, sandboxRunner: RUNNER }), flow, 'a row that is already right is left alone, whatever its style')
+})
+
+test('the sandbox row is matched as dsh\'s config editor matches rows: the last one, never an insert, only by name', () => {
+  const other = `- id: sandbox\n  name: some-other-provider\n  config:\n    runnerCommand: [/other]\n`
+  const out = writeDishRows(DISH_ROWS + sandboxRow('/first') + other, { ...OPTIONS, sandboxRunner: RUNNER })
+  const sandboxRows = rows(out).filter((row) => row.id === 'sandbox')
+  assert.deepEqual(sandboxRows.map((row) => row.config.runnerCommand), [[RUNNER], ['/other']], 'the last row with the name is written; the other provider\'s is left')
+  const removed = writeDishRows(out, { ...OPTIONS, sandboxRunner: null })
+  assert.deepEqual(rows(removed).filter((row) => row.id === 'sandbox').map((row) => row.name), ['some-other-provider'])
+})
+
+test('a sandbox runner that is not an absolute single-line path is refused', async () => {
+  for (const runner of ['', 'deploy/dish-sandbox', '~/dish/deploy/dish-sandbox', '/a\nb']) {
+    assert.throws(() => writeDishRows('', { ...OPTIONS, sandboxRunner: runner }), /sandboxRunner/, JSON.stringify(runner))
+  }
+  const path = await patchFile()
+  for (const args of [['--sandbox-runner', 'deploy/dish-sandbox'], ['--sandbox-runner='], ['--sandbox-runner', RUNNER, '--no-sandbox-runner']]) {
+    const result = await cli(path, args)
+    assert.equal(result.code, 2, args.join(' '))
+    assert.match(result.stderr, /usage: node deploy\/profile\.ts/)
+  }
+  await assert.rejects(stat(path), { code: 'ENOENT' }, 'nothing was created')
+})
+
+test('an anchored runner list that needs changing is refused', () => {
+  const text = DISH_ROWS + `- id: sandbox\n  name: "@deepseek-ai/dsh-sandbox-local"\n  config:\n    runnerCommand: &r [/old]\n- id: other\n  config:\n    x: *r\n`
+  assert.throws(() => writeDishRows(text, { ...OPTIONS, sandboxRunner: RUNNER }), /&r/)
+  assert.throws(() => writeDishRows(text, { ...OPTIONS, sandboxRunner: null }), /&r/)
+})
