@@ -22,7 +22,7 @@ Without [`dish-crew`](../crew/) it does nothing. Without [`dish-workspaces`](../
 ## A gated stop, step by step
 
 For each end of turn of any agent:
-1. **Not gated:** the turn was cancelled, the agent is the main agent, crew isn't running, or crew's record has no worktree for the child. Nothing is recorded.
+1. **Not gated:** the turn was cancelled, the agent is the main agent, crew isn't running, or crew's record has no worktree for the child. Nothing is recorded. Nor is a stop whose newest message holds tool calls: the coder hasn't finished. dsh fires such stops only after a step of the turn was cut at `max-tokens`, as it then keeps `max-tokens` as the turn's end; the cut message holds no tool calls (dsh drops them), so its stop is gated once.
 2. **One gate per worktree.** A second stop for the same worktree waits for the first. A stop cancelled while it waits returns at once.
 3. **The round** is 1 + the failed gates already recorded for this turn of the child.
 4. **The worktree** must resolve (`dishWorkspaces.resolve`, which runs dish's checks on the clone and the worktree). When it doesn't:

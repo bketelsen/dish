@@ -13,6 +13,12 @@
  * text (reasoning only, only blanks, or a `max-tokens` cut), so the head is the newest message *with* text. Every turn opens
  * with a `turn/start` event, which clears the head: a `BLOCKED:` that closed an earlier turn says nothing about this one.
  *
+ * **Tool calls.** Beside the head, it keeps whether the newest `assistant/message` of the turn holds `tool-call` blocks: a
+ * coder whose newest message calls tools hasn't finished. dsh-agent-loop (0.2.0-rc.2, `turn()`) keeps a turn's end as
+ * `max-tokens` for the rest of the turn once a step is cut, so `agent/turn-stopping` fires after every later step, tool-call
+ * steps included; the listener lets those go by. The cut message itself never holds a tool call: dsh-llm's `BlockAssembler`
+ * drops the tool calls of a `max-tokens` message, as they can't be run safely. So the stop at the cut is gated, once.
+ *
  * @module dish-gates/closing
  */
 
@@ -31,25 +37,36 @@ export function optsOut(head: string): boolean {
   return OPT_OUT.test(head)
 }
 
+/** What `ClosingHeads` keeps of a session's current turn. */
+export interface Closing {
+  /** The head of the newest assistant message with text, or `''`. */
+  head: string
+  /** Whether the newest assistant message, text or not, holds `tool-call` blocks: the agent hasn't finished. */
+  toolCalls: boolean
+}
+
+const NONE: Closing = Object.freeze({ head: '', toolCalls: false })
+
 /**
- * The head of the newest assistant message with text in the session's current turn, per session. Keyed by the session object, in a `WeakMap`, as dsh's own
- * recorders are: a session that is gone takes its head with it, and nothing needs disposing.
+ * The closing of each session's current turn: the head of its newest assistant message with text, and whether its newest
+ * assistant message holds tool calls. Keyed by the session object, in a `WeakMap`, as dsh's own recorders are: a session
+ * that is gone takes its entry with it, and nothing needs disposing.
  */
 export class ClosingHeads {
-  readonly #heads = new WeakMap<object, string>()
+  readonly #closings = new WeakMap<object, Closing>()
 
   /**
-   * An `assistant/message` event with text blocks: their text joined by a newline, leading whitespace dropped, its first
-   * `HEAD_CHARS` characters. A message with no text (only tool calls or reasoning, or only blanks) leaves the head before it.
-   * A `turn/start` clears the head. Anything else is ignored. Never throws: it runs inside a session's append, where dsh
-   * would only log a throw, but that event's head would be lost.
+   * An `assistant/message` event: whether it holds tool calls, and, when it has text blocks, the head: their text joined
+   * by a newline, leading whitespace dropped, its first `HEAD_CHARS` characters. A message with no text (only tool calls or
+   * reasoning, or only blanks) leaves the head before it. A `turn/start` clears both. Anything else is ignored. Never
+   * throws: it runs inside a session's append, where dsh would only log a throw, but that event's closing would be lost.
    */
   observe(session: object, event: unknown): void {
     try {
       if (typeof event !== 'object' || event === null) return
       const kind = (event as { type?: unknown }).type
       if (kind === 'turn/start') {
-        this.#heads.delete(session)
+        this.#closings.delete(session)
         return
       }
       if (kind !== 'assistant/message') return
@@ -60,21 +77,28 @@ export class ClosingHeads {
       const content = (message as { content?: unknown }).content
       if (!Array.isArray(content)) return
       const texts: string[] = []
+      let toolCalls = false
       for (const block of content as unknown[]) {
         if (typeof block !== 'object' || block === null) continue
         const { type, text } = block as { type?: unknown, text?: unknown }
         if (type === 'text' && typeof text === 'string') texts.push(text)
+        if (type === 'tool-call') toolCalls = true
       }
       const whole = texts.join('\n')
-      if (whole.trim() === '') return
-      this.#heads.set(session, whole.trimStart().slice(0, HEAD_CHARS))
+      const head = whole.trim() === '' ? this.closing(session).head : whole.trimStart().slice(0, HEAD_CHARS)
+      this.#closings.set(session, { head, toolCalls })
     } catch {
-      // a malformed event, or one that throws when read: not a head
+      // a malformed event, or one that throws when read: not a closing
     }
+  }
+
+  /** The session's current turn's closing; `{ head: '', toolCalls: false }` when none was seen. */
+  closing(session: object): Closing {
+    return this.#closings.get(session) ?? NONE
   }
 
   /** The head the newest message with text in the session's current turn had, or `''` when none was seen. */
   headOf(session: object): string {
-    return this.#heads.get(session) ?? ''
+    return this.closing(session).head
   }
 }

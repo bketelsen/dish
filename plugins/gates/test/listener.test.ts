@@ -63,6 +63,8 @@ interface World {
   script: Map<string, Outcome[]>
   settings: { maxRounds: number, tailLines: number }
   heads: Map<StoppingAgent, string>
+  /** The agents whose newest message holds tool calls. */
+  calling: Set<StoppingAgent>
   warns: string[]
   infos: string[]
   /** The plugin's own signal. */
@@ -102,6 +104,7 @@ async function world(options: WorldOptions = {}): Promise<World> {
     script: new Map(),
     settings: { maxRounds: 3, tailLines: 200 },
     heads: new Map(),
+    calling: new Set(),
     warns: [],
     infos: [],
     plugin: new AbortController(),
@@ -154,7 +157,7 @@ async function world(options: WorldOptions = {}): Promise<World> {
       : undefined,
     projects: () => w.services.projects ? { get: async (name: string) => name === 'acme/widget' ? w.project : undefined } : undefined,
     shell: () => w.services.shell ? shell : undefined,
-    headOf: agent => w.heads.get(agent) ?? '',
+    closing: agent => ({ head: w.heads.get(agent) ?? '', toolCalls: w.calling.has(agent) }),
     settings: () => ({ ...w.settings }),
     state: join(directory, 'state'),
     signal: w.plugin.signal,
@@ -321,6 +324,31 @@ test('an opt-out is skipped with the reason, and nothing runs; a marker that isn
   await w.stop(c1, 9)
   assert.equal(w.runs.length, 1)
   assert.equal((await w.gates('c1')).at(-1)!.outcome, 'passed')
+})
+
+test('a stop whose newest message holds tool calls isn\'t gated: the coder hasn\'t finished (dsh keeps max-tokens for the turn)', async () => {
+  const w = await world()
+  await w.coder('c1')
+  const c1 = w.agent('c1')
+  w.script.set('c1', [fail(), fail(), fail()])
+  // The max-tokens stop: its message holds no tool calls (dsh drops the cut ones), so it is gated, failed, and steered.
+  w.heads.set(c1, 'Half of the work')
+  await w.stop(c1, 1)
+  // The steered steps call tools; dsh still fires agent/turn-stopping after each, as the turn's end stays max-tokens.
+  w.calling.add(c1)
+  w.heads.set(c1, 'BLOCKED: not a closing either')
+  await w.stop(c1, 1)
+  await w.stop(c1, 1)
+  assert.equal(w.runs.length, 1)
+  assert.deepEqual(w.resolves, [FIX1])
+  assert.deepEqual((await w.gates('c1')).map(g => [g.round, g.outcome]), [[1, 'failed']])
+  assert.equal(c1.steers.length, 1)
+  assert.deepEqual(w.warns, [])
+  // The step that finishes holds no tool calls: it is gated, in round 2.
+  w.calling.delete(c1)
+  w.heads.set(c1, 'Done.')
+  await w.stop(c1, 1)
+  assert.deepEqual((await w.gates('c1')).map(g => [g.round, g.outcome]), [[1, 'failed'], [2, 'failed']])
 })
 
 // --- a pass and a failure -------------------------------------------------------------------------------------------
@@ -806,13 +834,13 @@ test('errors: steer throws; the failure stays recorded, an error follows it, and
   assert.deepEqual(w.warns, ['dish-gates failed: agent disposed'])
 })
 
-test('errors: a run that throws (it shouldn\'t) and a headOf that throws are recorded as errors, never thrown', async () => {
+test('errors: a run that throws (it shouldn\'t) and a closing that throws are recorded as errors, never thrown', async () => {
   const w = await world()
   await w.coder('c1')
   const c1 = w.agent('c1')
   w.script.set('c1', [() => { throw new Error('boom') }])
   await w.stop(c1, 1)
-  w.deps.headOf = () => { throw new Error('bad head') }
+  w.deps.closing = () => { throw new Error('bad head') }
   await w.stop(c1, 2)
   assert.deepEqual((await w.gates('c1')).map(g => [g.turn, g.outcome, g.reason]), [
     [1, 'error', 'dish-gates failed: boom'],

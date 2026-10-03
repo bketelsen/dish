@@ -5,7 +5,8 @@
  * events through a carrier that admits every listener whose context has no scope, and a session's `session/event` through
  * the session store's (see `test/plugin.test.ts`, which runs a real child through dsh's agent loop). The plugin:
  *
- * - keeps the head of each session's newest closing message, from `session/event` (`closing.ts`), for the opt-out;
+ * - keeps the head of each session's newest closing message, from `session/event` (`closing.ts`), for the opt-out, and
+ *   whether its newest message calls tools: a coder that does hasn't finished, and isn't gated;
  * - gates a bound coder's end of turn, from `agent/turn-stopping` (`listener.ts`): it runs the project's gate in the
  *   coder's worktree through dsh's sandboxed shell, records the result in crew's record, and steers a failure back to
  *   the coder, up to `maxRounds` gate runs per turn;
@@ -115,7 +116,7 @@ export function start(ctx: Context, config: Config, internals: GatesInternals): 
     workspaces: () => ctx.get('dishWorkspaces'),
     projects: () => ctx.get('dishProjects'),
     shell: () => ctx.get('shell'),
-    headOf: agent => heads.headOf(agent.session),
+    closing: agent => heads.closing(agent.session),
     settings: () => ({ maxRounds: config.maxRounds, tailLines: config.tailLines }),
     state,
     signal: stopped.signal,

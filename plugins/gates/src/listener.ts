@@ -5,7 +5,10 @@
  *
  * For each stop, in order (the gates spec as revised 2026-10-03):
  * 1. **Not gated:** the turn's (or the plugin's) signal is aborted, the agent is top-level, crew isn't running, or crew's
- *    record has no worktree for the agent. Nothing is recorded, nothing is asked of dish-workspaces.
+ *    record has no worktree for the agent. Nothing is recorded, nothing is asked of dish-workspaces. Nor is a stop whose
+ *    newest message holds tool calls (checked once the record is read, in the lock): the coder hasn't finished. dsh fires
+ *    `agent/turn-stopping` after such a step only when an earlier step of the turn was cut at `max-tokens`, which dsh
+ *    keeps as the turn's end; the cut message itself holds no tool calls, so that stop is gated (`closing.ts`).
  * 2. **One gate per worktree.** The rest runs in a lock keyed by the record's worktree: a second stop for it waits for the
  *    first. A stop whose signal aborts while it waits returns at once, recording nothing; the lock still passes in order.
  * 3. **The round:** the record is read again, and the round is 1 + the `failed` results it holds for this turn. Rounds are
@@ -47,6 +50,7 @@ import { isTopLevelAgent, maskSecrets } from 'dish-kit'
 import type { DishProjects } from 'dish-projects'
 import type { DishWorkspaces } from 'dish-workspaces'
 import { optsOut } from './closing.ts'
+import type { Closing } from './closing.ts'
 import { gateEnvironment } from './env.ts'
 import { gateLogFile } from './logs.ts'
 import { runGate } from './run.ts'
@@ -100,8 +104,8 @@ export interface GateDeps {
   projects(): Pick<DishProjects, 'get'> | undefined
   /** `ctx.get('shell')`. */
   shell(): ShellLike | undefined
-  /** `ClosingHeads.headOf(agent.session)`. */
-  headOf(agent: StoppingAgent): string
+  /** `ClosingHeads.closing(agent.session)`. */
+  closing(agent: StoppingAgent): Closing
   /** The config's rows, read on each stop. */
   settings(): { maxRounds: number, tailLines: number }
   /** dish's state directory: the logs go under `<state>/gates`. */
@@ -270,6 +274,9 @@ export function gateListener(deps: GateDeps): (payload: StoppingPayload) => Prom
       if (found?.record.worktree === undefined || signal.aborted) return
       failures = failuresIn(found.record, turn)
       const round = failures + 1
+      // A coder whose newest message calls tools hasn't finished: not gated, and nothing recorded.
+      const closing = deps.closing(agent)
+      if (closing.toolCalls) return
 
       const workspaces = deps.workspaces()
       if (workspaces === undefined) return void await recordNotRun('error', NO_WORKSPACES)
@@ -283,7 +290,7 @@ export function gateListener(deps: GateDeps): (payload: StoppingPayload) => Prom
       const project = await projects.get(worktree.project)
       if (project === undefined) return void await recordNotRun('skipped', `${worktree.project} isn't in projects.yaml`)
 
-      if (optsOut(deps.headOf(agent))) return void await recordNotRun('skipped', BLOCKED_REASON)
+      if (optsOut(closing.head)) return void await recordNotRun('skipped', BLOCKED_REASON)
       if (failures >= maxRounds) return
 
       const shell = deps.shell()

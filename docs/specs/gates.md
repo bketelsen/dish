@@ -44,14 +44,15 @@ When a crew coder bound to a worktree is about to end its turn, dish runs the pr
 ## The hook
 
 A host-level `agent/turn-stopping` listener in `dish-gates`.
-- dsh fires it before a turn closes: after a step that made no tool calls, and after a `max-tokens` stop.
+- dsh fires it before a turn closes: after a step that made no tool calls, and after a `max-tokens` stop. Once a step is cut at `max-tokens`, dsh keeps that as the turn's end, so it also fires after every later step of that turn, tool-call steps included.
 - The listener keeps the turn going by steering, as dsh's Claude Code hooks bridge does for its Stop hook.
 - dsh awaits it (serial), and a listener that throws fails the turn, so this one never throws.
 
 For each event, in order:
 1. **Not a crew child bound to a worktree** → return. That is:
    - the agent is top-level;
-   - or crew's record (`dishCrew.records.lookup(agent.id)`) has no `worktree`.
+   - or crew's record (`dishCrew.records.lookup(agent.id)`) has no `worktree`;
+   - or the agent's newest message in this turn holds tool calls: it hasn't finished. Nothing is recorded.
 2. **The turn's signal is aborted** → return.
 3. **The worktree doesn't resolve** (`dishWorkspaces.resolve(worktree)` gives `undefined`) → record it, and return without steering:
    - **as `error`,** when `dishWorkspaces.resolveProblem` gives a reason: the clone or the worktree failed dish's safety check, such as a key an agent wrote in `.git/config`. So a coder can't skip its gate by breaking the clone's config;
@@ -265,6 +266,7 @@ What the build decided within this spec, or added to it, beyond the plan's corre
 - **Skip reasons are read after "Gate skipped: ",** with no "not gated: " prefix: "Gate skipped: its worktree is gone, or its project is no longer registered." A project removed from `projects.yaml` between the worktree's check and the gate is "<project> isn't in projects.yaml".
 - **Without dish-projects,** as without dish-workspaces or dsh's shell, dish-gates' own check records an `error`. In practice dish-workspaces resolves no worktree without dish-projects, so such a stop is `skipped` as a worktree that is gone, before that check. Nothing runs either way, and a review still needs a pass or a ruling.
 - **The opt-out is per turn.** Each turn's `turn/start` clears the closing message held for its session, so a `BLOCKED:` that closed an earlier turn doesn't skip a later turn's gate (a follow-up whose last step has no text, say).
+- **A stop after a `max-tokens` cut** (found in the final review). dsh-agent-loop keeps a turn's end as `max-tokens` for the rest of the turn, so `agent/turn-stopping` fires after every later step, tool-call steps included. Gating those ran the gate mid-work, steered the coder again, and could end a turn "failed after 3 rounds" while the coder was still working. So a stop whose newest assistant message holds tool calls isn't gated and records nothing. The cut message itself never holds one (dsh-llm's assembler drops the tool calls of a `max-tokens` message), so the stop at the cut is gated once, and so is the step that finishes. dsh ends such a turn after the next step unless something steers it; a gate failure at the cut therefore gets one step of fixing in that turn, and the failure stays on the record for the main agent's fix round.
 - **Cancels.** A stop whose signal aborts while it waits for the worktree's lock returns at once, recording nothing, and the lock still passes to the stops after it in order. A result that comes back after an abort is dropped: once the signal is aborted, nothing is recorded or steered.
 - **Every steer adds a failure to the record.** A failure that couldn't be recorded (crew no longer has the child) isn't steered, so a turn's rounds always run out. When the steer itself throws, the failure stays on the record and an `error` ("dish-gates failed: …") is recorded after it, so the run's last result, which the notice and the review check read, is that error.
 

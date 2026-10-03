@@ -146,6 +146,28 @@ test('a turn/start clears the head: a BLOCKED that closed an earlier turn says n
   assert.equal(heads.headOf(session), 'Done.')
 })
 
+test('closing: whether the newest message of the turn holds tool calls, beside the head', () => {
+  const heads = new ClosingHeads()
+  const session = {}
+  assert.deepEqual(heads.closing(session), { head: '', toolCalls: false }, 'none seen')
+  heads.observe(session, assistantEvent([text('I will run the tests.'), call()]))
+  assert.deepEqual(heads.closing(session), { head: 'I will run the tests.', toolCalls: true })
+  heads.observe(session, assistantEvent([call()]))
+  assert.deepEqual(heads.closing(session), { head: 'I will run the tests.', toolCalls: true }, 'only tool calls: the head stays')
+  heads.observe(session, assistantEvent([{ type: 'reasoning', text: 'thinking' } as ContentBlock]))
+  assert.deepEqual(heads.closing(session), { head: 'I will run the tests.', toolCalls: false }, 'the newest message counts, text or not')
+  heads.observe(session, assistantEvent([call()]))
+  heads.observe(session, assistantEvent([text('Done.')]))
+  assert.deepEqual(heads.closing(session), { head: 'Done.', toolCalls: false })
+  heads.observe(session, assistantEvent([call()]))
+  heads.observe(session, { type: 'turn/start', seq: 9, time: 2, data: { turn: 2 } })
+  assert.deepEqual(heads.closing(session), { head: '', toolCalls: false }, 'a turn/start clears both')
+  heads.observe(session, assistantEvent([call()]))
+  heads.observe(session, { type: 'tool/result', seq: 10, time: 3, data: {} })
+  assert.equal(heads.closing(session).toolCalls, true, 'other events leave it')
+  assert.equal(heads.headOf(session), heads.closing(session).head)
+})
+
 test('none seen is the empty string', () => {
   const heads = new ClosingHeads()
   assert.equal(heads.headOf({}), '')

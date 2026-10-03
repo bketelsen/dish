@@ -3,7 +3,7 @@
  * providing stubs of `dishWorkspaces`, `dishProjects` and dsh's `shell` (a fake shell that sandboxes). Most tests drive
  * dsh's two events by hand, with a fake agent: `session/event` for the closing message and `agent/turn-stopping`.
  *
- * Two tests run a **real crew child** instead, through dsh's own agent loop (`dsh-agent-loop`), its spawn backend
+ * A few tests run a **real crew child** instead, through dsh's own agent loop (`dsh-agent-loop`), its spawn backend
  * (`dsh-subagent`, `dsh-subagent-spawn-in-process`) and a scripted model, with crew's host listeners recording the child
  * as they do in dsh. They pin what dish-gates relies on and the other tests only assume: that a child's
  * `agent/turn-stopping` and `session/event` reach a host plugin's listeners, that the closing message comes before the
@@ -28,6 +28,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { format } from 'node:util'
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { ShellExecRequest, ShellExecSpec, ShellExecution, ShellRunResult } from '@deepseek-ai/dsh-shell'
 import * as crewPlugin from 'dish-crew'
@@ -551,8 +552,14 @@ async function dshModule(name: string): Promise<any> {
   return import(pathToFileURL(fromDsh.resolve(name)).href)
 }
 
+/**
+ * What the coder's model answers in one step: text, tool calls (by name, with `{}` for arguments), and whether the answer
+ * is cut at `max-tokens`. A string is text alone.
+ */
+type CoderReply = string | { text?: string, calls?: string[], cut?: boolean }
+
 /** What the coder's model answers to a request, given every earlier request's text and this one's. */
-type CoderScript = (request: string, count: number) => string
+type CoderScript = (request: string, count: number) => CoderReply
 
 interface DshWorld {
   ctx: Context
@@ -587,17 +594,29 @@ async function withDsh(coder: CoderScript, body: (dsh: DshWorld) => Promise<void
       providerInfo(provider: string) { return { id: provider, name: provider } }
       async *stream(options: { model: string, messages: unknown }) {
         const request = JSON.stringify(options.messages)
-        let text = 'ok'
+        let reply: CoderReply = 'ok'
         if (options.model === 'fake-coder') {
           coderRequests.push(request)
-          text = coder(request, coderRequests.length)
+          reply = coder(request, coderRequests.length)
         } else {
           mainRequests++
         }
-        yield { type: 'block-start', index: 0, blockType: 'text' }
-        yield { type: 'text-delta', index: 0, text }
-        yield { type: 'block-end', index: 0, block: { type: 'text', text } }
-        yield { type: 'finish', reason: 'stop' }
+        const { text, calls = [], cut = false } = typeof reply === 'string' ? { text: reply } : reply
+        let index = 0
+        if (text !== undefined) {
+          yield { type: 'block-start', index, blockType: 'text' }
+          yield { type: 'text-delta', index, text }
+          yield { type: 'block-end', index, block: { type: 'text', text } }
+          index++
+        }
+        for (const name of calls) {
+          const id = `call-${coderRequests.length}-${index}`
+          yield { type: 'block-start', index, blockType: 'tool-call' }
+          yield { type: 'tool-call-delta', index, id, name, argumentsDelta: '{}' }
+          yield { type: 'block-end', index, block: { type: 'tool-call', id, name, arguments: '{}' } }
+          index++
+        }
+        yield { type: 'finish', reason: { kind: cut ? 'max-tokens' : calls.length > 0 ? 'tool-calls' : 'stop' } }
       }
     }
     const ctx = new Context()
@@ -695,6 +714,49 @@ test('a real crew child that closes with BLOCKED: its own session\'s message is 
       assert.deepEqual(record.runs[0]!.gates?.map(result => [result.outcome, result.reason]), [['skipped', BLOCKED_REASON]])
       assert.equal(w.shell.requests.length, 0)
     } finally {
+      await w.dispose()
+    }
+  })
+})
+
+test('a real crew child cut at max-tokens: its stop is gated once, the tool-call steps after it aren\'t, and the step that finishes is', async () => {
+  // dsh keeps a turn's end as max-tokens once a step is cut, so agent/turn-stopping fires after every later step of the turn.
+  const steps: CoderReply[] = [
+    // The cut step: dsh drops its tool call, so the message holds text alone, and the stop is gated (and fails).
+    { text: 'Half of the work', calls: ['no_such_tool'], cut: true },
+    // Two steps that call tools, each followed by a stop: the coder hasn't finished, and they aren't gated.
+    { calls: ['no_such_tool'] },
+    { text: 'Still going.', calls: ['no_such_tool'] },
+    'Done.',
+  ]
+  await withDsh((_, count) => steps[count - 1] ?? 'Done.', async (dsh) => {
+    const w = await world({ ctx: dsh.ctx })
+    // A steer after each tool-call step, as a message sent to the running child would be: without one, dsh would end the
+    // turn there, as the turn's end is already max-tokens.
+    let nudges = 0
+    const nudge = dsh.ctx.plugin({
+      name: 'nudge',
+      apply(own: Context) {
+        own.on('agent/turn-stopping' as never, ((payload: { agent: Agent }) => {
+          if (String(payload.agent.id) !== 'child-3' || dsh.coderRequests.length < 2 || dsh.coderRequests.length > 3) return
+          nudges++
+          payload.agent.steer(createUserMessage({ content: [{ type: 'text', text: 'keep going' }], source: { kind: 'user' } }))
+        }) as never)
+      },
+    } as never, undefined as never) as unknown as Handle
+    try {
+      await nudge
+      w.shell.script.push(FAIL, PASS)
+      await dsh.delegate('child-3', 'create ok.txt')
+      const record = await settled(w, dsh, 'child-3')
+      assert.equal(dsh.coderRequests.length, 4)
+      assert.equal(nudges, 2)
+      assert.ok(dsh.coderRequests[1]!.includes(GATE_FAILED), 'the cut stop was gated, and its failure steered')
+      // Two gate runs: the cut stop's, and the finishing step's; none after the tool-call steps.
+      assert.equal(w.shell.requests.length, 2)
+      assert.deepEqual(record.runs[0]!.gates?.map(result => [result.outcome, result.round, result.turn]), [['failed', 1, 1], ['passed', 2, 1]])
+    } finally {
+      await nudge.dispose()
       await w.dispose()
     }
   })
