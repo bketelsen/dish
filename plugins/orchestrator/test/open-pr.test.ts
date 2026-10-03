@@ -465,7 +465,8 @@ test('open_pr: all passing pushes the head, opens the pull request, and closes t
   assert.equal(value.text, [
     `Opened PR #1 for run \`${run.id}\`: ${url}`,
     'Pushed dish/fix-login at bbbbbbb: the gate passed on it; the final review approved it.',
-    `Run \`${run.id}\` is closed. Humans merge; dish removes the run's worktrees once the PR is merged. Review feedback: \`run\` \`resume\` reopens it.`,
+    `Run \`${run.id}\` is closed. Humans merge; dish removes the run's own worktree once the PR is merged, and task worktrees are removed with \`worktree\` \`remove\`. `
+      + 'Review feedback: `run` `resume` reopens it.',
   ].join('\n'))
 
   assert.deepEqual(await written(w, run), ['pr.checked', 'pr.opened', 'run.closed'])

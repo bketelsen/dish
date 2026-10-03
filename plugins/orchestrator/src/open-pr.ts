@@ -573,7 +573,8 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
       else if (comment?.comment === 'posted') lines.push('dish posted the override line as a comment on it.')
       else lines.push(`dish couldn't post the override line as a comment (${comment?.commentError ?? 'unknown'}): add it to the pull request by hand.`)
     }
-    lines.push(`Run \`${run.id}\` is closed. Humans merge; dish removes the run's worktrees once the PR is merged. Review feedback: \`run\` \`resume\` reopens it.`)
+    lines.push(`Run \`${run.id}\` is closed. Humans merge; dish removes the run's own worktree once the PR is merged, and task worktrees are removed with \`worktree\` \`remove\`. `
+      + 'Review feedback: `run` `resume` reopens it.')
     lines.push(...unrecorded)
     if (seen.untracked !== undefined && seen.untracked.length > 0) lines.push(untrackedLine(seen.untracked))
     return { url, number, existing: pull.existing, head, text: maskSecrets(lines.join('\n')) }

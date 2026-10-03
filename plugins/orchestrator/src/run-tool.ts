@@ -242,8 +242,8 @@ class RunTool {
     if (run.plan !== undefined) lines.push(`Plan: ${run.plan.path} at ${shortSha(run.plan.commit)}.`)
     else if (checked !== undefined && !checked.ok) lines.push(`Plan not attached: ${checked.why}. Attach it with \`run\` \`plan\` once it is in the run's branch.`)
     lines.push(
-      `This chat drives it. Worktrees you make in ${run.project} while you drive it are its tasks; bind a coder to the run's own worktree with `
-        + `delegate's \`worktree\`: ${run.project}/${run.slug}. \`open_pr\` ends the run.`,
+      `This chat drives it. Worktrees you make in ${run.project} while you drive it are its tasks. Bind coders to it (delegate's \`worktree\`: `
+        + `${run.project}/${run.slug}), or to task worktrees made with \`worktree\` (base \`${run.branch}\`). \`open_pr\` ends the run.`,
       setupSentence(created.setup),
     )
     if (released !== undefined) lines.push(`Released run \`${released.id}\`: it stays open, and \`run\` \`resume\` takes it back.`)
