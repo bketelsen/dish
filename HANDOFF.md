@@ -37,6 +37,7 @@ Everything below is merged and running on the VM.
 | Friction fixes from the clippy session | #17 | One `/tmp` for every agent and tool, which lasts (dsh's own temp files moved to `~/.cache/dish/tmp`, the unit's `TMPDIR`); mise's shims at the end of a sandboxed command's `PATH`; the judge counts `/tmp` with the workspace; `read_image` for the coder, reviewer and writer. Checked on the VM after the deploy. |
 | `file` on the VM | fleet #42 | Guest play applied 2026-10-03 (`changed=1`, rerun `changed=0`). |
 | Chromium, `fonts-liberation` and `xmllint` on the VM | fleet #43 | Guest play applied 2026-10-04 (`changed=1`, rerun `changed=0`). Checked through `dish-sandbox` as `dish`: headless screenshots of a `file://` page and of a `127.0.0.1` dev server started in the same call, fonts rendering, no process left; `xmllint` in both modes. Chromium needs a writable sandbox: in read-only mode it can't make its profile directory. `common.md` tells agents. |
+| `bketelsen/dish` as a dish project | registered 2026-10-04 | `projects.yaml`: family `bketelsen`, gate `pnpm typecheck && pnpm test` (10m), setup `pnpm install --frozen-lockfile`, and a role line telling agents the user deploys it (never run `deploy/` scripts or restart `dish-web`). Its gate passes inside the VM's sandbox: 4,505 tests, 4,499 pass, 0 fail, 6 skipped, in about 146 s. Two of the skips are the shellcheck tests, until [bketelsen/fleet#44](https://github.com/bketelsen/fleet/pull/44) installs `shellcheck` on the guest. Each task worktree needs its own `pnpm install --frozen-lockfile` (the `worktree` tool's answer says so). |
 | 7 `orchestrator` | #21 | Deployed 2026-10-03 at 23:23 UTC. The first live run, on `bketelsen/clippy` (`20261003-readme-output-example`), went clean from start to finish: a coder's `report`, the gate passed at its head, a `final: true` review approved that head, and `open_pr` opened [bketelsen/clippy#13](https://github.com/bketelsen/clippy/pull/13), which the user merged. Every ledger line was the harness's, and no token was on disk. |
 
 **The VM's `judge.yaml`** has `reversible: 0.80` and `servesTask: 0.40` (set in the web UI on 2026-10-03; the shipped default is 0.90/0.50). The [judge spec](docs/specs/judge.md) has the replay behind them. Its `tools.screened` gained `pr_feedback` by hand on 2026-10-03, as step 7's rollout says.
@@ -118,7 +119,8 @@ Sessions are `session.v4.jsonl.zstd` under the workspace's directory, and a crew
    - a message typed mid-turn waits for the whole turn;
    - `bash` without `description` is refused;
    - `edit` refuses a file seen only through `cat`, and a file read in an earlier turn of a follow-up (a writer's 8 edits failed that way);
-   - a `workdir` that doesn't exist is reported as `spawn <runner> ENOENT`, which reads as the sandbox runner missing.
+   - a `workdir` that doesn't exist is reported as `spawn <runner> ENOENT`, which reads as the sandbox runner missing;
+   - `grep` refuses `include: ""` ("include must be a non-empty glob when given") instead of taking it as absent, which a model passes for "no filter".
 
 ## Known limits to keep in mind
 
