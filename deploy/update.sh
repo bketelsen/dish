@@ -131,8 +131,9 @@ usage_error() {
   exit 2
 }
 
-# Run by the EXIT trap.
-# shellcheck disable=SC2329
+# Run by the EXIT trap. shellcheck reports a function it only reaches through a trap as SC2317 in 0.10 (the VM's)
+# and as SC2329 in 0.11.
+# shellcheck disable=SC2317,SC2329
 on_exit() {
   local status=$? now service
   if [ "${#temporary[@]}" -gt 0 ]; then rm -f -- "${temporary[@]}"; fi

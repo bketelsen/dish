@@ -45,7 +45,7 @@ die() {
   exit "$code"
 }
 
-# shellcheck disable=SC2329  # run by the EXIT trap below (shellcheck loses sight of the trap before `main "$@"; exit`)
+# shellcheck disable=SC2317,SC2329  # run by the EXIT trap below (shellcheck loses sight of the trap before `main "$@"; exit`); 0.10 calls it SC2317, 0.11 SC2329
 cleanup() {
   local status=$?
   if [ "$status" -ne 0 ] && [ "$reported" -eq 0 ]; then echo "url: FAILED at step: $step (exit $status)" >&2; fi
