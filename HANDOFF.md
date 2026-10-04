@@ -36,6 +36,7 @@ Everything below is merged and running on the VM.
 | 6c `gates` | #16 | Its last live checks are in step 7's (Next, item 1). |
 | Friction fixes from the clippy session | #17 | One `/tmp` for every agent and tool, which lasts (dsh's own temp files moved to `~/.cache/dish/tmp`, the unit's `TMPDIR`); mise's shims at the end of a sandboxed command's `PATH`; the judge counts `/tmp` with the workspace; `read_image` for the coder, reviewer and writer. Checked on the VM after the deploy. |
 | `file` on the VM | fleet #42 | Guest play applied 2026-10-03 (`changed=1`, rerun `changed=0`). |
+| Chromium, `fonts-liberation` and `xmllint` on the VM | fleet #43 | Guest play applied 2026-10-04 (`changed=1`, rerun `changed=0`). Checked through `dish-sandbox` as `dish`: headless screenshots of a `file://` page and of a `127.0.0.1` dev server started in the same call, fonts rendering, no process left; `xmllint` in both modes. Chromium needs a writable sandbox: in read-only mode it can't make its profile directory. `common.md` tells agents. |
 | 7 `orchestrator` | #21 | Deployed 2026-10-03 at 23:23 UTC. The first live run, on `bketelsen/clippy` (`20261003-readme-output-example`), went clean from start to finish: a coder's `report`, the gate passed at its head, a `final: true` review approved that head, and `open_pr` opened [bketelsen/clippy#13](https://github.com/bketelsen/clippy/pull/13), which the user merged. Every ledger line was the harness's, and no token was on disk. |
 
 **The VM's `judge.yaml`** has `reversible: 0.80` and `servesTask: 0.40` (set in the web UI on 2026-10-03; the shipped default is 0.90/0.50). The [judge spec](docs/specs/judge.md) has the replay behind them. Its `tools.screened` gained `pr_feedback` by hand on 2026-10-03, as step 7's rollout says.
@@ -108,7 +109,6 @@ Sessions are `session.v4.jsonl.zstd` under the workspace's directory, and a crew
 4. **Going public.** An audit on 2026-10-03 found no real secret anywhere in the history. Before flipping the repo to public, run, with direnv loaded, `git log --all --format=%h -S"${TYPESAFE_API_KEY:8:16}"`: no output means the key was never committed. The two `apikey_…` values in `packages/dish-kit/test/secrets.test.ts` should be the fakes their comment says they are. Also: delete the merged branches, turn off the wiki if unused, and skim the PR descriptions. Links to `bketelsen/fleet` go to a private repository.
 5. **[ROADMAP.md](ROADMAP.md)'s backlog.** The items that matter most in daily use:
    - watching a run's pull request after `open_pr` (CI failures, conflicts, review comments) and waking the chat that drives it, as Claude Code desktop's "Auto-fix pull requests" does;
-   - Chromium and `libxml2-utils` on the VM;
    - dev-server previews.
 6. **dsh issues worth filing upstream**, seen in sessions:
    - `{{model}}` shows the preset's model, not the session's;
