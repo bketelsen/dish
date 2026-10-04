@@ -4346,11 +4346,13 @@ Run a whole-branch review from `main`, on the strongest model. Check it against 
 
 ## The rollout (for you)
 
+**As done (2026-10-03):** merged as [bketelsen/dish#21](https://github.com/bketelsen/dish/pull/21) and deployed that evening. There is one App, `bketelsen-dish-dev`: no separate prod App was made, and you gave it Checks and Commit statuses read. The rulesets are on `bketelsen/clippy` and `bketelsen/dish`, and, wider than step 2 says, on every frostyard repository at org level, with every other installed App (renovate, the hive Apps, …) on the bypass list, since the App is installed on all of frostyard. `pr_feedback` was added to the VM's `judge.yaml` by hand. The first live run on `bketelsen/clippy` opened [bketelsen/clippy#13](https://github.com/bketelsen/clippy/pull/13), merged.
+
 **1. Review and merge `orchestrator` into `main`.**
 - Your four answers (2026-10-03) are in the spec and in this plan's header. The [Spec corrections](#spec-corrections-for-the-user) are in the spec too; 1, 2 and 4 are new decisions for your review, and 3 extends your answer 1: confirm it at step 2.
 - Before you merge, Task 12's last step has run: `pnpm test` passes on the branch's tip, which includes both drift tests for `previous.json`.
 
-**2. Rulesets on default branches: do this first, now, before step 1.** The prod App, `bketelsen-dish`, was made with write access on 2026-10-03, and the VM uses it (Settings → GitHub App). Agents' shells can read its private key in dsh's credential file, so an agent that reads it can mint a write token today, whatever dish's code asks for, and push to or merge into the default branch of any repository the App is installed on. Until these rulesets are on, nothing stops that.
+**2. Rulesets on default branches: do this first, now, before step 1.** The App, `bketelsen-dish-dev` (dish's only one, despite its name), has write access since 2026-10-03, and the VM uses it (Settings → GitHub App). Agents' shells can read its private key in dsh's credential file, so an agent that reads it can mint a write token today, whatever dish's code asks for, and push to or merge into the default branch of any repository the App is installed on. Until these rulesets are on, nothing stops that.
 
 *To confirm with you first:* the one required approval below extends your answer 1 ([Spec correction 3](#spec-corrections-for-the-user)).
 - **Each `bketelsen` repo the App is installed on** (the dish projects: today `bketelsen/clippy`; later `bketelsen/dish`): the repo's **Settings → Rules → Rulesets → New ruleset → New branch ruleset**:
@@ -4372,13 +4374,13 @@ Run a whole-branch review from `main`, on the strongest model. Check it against 
 - **Plans:** rulesets on a private repository need GitHub Pro (your account) or Team (frostyard). On the free plans they apply to public repositories only. Check before relying on them.
 - **Check:** the ruleset shows Active, targeting the default branch.
 
-**3. The App's permissions.** The App is `bketelsen-dish`, the VM's (dev keeps `bketelsen-dish-dev`). It was made with write access, so check what it has and set what's missing. On github.com, **Settings → Developer settings → GitHub Apps → `bketelsen-dish` → Edit → Permissions & events → Repository permissions:**
+**3. The App's permissions.** The App is `bketelsen-dish-dev`, the VM's. It has write access, so check what it has and set what's missing. On github.com, **Settings → Developer settings → GitHub Apps → `bketelsen-dish-dev` → Edit → Permissions & events → Repository permissions:**
 - **Contents: Read and write.** **Pull requests: Read and write.** **Metadata: Read-only.** **Checks: Read-only.** **Commit statuses: Read-only.** Checks and Commit statuses are for `pr_feedback`, which shows the checks on a pull request's head ([correction 16](#spec-corrections-for-the-user)).
 - **Workflows: No access.** A run that changes `.github/workflows/` then fails at the push with GitHub's reason. Adding it on GitHub isn't enough for such runs: dish's push token asks for Contents only (`PUSH_PERMISSIONS`, Task 6), so dish would need to ask for `workflows: write` too. That is a later change.
 - **Save changes,** if you changed anything. GitHub then asks each installation to accept.
 
 **4. Each installation accepts,** when step 3 changed a permission.
-- **`bketelsen`:** github.com/settings/installations → `bketelsen-dish` → the banner "… is requesting an update to its permissions" → **Review request** → **Accept new permissions**.
+- **`bketelsen`:** github.com/settings/installations → `bketelsen-dish-dev` → the banner "… is requesting an update to its permissions" → **Review request** → **Accept new permissions**.
 - **`frostyard`,** if the App is installed there: github.com/organizations/frostyard/settings/installations → the same. An org owner accepts.
 
 Until an installation accepts, a token that asks for a permission it lacks gets GitHub's 422: `open_pr` fails at the token without Contents or Pull requests write, `pr_feedback` says it can't read the checks without Checks and Commit statuses read, and agents' read tokens and dish's own API reads work as before.
@@ -4391,7 +4393,7 @@ incus exec minideb:dish --project dish -- dish-update --apply
 Expect `install: bundles added: orchestrator; …`, `install: profile changed`, and a restart. One `--apply` is enough: the bundle list is in `install.sh`, which the first run already takes from the new checkout.
 
 Then, over `https://dish.<tailnet>.ts.net`:
-- **Settings → GitHub App → Test** shows the App (`bketelsen-dish`), its bot and the installations, not the permissions. Check those on the App's GitHub page (step 3). Then, once dish has read a pull request (step 7's `pr_feedback`, or a sweep that found one), dish's log has no "hasn't accepted Checks and Commit statuses read" line:
+- **Settings → GitHub App → Test** shows the App (`bketelsen-dish-dev`), its bot and the installations, not the permissions. Check those on the App's GitHub page (step 3). Then, once dish has read a pull request (step 7's `pr_feedback`, or a sweep that found one), dish's log has no "hasn't accepted Checks and Commit statuses read" line:
   ```bash
   incus exec minideb:dish --project dish -- su - dish -c 'journalctl --user -u dish-web.service --since today --grep "accepted Checks"'
   ```
@@ -4416,7 +4418,7 @@ Then, over `https://dish.<tailnet>.ts.net`:
   - the notice renders the report and "Gate passed (round 1).";
   - the reviewer's `report` gives its verdict and the head, and the final review is started with `final: true`;
   - `open_pr` answers a PR's URL. On GitHub:
-    - the author is the App's bot, `bketelsen-dish[bot]`, the base `main`, the head `dish/readme-usage`;
+    - the author is the App's bot, `bketelsen-dish-dev[bot]`, the base `main`, the head `dish/readme-usage`;
     - the body is the main agent's, with no ⚠ line;
     - the PR page says a review is required (step 2's rule), and offers you a merge past the rules;
   - **as `dish`:**
