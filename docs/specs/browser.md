@@ -1,6 +1,6 @@
 # Spec: browser (`dish-browser`)
 
-Status: Draft 2026-10-04, from the brainstorm (the user's six answers are under Decisions); waiting for your review. It is the backlog row "A shared browser (step-sized)" in [ROADMAP.md](../../ROADMAP.md#backlog), and it covers the row before it, "Dev-server previews": you see an agent's dev server in the Browser tab. It builds on [crew](crew.md) (role tool lists), the [judge](judge.md) (the result screen) and [prompts](prompts.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources, and every claim about Playwright against the spike on the VM or a local copy of playwright-core 1.62.1's types; see [Checks](#checks-2026-10-04). A plan comes after your review.
+Status: Draft 2026-10-04, from the brainstorm (the user's six answers are under Decisions), with the four [Questions for you](#questions-for-you) answered the same day (decisions 8–11) and the spike's results in [Checks](#checks-2026-10-04); waiting for your review. It is the backlog row "A shared browser (step-sized)" in [ROADMAP.md](../../ROADMAP.md#backlog), and it covers the row before it, "Dev-server previews": you see an agent's dev server in the Browser tab. It builds on [crew](crew.md) (role tool lists), the [judge](judge.md) (the result screen) and [prompts](prompts.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources, and every claim about Playwright against the spike on the VM or a local copy of playwright-core 1.62.1's types; see [Checks](#checks-2026-10-04). A plan comes after your review.
 
 ## Summary
 
@@ -18,11 +18,15 @@ Agents can screenshot a page today only through `chromium --headless --screensho
 |---|---|---|
 | 1 | Who gets the tools | The main agent, the coder, the reviewer and the writer. Not the researcher, the architect or ops. |
 | 2 | How many browsers | One per agent session. Each crew child has its own. The tab shows the browser of the chat you're viewing. |
-| 3 | What it can open | Any `http`/`https` page, as `web_fetch` can, and `file://` inside the session's own workspace. Never `chrome:`, `javascript:`, `data:`, `view-source:`, `blob:` (top level), or `file://` outside the workspace. |
+| 3 | What it can open | Any `http`/`https` page, as `web_fetch` can, and `file://` inside the session's own workspace (and under `/tmp`: decision 9). Never `chrome:`, `javascript:`, `data:`, `view-source:`, `blob:` (top level), or `file://` outside the workspace. |
 | 4 | Your control | You can watch and drive at any time. The agent's next browser call notes that you changed the page. |
 | 5 | Cookies and sign-ins | Per session, gone when that session's browser closes. |
 | 6 | Engine | `playwright-core`, one dependency, pinned exactly (1.63.0), driving the system's Chromium (`/usr/bin/chromium` on the VM, fleet #43). |
 | 7 | Housekeeping (Claude's calls, unless you object) | A new plugin, `dish-browser` (`plugins/browser`), host and client halves, like `dish-orchestrator`. Actions return the new snapshot. Ten tools, `browser_select` and `browser_wait` among them. The tab is a `dish-browser` kind, not dsh's `browser`, and it can switch to a crew child's browser. The judge screens `"browser_*"`. dsh's own address is refused. With no Chromium on the host, the tools aren't registered. |
+| 8 | Real-Chromium tests | They skip on the desktop, which has no Chromium, and run in the `bketelsen/dish` project's gate on the VM. The end-to-end run is on the VM too, in a scratch dsh, with your go-ahead. `DISH_TEST_CHROMIUM` lets a desktop run use a Chromium you provide. |
+| 9 | `file://` under `/tmp` | Allowed, on the VM: `file://` opens inside the session's workspace or under `/tmp`, the places an agent's command can write. |
+| 10 | A crew child's browser | It lasts one run, closing when dsh disposes the child, except that a browser you're watching stays open until you stop watching. |
+| 11 | Judging clicks | Not in v1. The prompts' "ask first" rule covers outward clicks; revisit if it bites. |
 
 ## Non-goals
 
@@ -39,11 +43,11 @@ Agents can screenshot a page today only through `chromium --headless --screensho
 - **The host half** runs in dsh's process, as the `dish` account, outside the agent sandbox. It drives Chromium through `playwright-core`, registers the tools, and serves the tab's stream.
 - **The client half** registers the tab type, its body and title, a header button, and the screenshot's inline view.
 - **What it reads, with `ctx.get` on each use:** dsh's `tools`, `agents`, `sandboxPolicy`, `attachments`, `llm` and `workspaceRegistry`, and crew's `dishCrew` for a child's label. Nothing from dish is required. It provides no service of its own in v1.
-- **Nothing of its own on disk.** Cookies live in memory, and screenshots go to dsh's attachment store, as `read_image`'s do. Playwright puts Chromium's temporary profile in `os.tmpdir()` (to verify in the spike), which on the VM is dsh's `TMPDIR`, `~/.cache/dish/tmp` (`deploy/dish-web.service:55`), protected from agents' writes. The unit's start removes anything there older than 10 days.
+- **Nothing of its own on disk.** Cookies live in memory, and screenshots go to dsh's attachment store, as `read_image`'s do. Playwright puts Chromium's temporary profile in `os.tmpdir()` (the spike saw `playwright_chromiumdev_profile-*` and `playwright-artifacts-*` there, removed at `close()`; Chromium leaves one small `org.chromium.Chromium.*` directory), which on the VM is dsh's `TMPDIR`, `~/.cache/dish/tmp` (`deploy/dish-web.service:55`), protected from agents' writes. The unit's start removes anything there older than 10 days.
 
 **One Chromium process.** `chromium.launch({ executablePath, chromiumSandbox: true })`, started on first need: an agent's first browser call, or an address bar.
 - It stops 60 s after the last browser closes, and when the plugin stops. systemd's default kill mode takes it with `dish-web.service`.
-- **Chromium's own sandbox is on.** Playwright turns it off unless asked (`chromiumSandbox` defaults to `false`). Debian's Chromium uses user namespaces. If it refuses to start for want of them, dish starts it without its sandbox, logs a warning once, and says so in the tab: the VM is the boundary, and a browser that doesn't start helps nobody. To verify in the plan's spike.
+- **Chromium's own sandbox is on.** Playwright turns it off unless asked (`chromiumSandbox` defaults to `false`). Debian's Chromium uses user namespaces. If it refuses to start for want of them, dish starts it without its sandbox, logs a warning once, and says so in the tab: the VM is the boundary, and a browser that doesn't start helps nobody. The spike launched it with `chromiumSandbox: true` on the VM.
 - **Fonts** come from fleet #43 (`fonts-liberation`).
 
 **One browser per agent session.** A browser is a `BrowserContext` with one page, keyed by the agent's session id (dsh's agent id is its session id).
@@ -107,9 +111,9 @@ Ten global tools, registered by `dish-browser` through `ctx.inject(['tools'])`, 
 - **Not in v1:** a diff against the last snapshot. If Playwright's refs prove stable for an element that stays, a later version could send only what changed.
 
 **The snapshot.** `page.ariaSnapshot({ mode: 'ai' })`, or `page.locator('aria-ref=<ref>').ariaSnapshot({ mode: 'ai' })` for one subtree. It is YAML with refs, such as `- textbox "Name" [ref=e7]` and `- link "First link" [ref=e4] [cursor=pointer]` (the spike), and it takes in iframes.
-- **Cut at `snapshotChars`** (30,000), at a line end. That should keep a result under dsh's spill cap (`maxInlineTokens: 12500`, by dsh's own estimate: the spike checks), so the agent and the judge get it whole, not a spilled file. A cut says "Cut at 30,000 of 93,512 characters: `browser_read` with the ref of a section (a `main`, `list` or `region`) reads that part."
+- **Cut at `snapshotChars`** (30,000), at a line end. That keeps a result under dsh's spill cap (`maxInlineTokens: 12500`): dsh estimates 30,000 characters at about 7,500 tokens ([Checks](#checks-2026-10-04)), so the agent and the judge get it whole, not a spilled file. A cut says "Cut at 30,000 of 93,512 characters: `browser_read` with the ref of a section (a `main`, `list` or `region`) reads that part."
 - **Masked** with dish-kit's `maskSecrets`, as is every text the tools return: URLs, titles, console lines, dialog text.
-- **Password fields.** Whether the snapshot shows a password field's value is to check in the plan's spike. If it does, dish blanks it.
+- **Password fields.** The snapshot shows a password field's value (the spike: `textbox "Password" [ref=e5]: hunter2-SECRET`). dish blanks it: a password field's line ends at its name and ref, with `(a password field; its value isn't shown)`. The plan finds a reliable way to tell those lines (the element's `type`, by ref) rather than matching the word "Password".
 
 **A result, laid out:**
 ```
@@ -160,13 +164,13 @@ The same rules apply to the agent's `browser_navigate` and to your address bar.
 | `http://…`, `https://…`, any host: `localhost`, `127.0.0.1`, the LAN, the internet | opened (usability first: the VM is the boundary) |
 | a bare host, such as `localhost:5173/x` or `example.com` | `http://` for `localhost`, `127.*`, `[::1]` and `*.localhost`; `https://` for the rest |
 | an absolute path, `/…` | a `file://` URL |
-| `file://…` | opened only if its real path is inside the session's workspace |
+| `file://…` | opened only if its real path is inside the session's workspace, or, on the VM, under `/tmp` (decision 9) |
 | `about:blank` | opened |
 | dsh's own address | refused |
 | anything else: `chrome:`, `javascript:`, `data:`, `view-source:`, `blob:`, `ftp:`, any other `about:` | refused |
 
 **`file://` confinement.**
-- The path is taken from the URL, its real path is resolved (`realpath`), and it must be the workspace root's real path or under it, on a `/` boundary. A symbolic link that leads out is refused, and so is a path that doesn't exist.
+- The path is taken from the URL, its real path is resolved (`realpath`), and it must be the workspace root's real path or under it, or `/tmp` or under it (decision 9), on a `/` boundary. `/tmp` counts only where agents share the machine's `/tmp`: when dsh's own `TMPDIR` is outside `/tmp`, the test `deploy/dish-sandbox` uses to bind it (on the VM). In dev, a command's `/tmp` is its own, and the host's `/tmp` holds other programs' files, so it stays out. A symbolic link that leads out is refused, and so is a path that doesn't exist.
 - A refusal names the workspace: "file:///etc/hosts is outside this chat's workspace (/home/dish/work/bketelsen/clippy)."
 - Chromium lists a directory, so a `file://` directory inside the workspace opens as a listing.
 - **From the address bar,** a `file://` URL needs the session's workspace. dish knows it once the session's agent has used the browser, or while that agent is live. Otherwise it is refused, with that reason.
@@ -174,7 +178,7 @@ The same rules apply to the agent's `browser_navigate` and to your address bar.
 **Navigations the page makes itself.**
 - Every main-frame navigation is checked (`framenavigated`). One outside the rules, such as a link from a workspace page to `file:///etc/passwd`, sends the page to `about:blank`. The next result notes "The page went to a URL dish doesn't allow (<scheme or path>); it was sent to about:blank."
 - `browser_read` and `browser_screenshot` never return a page whose URL breaks the rules.
-- **Subresources of a `file://` page,** such as an image or an iframe that points at another local file, are a known limit. The spike checks whether `context.route` sees `file://` requests; if it does, dish aborts those outside the workspace.
+- **Subresources of a `file://` page,** such as an image or an iframe that points at another local file, go through the same rule. `context.route('**/*')` sees `file://` subresource requests (the spike: a workspace page's `<img src="file:///etc/hostname">` and `<iframe src="file:///etc/os-release">` both reached the route, and without a route the iframe's text was in the snapshot). dish's context route aborts any `file://` request outside the allowed places.
 
 **dsh's own address.** The agent's browser can reach dsh itself: `127.0.0.1:3080` (`deploy/dish-web.service:66`), the same port on `localhost`, and its trusted host.
 - dsh needs its browser-session cookie for every call (dsh-client-connection's README), so a fresh browser gets nothing from it.
@@ -353,7 +357,7 @@ The shipped defaults change, and `previous.json` is regenerated for each (dish-p
   - its browser closes when the run ends;
   - an archived chat's browser closes.
 
-  Where it runs is question 1.
+  It runs on the VM (decision 8).
 
 ## Known limits
 
@@ -361,13 +365,15 @@ The shipped defaults change, and `previous.json` is regenerated for each (dish-p
 - **Navigation can carry data out,** as `web_fetch` can: a URL is a request. A page's JavaScript runs with the VM's network: the internet, the LAN, and services on `127.0.0.1`.
 - **Your sign-ins act for the agent.** Whatever you sign in to in a session's browser, that session's agent can use until it closes, and dish doesn't judge clicks. Sign in only where the work needs it, and use Close after.
 - **The URLs you open are told to the agent** (masked), since it needs to know where the page is.
-- **Local files.** A `file://` page in the workspace may load other local files as images or frames, if the spike finds `context.route` can't stop them. Chromium runs as `dish`, outside the sandbox, so it can read what `dish` can. An agent's shell can already read those files: reads were never confined.
+- **Local files.** Chromium runs as `dish`, outside the sandbox, so it could read what `dish` can; the URL rules and the context route keep pages to the workspace and `/tmp`. An agent's shell can already read those files: reads were never confined.
 - **Bots.** Some sites treat headless Chromium as a bot, or show a CAPTCHA. Agents stop and tell you.
 - **Screenshots are kept** in dsh's attachment store with the session, as `read_image`'s are.
 - **The tab's picture is lossy JPEG,** and small text can blur. A screenshot is a PNG.
-- **Browsers live in memory.** A restart closes every browser, and crew children's browsers last one run (question 3).
+- **Browsers live in memory.** A restart closes every browser, and crew children's browsers last one run (decision 10).
 
 ## Questions for you
+
+**Answered 2026-10-04,** each as recommended: 1 C, 2 yes, 3 agreed, 4 agreed (decisions 8–11).
 
 1. **Real-Chromium tests and the end-to-end run on the desktop.** Bluefin has no Chromium, only a flatpak, and driving a flatpak's wrapper through Playwright's debugging pipe is untested. Three ways:
    - **A. Playwright's own Chromium,** downloaded on demand into a scratch path (`npx playwright-core@1.63.0 install chromium` with `PLAYWRIGHT_BROWSERS_PATH` set there, well over 100 MB) and given to the tests as `DISH_TEST_CHROMIUM`. It's the build Playwright 1.63 was tested with, not the VM's Chromium 154, and it's a download you'd approve.
@@ -451,11 +457,11 @@ Against dsh 0.2.0-rc.2's sources, under `node_modules/.pnpm/@deepseek-ai+<packag
 - **Playwright's MCP server in 1.62.1** includes the snapshot after each action, "full" by default (`lib/coreBundle.js:65079-65081`).
 - **The package:** `npm view playwright-core@1.63.0` shows no `scripts`, no dependencies, 114 files and 13,453,369 bytes unpacked, published 2026-09-04.
 
-**To verify in the plan's spike** (on the VM, as `dish`, outside the sandbox):
-1. Chromium launches with `chromiumSandbox: true`.
-2. 1.63's `page.ariaSnapshot({ mode: 'ai' })`, its iframes, and whether it shows a password field's value.
-3. Whether `context.route` sees `file://` subresource requests.
-4. A source-mode stream's uplink, end to end through the gateway.
-5. The `download` event with `acceptDownloads: false`; following a popup; `Page.screencastFrame`'s metadata.
-6. Playwright's temporary profile lands in dsh's `TMPDIR`.
-7. A 30,000-character snapshot stays under the spill policy's 12,500-token estimate.
+**The second spike** (2026-10-04, on the VM, as `dish`, outside the sandbox, `TMPDIR` a scratch directory; removed afterwards):
+1. **Chromium's sandbox:** `chromium.launch({ chromiumSandbox: true })` starts.
+2. **The snapshot:** `page.ariaSnapshot({ mode: 'ai' })` exists on the page in 1.63; an iframe's content is in it, with refs like `f1e2`; a password field's value is in it (`textbox "Password" [ref=e5]: hunter2-SECRET`), so dish blanks it.
+3. **`file://` subresources:** `context.route('**/*')` saw a workspace page's `file:///etc/hostname` image and `file:///etc/os-release` iframe; without a route, the iframe's text reached the snapshot.
+4. **A source-mode stream's uplink** through dsh's gateway: not checked (it needs a running dsh). The plan's first task checks it.
+5. **Popups, downloads, the screencast:** `page.on('popup')` fires for a `target=_blank` link, with its URL; with `acceptDownloads: false`, `download` fires with a failure ("Pass { acceptDownloads: true } …") and nothing is saved; `Page.screencastFrame`'s metadata has `deviceWidth`, `deviceHeight`, `pageScaleFactor`, `scrollOffsetX/Y` and `offsetTop`.
+6. **The temporary profile** goes to `TMPDIR` (`playwright_chromiumdev_profile-*`, `playwright-artifacts-*`), removed at `close()`; Chromium leaves one `org.chromium.Chromium.*` directory, which the unit's 10-day aging removes.
+7. **Size:** dsh estimates a text block at `ceil(chars / 4) + 4` tokens (`dsh-token-meter`'s `estimateContent`, `CHARS_PER_TOKEN = 4`, `BLOCK_OVERHEAD = 4`), so 30,000 characters is about 7,500 of the 12,500. A list of 1,500 links gave a 209,697-character snapshot: the cut is needed.
