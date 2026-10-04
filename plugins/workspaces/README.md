@@ -6,7 +6,7 @@ The mechanics behind dish's [projects](../projects/): the clones, the GitHub App
 - **Worktrees.** The `worktree` tool, for the main agent: one worktree per task, inside the clone, on `dish/<slug>`. Crew's `delegate` binds a coder to one. Merged ones are swept away.
 - **Settings → GitHub App** takes the App's ID and private key, and tests them.
 
-The design is in the [spec](../../docs/specs/projects-workspaces.md) and the [plan](../../docs/plans/2026-10-02-projects.md). Its "Notes from the build" say what changed on the way. The Apps themselves are made by hand: the plan's [rollout](../../docs/plans/2026-10-02-projects.md#the-rollout-for-you) has the steps. Both exist: the prod App, `bketelsen-dish`, made with write access on 2026-10-03, is the one the VM uses, and dev keeps `bketelsen-dish-dev`. Step 7's [rollout](../../docs/plans/2026-10-03-orchestrator.md#the-rollout-for-you) sets the prod App's permissions and the rulesets that keep its key from reaching a default branch.
+The design is in the [spec](../../docs/specs/projects-workspaces.md) and the [plan](../../docs/plans/2026-10-02-projects.md). Its "Notes from the build" say what changed on the way. The Apps themselves are made by hand: the plan's [rollout](../../docs/plans/2026-10-02-projects.md#the-rollout-for-you) has the steps. The plan has one App each for prod and dev; only one was made, `bketelsen-dish-dev`, which the VM uses despite its name. It got write access for step 7 on 2026-10-03, and step 7's [rollout](../../docs/plans/2026-10-03-orchestrator.md#the-rollout-for-you) has its permissions and the rulesets that keep its key from reaching a default branch.
 
 ## Install
 
