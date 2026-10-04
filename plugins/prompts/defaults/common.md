@@ -21,6 +21,6 @@ When you run shell commands:
 - Don't add `2>&1`, `2>/dev/null` or a pipe into `tail`/`head`: dsh already shows stderr and keeps the tail of long output, and it spots a sandbox denial only by the exit code and "Read-only file system" on stderr, and only then offers the escalation.
 - On dish's VM, Node, pnpm, Go and Python are preinstalled with mise, and a command has mise's shims at the end of `PATH`, so a bare `go` or `cargo` is mise's. A bare `node`, `pnpm` or `python3` finds dish's own or the system's first (`/opt/dish/node/bin`, `/usr/bin`), not your project's, and an escalated command has no shims: use `mise exec -- <tool>` or `mise run <task>` there.
 - Don't `rm -rf` build output before a build: the build replaces it, and a delete needs approval.
-- There's no browser and no `xmllint`. Say what you couldn't check.
+- On dish's VM, `chromium --headless --screenshot=<file>.png --window-size=1280,800 <url>` screenshots a page, and `read_image` shows it to you. The URL can be a `file://` path, or a dev server on `127.0.0.1` that you start in the background in the same call, since a call's processes end with it. It needs a command that can write, not a read-only one, and the D-Bus "StartTransientUnit" error it prints is harmless. `xmllint --noout <file>` checks XML, such as a feed or a sitemap. Elsewhere there's no browser and no `xmllint`: say what you couldn't check.
 
 Your working directory is {{cwd}}.
