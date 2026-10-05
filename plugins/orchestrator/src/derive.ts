@@ -14,7 +14,7 @@
 import { HARNESS_KINDS, MAIN_KINDS } from './entries.ts'
 import type { LedgerEntry } from './entries.ts'
 import type { Run } from './store.ts'
-import { isObject } from './text.ts'
+import { cut, isObject, line } from './text.ts'
 
 export interface GateView { child: string, outcome: string, exitCode: number | null, head: string | null, at: number, log: string | null }
 export interface VerdictView {
@@ -65,6 +65,10 @@ const STATUSES: readonly string[] = ['done', 'blocked', 'needs_context']
 const VERDICTS: readonly string[] = ['approved', 'changes_requested']
 /** A full commit id: sha-1's 40 hex digits, or sha-256's 64. */
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
+/** How many rulings a close answer lists: the newest. */
+export const CLOSING_RULINGS = 10
+/** The most characters each line of a close answer's rulings keeps. */
+const CLOSING_RULING_MAX = 300
 
 function isNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
@@ -246,6 +250,71 @@ function rulingsOf(entries: readonly LedgerEntry[]): RulingView[] {
     }
   }
   return rulings
+}
+
+/** A report's ruling, as `report` takes one. */
+function isReportRuling(value: unknown): value is { what: string, why: string, costIfWrong: string } {
+  return isObject(value) && isString(value.what) && isString(value.why) && isString(value.costIfWrong)
+}
+
+/**
+ * Every ruling of the run, oldest first: the main agent's `ruling` entries, `ladder.ruled`, pr.checked's overrides (the
+ * gate's first), and coders' report rulings (a `child.ended` whose report is a coder's). Each one line, masked, and at most
+ * 300 characters; a coder's keeps its `(coder, task)` tag, its text cut before it. Unlike `rulingsOf` (`run` `status` and
+ * the Runs page), it has the coders'.
+ */
+export function closingRulings(entries: readonly LedgerEntry[]): string[] {
+  const texts: string[] = []
+  const add = (text: string): void => {
+    texts.push(line(text, CLOSING_RULING_MAX))
+  }
+  const onTask = (task: unknown, text: string): string => isString(task) ? `${task}: ${text}` : text
+  for (const entry of entries) {
+    const main = as(entry, 'ruling')
+    if (main !== undefined) {
+      if (isString(main.what) && isString(main.why) && isString(main.costIfWrong)) add(onTask(main.task, `${main.what} — ${main.why} — ${main.costIfWrong}`))
+      continue
+    }
+    const ladder = as(entry, 'ladder.ruled')
+    if (ladder !== undefined) {
+      if (isString(ladder.ruling)) add(onTask(ladder.task, ladder.ruling))
+      continue
+    }
+    const checked = as(entry, 'pr.checked')
+    if (checked !== undefined) {
+      if (isObject(checked.overrides)) {
+        for (const which of ['gate', 'review'] as const) {
+          const ruling = checked.overrides[which]
+          if (isString(ruling)) add(`${which}: ${ruling}`)
+        }
+      }
+      continue
+    }
+    const ended = as(entry, 'child.ended')
+    const report = ended?.report
+    if (ended === undefined || !isObject(report) || report.role !== 'coder' || !Array.isArray(report.rulings)) continue
+    const tag = line(isString(ended.task) ? `(coder, ${ended.task})` : '(coder)')
+    for (const ruling of report.rulings) {
+      if (!isReportRuling(ruling)) continue
+      // The text is cut before its tag, which always stays: a long coder's ruling never reads as the main agent's.
+      const text = line(`${ruling.what} — ${ruling.why} — ${ruling.costIfWrong}`, CLOSING_RULING_MAX - tag.length - 1)
+      texts.push(cut(`${text} ${tag}`, CLOSING_RULING_MAX))
+    }
+  }
+  return texts
+}
+
+/**
+ * The close answer's block: '' with no rulings; else `Rulings in this run:` and the newest CLOSING_RULINGS, oldest first,
+ * a `- ` line each, then `- and N more in the ledger` when there were more.
+ */
+export function closingRulingsBlock(entries: readonly LedgerEntry[]): string {
+  const rulings = closingRulings(entries)
+  if (rulings.length === 0) return ''
+  const more = rulings.length - CLOSING_RULINGS
+  const lines = ['Rulings in this run:', ...rulings.slice(-CLOSING_RULINGS).map(text => `- ${text}`)]
+  if (more > 0) lines.push(`- and ${more} more in the ledger`)
+  return lines.join('\n')
 }
 
 function prOf(entries: readonly LedgerEntry[]): RunSummary['pr'] {

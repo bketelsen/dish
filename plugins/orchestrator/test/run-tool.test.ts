@@ -523,6 +523,47 @@ test('abandon: the record and run.closed; the chat drives nothing after it, and 
   await assert.rejects(call(w, { action: 'goal', goal: 'Another' }), { message: NO_RUN })
 })
 
+test('abandon: the answer ends with the run\'s rulings, read after the close; a ledger that can\'t be read then adds none', async () => {
+  const w = await world()
+  const run = await openRun(w)
+  await call(w, { action: 'ruling', what: 'Kept the old cookie', why: 'Compatibility', costIfWrong: 'One more round', task: 'fix-login' })
+  await w.runs.harness(run, { kind: 'ladder.ruled', session: SESSION, task: 'fix-login', round: 5, ruling: 'one more round — close — an hour' })
+  await w.runs.harness(run, {
+    kind: 'child.ended', session: SESSION, child: 'c1', task: 'fix-login', role: 'coder', stopReason: 'completed', reportFile: '/r/c1.md', head: null,
+    report: { role: 'coder', turn: 1, at: NOW, status: 'done', summary: 'Done', rulings: [{ what: 'Skipped e2e', why: `Flaky with ${TOKEN}`, costIfWrong: 'A regression' }] },
+  })
+  const entries = w.runs.entries.bind(w.runs)
+  const read: string[][] = []
+  w.runs.entries = async target => {
+    const found = await entries(target)
+    read.push(found.map(entry => entry.kind))
+    return found
+  }
+  const answer = await call(w, { action: 'abandon', reason: 'Not needed after all' })
+  assert.deepEqual(answer, {
+    action: 'abandon', run: run.id,
+    text: `Abandoned run \`${run.id}\`: Not needed after all. Its worktrees are left as they are: remove them with \`worktree\` \`remove\` `
+      + '(with `force` if unmerged). This chat drives no run now.\n\n'
+      + [
+        'Rulings in this run:',
+        '- fix-login: Kept the old cookie — Compatibility — One more round',
+        '- fix-login: one more round — close — an hour',
+        `- Skipped e2e — Flaky with ${MASKED_TOKEN} — A regression (coder, fix-login)`,
+      ].join('\n'),
+  })
+  assert.equal(read.at(-1)?.at(-1), 'run.closed')
+
+  // The run is closed either way: a ledger that can't be read after it is logged, and the answer has no rulings.
+  const other = await openRun(w, { slug: 'other' })
+  await call(w, { action: 'ruling', what: 'a', why: 'b', costIfWrong: 'c' })
+  w.runs.entries = async () => { throw new Error(`disk gone ${TOKEN}`) }
+  assert.equal((await call(w, { action: 'abandon', reason: 'No' })).text,
+    `Abandoned run \`${other.id}\`: No. Its worktrees are left as they are: remove them with \`worktree\` \`remove\` (with \`force\` if unmerged). This chat drives no run now.`)
+  assert.equal(w.record(other)?.state, 'abandoned')
+  assert.ok(w.logs.some(text => text.includes(`run ${other.id}`) && text.includes('rulings') && text.includes(`disk gone ${MASKED_TOKEN}`)), w.logs.join('\n'))
+  assert.ok(!w.logs.some(text => text.includes(TOKEN)))
+})
+
 test('the writes read the run again under its lock: a run closed while the call waited gives NO_RUN, and nothing is written', async () => {
   const w = await world()
   const run = await openRun(w)

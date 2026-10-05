@@ -25,7 +25,7 @@ import { isAbsolute, join, posix, relative, sep } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { maskSecrets } from 'dish-kit'
-import { gateAt, summarize } from './derive.ts'
+import { closingRulingsBlock, gateAt, summarize } from './derive.ts'
 import { SLUG, splitProject } from './paths.ts'
 import { describe, mainSession } from './runs.ts'
 import type { Runs, ToolDeps } from './runs.ts'
@@ -355,11 +355,17 @@ class RunTool {
     if (asked === undefined) throw new Error('`reason` is required for abandon: why, in one line')
     const reason = line(asked, REASON_MAX)
     const written = await this.#locked(session, run, fresh => this.#runs.close(fresh, session, { state: 'abandoned', reason }))
-    return {
-      run: written.id,
-      text: `Abandoned run \`${written.id}\`: ${sentence(written.reason ?? reason)} Its worktrees are left as they are: remove them with \`worktree\` \`remove\` `
-        + '(with `force` if unmerged). This chat drives no run now.',
+    const text = `Abandoned run \`${written.id}\`: ${sentence(written.reason ?? reason)} Its worktrees are left as they are: remove them with \`worktree\` \`remove\` `
+      + '(with `force` if unmerged). This chat drives no run now.'
+    // The run's rulings, read after the close. The run is closed either way: a ledger that can't be read is logged, and the
+    // answer goes without them.
+    let rulings = ''
+    try {
+      rulings = closingRulingsBlock(await this.#runs.entries(written))
+    } catch (error) {
+      this.#runs.logOnce(`run ${written.id} of ${written.project} was abandoned, but its ledger couldn't be read for its rulings: ${describe(error)}`)
     }
+    return { run: written.id, text: rulings === '' ? text : `${text}\n\n${rulings}` }
   }
 
   async #ruling(session: string, args: Args): Promise<Answer> {
