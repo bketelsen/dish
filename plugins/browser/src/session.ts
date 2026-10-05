@@ -249,18 +249,33 @@ export class SessionBrowser {
     next?.start()
   }
 
-  /** `work`, or `BrowserError('closed')` as soon as this browser closes: what isn't in the queue never hangs on it either. */
-  whileOpen<T>(work: Promise<T>): Promise<T> {
-    if (this.closed !== undefined) {
-      work.catch(() => {})
-      return Promise.reject(new BrowserError('closed', this.closed))
-    }
+  /**
+   * `work`, or `BrowserError('closed')` as soon as this browser closes, so that nothing waits on a driver promise that
+   * never settles. A value that comes after the close is given to `late` (to close what it made).
+   */
+  whileOpen<T>(work: Promise<T>, late?: (value: T) => void): Promise<T> {
+    let settled = this.closed !== undefined
+    work.then(value => { if (settled) late?.(value) }, () => {})
+    if (this.closed !== undefined) return Promise.reject(new BrowserError('closed', this.closed))
     return new Promise<T>((resolve, reject) => {
-      const onClosed = (reason: CloseReason): void => { reject(new BrowserError('closed', reason)) }
+      const onClosed = (reason: CloseReason): void => {
+        settled = true
+        reject(new BrowserError('closed', reason))
+      }
       this.closeListeners.add(onClosed)
       work.then(
-        value => { this.closeListeners.delete(onClosed); resolve(value) },
-        (error: unknown) => { this.closeListeners.delete(onClosed); reject(error) },
+        value => {
+          if (settled) return
+          settled = true
+          this.closeListeners.delete(onClosed)
+          resolve(value)
+        },
+        (error: unknown) => {
+          if (settled) return
+          settled = true
+          this.closeListeners.delete(onClosed)
+          reject(error)
+        },
       )
     })
   }
@@ -305,7 +320,7 @@ export class SessionBrowser {
     const check = await this.check(page.url())
     if (check.ok) return
     try {
-      await page.goto('about:blank', { timeoutMs: NAV_MS, loadMs: LOAD_MS })
+      await this.whileOpen(page.goto('about:blank', { timeoutMs: NAV_MS, loadMs: LOAD_MS }))
     } catch {
       // Whatever the page does now, the next result shows it.
     }
@@ -378,8 +393,9 @@ export class SessionBrowser {
         if (action === undefined || this.closed !== undefined) break
         if (isMove(action) && this.inputs[0] !== undefined && isMove(this.inputs[0])) continue
         try {
-          await this.replay(action)
+          await this.whileOpen(this.replay(action))
         } catch {
+          if (this.closed !== undefined) break
           if (!this.inputFailureLogged) {
             this.inputFailureLogged = true
             this.host.log.warn(`input from the Browser tab failed on the page of ${this.sessionId}; later failures there aren't logged`)
@@ -625,11 +641,8 @@ export class SessionBrowser {
   private async replace(old: DriverPage): Promise<void> {
     void old.close().catch(() => {})
     try {
-      const page = await this.context.newPage()
-      if (this.closed !== undefined) {
-        void page.close().catch(() => {})
-        return
-      }
+      // Bounded by the close: a new page that never comes doesn't hold the queue, the input or the tab forever.
+      const page = await this.whileOpen(this.context.newPage(), made => { void made.close().catch(() => {}) })
       this.currentPage = page
       this.pageView = { url: page.url(), title: '', loading: false, canGoBack: false, canGoForward: false }
       this.heldModifiers.clear()

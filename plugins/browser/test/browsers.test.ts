@@ -14,8 +14,8 @@ import { DriverTimeout } from '../src/driver.ts'
 import { CONTROL } from '../src/protocol.ts'
 import { CAP_WAIT_MS, LINGER_MS, STOP_MS } from '../src/types.ts'
 import type { TabNotice } from '../src/types.ts'
-import { FakeDriver, ManualClock, deferred, flush, simpleRules } from './fake-driver.ts'
-import type { FakePage, Hold } from './fake-driver.ts'
+import { FakeContext, FakeDriver, FakePage, ManualClock, deferred, flush, simpleRules } from './fake-driver.ts'
+import type { Hold } from './fake-driver.ts'
 
 const VIEWPORT = { width: 1280, height: 800 }
 const never = new AbortController().signal
@@ -268,6 +268,204 @@ test('a queued call counts as in a call: its browser isn\'t evicted', async () =
   assert.equal(w.core.view('s1').reason, 'evicted')
 })
 
+test('a call queued behind a crashed page\'s replacement counts as in a call: its browser isn\'t evicted', async () => {
+  const w = world({ limits: { maxBrowsers: 1, idleMinutes: 15 } })
+  const browser = await w.core.forAgent('s1', undefined, never)
+  const context = w.driver.browser.contexts[0]!
+  const replacement = deferred<FakePage>()
+  const call = await busyCall(w, 's1')
+  const queued = browser.call(never, async () => 'ran')
+  context.newPage = () => replacement.promise
+  pageOf(w, 's1').emit('crash')
+  await assert.rejects(call.done, isCode('crashed'))
+  assert.equal(browser.acting, false)
+  assert.equal(browser.inCall, true)
+  const waiting = w.core.forAgent('s2', undefined, never)
+  waiting.catch(() => {})
+  await w.clock.tick(500)
+  assert.equal(w.core.isOpen('s1'), true)
+  replacement.resolve(new FakePage())
+  assert.equal(await queued, 'ran')
+  await waiting
+  assert.equal(w.core.view('s1').reason, 'evicted')
+})
+
+test('an opening abandoned during the launch: no browser, and Chromium lingers 60 s, then closes', async () => {
+  const w = world()
+  const hold = w.driver.holdLaunch()
+  const controller = new AbortController()
+  const opening = w.core.forAgent('s1', undefined, controller.signal)
+  opening.catch(() => {})
+  await hold.reached
+  controller.abort(new Error('the agent cancelled'))
+  await assert.rejects(opening, /the agent cancelled/)
+  hold.release()
+  await flush()
+  assert.equal(w.core.isOpen('s1'), false)
+  assert.equal(w.driver.browser.contexts.length, 0)
+  w.clock.advance(LINGER_MS - 1)
+  await flush()
+  assert.equal(w.driver.browser.closeCalls, 0)
+  w.clock.advance(1)
+  await flush()
+  assert.equal(w.driver.browser.closeCalls, 1)
+  assert.equal(w.clock.pending, 0)
+})
+
+test('two callers sharing one opening: one aborts, the other still gets the browser', async () => {
+  const w = world()
+  const hold = w.driver.holdLaunch()
+  const controller = new AbortController()
+  const first = w.core.forAgent('s1', undefined, controller.signal)
+  first.catch(() => {})
+  const second = w.core.forAgent('s1', undefined, never)
+  await hold.reached
+  controller.abort(new Error('the first caller left'))
+  await assert.rejects(first, /the first caller left/)
+  hold.release()
+  const browser = await second
+  assert.equal(w.core.browserOf('s1'), browser)
+  assert.equal(w.driver.browser.contexts.length, 1)
+})
+
+test('the tab and an agent sharing an opening: the tab joining an agent\'s wait at the cap gets busy at once; the agent goes on waiting', async () => {
+  const w = world({ limits: { maxBrowsers: 1, idleMinutes: 15 } })
+  const s0 = await busyCall(w, 's0')
+  let agent = 'pending'
+  const opening = w.core.forAgent('s1', undefined, never).then(() => { agent = 'opened' }, (error: unknown) => { agent = `rejected ${String((error as BrowserError).code)}` })
+  await flush()
+  let tabDone = false
+  void w.core.user('s1', { kind: 'navigate', url: 'example.test' }, { workspace: undefined }).then(() => { tabDone = true })
+  await flush()
+  assert.equal(tabDone, true)
+  assert.deepEqual(w.notices('s1'), [{ kind: 'error', code: 'busy', detail: '' }])
+  assert.equal(agent, 'pending')
+  s0.hold.release()
+  await s0.done
+  await opening
+  assert.equal(agent, 'opened')
+  assert.equal(w.core.view('s0').reason, 'evicted')
+})
+
+test('the tab and an agent sharing an opening: an agent arriving as the tab gets busy at the cap waits, as its own call would', async () => {
+  // The address resolves at once, so the tab's opening is decided before the agent's call arrives in the next microtask.
+  const rules = { ...simpleRules, resolve: () => Promise.resolve({ ok: true as const, url: 'https://example.test/' }) }
+  const w = world({ limits: { maxBrowsers: 1, idleMinutes: 15 }, rules })
+  const s0 = await busyCall(w, 's0')
+  const tab = w.core.user('s1', { kind: 'navigate', url: 'example.test' }, { workspace: undefined })
+  await Promise.resolve()
+  let agent = 'pending'
+  const opening = w.core.forAgent('s1', undefined, never).then(() => { agent = 'opened' }, (error: unknown) => { agent = `rejected ${String((error as BrowserError).code)}` })
+  await tab
+  await flush()
+  assert.deepEqual(w.notices('s1'), [{ kind: 'error', code: 'busy', detail: '' }])
+  assert.equal(agent, 'pending')
+  s0.hold.release()
+  await s0.done
+  await opening
+  assert.equal(agent, 'opened')
+})
+
+test('the pending notes are kept for the newest 200 sessions', async () => {
+  const w = world()
+  for (let i = 0; i <= 200; i++) {
+    await w.core.forAgent(`s${i}`, undefined, never)
+    await w.core.close(`s${i}`, 'idle')
+  }
+  assert.deepEqual((await w.core.forAgent('s0', undefined, never)).takeNotes().events, [])
+  assert.deepEqual((await w.core.forAgent('s1', undefined, never)).takeNotes().events, [{ kind: 'reopened', reason: 'idle' }])
+  assert.deepEqual((await w.core.forAgent('s200', undefined, never)).takeNotes().events, [{ kind: 'reopened', reason: 'idle' }])
+})
+
+// --- never a hang on the driver ---------------------------------------------------------------------------------------
+
+test('never a hang: a crashed page whose replacement never comes, then a close: the tab\'s navigation and the queued call settle', async () => {
+  const w = world()
+  const browser = await w.core.forAgent('s1', undefined, never)
+  const replacement = deferred<FakePage>()
+  w.driver.browser.contexts[0]!.newPage = () => replacement.promise
+  pageOf(w, 's1').emit('crash')
+  const queued = browser.call(never, async () => 'never')
+  queued.catch(() => {})
+  let tabDone = false
+  void w.core.user('s1', { kind: 'navigate', url: 'example.test/x' }, undefined).then(() => { tabDone = true })
+  await flush()
+  assert.equal(tabDone, false)
+  await w.core.close('s1', 'tab')
+  await flush()
+  assert.equal(tabDone, true)
+  await assert.rejects(queued, isCode('closed', 'tab'))
+  const late = new FakePage()
+  replacement.resolve(late)
+  await flush()
+  assert.equal(late.closed, true)
+})
+
+test('never a hang: a new context that never comes, then Chromium\'s disconnect: the call rejects closed, and a late context is closed', async () => {
+  const w = world()
+  await w.core.forAgent('s0', undefined, never)
+  const fake = w.driver.browser
+  const late = deferred<FakeContext>()
+  fake.newContext = () => late.promise
+  let outcome = 'pending'
+  const opening = w.core.forAgent('s1', undefined, never).then(() => { outcome = 'opened' }, (error: unknown) => {
+    outcome = error instanceof BrowserError ? `${error.code} ${error.detail}` : String(error)
+  })
+  await flush()
+  assert.equal(outcome, 'pending')
+  fake.disconnect()
+  await flush()
+  assert.equal(outcome, 'closed chromium')
+  await opening
+  const context = new FakeContext(fake, { viewport: VIEWPORT, route: async () => 'continue', refuseWebSocket: () => false })
+  late.resolve(context)
+  await flush()
+  assert.equal(context.closeCalls, 1)
+})
+
+test('never a hang: a first page that never comes, then stop: the call rejects stopped, and the context is closed', async () => {
+  const w = world()
+  await w.core.forAgent('s0', undefined, never)
+  const fake = w.driver.browser
+  const late = deferred<FakePage>()
+  const newContext = fake.newContext.bind(fake)
+  fake.newContext = async options => {
+    const context = await newContext(options)
+    context.newPage = () => late.promise
+    return context
+  }
+  let outcome = 'pending'
+  const opening = w.core.forAgent('s1', undefined, never).then(() => { outcome = 'opened' }, (error: unknown) => {
+    outcome = error instanceof BrowserError ? `${error.code} ${error.detail}` : String(error)
+  })
+  await flush()
+  assert.equal(outcome, 'pending')
+  await w.core.stop()
+  await flush()
+  assert.equal(outcome, 'closed stopped')
+  await opening
+  late.resolve(new FakePage())
+  await flush()
+  assert.equal(fake.contexts[1]?.closeCalls, 1)
+})
+
+test('never a hang: a launch that never ends, then stop: the call rejects stopped, and stop takes at most 5 s', async () => {
+  const w = world()
+  w.driver.holdLaunch()
+  let outcome = 'pending'
+  const opening = w.core.forAgent('s1', undefined, never).then(() => { outcome = 'opened' }, (error: unknown) => {
+    outcome = error instanceof BrowserError ? `${error.code} ${error.detail}` : String(error)
+  })
+  await flush()
+  const stopping = w.core.stop()
+  await flush()
+  assert.equal(outcome, 'closed stopped')
+  await opening
+  w.clock.advance(STOP_MS)
+  await stopping
+  assert.equal(w.clock.pending, 0)
+})
+
 // --- closing ----------------------------------------------------------------------------------------------------------
 
 test('a close under a call: the call rejects closed with the reason, never a hang; the next call gets a new browser and the note', async () => {
@@ -434,6 +632,19 @@ test('stop: every browser closes (no notes) and Chromium once; timers cancelled;
   await assert.rejects(w.core.forAgent('s3', undefined, never), isCode('closed', 'stopped'))
   assert.equal(w.driver.launches.length, 1)
   watcher.close()
+})
+
+test('stop during the linger: Chromium closes once, and no timer is left', async () => {
+  const w = world()
+  await w.core.forAgent('s1', undefined, never)
+  await w.core.close('s1', 'agent')
+  assert.equal(w.clock.pending, 1)
+  await w.core.stop()
+  assert.equal(w.clock.pending, 0)
+  assert.equal(w.driver.browser.closeCalls, 1)
+  w.clock.advance(LINGER_MS)
+  await flush()
+  assert.equal(w.driver.browser.closeCalls, 1)
 })
 
 test('stop: waits at most 5 s for a close that hangs', async () => {
@@ -624,6 +835,26 @@ test('user navigate: a failure is a notice with the URL and the error; a timeout
   noUrlsLogged(w)
 })
 
+test('user navigate that fails records the URL asked for, not the error page; a back or forward that goes nowhere records nothing', async () => {
+  const w = world()
+  const browser = await w.core.forAgent('s1', undefined, never)
+  const page = browser.page as FakePage
+  // As Chromium does: a failed load leaves its own error page as the URL.
+  page.goto = async (url: string) => {
+    page.currentUrl = 'chrome-error://chromewebdata/'
+    throw new Error(`page.goto: net::ERR_CONNECTION_REFUSED at ${url}`)
+  }
+  await w.core.user('s1', { kind: 'navigate', url: 'http://127.0.0.1:5173/' }, undefined)
+  await w.core.user('s1', { kind: 'back' }, undefined)
+  await w.core.user('s1', { kind: 'forward' }, undefined)
+  page.failNext('reload', new Error('page.reload: net::ERR_FAILED'))
+  await w.core.user('s1', { kind: 'reload' }, undefined)
+  const user = browser.takeNotes().user
+  assert.deepEqual(user?.navigations, ['http://127.0.0.1:5173/'])
+  assert.equal(user?.moreNavigations, 0)
+  assert.equal(w.notices('s1').length, 2)
+})
+
 test('user navigate doesn\'t wait for the agent\'s call', async () => {
   const w = world()
   const call = await busyCall(w, 's1')
@@ -652,7 +883,8 @@ test('user back, forward and reload: done on the open browser and recorded; igno
   const browser = await w.core.forAgent('s1', undefined, never)
   const user = browser.takeNotes().user
   assert.deepEqual(user?.navigations, ['https://example.test/1', 'https://example.test/2', 'https://example.test/1', 'https://example.test/2', 'https://example.test/2'])
-  assert.equal(user?.moreNavigations, 1)
+  // The failed back records nothing.
+  assert.equal(user?.moreNavigations, 0)
 })
 
 test('user input: mouse, wheel, keys and text replayed in order while the agent\'s call is held; a move coalesced; a modifier released', async () => {
@@ -719,6 +951,9 @@ test('a page that can\'t be replaced after a crash closes its browser (reason ch
   pageOf(w, 's1').emit('crash')
   await flush()
   assert.equal(w.core.view('s1').reason, 'chromium')
+  // Chromium is still up: the context is closed, not left until Chromium goes.
+  assert.equal(w.driver.browser.closed, false)
+  assert.equal(w.driver.browser.contexts[0]!.closeCalls, 1)
 })
 
 test('a context that won\'t open fails the call wont-start, and the cap isn\'t held by it', async () => {

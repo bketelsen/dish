@@ -82,9 +82,21 @@ const NOTED: ReadonlySet<CloseReason> = new Set<CloseReason>(['evicted', 'idle',
 /** A signal that never aborts: the tab's openings. */
 const NEVER = new AbortController().signal
 
-interface Chromium { browser: DriverBrowser, closing: boolean }
+/** The running Chromium; `gone` aborts when it disconnects or the core closes it. */
+interface Chromium { browser: DriverBrowser, closing: boolean, gone: AbortController }
 interface CloseRecord { reason: CloseReason, at: number, frame: Frame | undefined }
-interface Opening { sessionId: string, promise: Promise<SessionBrowser>, controller: AbortController, sharers: number }
+/** One session's browser being opened, shared by every caller of the moment. */
+interface Opening {
+  sessionId: string
+  workspace: string | undefined
+  how: { started: boolean, wait: boolean }
+  promise: Promise<SessionBrowser>
+  /** Aborts when every caller has left. */
+  controller: AbortController
+  sharers: number
+  /** It is waiting at the cap for room. */
+  waiting: boolean
+}
 interface Waiter { wake(): void, fail(error: unknown): void }
 
 function messageOf(error: unknown): string {
@@ -127,6 +139,8 @@ export class Browsers {
   private readonly timers = new Set<() => void>()
   private stopping = false
   private stopped: Promise<void> | undefined
+  /** Aborts at `stop()`: every wait of an opening ends with it. */
+  private readonly stopController = new AbortController()
 
   constructor(options: BrowsersOptions) {
     this.options = options
@@ -292,30 +306,41 @@ export class Browsers {
       }
       browser = await this.openFor(sessionId, start.workspace, NEVER, { started: true, wait: false })
     }
-    await this.go(browser, check.url, page => page.goto(check.url, { timeoutMs: NAV_MS, loadMs: LOAD_MS }))
+    await this.go(browser, 'navigate', check.url)
   }
 
   private async userHistory(sessionId: string, kind: 'back' | 'forward' | 'reload'): Promise<void> {
     const browser = this.open.get(sessionId)
     if (browser === undefined) return
-    await this.go(browser, undefined, page => {
-      const options = { timeoutMs: NAV_MS }
-      return kind === 'back' ? page.back(options) : kind === 'forward' ? page.forward(options) : page.reload(options)
-    })
+    await this.go(browser, kind, undefined)
   }
 
-  /** One of the tab's navigations: not queued, ended by a close; a failure is a notice; the activity gets where it landed. */
-  private async go(browser: SessionBrowser, url: string | undefined, act: (page: DriverPage) => Promise<unknown>): Promise<void> {
+  /**
+   * One of the tab's navigations: not queued, and ended by a close, never a hang; a failure is a notice. The activity
+   * gets where it landed: the page's URL after a load, or a back or forward that moved; the URL asked for after a failed
+   * navigate (the page then shows Chromium's error page); nothing after a back or forward that went nowhere, or a failed
+   * back, forward or reload.
+   */
+  private async go(browser: SessionBrowser, kind: 'navigate' | 'back' | 'forward' | 'reload', url: string | undefined): Promise<void> {
+    // A crashed page's replacement ends at the close too, so this never hangs.
     await browser.ready()
     const page = browser.page
     const from = page.url()
+    const options = { timeoutMs: NAV_MS }
+    let moved: boolean
     try {
-      await browser.whileOpen(act(page))
+      moved = await browser.whileOpen(
+        kind === 'navigate' ? page.goto(url ?? 'about:blank', { ...options, loadMs: LOAD_MS }).then(() => true)
+        : kind === 'reload' ? page.reload(options).then(() => true)
+        : kind === 'back' ? page.back(options)
+        : page.forward(options))
     } catch (error) {
       if (error instanceof BrowserError) throw error
       this.notice(browser.sessionId, { kind: 'failed', url: url ?? from, error: error instanceof DriverTimeout ? 'timeout' : messageOf(error) })
+      if (kind === 'navigate' && url !== undefined) browser.recordNavigation(url)
+      return
     }
-    if (browser.closedReason === undefined) browser.recordNavigation(page.url())
+    if (moved) browser.recordNavigation(page.url())
   }
 
   // --- lifecycle --------------------------------------------------------------------------------------------------------
@@ -340,7 +365,12 @@ export class Browsers {
     void this.close(sessionId, 'agent')
   }
 
-  async close(sessionId: string, reason: CloseReason): Promise<void> {
+  close(sessionId: string, reason: CloseReason): Promise<void> {
+    return this.closeBrowser(sessionId, reason, true)
+  }
+
+  /** `close`; `contextToo` is false only when Chromium disconnected, and its contexts went with it. */
+  private async closeBrowser(sessionId: string, reason: CloseReason, contextToo: boolean): Promise<void> {
     const browser = this.open.get(sessionId)
     if (browser === undefined) return
     // Out of the map first, so that new calls make a new browser.
@@ -360,8 +390,7 @@ export class Browsers {
     this.say('info', `closed the browser of ${sessionId} (${reason})`)
     this.wakeWaiters()
     this.checkLinger()
-    // Chromium gone: its contexts went with it.
-    if (reason === 'chromium') return
+    if (!contextToo) return
     try {
       await browser.context.close()
     } catch {
@@ -389,6 +418,7 @@ export class Browsers {
 
   private async stopNow(): Promise<void> {
     this.stopping = true
+    this.stopController.abort(new BrowserError('closed', 'stopped'))
     for (const waiter of [...this.waiters]) waiter.fail(new BrowserError('closed', 'stopped'))
     const work: Array<Promise<unknown>> = [...this.open.keys()].map(sessionId => this.close(sessionId, 'stopped'))
     work.push(this.closeChromium())
@@ -407,17 +437,29 @@ export class Browsers {
 
   // --- opening ----------------------------------------------------------------------------------------------------------
 
-  /** The session's browser being opened, shared by every caller; each caller's own signal ends its own wait. */
+  /**
+   * The session's browser being opened, shared by every caller; each caller's own signal ends its own wait. The tab never
+   * waits at the cap (`wait: false`): it takes its place under the cap before its opening exists, or is busy at once, so
+   * an agent that joins the tab's opening never gets a busy it wouldn't have got on its own; and it is busy at once rather
+   * than join an agent's opening that is waiting at the cap.
+   */
   private openFor(sessionId: string, workspace: string | undefined, signal: AbortSignal, how: { started: boolean, wait: boolean }): Promise<SessionBrowser> {
-    let opening = this.openings.get(sessionId)
-    if (opening === undefined) {
-      const controller = new AbortController()
-      const made: Opening = { sessionId, promise: Promise.resolve(undefined as unknown as SessionBrowser), controller, sharers: 0 }
-      made.promise = this.openNew(sessionId, workspace, controller.signal, how)
-      made.promise.then(() => { this.forget(made) }, () => { this.forget(made) })
-      this.openings.set(sessionId, made)
-      opening = made
+    const existing = this.openings.get(sessionId)
+    if (existing !== undefined) {
+      if (!how.wait && existing.waiting) return Promise.reject(new BrowserError('busy'))
+      return this.join(existing, signal)
     }
+    let reserved = false
+    if (!how.wait && !this.stopping && this.unavailable === undefined) {
+      if (!this.reserveNow()) return Promise.reject(new BrowserError('busy'))
+      reserved = true
+    }
+    const opening: Opening = {
+      sessionId, workspace, how, promise: null as unknown as Promise<SessionBrowser>, controller: new AbortController(), sharers: 0, waiting: false,
+    }
+    opening.promise = this.openNew(opening, reserved)
+    opening.promise.then(() => { this.forget(opening) }, () => { this.forget(opening) })
+    this.openings.set(sessionId, opening)
     return this.join(opening, signal)
   }
 
@@ -459,15 +501,32 @@ export class Browsers {
     })
   }
 
-  private async openNew(sessionId: string, workspace: string | undefined, signal: AbortSignal, how: { started: boolean, wait: boolean }): Promise<SessionBrowser> {
-    if (this.stopping) throw new BrowserError('closed', 'stopped')
-    if (this.unavailable !== undefined) throw new BrowserError('unavailable', this.options.executablePath)
-    await this.reserve(signal, how.wait)
-    let holding = true
+  /**
+   * Open the session's browser: a place under the cap (`reserved` when the caller took it already), Chromium, a context
+   * and its page. Each wait on the driver is bounded by the callers leaving, Chromium going and the core stopping, so an
+   * opening never hangs on a driver promise; what such a promise makes too late is closed.
+   */
+  private async openNew(opening: Opening, reserved: boolean): Promise<SessionBrowser> {
+    const { sessionId, workspace, how } = opening
+    const signal = opening.controller.signal
+    let holding = reserved
     try {
+      if (this.stopping) throw new BrowserError('closed', 'stopped')
+      if (this.unavailable !== undefined) throw new BrowserError('unavailable', this.options.executablePath)
+      if (!holding) {
+        await this.reserve(opening)
+        holding = true
+      }
       this.stopLinger()
-      const chromium = await this.chromiumNow()
+      let chromium: Chromium
+      try {
+        chromium = await this.bounded(this.chromiumNow(), [signal])
+      } catch (error) {
+        if (signal.aborted) throw signal.reason
+        throw error
+      }
       this.throwIfGone(chromium, signal)
+      const until = [signal, chromium.gone.signal]
       let made: SessionBrowser | undefined
       const route: RouteDecider = async request => {
         if (made !== undefined) return made.route(request)
@@ -481,17 +540,18 @@ export class Browsers {
       }
       let context: DriverContext
       try {
-        context = await chromium.browser.newContext({ viewport: this.options.viewport, route, refuseWebSocket: url => this.refusesWebSocket(url) })
+        const making = chromium.browser.newContext({ viewport: this.options.viewport, route, refuseWebSocket: url => this.refusesWebSocket(url) })
+        context = await this.bounded(making, until, late => { void late.close().catch(() => {}) })
       } catch (error) {
-        throw this.openFailure(error, chromium)
+        throw this.openFailure(error, chromium, signal)
       }
       let page: DriverPage
       try {
-        page = await context.newPage()
+        page = await this.bounded(context.newPage(), until)
         this.throwIfGone(chromium, signal)
       } catch (error) {
         void context.close().catch(() => {})
-        throw this.openFailure(error, chromium)
+        throw this.openFailure(error, chromium, signal)
       }
       const existing = this.open.get(sessionId)
       if (existing !== undefined) {
@@ -527,8 +587,9 @@ export class Browsers {
     if (signal.aborted) throw signal.reason
   }
 
-  private openFailure(error: unknown, chromium: Chromium): unknown {
+  private openFailure(error: unknown, chromium: Chromium, signal: AbortSignal): unknown {
     if (error instanceof BrowserError) return error
+    if (signal.aborted) return signal.reason
     if (this.stopping) return new BrowserError('closed', 'stopped')
     if (this.chromium !== chromium || error instanceof DriverClosed) return new BrowserError('closed', 'chromium')
     return new BrowserError('wont-start', firstLine(messageOf(error)))
@@ -571,23 +632,34 @@ export class Browsers {
 
   // --- the cap ----------------------------------------------------------------------------------------------------------
 
-  /** A place under the cap: free, or made by evicting; else (an agent's call) a wait for one, up to `CAP_WAIT_MS`. */
-  private async reserve(signal: AbortSignal, wait: boolean): Promise<void> {
+  /** An agent's place under the cap: now, or after a wait of up to `CAP_WAIT_MS` for one, honouring its callers leaving. */
+  private async reserve(opening: Opening): Promise<void> {
+    const signal = opening.controller.signal
     const deadline = this.options.clock.now() + CAP_WAIT_MS
     for (;;) {
       if (this.stopping) throw new BrowserError('closed', 'stopped')
       if (signal.aborted) throw signal.reason
+      if (this.reserveNow()) return
+      opening.waiting = true
+      try {
+        await this.waitForRoom(signal, deadline)
+      } finally {
+        opening.waiting = false
+      }
+    }
+  }
+
+  /** A place under the cap now: a free one, or one made by evicting. False when every browser is in a call. */
+  private reserveNow(): boolean {
+    for (;;) {
       if (this.open.size + this.reserved < this.options.limits.maxBrowsers) {
         this.reserved++
-        return
+        return true
       }
       const victim = this.evictable()
-      if (victim !== undefined) {
-        void this.close(victim, 'evicted')
-        continue
-      }
-      if (!wait) throw new BrowserError('busy')
-      await this.waitForRoom(signal, deadline)
+      if (victim === undefined) return false
+      // Out of the map at once: the loop sees the room.
+      void this.close(victim, 'evicted')
     }
   }
 
@@ -685,7 +757,7 @@ export class Browsers {
         this.say('warn', `Chromium started without its own sandbox: ${forLog(firstLine(text))}`)
       }
     }
-    const chromium: Chromium = { browser, closing: false }
+    const chromium: Chromium = { browser, closing: false, gone: new AbortController() }
     if (this.stopping) {
       chromium.closing = true
       await browser.close().catch(() => {})
@@ -695,6 +767,8 @@ export class Browsers {
     this.sandboxOff = sandboxOff
     browser.onDisconnected(() => { this.disconnected(chromium) })
     this.say('info', `launched Chromium (sandbox ${sandboxOff ? 'off' : 'on'})`)
+    // The opening that wanted it may have been left meanwhile: with nothing open, it lingers, then closes.
+    this.checkLinger()
     return chromium
   }
 
@@ -702,9 +776,10 @@ export class Browsers {
   private disconnected(chromium: Chromium): void {
     if (chromium.closing || this.chromium !== chromium) return
     this.chromium = undefined
+    chromium.gone.abort(new BrowserError('closed', 'chromium'))
     this.stopLinger()
     this.say('warn', 'Chromium stopped unexpectedly')
-    for (const sessionId of [...this.open.keys()]) void this.close(sessionId, 'chromium')
+    for (const sessionId of [...this.open.keys()]) void this.closeBrowser(sessionId, 'chromium', false)
   }
 
   private checkLinger(): void {
@@ -725,6 +800,7 @@ export class Browsers {
     if (chromium === undefined) return
     this.chromium = undefined
     chromium.closing = true
+    chromium.gone.abort(new BrowserError('closed', this.stopping ? 'stopped' : 'chromium'))
     this.say('info', 'closed Chromium')
     try {
       await chromium.browser.close()
@@ -755,6 +831,38 @@ export class Browsers {
     } catch {
       // A logger that throws is ignored.
     }
+  }
+
+  /**
+   * `work`, or a rejection with the reason of the first of `signals` to abort, or of the core's stop: a driver promise
+   * that never settles never holds an opening. A value that comes after that is given to `late`.
+   */
+  private bounded<T>(work: Promise<T>, signals: readonly AbortSignal[], late?: (value: T) => void): Promise<T> {
+    const until = AbortSignal.any([...signals, this.stopController.signal])
+    let settled = until.aborted
+    work.then(value => { if (settled) late?.(value) }, () => {})
+    if (until.aborted) return Promise.reject(until.reason)
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = (): void => {
+        settled = true
+        reject(until.reason)
+      }
+      until.addEventListener('abort', onAbort, { once: true })
+      work.then(
+        value => {
+          if (settled) return
+          settled = true
+          until.removeEventListener('abort', onAbort)
+          resolve(value)
+        },
+        (error: unknown) => {
+          if (settled) return
+          settled = true
+          until.removeEventListener('abort', onAbort)
+          reject(error)
+        },
+      )
+    })
   }
 
   /** A timer of the core's: cancelled at `stop()`. */

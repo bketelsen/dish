@@ -348,6 +348,20 @@ test('takeNotes: the pending notes first, then the events, in order; the user\'s
   assert.deepEqual(w.browser.takeNotes(), { user: undefined, events: [] })
 })
 
+test('notes are kept to 100: the oldest page-caused ones go first; reopened and crashed stay', async () => {
+  const w = await world({ notes: [{ kind: 'reopened', reason: 'idle' }] })
+  for (let i = 0; i < 150; i++) w.page.emit('download', `f${i}.zip`)
+  w.page.emit('crash')
+  await flush()
+  const { events } = w.browser.takeNotes()
+  assert.equal(events.length, LOG_RING)
+  assert.deepEqual(events[0], { kind: 'reopened', reason: 'idle' })
+  // 151 page-caused notes came after the reopened one: the 52 oldest (f0 to f51) went.
+  assert.deepEqual(events[1], { kind: 'download', name: 'f52.zip' })
+  assert.deepEqual(events.at(-2), { kind: 'download', name: 'f149.zip' })
+  assert.deepEqual(events.at(-1), { kind: 'crashed' })
+})
+
 test('takeNotes: a browser the user started says so once; mouse moves alone are no activity', async () => {
   const w = await world({ started: true })
   w.browser.recordNavigation('https://ok.test/')
