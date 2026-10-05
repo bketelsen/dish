@@ -33,7 +33,7 @@ import { isLive, workspaceOf } from './services.ts'
 import type { Services } from './services.ts'
 import type { Limits } from './types.ts'
 import { parseUp } from './uplink.ts'
-import { closedText, errorText, quoted, tabNoticeText } from './words.ts'
+import { ARCHIVED, closedText, errorText, NOT_A_CHAT, quoted, tabNoticeText } from './words.ts'
 
 /** The Cordis service key. (The wire namespace is `NAMESPACE`.) */
 export const SERVICE = 'dishBrowserRemote'
@@ -43,11 +43,6 @@ declare module '@deepseek-ai/cordis' {
     dishBrowserRemote: BrowserRemote
   }
 }
-
-/** The refusal of an id that isn't a chat's. */
-export const NOT_A_CHAT = 'That isn\'t a chat.'
-/** The refusal of an archived chat. */
-export const ARCHIVED = 'This chat is archived.'
 
 /** The least time between two `state` items. */
 const STATE_MS = 100
@@ -244,7 +239,7 @@ class Watch {
     this.poke()
     if (this.dropped > 1) {
       const more = this.dropped - 1
-      this.say(`dropped ${more} more item${more === 1 ? '' : 's'} from the Browser tab`)
+      this.say(`dropped ${more} more item${more === 1 ? '' : 's'} from the Browser tab for ${this.sessionId}`)
     }
   }
 
@@ -346,7 +341,7 @@ class Watch {
     const parsed = parseUp(item, this.options.viewport)
     if (!parsed.ok) {
       this.dropped++
-      if (this.dropped === 1) this.say(`dropped an item from the Browser tab (${parsed.why})`)
+      if (this.dropped === 1) this.say(`dropped an item from the Browser tab for ${this.sessionId} (${parsed.why})`)
       return
     }
     const up = parsed.up

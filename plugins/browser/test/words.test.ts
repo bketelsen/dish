@@ -7,8 +7,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Limits, UserActivity } from '../src/types.ts'
 import {
-  closedText, cutNote, done, EMPTY_TREE, errorsNote, errorText, LEAD, navigationFailure, notDone, noteText, notesLine, pageLine, quoted,
-  readExtra, refusal, resultText, screenshotText, shown, tabNoticeText, UNCHANGED, urlRefusal, userText,
+  ARCHIVED, closedText, cutNote, done, EMPTY_TREE, errorsNote, errorText, LEAD, navigationFailure, NOT_A_CHAT, notDone, noteText, notesLine,
+  pageLine, quoted, readExtra, refusal, resultText, screenshotText, shown, tabNoticeText, UNCHANGED, urlRefusal, userText,
 } from '../src/words.ts'
 
 const TOKEN = `ghp_${'A1b2C3d4E5'.repeat(4)}`
@@ -184,6 +184,11 @@ test('tabNoticeText: a note, a refusal, a failure, an error, and a browser that 
   assert.equal(tabNoticeText({ kind: 'failed', url: 'https://example.com/', error: 'timeout' }, LIMITS), 'https://example.com/ didn\'t load within 30 s.')
   assert.equal(tabNoticeText({ kind: 'error', code: 'busy', detail: '' }, LIMITS), 'All 6 browsers dish keeps are in use by other calls; try again in a moment.')
   assert.equal(tabNoticeText({ kind: 'cannot-start' }, LIMITS), 'A page opens here once this chat\'s agent is running.')
+})
+
+test('the tab\'s refusals: an id that isn\'t a chat\'s, and an archived chat', () => {
+  assert.equal(NOT_A_CHAT, 'That isn\'t a chat.')
+  assert.equal(ARCHIVED, 'This chat is archived.')
 })
 
 // --- what was done, what wasn't, and the refusals --------------------------------------------------------------------------

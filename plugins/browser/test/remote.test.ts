@@ -24,11 +24,11 @@ import type { UserAction } from '../src/browsers.ts'
 import { replayAs } from '../src/keys.ts'
 import { NAMESPACE } from '../src/protocol.ts'
 import type { ChildrenDown, Down, FrameDown, HelloDown, NoticeDown, StateDown, Up } from '../src/protocol.ts'
-import { ARCHIVED, BrowserRemote, NOT_A_CHAT, SERVICE, browserRemote, watchStream } from '../src/remote.ts'
+import { BrowserRemote, SERVICE, browserRemote, watchStream } from '../src/remote.ts'
 import type { RemoteOptions } from '../src/remote.ts'
 import type { AgentHandle, Services } from '../src/services.ts'
 import type { Limits } from '../src/types.ts'
-import { closedText } from '../src/words.ts'
+import { ARCHIVED, NOT_A_CHAT, closedText } from '../src/words.ts'
 import { FakeDriver, FakePage, ManualClock, simpleRules } from './fake-driver.ts'
 
 const VIEWPORT = { width: 1280, height: 800 }
@@ -428,8 +428,6 @@ test('refusals: an archived chat, and an id that isn\'t one, are refused; the st
     await a.end()
     assert.equal(a.uplink.returned, true)
   }
-  assert.equal(ARCHIVED, 'This chat is archived.')
-  assert.equal(NOT_A_CHAT, 'That isn\'t a chat.')
   assert.equal(opened.screencasting, false)
   assert.deepEqual(opened.callsOf('mouse'), [])
   assert.deepEqual(opened.callsOf('goto'), [])
@@ -662,6 +660,42 @@ test('notices keep the newest 20 for a reader that is behind', async () => {
   assert.equal(listenerCount(w.core), 0)
 })
 
+test('frames off drops a frame a reader that is behind hasn\'t taken yet', async () => {
+  const w = world()
+  await w.core.forAgent('s1', undefined, never)
+  const page = pageOf(w, 's1')
+  // The core keeps a newest frame, so frames on hands it to the pacer at once.
+  const earlier = w.core.watch('s1')
+  earlier.setFrames(true)
+  await settle()
+  page.frame('one')
+  earlier.close()
+  await settle()
+  assert.equal(page.screencasting, false)
+
+  // A reader that has stopped after the opening: the frame waits for it, then frames go off before it reads on.
+  const uplink = new Channel<unknown>()
+  const controller = new AbortController()
+  const paused = watchStream(w.options, 's1', uplink, controller.signal)
+  const items: Down[] = []
+  for (let i = 0; i < 3; i++) items.push((await paused.next()).value as Down)
+  assert.deepEqual(items.map(item => item.kind), ['hello', 'state', 'children'])
+  uplink.push({ kind: 'frames', on: true })
+  await waitFor(() => page.screencasting, 'frames on')
+  uplink.push({ kind: 'frames', on: false })
+  await waitFor(() => !page.screencasting, 'frames off')
+  await settle()
+
+  let taken: IteratorResult<Down> | undefined
+  const next = paused.next().then(result => { taken = result })
+  await tick(w, 500)
+  assert.equal(taken, undefined, 'no frame comes')
+  controller.abort()
+  await next
+  assert.deepEqual(taken, { value: undefined, done: true }, 'the next thing is the end')
+  assert.equal(listenerCount(w.core), 0)
+})
+
 test('the uplink is read on while a navigation loads, and the tab\'s actions keep their order', async () => {
   const w = world()
   await live(w, 's1')
@@ -769,10 +803,10 @@ test('bad items are dropped and logged once, the rest counted; the stream goes o
     DOWN,
   )
   await waitFor(() => page.callsOf('mouse').length === 1, 'the good item')
-  assert.deepEqual(w.logs, ['dropped an item from the Browser tab (unknown kind)'])
+  assert.deepEqual(w.logs, ['dropped an item from the Browser tab for s1 (unknown kind)'])
   assert.equal(a.done, false)
   await a.end()
-  assert.deepEqual(w.logs, ['dropped an item from the Browser tab (unknown kind)', 'dropped 4 more items from the Browser tab'])
+  assert.deepEqual(w.logs, ['dropped an item from the Browser tab for s1 (unknown kind)', 'dropped 4 more items from the Browser tab for s1'])
   for (const line of w.logs) assert.doesNotMatch(line, /secret-typed/)
 })
 
@@ -790,13 +824,20 @@ test('the end: the signal ends the stream, closes the watcher (its frames-on cou
   await waitFor(() => a.frames.length === 1, 'a frame')
   await settle()
   assert.equal(page.screencasting, true)
-  // A disposed agent's browser is held while a frames-on watcher watches it; its change sets a state timer.
-  w.core.agentDisposed('s1')
-  // A children timer and a pending frame too, all left behind by the end.
-  await w.core.forAgent('other', undefined, never)
+  // The frame in flight acked, and a new one within the pacer's interval: the pacer's timer holds it.
+  a.send({ kind: 'ack', seq: a.frames[0]!.seq })
+  await settle()
+  const before = w.streamClock.pending
   page.frame('pending')
   await settle()
-  assert.ok(w.streamClock.pending > 0)
+  assert.equal(w.streamClock.pending, before + 1, 'the pacer waits out its interval')
+  assert.equal(a.frames.length, 1)
+  // A disposed agent's browser is held while a frames-on watcher watches it; its change sets a state timer.
+  w.core.agentDisposed('s1')
+  // A children timer too: all of them left behind by the end.
+  await w.core.forAgent('other', undefined, never)
+  await settle()
+  assert.ok(w.streamClock.pending >= before + 2)
   assert.equal(w.core.isOpen('s1'), true)
 
   await a.end()
