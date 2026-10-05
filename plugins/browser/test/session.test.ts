@@ -11,7 +11,7 @@ import { SessionBrowser } from '../src/session.ts'
 import type { SessionHost } from '../src/session.ts'
 import type { ScreencastFrame } from '../src/driver.ts'
 import { CONTROL, SHIFT } from '../src/protocol.ts'
-import { LOG_RING, POPUP_URL_MS } from '../src/types.ts'
+import { LISTED, LOG_RING, POPUP_URL_MS } from '../src/types.ts'
 import type { Note, TabNotice } from '../src/types.ts'
 import { FakeBrowser, FakeContext, FakeDialog, FakePage, FakePopup, ManualClock, deferred, flush, simpleRules } from './fake-driver.ts'
 
@@ -332,6 +332,21 @@ test('logs: console errors and failed requests in rings of 100 (lines cut to 100
   assert.deepEqual(w.browser.newLogCounts(), { console: 1, requests: 0 })
 })
 
+test('newLogCounts: when new ones came, the totals since the last read (takeLogs), not only the new ones', async () => {
+  const w = await world()
+  w.page.emit('consoleError', 'first')
+  w.page.emit('consoleError', 'second')
+  assert.deepEqual(w.browser.newLogCounts(), { console: 2, requests: 0 })
+  w.page.emit('consoleError', 'one more')
+  assert.deepEqual(w.browser.newLogCounts(), { console: 3, requests: 0 }, 'the two before are still unread')
+  w.page.emit('requestFailed', { url: 'https://ok.test/a.js', status: 404 })
+  assert.deepEqual(w.browser.newLogCounts(), { console: 3, requests: 1 })
+  assert.deepEqual(w.browser.newLogCounts(), { console: 0, requests: 0 }, 'nothing new: no note')
+  w.browser.takeLogs()
+  w.page.emit('consoleError', 'after the read')
+  assert.deepEqual(w.browser.newLogCounts(), { console: 1, requests: 0 })
+})
+
 // --- notes ------------------------------------------------------------------------------------------------------------
 
 test('takeNotes: the pending notes first, then the events, in order; the user\'s activity on its own; both cleared', async () => {
@@ -345,21 +360,25 @@ test('takeNotes: the pending notes first, then the events, in order; the user\'s
   assert.deepEqual(taken.user?.navigations, ['https://ok.test/1'])
   assert.equal(taken.user?.clicks, 1)
   assert.equal(taken.user?.last, w.clock.now())
-  assert.deepEqual(w.browser.takeNotes(), { user: undefined, events: [] })
+  assert.deepEqual(w.browser.takeNotes(), { user: undefined, events: [], leftOut: 0 })
 })
 
-test('notes are kept to 100: the oldest page-caused ones go first; reopened and crashed stay', async () => {
+test('notes keep the newest 10 page events and count the rest; reopened and crashed always stay', async () => {
   const w = await world({ notes: [{ kind: 'reopened', reason: 'idle' }] })
-  for (let i = 0; i < 150; i++) w.page.emit('download', `f${i}.zip`)
+  for (let i = 0; i < 70; i++) w.page.emit('download', `f${i}.zip`)
   w.page.emit('crash')
   await flush()
-  const { events } = w.browser.takeNotes()
-  assert.equal(events.length, LOG_RING)
-  assert.deepEqual(events[0], { kind: 'reopened', reason: 'idle' })
-  // 151 page-caused notes came after the reopened one: the 52 oldest (f0 to f51) went.
-  assert.deepEqual(events[1], { kind: 'download', name: 'f52.zip' })
-  assert.deepEqual(events.at(-2), { kind: 'download', name: 'f149.zip' })
-  assert.deepEqual(events.at(-1), { kind: 'crashed' })
+  const fresh = w.context.pages[1]!
+  for (let i = 70; i < 150; i++) fresh.emit('download', `f${i}.zip`)
+  const { events, leftOut } = w.browser.takeNotes()
+  assert.equal(leftOut, 140)
+  assert.deepEqual(events, [
+    { kind: 'reopened', reason: 'idle' },
+    { kind: 'crashed' },
+    ...Array.from({ length: LISTED }, (_, i) => ({ kind: 'download', name: `f${140 + i}.zip` })),
+  ])
+  fresh.emit('filechooser')
+  assert.deepEqual(w.browser.takeNotes(), { user: undefined, events: [{ kind: 'filechooser' }], leftOut: 0 }, 'the count starts again')
 })
 
 test('takeNotes: a browser the user started says so once; mouse moves alone are no activity', async () => {
@@ -538,7 +557,7 @@ test('watched: the screencast at the viewport\'s size, frames passed on; lastUse
 
 test('a crash: the call in flight rejects crashed; the page is replaced in the same context; noted; the queue goes on there', async () => {
   const w = await world()
-  w.browser.lastSnapshot = '- button "Old" [ref=e1]'
+  w.browser.lastSnapshot = { text: '- button "Old" [ref=e1]', digest: 'old' }
   w.browser.setWatched(true)
   await flush()
   const hold = w.page.hold('click')
@@ -570,6 +589,53 @@ test('a crash: the user\'s input while the page is replaced goes to the new page
   await flush(6)
   assert.deepEqual(w.page.callsOf('insertText'), [])
   assert.deepEqual(w.context.pages[1]?.callsOf('insertText'), [['hi']])
+})
+
+// --- a page that stops answering ---------------------------------------------------------------------------------------
+
+test('replaceFrozen: the call in flight goes on, on a new page in the same context; the tab is told, and the agent when asked', async () => {
+  const w = await world()
+  w.browser.lastSnapshot = { text: '- button "Old" [ref=e1]', digest: 'old' }
+  w.browser.lastSubtree = '- button "Older" [ref=e2]'
+  w.browser.setWatched(true)
+  await flush()
+  const queued: string[] = []
+  const inFlight = w.browser.call(never, async page => {
+    const fresh = await w.browser.replaceFrozen(page, false)
+    await fresh.goto('https://ok.test/', { timeoutMs: 1000, loadMs: 0 })
+    return fresh
+  })
+  const next = w.browser.call(never, async page => { queued.push(page === w.context.pages[1] ? 'on the new page' : 'elsewhere') })
+  const fresh = await inFlight
+  await next
+  assert.equal(fresh, w.context.pages[1])
+  assert.equal(w.browser.page, fresh)
+  assert.equal(w.page.closed, true)
+  assert.deepEqual(queued, ['on the new page'])
+  assert.equal(w.context.pages[1]?.screencasting, true)
+  assert.equal(w.browser.lastSnapshot, undefined)
+  assert.equal(w.browser.lastSubtree, undefined)
+  assert.deepEqual(w.notices, [{ kind: 'frozen' }])
+  assert.deepEqual(w.browser.takeNotes().events, [], 'no note: the call says it')
+  assert.match(w.logs.join('\n'), /the page of s1 stopped responding; it was replaced/)
+
+  const again = await w.browser.call(never, page => w.browser.replaceFrozen(page, true))
+  assert.equal(again, w.context.pages[2])
+  assert.deepEqual(w.browser.takeNotes().events, [{ kind: 'frozen' }])
+})
+
+test('replaceFrozen: a page that is no longer the browser\'s is left alone; a browser that closed meanwhile rejects', async () => {
+  const w = await world()
+  const old = w.page
+  await w.browser.call(never, page => w.browser.replaceFrozen(page, false))
+  const now = w.browser.page
+  assert.equal(await w.browser.replaceFrozen(old, false), now, 'nothing more replaced')
+  assert.equal(w.context.pages.length, 2)
+  // The new page can't be made: the core closes the browser (`broken`), and the replacement says so.
+  w.context.failNewPage = new Error('no more pages')
+  const replacing = w.browser.replaceFrozen(now, false)
+  w.browser.markClosed('chromium')
+  await assert.rejects(replacing, (error: unknown) => error instanceof BrowserError && error.code === 'closed' && error.detail === 'chromium')
 })
 
 test('a crash whose page can\'t be replaced: the browser says it is broken', async () => {

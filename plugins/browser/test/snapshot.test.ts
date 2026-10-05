@@ -10,7 +10,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { PASSWORD_CHECKS } from '../src/types.ts'
-import { elementOf, processSnapshot, REF } from '../src/snapshot.ts'
+import { createHash } from 'node:crypto'
+import { elementIn, elementOf, keep, KEEP_FACTOR, processSnapshot, REF } from '../src/snapshot.ts'
 
 const TOKEN = `ghp_${'A1b2C3d4E5'.repeat(4)}`
 const PASSWORD = '(a password field; its value isn\'t shown)'
@@ -382,9 +383,9 @@ test('the cut: at a line end past half, total and cut set', async () => {
 test('the cut: a text exactly at max is not cut; a newline right at max counts', async () => {
   const { isPassword } = checker([])
   const exact = await processSnapshot('x'.repeat(50), isPassword, 50)
-  assert.deepEqual(exact, { text: 'x'.repeat(50), total: 50, cut: false })
+  assert.deepEqual(exact, { text: 'x'.repeat(50), whole: 'x'.repeat(50), total: 50, cut: false, sections: { listed: [], more: 0 } })
   const atMax = await processSnapshot(`${'x'.repeat(50)}\nmore`, isPassword, 50)
-  assert.deepEqual(atMax, { text: 'x'.repeat(50), total: 55, cut: true })
+  assert.deepEqual(atMax, { text: 'x'.repeat(50), whole: `${'x'.repeat(50)}\nmore`, total: 55, cut: true, sections: { listed: [], more: 0 } })
 })
 
 test('the cut: a single long line, or a line end before half, is cut at max', async () => {
@@ -396,6 +397,91 @@ test('the cut: a single long line, or a line end before half, is cut at max', as
   const early = await processSnapshot(`- a\n${'z'.repeat(5000)}`, isPassword, 1000)
   assert.equal(early.text.length, 1000)
   assert.ok(early.text.startsWith('- a\nzzz'))
+})
+
+test('whole: the masked and blanked text before the cut', async () => {
+  const raw = [`- textbox "Password" [ref=e5]: hunter2`, ...Array.from({ length: 100 }, (_, i) => `- listitem [ref=e${i + 10}]: row ${i} ${TOKEN}`)].join('\n')
+  const result = await processSnapshot(raw, async ref => ref === 'e5', 1000)
+  assert.equal(result.cut, true)
+  assert.equal(result.total, result.whole.length)
+  assert.ok(result.whole.startsWith(`- textbox "Password" [ref=e5] ${PASSWORD}\n`))
+  assert.ok(result.whole.endsWith('- listitem [ref=e109]: row 99 ‹secret: a GitHub token›'))
+  assert.ok(!result.whole.includes(TOKEN) && !result.whole.includes('hunter2'))
+  assert.ok(result.whole.startsWith(result.text))
+})
+
+/** A long list, then a region past the cut with a button and a list in it, as on a page of 1,500 links. */
+function longPage(rows: number): string {
+  return [
+    '- list [ref=e2]:',
+    ...Array.from({ length: rows }, (_, i) => `  - listitem [ref=e${i + 3}]:\n    - link "Link number ${i}" [ref=e${i + 1000}]`),
+    '- region "Bottom" [ref=e3002]:',
+    '  - button "Add at bottom" [ref=e3004] [cursor=pointer]',
+    '  - list [ref=e3005]:',
+    '    - listitem [ref=e3006]: ADDED-0',
+  ].join('\n')
+}
+
+test('the cut: the sections past it are listed, by their words, within max with the tree', async () => {
+  const raw = longPage(200)
+  const result = await processSnapshot(raw, async () => false, 2000)
+  assert.equal(result.cut, true)
+  assert.deepEqual(result.sections, { listed: ['region "Bottom" [ref=e3002]', 'list [ref=e3005]'], more: 0 })
+  assert.ok(result.text.length + result.sections.listed.join(', ').length <= 2000, `${result.text.length} + the sections`)
+  assert.ok(result.text.length > 1000)
+  assert.equal(raw[result.text.length], '\n', 'the tree still ends where a line ended')
+  assert.ok(!result.text.includes('Bottom'))
+  // A section above the cut isn't listed: its ref is in the tree.
+  const above = await processSnapshot(`- main [ref=e1]:\n${'  - text: filler line here\n'.repeat(200)}`, async () => false, 2000)
+  assert.deepEqual(above.sections, { listed: [], more: 0 })
+})
+
+test('the cut: past 20 sections, the shallowest are listed in page order, and the rest counted', async () => {
+  const lines = ['- main [ref=e1]:', ...Array.from({ length: 600 }, (_, i) => `  - text: filler ${i}`)]
+  for (let i = 0; i < 40; i++) lines.push(`  - list [ref=e${100 + i}]:`, `    - list [ref=e${200 + i}]:`, '      - listitem: x')
+  lines.push('- navigation "Footer" [ref=e900]:', '  - link "About" [ref=e901]')
+  lines.push('- region "Last" [ref=e950]')
+  const result = await processSnapshot(lines.join('\n'), async () => false, 8000)
+  assert.equal(result.cut, true)
+  const { listed, more } = result.sections
+  assert.equal(listed.length, 20)
+  assert.equal(listed[0], 'list [ref=e100]', 'the first list past the cut, at the shallower depth')
+  assert.ok(listed.includes('navigation "Footer" [ref=e900]') && listed.includes('region "Last" [ref=e950]'), listed.join(', '))
+  assert.ok(!listed.some(words => /ref=e2\d\d\]/.test(words)), 'no deeper list while a shallower one is left out')
+  assert.equal(listed.indexOf('navigation "Footer" [ref=e900]'), 18, 'in page order')
+  assert.equal(listed.length + more, 82)
+})
+
+test('the cut: a small max lists what fits in its share', async () => {
+  const result = await processSnapshot(longPage(100), async () => false, 2000)
+  const room = Math.floor(2000 / 16)
+  assert.ok(result.sections.listed.join(', ').length <= room)
+  const wide = await processSnapshot(`${longPage(100)}\n- region "${'Very long name '.repeat(20)}" [ref=e4000]`, async () => false, 2000)
+  assert.ok(wide.sections.listed.join(', ').length <= room)
+  assert.equal(wide.sections.listed.length + wide.sections.more, 3)
+})
+
+test('keep: the whole text up to 4× max at a line end, and a digest of all of it', async () => {
+  assert.equal(KEEP_FACTOR, 4)
+  const small = await processSnapshot(longPage(20), async () => false, 30_000)
+  assert.deepEqual(keep(small, 30_000), { text: small.whole, digest: createHash('sha256').update(small.whole).digest('base64') })
+  const big = await processSnapshot(longPage(500), async () => false, 2000)
+  const kept = keep(big, 2000)
+  assert.ok(big.whole.length > 8000)
+  assert.ok(kept.text.length <= 8000 && kept.text.length > 4000, `${kept.text.length}`)
+  assert.equal(big.whole[kept.text.length], '\n')
+  assert.equal(kept.digest, createHash('sha256').update(big.whole).digest('base64'), 'the digest is of all of it')
+  const changed = await processSnapshot(longPage(500).replace('ADDED-0', 'ADDED-1'), async () => false, 2000)
+  assert.equal(changed.text, big.text, 'the cut text is the same')
+  assert.notEqual(keep(changed, 2000).digest, kept.digest, 'the digest is not')
+})
+
+test('elementIn: the first text that knows the ref', () => {
+  assert.equal(elementIn(['- button "A" [ref=e1]', '- button "B" [ref=e2]'], 'e2'), 'button "B" [ref=e2]')
+  assert.equal(elementIn([undefined, '- button "B" [ref=e2]\n- link "C" [ref=e3]'], 'e3'), 'link "C" [ref=e3]')
+  assert.equal(elementIn(['- button "A" [ref=e1]', '- button "Also A" [ref=e1]'], 'e1'), 'button "A" [ref=e1]')
+  assert.equal(elementIn([undefined, '- text: x'], 'e9'), '[ref=e9]')
+  assert.equal(elementIn([], 'e9'), '[ref=e9]')
 })
 
 test('the cut never leaves half a surrogate pair', async () => {

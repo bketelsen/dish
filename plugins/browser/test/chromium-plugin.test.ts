@@ -36,7 +36,7 @@ import type { RemoteOptions } from '../src/remote.ts'
 import { contextServices } from '../src/services.ts'
 import type { AgentHandle, ImageRef } from '../src/services.ts'
 import { REF_MS } from '../src/types.ts'
-import { notDone, PASSWORD_HIDDEN, urlRefusal } from '../src/words.ts'
+import { errorText, notDone, noteText, PASSWORD_HIDDEN, urlRefusal } from '../src/words.ts'
 import { chromiumPath, closeLater, pageServer, processesHolding, scratchTmp } from './chromium.ts'
 import type { PageServer, TestPage } from './chromium.ts'
 
@@ -138,6 +138,11 @@ function pages(dshPort: number): Record<string, TestPage> {
     '/input.html': html(`<title>Input</title><button ${fixedButton}>Pressed 0</button>
       <textarea aria-label="Keys" autofocus style="position: fixed; left: 20px; top: 100px; width: 300px; height: 60px"></textarea>
       <script>let presses = 0</script>`),
+    '/frozen.html': html('<title>Frozen</title><p>Soon stuck</p><script>document.cookie = "kept=yes; path=/"; setTimeout(() => { for (;;) {} }, 300)</script>'),
+    '/cookie.html': html('<title>Cookie</title><p id="cookie"></p><script>document.getElementById("cookie").textContent = "cookie " + document.cookie</script>'),
+    '/long.html': html(`<title>Long</title><ul>${Array.from({ length: 1500 }, (_, i) => `<li><a href="/x${i}">Link number ${i}</a></li>`).join('')}</ul>
+      <section aria-label="Bottom"><button onclick="const li = document.createElement('li'); li.textContent = 'ADDED-' + document.querySelectorAll('#added li').length; document.getElementById('added').append(li)">Add at bottom</button><ul id="added"></ul></section>`),
+    '/spam.html': html(`<title>Spam</title><button onclick="for (let i = 0; i < 150; i++) alert('message ' + i + ' ' + 'x'.repeat(600))">Spam</button>`),
     '/screencast.html': html(`<title>Screencast</title><button ${fixedButton}>Pressed 0</button>
       <p id="tick" style="position: fixed; left: 20px; top: 120px">0</p>
       <script>let presses = 0, n = 0; setInterval(() => { document.getElementById('tick').textContent = String(++n) }, 30)</script>`),
@@ -623,6 +628,89 @@ test('a page crash (chrome://crash, on the core\'s page): a new page, and the ne
   assert.match(next, /The page crashed; this is a new page\./)
   assert.match(await ok(s, id, 'browser_navigate', { url: `${s.site.origin}/second.html` }), /heading "Second page"/)
   assert.equal(s.core.browserOf(id), browser, 'the same browser, its context kept')
+})
+
+test('a frozen page: a call fails with the replacement\'s words, the tab is told, and a navigate then works, its cookie kept', async (t) => {
+  if (skipped(t)) return
+  const s = await setUp()
+  const id = session(t, s, 'frozen')
+  const told: unknown[] = []
+  t.after(s.core.subscribe(event => { if (event.kind === 'notice' && event.sessionId === id) told.push(event.notice) }))
+  await ok(s, id, 'browser_navigate', { url: `${s.site.origin}/frozen.html` })
+  await sleep(800)
+  const browser = s.core.browserOf(id)!
+  const old = browser.page
+  const started = Date.now()
+  const read = await call(s, id, 'browser_read')
+  t.diagnostic(`a read of the frozen page ended in ${Date.now() - started} ms`)
+  assert.equal(read.isError, true)
+  assert.equal(read.text, `Error: ${errorText('frozen', '', LIMITS)}`)
+  assert.notEqual(browser.page, old)
+  assert.equal(s.core.browserOf(id), browser, 'the same browser')
+  assert.deepEqual(told, [{ kind: 'frozen' }])
+  const next = await ok(s, id, 'browser_navigate', { url: `${s.site.origin}/cookie.html` })
+  assert.match(next, /cookie kept=yes/, 'the same context: its cookie stays')
+
+  // A click by ref: its `hasRef` times out on the frozen page, and the same happens.
+  const frozen = await ok(s, id, 'browser_navigate', { url: `${s.site.origin}/frozen.html` })
+  await sleep(800)
+  const clickStarted = Date.now()
+  const paragraph = /- paragraph \[ref=((?:f\d+)?e\d+)\]: Soon stuck/.exec(frozen)?.[1]
+  assert.ok(paragraph !== undefined, frozen)
+  const clicked = await call(s, id, 'browser_click', { ref: paragraph })
+  t.diagnostic(`a click on the frozen page ended in ${Date.now() - clickStarted} ms`)
+  assert.equal(clicked.isError, true)
+  assert.equal(clicked.text, `Error: ${errorText('frozen', '', LIMITS)}`)
+  assert.deepEqual(told, [{ kind: 'frozen' }, { kind: 'frozen' }])
+  assert.match(await ok(s, id, 'browser_navigate', { url: `${s.site.origin}/cookie.html` }), /cookie kept=yes/)
+})
+
+test('a frozen page: browser_navigate replaces it at once and goes where it was asked, with the note', async (t) => {
+  if (skipped(t)) return
+  const s = await setUp()
+  const id = session(t, s, 'frozen-navigate')
+  await ok(s, id, 'browser_navigate', { url: `${s.site.origin}/frozen.html` })
+  await sleep(800)
+  const started = Date.now()
+  const opened = await ok(s, id, 'browser_navigate', { url: `${s.site.origin}/cookie.html` })
+  t.diagnostic(`the navigation ended in ${Date.now() - started} ms`)
+  assert.ok(Date.now() - started < 10_000, `${Date.now() - started} ms`)
+  assert.ok(opened.startsWith(`Opened ${s.site.origin}/cookie.html.\nNotes: ${noteText({ kind: 'frozen' }, LIMITS)}\n`), opened.slice(0, 300))
+  assert.match(opened, /cookie kept=yes/)
+})
+
+test('a long page, cut: the sections past the cut are named; a change past it is no "Unchanged"; its elements have their words', async (t) => {
+  if (skipped(t)) return
+  const s = await setUp()
+  const id = session(t, s, 'long')
+  const opened = await ok(s, id, 'browser_navigate', { url: `${s.site.origin}/long.html` })
+  const sections = /\nCut at 30,000 of [\d,]+ characters: `browser_read` with a section's ref reads that part\. Sections past the cut: (.*)\.$/.exec(opened)
+  assert.ok(sections, opened.slice(-400))
+  const bottom = /region "Bottom" \[ref=((?:f\d+)?e\d+)\]/.exec(sections[1]!)?.[1]
+  assert.ok(bottom !== undefined, sections[1])
+  assert.ok(opened.length < 33_000, `${opened.length} characters`)
+  const part = await ok(s, id, 'browser_read', { ref: bottom })
+  const button = refOf(part, 'button', 'Add at bottom')
+  for (const n of [0, 1]) {
+    const clicked = await ok(s, id, 'browser_click', { ref: button })
+    assert.ok(clicked.startsWith(`Clicked button "Add at bottom" [ref=${button}].\n`), clicked.slice(0, 200))
+    assert.doesNotMatch(clicked, /Unchanged since your last snapshot/, `click ${n + 1}: the change is past the cut`)
+  }
+  assert.match(await ok(s, id, 'browser_read', { ref: bottom }), /ADDED-0[\s\S]*ADDED-1/)
+  assert.match(await ok(s, id, 'browser_click', { ref: refOf(opened, 'link', 'Link number 0') }), /^Clicked link "Link number 0"/)
+})
+
+test('a page\'s 150 alerts: the result lists the newest 10, after a count of the rest, and stays under dsh\'s spill cap', async (t) => {
+  if (skipped(t)) return
+  const s = await setUp()
+  const id = session(t, s, 'spam')
+  const opened = await ok(s, id, 'browser_navigate', { url: `${s.site.origin}/spam.html` })
+  const clicked = await ok(s, id, 'browser_click', { ref: refOf(opened, 'button', 'Spam') })
+  const notes = clicked.split('\n').find(line => line.startsWith('Notes:')) ?? ''
+  assert.ok(notes.startsWith('Notes: 140 earlier page events (dialogs, popups, downloads) aren\'t listed; the newest 10 follow. The page showed an alert: «message 140 '), notes.slice(0, 300))
+  assert.equal((notes.match(/The page showed an alert/g) ?? []).length, 10)
+  assert.match(notes, /«message 149 x+…» \(dismissed\)\.$/)
+  assert.ok(Math.ceil(clicked.length / 4) + 4 < 12_500, `${clicked.length} characters`)
 })
 
 test('every name in KEY_NAMES replays through keyDown and keyUp without an error, directly and on the tab\'s input chain', async (t) => {

@@ -13,6 +13,7 @@
  *   service worker's script and its fetches included: Playwright routes those only while it watches service workers,
  *   and `'block'` would stop that while blocking nothing but the usual `navigator.serviceWorker.register` (a page can
  *   call the container's own method). WebSockets, which the route doesn't see, go through `routeWebSocket` (:10482).
+ *   A page of the context that dish didn't make, and that isn't a popup of its page, is closed at once (`stray`).
  * - **A page** reports its events in dish's terms (`PageEvents`), and keeps one CDP session (`newCDPSession`, :10325)
  *   for its history, the screencast and the tab's capture.
  * - **No capture is lost to a navigation.** Chromium never answers a capture asked for just before the main frame commits
@@ -29,7 +30,8 @@
  *   An action whose signal aborted rejects with the signal's reason. Launch errors are never mapped: dish reads
  *   Chromium's own words in them (its sandbox fallback).
  * - **Nothing hangs on a frozen page.** A call Playwright doesn't time out itself (the mouse and keyboard, `title`,
- *   `count`, `evaluate`, CDP) is bounded by `REF_MS` or the action's own time, and then a `DriverTimeout`.
+ *   `count`, `evaluate`, CDP) is bounded by `REF_MS` or the action's own time, and then a `DriverTimeout`. `responds`
+ *   tells a frozen page from a slow one: a trivial script, bounded by the time it is given.
  *
  * @module dish-browser/playwright
  */
@@ -377,12 +379,33 @@ async function refuseSocket(socket: WebSocketRoute): Promise<void> {
 class PlaywrightContext implements DriverContext {
   private readonly context: BrowserContext
   private readonly viewport: Viewport
-  /** The newest page `newPage` gave: `ownPage` in a route request. */
+  /** The newest page `newPage` gave: `ownPage` in a route request, and the one page whose popups stay open (`stray`). */
   private newest: Page | undefined
+  /** Every page `newPage` gave. */
+  private readonly made = new WeakSet<Page>()
+  /** Settles once every `newPage` call made so far has: a page the context announces meanwhile may be one of them. */
+  private creating: Promise<unknown> = Promise.resolve()
 
   constructor(context: BrowserContext, viewport: Viewport) {
     this.context = context
     this.viewport = viewport
+    // Every page of the context (`on('page')`, :9369), the session's page's popups among them.
+    context.on('page', page => { void this.stray(page) })
+  }
+
+  /**
+   * A page dish didn't ask for, and that isn't a popup of the session's page, is closed at once. The session follows such
+   * a popup and closes it itself; but a script in it may open a window of its own first, which no one else hears of
+   * (`popup` fires on the opener only), and which would run hidden, its scripts and requests going on, for the browser's
+   * life. So would a window a service worker opens. A page `newPage` is making is announced before it resolves, so the
+   * check waits for every `newPage` in flight. `opener()` (:4025) is null once the opener has closed.
+   */
+  private async stray(page: Page): Promise<void> {
+    await this.creating
+    if (this.made.has(page)) return
+    const opener = await page.opener().catch(() => null)
+    if (opener !== null && opener === this.newest) return
+    await page.close().catch(() => {})
   }
 
   /** The route's handler: dish decides, Playwright aborts (`Route.abort`, :22727) or lets it go on (`Route.fallback`, :22863). */
@@ -416,9 +439,14 @@ class PlaywrightContext implements DriverContext {
   }
 
   async newPage(): Promise<DriverPage> {
-    const page = await act(undefined, () => this.context.newPage())
-    this.newest = page
-    return new PlaywrightPage(page, this.viewport)
+    const making = act(undefined, () => this.context.newPage()).then(page => {
+      this.made.add(page)
+      this.newest = page
+      return page
+    })
+    // Settled, and holding no page: the chain keeps nothing alive.
+    this.creating = Promise.allSettled([this.creating, making]).then(() => {})
+    return new PlaywrightPage(await making, this.viewport)
   }
 
   async close(): Promise<void> {
@@ -707,6 +735,22 @@ class PlaywrightPage implements DriverPage {
       const message = messageOf(error)
       if (staleRef(message) || message.includes('Execution context was destroyed')) return false
       throw driverError(error)
+    }
+  }
+
+  /**
+   * A trivial script in the page's main frame (`evaluate`, :190), bounded by `timeoutMs`: a page whose script never ends
+   * doesn't answer. An answer that is an error (a navigation under way) is an answer.
+   */
+  async responds(timeoutMs: number): Promise<boolean> {
+    try {
+      await bounded(this.page.evaluate(() => 1), timeoutMs)
+      return true
+    } catch (error) {
+      if (error instanceof DriverTimeout) return false
+      const mapped = driverError(error)
+      if (mapped instanceof DriverClosed) throw mapped
+      return true
     }
   }
 

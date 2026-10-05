@@ -202,6 +202,11 @@ function pages(refused: number): Record<string, TestPage> {
     '/screencast.html': html(`<title>Screencast</title><p id="tick">0</p>
       <script>let n = 0; setInterval(() => { document.getElementById('tick').textContent = String(++n) }, 50)</script>`),
     '/frozen.html': html('<title>Frozen</title><p>Soon stuck</p><script>setTimeout(() => { for (;;) {} }, 500)</script>'),
+    '/opener.html': html(`<title>Opener</title><p><a href="/child.html" target="_blank">Open child</a></p>
+      <p><a href="/plain-popup.html" target="_blank" rel="noopener">Open plain</a></p>`),
+    '/child.html': html(`<title>Child</title><script>window.open('/grandchild.html'); setInterval(() => fetch('/beacon/child').catch(() => {}), 100)</script>`),
+    '/grandchild.html': html(`<title>Grandchild</title><script>setInterval(() => fetch('/beacon/grandchild').catch(() => {}), 100)</script>`),
+    '/plain-popup.html': html(`<title>Plain</title><script>setInterval(() => fetch('/beacon/plain').catch(() => {}), 100)</script>`),
     '/freeze-on-wheel.html': html(`<title>Freeze on wheel</title><div style="height: 3000px">Tall</div>
       <script>addEventListener('wheel', () => setTimeout(() => { for (;;) {} }, 0))</script>`),
     '/number.html': html('<title>Number</title><label>Quantity <input type="number" value="7" data-secret="PAGE-ATTR-TEXT"></label>'),
@@ -648,6 +653,55 @@ test('a frozen page: the calls Playwright doesn\'t time out end within about REF
   await wheeled.page.goto(`${server.origin}/freeze-on-wheel.html`, NAV)
   const result = await outcome(wheeled.page.scrollBy(0, 100), limit)
   assert.ok(result !== 'hung', 'scrollBy ended')
+})
+
+test('responds: a page answers; a frozen one doesn\'t, within the time; a new page in its context does; a closed one is DriverClosed', async (t) => {
+  if (skipped(t)) return
+  const { server, context, page } = await open(t)
+  await page.goto(`${server.origin}/form.html`, NAV)
+  assert.equal(await page.responds(1_000), true)
+  await page.goto(`${server.origin}/frozen.html`, NAV)
+  await sleep(1_500)
+  const started = Date.now()
+  assert.equal(await page.responds(1_000), false)
+  assert.ok(Date.now() - started < 3_000, `it gave up in ${Date.now() - started} ms`)
+  const fresh = await context.newPage()
+  await fresh.goto(`${server.origin}/second.html`, NAV)
+  assert.equal(await fresh.responds(1_000), true)
+  await page.close()
+  await assert.rejects(page.responds(1_000), DriverClosed)
+})
+
+test('a popup\'s own window is closed at once; the page\'s own popups, noopener too, are left to their listener', async (t) => {
+  if (skipped(t)) return
+  const { server, page } = await open(t)
+  const popups: DriverPopup[] = []
+  page.on('popup', popup => popups.push(popup))
+  const count = (path: string) => server.requests.filter(request => request === path).length
+  await page.goto(`${server.origin}/opener.html`, NAV)
+  const snapshot = await page.snapshot(SNAP)
+
+  await page.click({ ref: refOf(snapshot, 'link', 'Open child') }, { ...ACT, double: false })
+  await eventually('the child popup', () => popups.length === 1)
+  assert.equal(await popups[0]!.waitForUrl(5_000), `${server.origin}/child.html`)
+  await eventually('the child\'s own window opened', () => server.requests.includes('/grandchild.html'))
+  await eventually('the child beacons', () => count('/beacon/child') >= 3)
+  await sleep(500)
+  const grandchild = count('/beacon/grandchild')
+  const child = count('/beacon/child')
+  await sleep(1_000)
+  assert.equal(count('/beacon/grandchild'), grandchild, 'the child\'s own window runs no more')
+  assert.ok(count('/beacon/child') > child, 'the page\'s own popup is left open, for its listener to close')
+  await popups[0]!.close()
+
+  await page.click({ ref: refOf(snapshot, 'link', 'Open plain') }, { ...ACT, double: false })
+  await eventually('the noopener popup', () => popups.length === 2)
+  assert.equal(await popups[1]!.waitForUrl(5_000), `${server.origin}/plain-popup.html`)
+  await eventually('the noopener popup beacons', () => count('/beacon/plain') >= 3)
+  const plain = count('/beacon/plain')
+  await sleep(500)
+  assert.ok(count('/beacon/plain') > plain, 'left open, for its listener to close')
+  await popups[1]!.close()
 })
 
 test('errors are one line, with no typed text and no page text', async (t) => {

@@ -109,9 +109,17 @@ export const UNCHANGED = 'Unchanged since your last snapshot (`browser_read` sho
 /** In place of a tree with nothing in it (`about:blank`), so the lead isn't followed by nothing. */
 export const EMPTY_TREE = '(The tree is empty.)'
 
-/** The note after a tree that was cut at `max` of `total` characters. */
-export function cutNote(total: number, max: number): string {
-  return `Cut at ${fmt(max)} of ${fmt(total)} characters: \`browser_read\` with the ref of a section (a \`main\`, \`list\` or \`region\`) reads that part.`
+/**
+ * The note after a tree that was cut at `max` of `total` characters. `sections` are the words of the sections past the
+ * cut (`region "Bottom" [ref=e3002]`, from `snapshot.ts`), and how many more there are: a read with one's ref reaches it.
+ */
+export function cutNote(total: number, max: number, sections?: { listed: readonly string[], more: number }): string {
+  const cut = `Cut at ${fmt(max)} of ${fmt(total)} characters`
+  if (sections === undefined || sections.listed.length === 0) {
+    return `${cut}: \`browser_read\` with the ref of a section (a \`main\`, \`list\` or \`region\`) reads that part.`
+  }
+  const more = sections.more > 0 ? `, and ${fmt(sections.more)} more` : ''
+  return `${cut}: \`browser_read\` with a section's ref reads that part. Sections past the cut: ${sections.listed.join(', ')}${more}.`
 }
 
 /** `Page: <url> — "<title>"`, or `Page: <url>` with no title. */
@@ -126,6 +134,10 @@ export function notesLine(notes: readonly string[]): string | undefined {
 }
 
 const DIALOG_NAMES = { alert: 'an alert', confirm: 'a confirm', prompt: 'a prompt' } as const
+
+/** A page that stopped answering, replaced: the note, the tab's notice, and the start of the call's error. */
+const FROZEN = 'The page stopped responding (a script that never ends?), so dish replaced it with a new, blank page in the same browser; '
+  + 'cookies and sign-ins stay.'
 
 /** What happened on the page, for the agent's next result (and the tab's notice). */
 export function noteText(note: Note, limits: Limits): string {
@@ -149,6 +161,8 @@ export function noteText(note: Note, limits: Limits): string {
       return `The page went to an address dish doesn't allow (${quoted(note.what, LINE_MAX)}); it was sent to about:blank.`
     case 'crashed':
       return 'The page crashed; this is a new page.'
+    case 'frozen':
+      return FROZEN
     case 'reopened':
       return reopenedText(note.reason, limits)
   }
@@ -195,6 +209,11 @@ export function userText(activity: UserActivity, page: { url: string, title: str
   return now - activity.last < USING_NOW_MS ? `${text} They are using it now.` : text
 }
 
+/** Before the newest `LISTED` page events of a result, when `count` earlier ones aren't listed. */
+export function eventsLeftOut(count: number): string {
+  return `${counted(count, 'earlier page event')} (dialogs, popups, downloads) ${count === 1 ? 'isn\'t' : 'aren\'t'} listed; the newest ${LISTED} follow.`
+}
+
 /** The note for new console errors and failed requests, or undefined when there are none. */
 export function errorsNote(counts: { console: number, requests: number }): string | undefined {
   const parts: string[] = []
@@ -236,6 +255,8 @@ export function errorText(code: BrowserErrorCode, detail: string, limits: Limits
     }
     case 'crashed':
       return 'The page crashed during this call. Your next browser call gets a new page.'
+    case 'frozen':
+      return `${FROZEN} Open it again with \`browser_navigate\`.`
   }
 }
 
@@ -304,7 +325,8 @@ export interface ResultParts {
   page: { url: string, title: string }
   /** browser_read's scroll, console and request lines. */
   extra?: readonly string[]
-  snapshot: { kind: 'tree', text: string, total: number, cut: boolean, max: number } | { kind: 'unchanged' }
+  /** `sections`: those past the cut, as `snapshot.ts` names them. */
+  snapshot: { kind: 'tree', text: string, total: number, cut: boolean, max: number, sections?: { listed: readonly string[], more: number } } | { kind: 'unchanged' }
 }
 
 /** A result: what was done, the notes, the page line, the extra lines, then the lead and the tree, or the unchanged line. */
@@ -319,7 +341,7 @@ export function resultText(parts: ResultParts): string {
     lines.push(UNCHANGED)
   } else {
     lines.push(LEAD, parts.snapshot.text === '' ? EMPTY_TREE : parts.snapshot.text)
-    if (parts.snapshot.cut) lines.push(cutNote(parts.snapshot.total, parts.snapshot.max))
+    if (parts.snapshot.cut) lines.push(cutNote(parts.snapshot.total, parts.snapshot.max, parts.snapshot.sections))
   }
   return maskSecrets(lines.join('\n'))
 }
@@ -416,6 +438,9 @@ export const notDone = {
   notFillable: (ref: string): string => `Not done: [ref=${own(ref)}] isn't a field you can type into.`,
   noBack: (): string => 'Not done: there\'s no earlier page in this browser.',
   noForward: (): string => 'Not done: there\'s no later page in this browser.',
+  /** A choice that timed out: Playwright waits for a matching option to appear, so a missing one and a stuck element look alike. */
+  noOption: (ref: string, values: readonly string[]): string =>
+    `Not done: [ref=${own(ref)}] has no option ${values.map(value => `"${own(value)}"`).join(' or ')} by label or value, or didn't respond within ${REF_MS / 1000} s. Its options are in the tree below.`,
   didNotAppear: (text: string, seconds: number): string => `Not done: "${own(text)}" didn't appear within ${fmt(seconds)} s.`,
   stillThere: (text: string, seconds: number): string => `Not done: "${own(text)}" was still there after ${fmt(seconds)} s.`,
 }
@@ -459,6 +484,10 @@ export const urlRefusal = {
     `${shown(url)} is outside this chat's workspace (${quoted(workspace, LINE_MAX)})${sharedTmp ? ' and /tmp' : ''}.`,
   noWorkspace: (url: string): string =>
     `dish doesn't know this chat's workspace yet, so ${shown(url)} can't open: a file:// page opens once the chat's agent has used the browser, or while it is running.`,
-  scheme: (scheme: string): string =>
-    `${quoted(scheme, OWN_MAX)} addresses aren't opened here: only http, https, file:// in this chat's workspace, and about:blank.`,
+  /** `sharedTmp`: `/tmp` counts too (the VM). */
+  scheme: (scheme: string, sharedTmp: boolean): string =>
+    `${quoted(scheme, OWN_MAX)} addresses aren't opened here: only http, https, file:// in this chat's workspace${sharedTmp ? ' or /tmp' : ''}, and about:blank.`,
+  /** A `file://` URL with a host other than `localhost`: a share on another machine. */
+  remoteFile: (host: string, sharedTmp: boolean): string =>
+    `file://${quoted(host, OWN_MAX)}/ addresses (a file on another machine) aren't opened here: only file:/// paths in this chat's workspace${sharedTmp ? ' or /tmp' : ''}.`,
 }

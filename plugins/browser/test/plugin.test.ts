@@ -326,13 +326,13 @@ test('the config: the defaults and bounds of the contracts', () => {
   assert.deepEqual(parse({}), DEFAULTS)
   const edges = { executablePath: '/opt/chromium/chrome', viewport: { width: 320, height: 240 }, maxBrowsers: 1, idleMinutes: 1, snapshotChars: 2000, terminal: false }
   assert.deepEqual(parse(edges), edges)
-  const top = { ...edges, viewport: { width: 3840, height: 2160 }, maxBrowsers: 20, idleMinutes: 24 * 60, snapshotChars: 48_000 }
+  const top = { ...edges, viewport: { width: 3840, height: 2160 }, maxBrowsers: 20, idleMinutes: 24 * 60, snapshotChars: 34_000 }
   assert.deepEqual(parse(top), top)
   assert.deepEqual(parse({ viewport: { width: 1024 } }).viewport, { width: 1024, height: 800 })
   for (const wrong of [
     { viewport: { width: 319 } }, { viewport: { width: 3841 } }, { viewport: { height: 239 } }, { viewport: { height: 2161 } },
     { viewport: { width: 1280.5 } }, { maxBrowsers: 0 }, { maxBrowsers: 21 }, { maxBrowsers: 1.5 }, { idleMinutes: 0 },
-    { snapshotChars: 1999 }, { snapshotChars: 48_001 },
+    { snapshotChars: 1999 }, { snapshotChars: 34_001 },
   ]) {
     assert.throws(() => parse(wrong), Error, JSON.stringify(wrong))
   }

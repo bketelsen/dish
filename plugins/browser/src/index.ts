@@ -66,7 +66,7 @@ export const Config: Schema<Config> = Schema.object({
     .description('Browsers open at once, over all sessions. Opening one more closes the least recently used.'),
   idleMinutes: Schema.natural().min(1).default(15)
     .description('A browser with no agent call, no input and no watcher for this long closes.'),
-  snapshotChars: Schema.natural().min(2000).max(48_000).default(30_000)
+  snapshotChars: Schema.natural().min(2000).max(34_000).default(30_000)
     .description('The most snapshot text in one result. Keep it under dsh\'s spill cap.'),
   terminal: Schema.boolean().default(true).description('Print this plugin\'s messages to the terminal.'),
 })
