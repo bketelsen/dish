@@ -1,0 +1,14 @@
+# Memory and direction (the dishMemory service): the vault, a bare git repository
+# of user and family memories in Claude Code's format; each family's direction,
+# kept in the config store; the dish-memory message, and Settings → Memory. It
+# reads dishProjects, dishWorkspaces and dishJudge with ctx.get on each use, and
+# claims families/ in dishConfig when the store is there, so there is no order to
+# keep. The dish preset mounts its row, dish-memory/context, which delivers the
+# message and registers remember, forget and recall. Config: `vault` (the bare
+# repository; $XDG_DATA_HOME/dish/vault.git by default), `remote` (its git
+# remote; empty keeps it local), `userName` and `userEmail` (your commits'
+# identity, as dish-config's), `indexLines` and `indexBytes` (each scope's index
+# budget in the message) and `terminal`.
+- insert:
+    - id: dish-memory
+      name: dish-memory
