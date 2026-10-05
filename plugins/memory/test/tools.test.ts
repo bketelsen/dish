@@ -65,6 +65,8 @@ interface World {
   child: AgentLike
   /** The main agent of a scratch chat: no family. */
   scratch: AgentLike
+  /** A crew child of the scratch chat: no scope at all. */
+  scratchChild: AgentLike
   /** An agent under no preset. */
   outside: AgentLike
   call(name: string, args: unknown, agent: AgentLike): Promise<Result>
@@ -112,6 +114,7 @@ async function world(options: { service?: boolean, wrap?: (memory: DishMemory) =
   const main = scoped(agentAt(clone), preset)
   const child = scoped(agentAt(clone, { depth: 1 }), main as object)
   const chat = scoped(agentAt(scratch), preset)
+  const scratchChild = scoped(agentAt(scratch, { depth: 1 }), chat as object)
   const outside = scoped(agentAt(clone), undefined)
 
   let calls = 0
@@ -119,7 +122,7 @@ async function world(options: { service?: boolean, wrap?: (memory: DishMemory) =
     callId: `call-${++calls}` as never, name, arguments: args, agent: agent as never, signal: new AbortController().signal,
   }) as unknown as Promise<Result>
   return {
-    ctx, memory, main, child, scratch: chat, outside, call,
+    ctx, memory, main, child, scratch: chat, scratchChild, outside, call,
     async answer(name, args, agent) {
       const result = await call(name, args, agent)
       assert.equal(result.isError, false, textOf(result))
@@ -266,6 +269,13 @@ test('recall lists both scopes for the main agent and the family for a child; he
   assert.equal(await w.answer('recall', {}, w.main), `${user}\n\n${family}`)
   assert.equal(await w.answer('recall', { id: '' }, w.child), family)
   assert.equal(await w.answer('recall', { id: '  ' }, w.scratch), user)
+})
+
+test('recall: a child outside a family is told it sees no scope, not that nothing is saved', async () => {
+  const w = await world()
+  await w.memory.memory.write(USER, input('talk-first'), AS_AGENT)
+  assert.equal(await w.answer('recall', {}, w.scratchChild), 'No memories you can see: a crew child sees only its family\'s memory, and this chat isn\'t working in a family\'s repos.')
+  assert.equal(await w.answer('recall', {}, w.child), 'No memories saved yet.')
 })
 
 test('recall with an id; a held one can\'t be read', async () => {

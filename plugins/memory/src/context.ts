@@ -89,6 +89,8 @@ const NO_FAMILY_MEMORY = 'this chat isn\'t working in a family\'s repos (scratch
 const FAMILY_UNAVAILABLE = 'Family memory is unavailable right now: this chat\'s family can\'t be looked up. Try again later.'
 const BAD_ID = 'INVALID: an id is user/<name> or family/<name>'
 const NOTHING_SAVED = 'No memories saved yet.'
+/** `recall`'s empty list for a crew child outside a family's repos: it sees no scope at all, saved memories or not. */
+const NOTHING_VISIBLE = 'No memories you can see: a crew child sees only its family\'s memory, and this chat isn\'t working in a family\'s repos.'
 
 const REMEMBER = 'Save a memory: something a later chat should know that the code, git history, AGENTS.md, the family\'s direction '
   + 'and the run ledgers don\'t already say. Types: feedback (what the user corrected or confirmed about how to work, with **Why:** and '
@@ -384,7 +386,8 @@ function memoryTools(ctx: Context): ToolDefinition[] {
             family === undefined ? undefined : listed(`Family ${family}:`, 'family', await memory.list({ kind: 'family', family })),
             unavailable ? FAMILY_UNAVAILABLE : undefined,
           ].filter(group => group !== undefined)
-          return { text: groups.length === 0 ? NOTHING_SAVED : groups.join('\n\n') }
+          if (groups.length > 0) return { text: groups.join('\n\n') }
+          return { text: !user && family === undefined ? NOTHING_VISIBLE : NOTHING_SAVED }
         }
         const { kind, name: memoryName } = parseId(wanted)
         const id = memoryId(kind, memoryName)
