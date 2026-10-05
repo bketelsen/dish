@@ -5,18 +5,18 @@
  * with no `await` between them, so the plugin's load waits for nothing (see `start`):
  *
  * - **The services.**
- *   - `dishJudge`: `settings()` is the `judge.yaml` in the config store as it is now (see `settings.ts`), and `log` is the
- *     decision log (see below).
+ *   - `dishJudge`: `settings()` is the `judge.yaml` in the config store as it is now (see `settings.ts`), `log` is the
+ *     decision log (see below), and `screenText` screens any text as the result screen screens a result (see `screen.ts`).
  *   - `judge`: the Jev client (see `client.ts`). The key is looked up in dsh's credential store on every call, the model and
  *     time limit are the settings of the moment, and every call is written to the decision log.
  * - **The listeners**, at the marker below, all there before the plugin is. Each looks the services up with `ctx.get` on every
- *   call:
+ *   call, except that the result screen has this plugin's own settings and log, and looks only the client up that way:
  *   - the command gate (`gate.ts`): a prepended `tools/pre-execute` listener, and a `tools/result` listener that forgets a
  *     call's verdict;
  *   - the approval answerer (`answerer.ts`): a prepended `approval/request` listener, and the switch that makes a crew
  *     child's approval policy `ask` when its parent's is;
  *   - `ask_judge` (`ask.ts`): the tool, through the `tools` service when there is one;
- *   - the result screen (`screen.ts`): a `tools/post-execute` listener, not prepended;
+ *   - the result screen (`screen.ts`): a `tools/post-execute` listener, not prepended, whose budget of calls `screenText` shares;
  *   - the remote (`remote.ts`): the server half of Settings → Judge, a child plugin that needs `dishJudge` and `judge`.
  * - **The prune**, in the background and last: the decision log's day files and withheld files older than 30 days. The load does
  *   not wait for it (dsh's server waits for every plugin to load, and a state directory that hangs must not hang the start);
@@ -66,13 +66,15 @@ import { registerCommandGate } from './gate.ts'
 import { JudgeLog } from './log.ts'
 import type { JudgeLogLine, ReadQuery, ReadResult } from './log.ts'
 import { JudgeRemote } from './remote.ts'
-import { registerResultScreen } from './screen.ts'
+import { createScreener, registerResultScreen } from './screen.ts'
+import type { TextScreen, TextScreenRequest } from './screen.ts'
 import { DEFAULT_SETTINGS, DEFAULT_TEXT, JUDGE_SPEC, parseSettings } from './settings.ts'
 import type { JudgeSettings } from './settings.ts'
 
 export { createJudge } from './client.ts'
 export type { Answer, Asked, DecideOptions, Decision, Judge, JudgeAgent, JudgeDeps, JudgeRequest, JudgeResult, JudgeStatus, JsonValue, LogLine, Purpose, Question } from './client.ts'
 export type { JudgeLogLine, JudgePurpose, ReadQuery, ReadResult } from './log.ts'
+export type { TextScreen, TextScreenRequest } from './screen.ts'
 export type { CommandSettings, JudgeSettings, ParseResult, ScreeningSettings, ToolSettings } from './settings.ts'
 
 export const name = 'dish-judge'
@@ -111,6 +113,13 @@ export interface DishJudge {
   settings(): Promise<JudgeSettings>
   /** The decision log. */
   log: JudgeLogService
+  /**
+   * Screen `text`, which is not a tool's result (a memory an agent saves, say), as the result screen screens a result: the same
+   * chunks, question and thresholds, a line in the log for each call with the request's `tool` and `subject`, and the same budget
+   * of calls. It says what it came to and changes nothing: it never keeps the text in the log, and never puts it in a warning.
+   * Never rejects: what it can't screen is `unscreened`, with why.
+   */
+  screenText(request: TextScreenRequest): Promise<TextScreen>
 }
 
 // Here, with the type, so that whoever imports it also gets `ctx.get('dishJudge')` typed.
@@ -616,7 +625,11 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
   // runs this when the plugin is disposed. Not for long, since a disk that is stuck is no reason to hold up a shutdown.
   ctx.effect(() => () => flushWithin(log, internals.flushBudgetMs ?? FLUSH_BUDGET_MS))
 
-  ctx.provide('dishJudge', { settings, log })
+  // The result screen and `screenText` (see `screen.ts`): one screener, so that they share one budget of calls to Jev. It finds
+  // the client with `ctx.get` on each screen, and has this plugin's own settings and log.
+  const screener = createScreener({ judge: () => ctx.get('judge'), settings, log: () => log, warn: message => warn('%s', message) })
+
+  ctx.provide('dishJudge', { settings, log, screenText: screener.screenText })
   ctx.provide('judge', createJudge({ baseUrl, key, settings, log: line => log.write(line) }))
 
   // ---- LISTENERS GO HERE ------------------------------------------------------------------------------------------
@@ -643,9 +656,9 @@ export function start(ctx: Context, config: Config, internals: Internals): Promi
     child.tools.register(askJudgeTool(() => ctx.get('judge')))
   })
 
-  // The result screen (see `screen.ts`): a `tools/post-execute` listener, not prepended. It looks the client, the settings and
-  // the log up with `ctx.get` on each result.
-  registerResultScreen(ctx)
+  // The result screen (see `screen.ts`): a `tools/post-execute` listener, not prepended: the screener's, whose budget
+  // `screenText` shares. It looks the client up with `ctx.get` on each result.
+  registerResultScreen(ctx, screener)
 
   // Settings → Judge's server half (see `remote.ts`): a child plugin that needs `dishJudge` and `judge`, so it goes when they do.
   // The page sets the key through dsh's own credentials remote and never through this one, which is told only the key's name.

@@ -28,8 +28,8 @@
  * prose but 45 KB of hex), and the calls run at once, so a screen takes about as long as one call. A call that Jev still says is
  * too big (`tooBig`) is split in two (a single chunk, in halves) and asked again, to a depth of `MAX_SPLIT_DEPTH` and at most
  * `MAX_CALLS` calls in all. Screens run at once too, and TypeSafe's limits (40 requests and 100k tokens a second) are for the whole
- * host, and a `429` puts every gate in a back-off: so every screen of the listener shares one budget of calls and characters in
- * a rolling second (`RATE_WINDOW_MS`). A call waits for room until the screen's deadline (`timeoutMs` and a little over), and
+ * host, and a `429` puts every gate in a back-off: so every screen of the screener (its listener and `screenText`) shares one
+ * budget of calls and characters in a rolling second (`RATE_WINDOW_MS`). A call waits for room until the screen's deadline (`timeoutMs` and a little over), and
  * what finds none is marked "not screened" or "partly screened".
  *
  * **A cap.** At most `MAX_SCREENED_CHARS` are screened. Past that the result is marked "Partly screened: the judge checked
@@ -57,6 +57,11 @@
  * **PTC inner calls.** A withheld one is `block { feedback: [note] }`; a warning, "not screened" or "partly screened" is the
  * chain's own decision with the banner as an `additionalContexts` message, since a value can't carry a banner.
  *
+ * **Any text.** `screenText` (on `dishJudge`) screens a text that is not a result, such as a memory an agent saves, with the same
+ * machinery: the same cut, chunks, question, criteria and calls, purpose `screen`, a line for each call with its decision, and the
+ * same budget as the listener (`createScreener` makes both). It answers a verdict and changes nothing: it never gives the text to
+ * the log to keep, so a withhold's line has no id. What it can't screen it answers `unscreened`, with why.
+ *
  * @module dish-judge/screen
  */
 
@@ -66,7 +71,7 @@ import type { ContentBlock, ContextFormed, UserMessage } from '@deepseek-ai/dsh-
 import type { PostToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { isTopLevelAgent, leftOut, privateKeyCuts } from 'dish-kit'
 import type { KeyCut, KeyCuts } from 'dish-kit'
-import type { Decision, Judge, JudgeResult, Question } from './client.ts'
+import type { Decision, Judge, JudgeAgent, JudgeResult, Question } from './client.ts'
 import type { JudgeLogLine } from './log.ts'
 import { DEFAULT_SETTINGS } from './settings.ts'
 import type { JudgeSettings } from './settings.ts'
@@ -535,7 +540,7 @@ export interface ResultScreenDeps {
   log(): ScreenLog | undefined
   /** Say something that went wrong in the screen, which was dealt with. */
   warn?(message: string): void
-  /** The budget of calls and characters that every screen of this listener shares. For a test to make it small; the default is the one above. */
+  /** The budget of calls and characters that every screen of this screener (its listener and `screenText`) shares. For a test to make it small; the default is the one above. */
   limits?: RateLimits
   /** What to cut out of a text before the judge reads it. For a test of what a failure of it does; the default is dish-kit's `privateKeyCuts`. */
   cutKeys?(text: string): KeyCuts
@@ -592,25 +597,66 @@ function contextsOf(decision: PostToolDecision): { additionalContexts: UserMessa
   return decision.additionalContexts === undefined || decision.additionalContexts.length === 0 ? {} : { additionalContexts: decision.additionalContexts }
 }
 
+/**
+ * What is screened, in place of a tool call: whose it is, what the calls and their lines say of it, and whether a withhold keeps
+ * it. A result's is its tool call's; a text's is what `screenText` was asked.
+ */
+interface Target {
+  /** The tool it is for: the state's `tool`, and the line's. */
+  tool: string
+  /** What the lines say was screened, given how many private keys were cut out of what was sent. */
+  subject: (keys: number) => string
+  /** What a warning calls it, such as `a result of web_fetch`. Never any of the text. */
+  what: string
+  agent?: JudgeAgent
+  callId?: string
+  /** Cancels the screen, which has a deadline of its own too. */
+  signal?: AbortSignal
+  /** Whether a withhold gives the text to the log to keep, for the user to read: a result's, yes; a text's, never. */
+  keep: boolean
+}
+
 interface Screening {
   deps: ResultScreenDeps
-  exec: ToolExecution
+  target: Target
   settings: JudgeSettings
-  /** The text of the result that is screened: the result's own, without dsh's framing. */
+  /** The text that is screened: a result's own, without dsh's framing. */
   content: string
-  /** All of the text of the result, which is what is kept when it is withheld, and what the line says the size of. */
+  /** All of the text, which is what is kept when it is withheld. */
   original: string
-  /** The budget that every screen of the listener shares. */
+  /** The budget that every screen of the screener shares. */
   budget: CallBudget
 }
 
+/** What a screen came to, for its caller to make its answer of. */
+interface Screened {
+  /** The highest P of any chunk that was screened, if any was. */
+  p?: number
+  /** For a withhold, whether the log kept the text. Never without `keep`. */
+  kept: boolean
+  /** How many characters of the content the chunks that were screened cover. */
+  checked: number
+  /** Set when every chunk that was sent was screened, and only `MAX_SCREENED_CHARS` kept the rest from the judge: how many characters that is. */
+  cappedAt?: number
+  /** Whether a call was not sent because of a private key in it (the client's `opaque`). */
+  keyed: boolean
+  /** How many private keys were cut out of what was sent. */
+  keys: number
+}
+
+/** What a subject says of the private keys that were cut out of what was sent. */
+function keysLeftOut(keys: number): string {
+  return `${keys === 1 ? 'a private key' : `${keys} private keys`} left out`
+}
+
 /**
- * Screen `content`: chunk it, ask Jev in as many calls as it takes, and say what the highest answer is.
- * @throws only for a mistake in this file; a failure of Jev, or of the log, is a verdict.
+ * Screen `content`: chunk it, ask Jev in as many calls as it takes, and say what the highest answer is. With `target.keep`, a
+ * withhold gives the text to the log to keep; without it, the log is never asked.
+ * @throws only for a mistake in this file; a failure of Jev, or of the log, is what it came to.
  */
-async function screen({ deps, exec, settings, content, original, budget }: Screening): Promise<Verdict> {
+async function screen({ deps, target, settings, content, original, budget }: Screening): Promise<Screened> {
   const { withhold: withholdAt, warn: warnAt, chunkChars } = settings.screening
-  const tool = exec.name
+  const { tool } = target
   const text = head(content, MAX_SCREENED_CHARS)
   const source: Source = { text, cuts: [] }
   let keys = 0
@@ -620,9 +666,9 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
     keys = found.keys
   } catch (error) {
     // Nothing is cut: the client finds the key, and refuses the call as it did before the cut, with the banner that says why.
-    deps.warn?.(`could not cut the private keys out of a result of ${tool}: ${describe(error)}`)
+    deps.warn?.(`could not cut the private keys out of ${target.what}: ${describe(error)}`)
   }
-  const subject = `${tool} (${original.length} chars${keys === 0 ? '' : `, ${keys === 1 ? 'a private key' : `${keys} private keys`} left out`})`
+  const subject = target.subject(keys)
   const base = Buffer.byteLength(JSON.stringify({ tool })) + 1
   const room = Math.max(MIN_ROOM_BYTES, CALL_STATE_BYTES - base - 64)
   const pieces = chunkSpans(text, chunkChars).flatMap((span, index) => fit(pieceOf(String(index), source, span.start, span.end), source, room))
@@ -632,7 +678,7 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
   const deadline = Math.max(0, settings.timeoutMs) + DEADLINE_SLACK_MS
   // From the start of the screen, not of each call: a client that ignores its signal can't stretch a screen past it by retrying.
   const hardAt = performance.now() + Math.max(0, settings.timeoutMs) + HARD_LIMIT_SLACK_MS
-  const signal = exec.signal === undefined ? AbortSignal.timeout(deadline) : AbortSignal.any([exec.signal, AbortSignal.timeout(deadline)])
+  const signal = target.signal === undefined ? AbortSignal.timeout(deadline) : AbortSignal.any([target.signal, AbortSignal.timeout(deadline)])
 
   // What is kept is the whole result, and the log is given it once, by the first call that finds it injected (or, if none got
   // as far, by the screen itself). The promise never rejects.
@@ -714,10 +760,10 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
           state,
           questions,
           purpose: 'screen',
-          ...exec.agent === undefined ? {} : { agent: exec.agent },
+          ...target.agent === undefined ? {} : { agent: target.agent },
           signal,
           tool,
-          callId: String(exec.callId),
+          ...target.callId === undefined ? {} : { callId: target.callId },
           subject,
           decide: async (answered, { signal: hookSignal }): Promise<Decision> => {
             if (!answered.ok) {
@@ -728,6 +774,7 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
             const p = highest(answered)
             if (p === undefined) return { decision: 'not-screened' }
             if (p >= withholdAt) {
+              if (!target.keep) return { decision: 'withhold' }
               const outcome = await within(keep(hookSignal), DECIDE_KEEP_MS)
               return outcome?.ok === true ? { decision: 'withhold', withheld: outcome.id } : { decision: 'withhold' }
             }
@@ -735,7 +782,7 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
           },
         })
       } catch (error) {
-        deps.warn?.(`the judge failed while screening a result of ${tool}: ${describe(error)}`)
+        deps.warn?.(`the judge failed while screening ${target.what}: ${describe(error)}`)
         return undefined
       }
     })()
@@ -744,7 +791,7 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
     if (result.decided?.withheld !== undefined) linked.add(result.decided.withheld)
     if (result.ok) {
       if (typeof result.answers !== 'object' || result.answers === null) {
-        deps.warn?.(`the judge's answer for a result of ${tool} had no answers`)
+        deps.warn?.(`the judge's answer for ${target.what} had no answers`)
         return unscreened(group)
       }
       return group.map((piece): Leaf => {
@@ -769,27 +816,40 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
   const found = leaves.flatMap(leaf => leaf.p === undefined ? [] : [leaf.p])
   const p = found.length === 0 ? undefined : Math.max(...found)
 
-  if (p !== undefined && p >= withholdAt) {
+  let kept = false
+  if (target.keep && p !== undefined && p >= withholdAt) {
     const result = await within(keep(AbortSignal.timeout(KEEP_GRACE_MS)), KEEP_GRACE_MS)
-    reportKept(deps, exec, subject, linked, result, keeping)
-    return { kind: 'withhold', p, kept: result?.ok === true }
+    reportKept(deps, target, subject, linked, result, keeping)
+    kept = result?.ok === true
   }
+  const capped = text.length < content.length && leaves.every(leaf => leaf.p !== undefined)
+  return {
+    ...p === undefined ? {} : { p },
+    kept,
+    checked: screenedChars(leaves),
+    ...capped ? { cappedAt: text.length } : {},
+    keyed: leaves.some(leaf => leaf.opaque === true),
+    keys,
+  }
+}
+
+/** What a screen of a result came to, as what is done with the result. */
+function verdictOf(screened: Screened, settings: JudgeSettings, length: number): Verdict {
+  const { p, checked, keyed } = screened
+  if (p !== undefined && p >= settings.screening.withhold) return { kind: 'withhold', p, kept: screened.kept }
 
   const banners: string[] = []
   const summaries: string[] = []
-  if (p !== undefined && p >= warnAt) {
+  if (p !== undefined && p >= settings.screening.warn) {
     banners.push(warnBanner(p))
     summaries.push(`possible instructions (p ${percent(p)})`)
   }
-  const checked = screenedChars(leaves)
   // What was not sent because of a private key says so, and not that the judge was unavailable.
-  const keyed = leaves.some(leaf => leaf.opaque === true)
   if (checked === 0) {
     banners.push(keyed ? privateKeyBanner(false) : notScreenedBanner())
     summaries.push('not screened')
-  } else if (checked < content.length) {
-    const tail = text.length < content.length && leaves.every(leaf => leaf.p !== undefined)
-    banners.push(keyed ? privateKeyBanner(true) : partlyScreenedBanner(tail ? text.length : undefined))
+  } else if (checked < length) {
+    banners.push(keyed ? privateKeyBanner(true) : partlyScreenedBanner(screened.cappedAt))
     summaries.push('partly screened')
   }
   return banners.length === 0 ? { kind: 'pass' } : { kind: 'mark', banners, summary: `Judge: ${summaries.join(', ')}` }
@@ -804,25 +864,25 @@ async function screen({ deps, exec, settings, content, original, budget }: Scree
  *
  * Never throws.
  */
-function reportKept(deps: ResultScreenDeps, exec: ToolExecution, subject: string, linked: ReadonlySet<string>, now: Kept | undefined, keeping: Promise<Kept> | undefined): void {
+function reportKept(deps: ResultScreenDeps, target: Target, subject: string, linked: ReadonlySet<string>, now: Kept | undefined, keeping: Promise<Kept> | undefined): void {
   const write = (error: string | null, id?: string): void => {
     try {
       const log = deps.log()
       if (log === undefined) return
-      const agentId = (exec.agent as { id?: unknown } | undefined)?.id
+      const agentId = target.agent?.id
       const line: JudgeLogLine = {
         at: Date.now(),
         purpose: 'screen',
         subject,
-        tool: exec.name,
-        callId: String(exec.callId),
+        tool: target.tool,
+        ...target.callId === undefined ? {} : { callId: target.callId },
         answers: {},
         decision: 'withhold',
         latencyMs: null,
         error,
         ...id === undefined ? {} : { withheld: id },
         ...typeof agentId === 'string' ? { agent: agentId } : {},
-        ...exec.agent === undefined ? {} : { child: !isTopLevelAgent(exec.agent) },
+        ...target.agent === undefined ? {} : { child: !isTopLevelAgent(target.agent) },
       }
       log.write(line)
     } catch {
@@ -846,25 +906,135 @@ function reportKept(deps: ResultScreenDeps, exec: ToolExecution, subject: string
 
 export type ResultScreen = (exec: ToolExecution, result: Readonly<ToolExecutionResult>, next: () => Promise<PostToolDecision>) => Promise<PostToolDecision>
 
+/** What `screenText` is asked: a text that is not a tool's result, and what its lines say of it. */
+export interface TextScreenRequest {
+  text: string
+  /** What the lines say was screened, such as `memory:family/flaky-e2e`. Never the text itself. */
+  subject: string
+  /** The tool the text is for, such as `remember`: the state's `tool`, and the line's. */
+  tool: string
+  /** The agent the text is from, as the result screen passes a tool call's: for the line. */
+  agent?: unknown
+  /** Cancels the screen, which ends by `timeoutMs` and a little over in any case. */
+  signal?: AbortSignal
+}
+
+/**
+ * What `screenText` answers. A verdict is from the highest P of the chunks, by the settings' thresholds (`clean` below `warn`), and
+ * `probability` is that P. `unscreened` is a text it could not screen, or not all of: `reason` says why, in words for a person.
+ */
+export type TextScreen =
+  | { verdict: 'clean' | 'warn' | 'withhold', probability: number }
+  | { verdict: 'unscreened', reason: string }
+
+/** Why `screenText` could not screen a text, or not all of it. */
+const NO_JUDGE = 'the judge is unavailable'
+const PART_UNCHECKED = 'part of it could not be checked'
+const HOLDS_KEY = 'it holds a private key'
+const SCREEN_FAILED = 'the screen failed'
+
+const unscreenedFor = (reason: string): TextScreen => ({ verdict: 'unscreened', reason })
+
+/**
+ * What a screen of a text came to, as `screenText` answers. As with a result, a withhold or a warning stands over what was not
+ * checked, and what was not sent because of a private key says so. A key the cut took out of what was sent is a text that was
+ * not all screened either, so it is `unscreened` too, unless what was sent is a warning or a withhold.
+ */
+function textScreenOf(screened: Screened, settings: JudgeSettings, length: number): TextScreen {
+  const { p, checked, keyed } = screened
+  if (p !== undefined && p >= settings.screening.withhold) return { verdict: 'withhold', probability: p }
+  if (p !== undefined && p >= settings.screening.warn) return { verdict: 'warn', probability: p }
+  if (checked === 0) return unscreenedFor(keyed ? HOLDS_KEY : NO_JUDGE)
+  if (checked < length) return unscreenedFor(keyed ? HOLDS_KEY : PART_UNCHECKED)
+  if (screened.keys > 0) return unscreenedFor(HOLDS_KEY)
+  return { verdict: 'clean', probability: p ?? 0 }
+}
+
+/** The settings now, or the shipped default, with a warning, if they can't be read. */
+async function settingsOf(deps: ResultScreenDeps): Promise<JudgeSettings> {
+  try {
+    return await deps.settings()
+  } catch (error) {
+    deps.warn?.(`could not read the judge settings (${describe(error)}); screening with the shipped default`)
+    return DEFAULT_SETTINGS
+  }
+}
+
+/** What `createScreener` makes: the result screen's listener, and `screenText`, which share one budget. */
+export interface Screener {
+  listener: ResultScreen
+  /**
+   * Screen `text` as a screened tool's result is screened, and say what it came to. It never throws, never gives the text to the
+   * log to keep, and never puts any of it in a warning: each call's line has the request's `tool` and `subject`. See `TextScreen`.
+   */
+  screenText(request: TextScreenRequest): Promise<TextScreen>
+}
+
+/**
+ * The result screen's listener and `screenText`, over one budget of calls and characters: they all ask Jev, and TypeSafe's limits
+ * are the host's. The plugin makes one, provides its `screenText` on `dishJudge` and registers its listener.
+ */
+export function createScreener(deps: ResultScreenDeps): Screener {
+  // One budget for every screen of this screener, which is every screen of the host: they run at once.
+  const budget = new CallBudget(deps.limits ?? DEFAULT_LIMITS)
+  return {
+    listener: listenerOf(deps, budget),
+    async screenText(request) {
+      // What the warning below names. The request is read inside the `try`: one that is not a request is a failed screen, not a throw.
+      let subject = 'a text'
+      try {
+        if (typeof request?.subject === 'string') subject = request.subject
+        const { text, tool, agent, signal } = request
+        if (typeof text !== 'string' || typeof tool !== 'string' || typeof request.subject !== 'string') {
+          throw new TypeError('screenText takes { text, subject, tool }, all strings')
+        }
+        // Nothing to read, and nothing in it.
+        if (text.trim() === '') return { verdict: 'clean', probability: 0 }
+        const settings = await settingsOf(deps)
+        const screened = await screen({
+          deps,
+          target: {
+            tool,
+            subject: keys => keys === 0 ? subject : `${subject} (${keysLeftOut(keys)})`,
+            what: subject,
+            ...agent === undefined ? {} : { agent: agent as JudgeAgent },
+            ...signal === undefined ? {} : { signal },
+            keep: false,
+          },
+          settings,
+          content: text,
+          original: text,
+          budget,
+        })
+        return textScreenOf(screened, settings, text.length)
+      } catch (error) {
+        try {
+          deps.warn?.(`the screen failed on ${subject}: ${describe(error)}`)
+        } catch {
+          // Nothing to do about it.
+        }
+        return unscreenedFor(SCREEN_FAILED)
+      }
+    },
+  }
+}
+
 /**
  * The `tools/post-execute` listener. The plan's `resultScreen(judge, settings, log)` takes the log for `withhold` only: the
- * client writes the line for each call, and the screen gives it the decision through `decide`.
+ * client writes the line for each call, and the screen gives it the decision through `decide`. It has a budget of its own: one
+ * that `screenText` shares is `createScreener`'s.
  *
  * It does not throw for anything Jev or the log does. If the listener itself fails, the call fails with it: the result is not
  * delivered, which is as closed as it can be.
  */
 export function resultScreen(deps: ResultScreenDeps): ResultScreen {
-  // One budget for every screen of this listener, which is every screen of the host: they run at once.
-  const budget = new CallBudget(deps.limits ?? DEFAULT_LIMITS)
+  return createScreener(deps).listener
+}
+
+function listenerOf(deps: ResultScreenDeps, budget: CallBudget): ResultScreen {
   return async (exec, result, next) => {
     if (result.isError) return next()
-    let settings: JudgeSettings
-    try {
-      settings = await deps.settings()
-    } catch (error) {
-      deps.warn?.(`could not read the judge settings (${describe(error)}); screening with the shipped default`)
-      settings = DEFAULT_SETTINGS
-    }
+    const settings = await settingsOf(deps)
     if (!isScreened(exec.name, settings.tools.screened)) return next()
 
     const downstream = await next()
@@ -886,9 +1056,18 @@ export function resultScreen(deps: ResultScreenDeps): ResultScreen {
       return downstream
     }
 
+    const target: Target = {
+      tool: exec.name,
+      subject: keys => `${exec.name} (${original.length} chars${keys === 0 ? '' : `, ${keysLeftOut(keys)}`})`,
+      what: `a result of ${exec.name}`,
+      ...exec.agent === undefined ? {} : { agent: exec.agent },
+      callId: String(exec.callId),
+      ...exec.signal === undefined ? {} : { signal: exec.signal },
+      keep: true,
+    }
     let verdict: Verdict
     try {
-      verdict = await screen({ deps, exec, settings, content, original, budget })
+      verdict = verdictOf(await screen({ deps, target, settings, content, original, budget }), settings, content.length)
     } catch (error) {
       deps.warn?.(`the result screen failed on a result of ${exec.name}: ${describe(error)}`)
       verdict = { kind: 'mark', banners: [notScreenedBanner()], summary: 'Judge: not screened' }
@@ -911,14 +1090,15 @@ export function resultScreen(deps: ResultScreenDeps): ResultScreen {
 }
 
 /**
- * Register the screen on `ctx` as a `tools/post-execute` listener, not prepended. It finds the client, the settings and the log
- * with `ctx.get` on each result, so it needs nothing from the plugin that is already provided. A listener is live as soon as it is
- * registered and a service only when the plugin's `apply` is done, so a screened result that comes between is marked "not screened".
- * It goes when `ctx` does.
+ * Register the screen on `ctx` as a `tools/post-execute` listener, not prepended: `screener`'s listener (the plugin's, whose
+ * budget its `screenText` shares), or else one of its own. That one finds the client, the settings and the log with `ctx.get` on
+ * each result, so it needs nothing from the plugin that is already provided. A listener is live as soon as it is registered and a
+ * service only when the plugin's `apply` is done, so a screened result that comes between is marked "not screened". It goes when
+ * `ctx` does.
  */
-export function registerResultScreen(ctx: Context): void {
+export function registerResultScreen(ctx: Context, screener?: Screener): void {
   const logger = ctx.logger('dish-judge')
-  const listener = resultScreen({
+  const { listener } = screener ?? createScreener({
     judge: () => ctx.get('judge'),
     settings: () => ctx.get('dishJudge')?.settings() ?? Promise.resolve(DEFAULT_SETTINGS),
     log: () => ctx.get('dishJudge')?.log,
