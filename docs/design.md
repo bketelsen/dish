@@ -7,7 +7,7 @@ Status: draft, from the brainstorm on 2026-09-30. It records what we decided and
 **One main agent** runs on a VM and works across whole GitHub orgs:
 - It talks with you, plans, and delegates about 90% of the work to a fixed crew of specialists.
 - It verifies what comes back and keeps the chat open the whole time.
-- It works toward a direction you set for each **project family**: a named set of repos you register explicitly. It works unattended, but only on initiatives you've approved.
+- It works toward a direction you set for each **project family**: a named set of repos you register explicitly. It works unattended, but only on routines you've approved and runs you started.
 - Code reaches a repo only through a pipeline: plan → implement → **structural gate** → **cross-family review** → PR. Humans merge.
 
 ## Principles
@@ -28,10 +28,10 @@ Status: draft, from the brainstorm on 2026-09-30. It records what we decided and
 
 | Kind | Default | Holds | Versioned |
 |---|---|---|---|
-| Config | `$XDG_CONFIG_HOME/dish/` | `crew.yaml` (roles, model tiers, tools), `prompts/<role>.md`, `skills/<name>/SKILL.md`, `projects.yaml` (the repo registry: family, role, gate, setup), `families/<family>/` (direction, approved initiatives) | git repo; every UI save is a commit; history, diff and revert in the UI |
-| Data | `$XDG_DATA_HOME/dish/` | `vault/` (memory, its own git repo pushed to a private GitHub repo), `ledgers/<owner>/<repo>/<run>.jsonl` (each run's ledger, written by `orchestrator`, kept forever; outside a registered project, the skills keep a plan's ledger in `.worktrees/<plan>-ledger.md`), initiative status, crew's records | the vault via git; ledgers append-only |
+| Config | `$XDG_CONFIG_HOME/dish/` | `crew.yaml` (roles, model tiers, tools), `prompts/<role>.md`, `skills/<name>/SKILL.md`, `projects.yaml` (the repo registry: family, role, gate, setup), `families/<family>/` (`direction.md`, routines) | git repo; every UI save is a commit; history, diff and revert in the UI |
+| Data | `$XDG_DATA_HOME/dish/` | `vault/` (user and family memory, its own git repo pushed to the private `bketelsen/dish-vault`), `ledgers/<owner>/<repo>/<run>.jsonl` (each run's ledger, written by `orchestrator`, kept forever; outside a registered project, the skills keep a plan's ledger in `.worktrees/<plan>-ledger.md`), crew's records | the vault via git; ledgers append-only |
 | Work | the work root: `~/work` (the service's working directory) | the projects' clones, `<owner>/<repo>`, each with its task worktrees in `.worktrees/<slug>`, and the `scratch` workspace for general chats. Not under `$XDG_DATA_HOME`: these are dsh workspaces, where agents write | each clone is its repo's git |
-| State | `$XDG_STATE_HOME/dish/` | inbox items, trigger and run state, logs; the projects' onboarding status, each clone's and worktree's record, setup logs, and the read-token files (`workspaces/`); gate logs (`gates/<owner>/<repo>/<slug>/<child>-<turn>-<round>.log`, pruned after 30 days); run records (`orchestrator/<owner>/<repo>/runs/`) | no |
+| State | `$XDG_STATE_HOME/dish/` | routine and run state, logs; the projects' onboarding status, each clone's and worktree's record, setup logs, and the read-token files (`workspaces/`); gate logs (`gates/<owner>/<repo>/<slug>/<child>-<turn>-<round>.log`, pruned after 30 days); run records (`orchestrator/<owner>/<repo>/runs/`) | no |
 | Cache | `$XDG_CACHE_HOME/dish/` | Copilot model catalog cache (`copilot-models.json`), fetched pages | no |
 
 One instance's dish directories move together: when `DSH_DISH_HOME` is set to an absolute path, dish-kit's `xdgPaths` puts all four at `$DSH_DISH_HOME/{config,state,data,cache}/dish`, ahead of the XDG variables, and `workRoot()` puts the work root at `$DSH_DISH_HOME/work`. Dev, the default for everything but the VM's service, sets it to `<checkout>/.dev`; prod uses the defaults above. dsh drops `DSH_*` names from agent shells, so it never reaches an agent's commands. See the [ops spec](specs/ops.md).
@@ -80,24 +80,27 @@ A family is a named set of repos with its own direction.
 
 The first family is **frostyard**, with these repos: `snosi`, `nsl`, `updex`, `chairlift`, `intuneme`, `core`, `firn`, `lab`, `testsuite`. Frostyard's earlier agent tooling (snowcat, bobsled, rime and others) is ignored and being replaced. A **bketelsen** family with a handful of repos is likely next.
 
+Revised 2026-10-05, after comparing this plan with [Claude Code's Projects](https://code.claude.com/docs/en/claude-projects): a family stays a set of repos, not a goal, so its memory and direction cover every stream of work in its repos. From Projects it takes the long-lived chat that coordinates work, a view of that work by state, and routines in place of initiatives. Memory (step 8) comes before families (step 9), and routines are step 10. Step 9's spec settles the details.
+
 | Part | Owner | Stored as |
 |---|---|---|
-| **Direction**: north star, ranked priorities, non-goals and constraints | you; the main agent can *propose* changes to your inbox | config |
+| **Direction**: north star, ranked priorities, non-goals and constraints | you; the main agent can *propose* changes | config (`families/<family>/direction.md`) |
 | **Repos**: each with a one-line role, its gate, and later an automerge flag | you | config |
-| **Initiatives**: workstreams under the direction | the main agent proposes; you approve. Approved definitions are config; their status is data. | config + data |
-| **Standing initiatives**, e.g. "keep CI green on the 9 repos", "triage new issues" | approved once; events feed work into them | config + data |
-| **Ledger**: decisions, rulings, actions, PRs | the main agent | data, append-only |
+| **Memory**: decisions, pitfalls, preferences and references the agents learned in the family's repos | the main agent writes; you edit | data (the vault) |
+| **Routines**: standing work, e.g. "keep CI green on the 9 repos", "triage new issues", a morning planning pass | you approve each one; the main agent may suggest them | config + data |
+| **Runs**: each change on its way to a PR, with its ledger (step 7) | the harness, and the main agent's rulings | data, append-only |
 
-Everything here is edited and watched on a **Families** page in the web UI.
+- **The family chat** is one long-lived conversation where you hand the family work. It coordinates the family's runs. Each run is driven by its own main-agent session in the project's workspace, which reports back when it finishes, is blocked or needs a ruling. The family chat works from its direction, its memory and the state of its runs, not its full history.
+- **The Overview** shows the family's runs grouped by state, derived from harness facts (run records, gates, verdicts and PR state), never from the model's account: working, waiting on you, ready for review, landing, idle, resolved. "Waiting on you" across all families takes the place of a separate inbox.
 
 ### Unattended work
 
-- **Wake-ups** come from schedules (e.g. a morning planning pass) and GitHub events (issues, CI failures in a family's registered repos, arriving through a Tailscale Funnel webhook path).
+- **Wake-ups** come only from routines: schedules (e.g. a morning planning pass) and GitHub events (issues, CI failures in a family's registered repos, arriving through a Tailscale Funnel webhook path). A run's PR is also watched: a CI failure or a review comment wakes the session that drives the run.
   - An org can send everything through one org webhook, and events from unregistered repos are dropped.
-  - A user namespace has no org-level webhook, so its registered repos each get their own hook. `triggers` installs and removes those as repos are registered.
-- On each wake-up the main agent reads the direction and the state of the repos, then works **only on approved or standing initiatives**.
-- A new issue gets filed under an existing initiative if it fits. Otherwise it becomes a *proposed* initiative in your inbox.
-- Results, proposals and anything waiting for you go to the **inbox** page. There are no push notifications.
+  - A user namespace has no org-level webhook, so its registered repos each get their own hook. `routines` installs and removes those as repos are registered.
+- On each wake-up the main agent reads the direction, its memory and the state of the repos, then works **only within the routine that woke it**.
+- Work outside every routine, such as a new issue no routine covers, becomes a *suggested* run under "Waiting on you".
+- Results go to the family chat and the Overview. There are no push notifications.
 - No budget cap for now.
 
 ## The judge (Jev)
@@ -115,7 +118,7 @@ At $0.042 per million input tokens it's cheap enough to sit on every tool call, 
 |---|---|
 | Shape | A `judge` service (`ctx.judge`) that plugins call. The main agent also gets an ad hoc `ask_judge` tool. |
 | First uses | **Guardrails.** (Refined in the [judge spec](specs/judge.md): in the web profile approvals only fire on sandbox escalations, so the gate sits on every shell command, with the approval answerer behind it.) (1) A machine answerer on dsh's approval seam: each command is read-only, reversible or irreversible, with confidence gating (confident and safe runs; irreversible is blocked; in between asks you). This makes `infra`'s tiered autonomy real. (2) Screening tool results for injected instructions before they reach an agent (GitHub issues, CI logs, web pages). |
-| Later uses | Checking crew claims against evidence, diff risk scores, issue triage into initiatives, model routing, and when to compact. |
+| Later uses | Checking crew claims against evidence, diff risk scores, issue triage into runs and suggestions, model routing, and when to compact. |
 | Questions vs thresholds | Questions live in each plugin's code, reviewed like code. Thresholds live in the config store, tunable in the UI with history. |
 | When Jev is down | Gates fail closed and ask you. Advisory uses skip. |
 | Access | Direct TypeSafe API (`api.typesafe.ai/v1/systemone`, `jev-latest`). The key goes in dsh's credential store through a small settings card, never in the config repo. |
@@ -136,10 +139,9 @@ Each is its own bundle. "Provides" names its Cordis service; plugins depend only
 | `gates` | `dishGates` | nothing at load; reads `dishCrew`, `dishWorkspaces`, `dishProjects` and dsh's `shell` with `ctx.get` | running a project's gate in a bound coder's worktree at turn-stop, through dsh's sandboxed shell; steering a failure back, up to 3 gate runs a turn; gating after a coder's `report`; `runAt` for `open_pr`; the gate logs; the `dish-gates/result` event. Results go in crew's record, which owns the finish notice's gate line and the review check. See the [gates spec](specs/gates.md) |
 | `orchestrator` | `dishRuns` | nothing at load; reads `dishCrew`, `dishGates`, `dishWorkspaces`, `dishProjects` and dsh's `agents` with `ctx.get` | runs, their ledgers, the `run`, `open_pr` and `pr_feedback` tools, and Settings → Runs. The dish preset stays in `crew`. See the [orchestrator spec](specs/orchestrator.md) |
 | `browser` | — | nothing at load; reads dsh's `agents`, `sandboxPolicy`, `attachments`, `llm`, `workspaceRegistry` and `webServer`, and `dishCrew`, with `ctx.get`, and waits for `tools` | one headless Chromium and a browser per agent session, the ten `browser_*` tools, the Browser tab (a live picture you can click and type into) and the screenshot's view in the chat. See the [browser spec](specs/browser.md) |
-| `families` | `families` | `dishConfig`, `projects` | direction, initiatives, ledger, the Families page |
-| `inbox` | `inbox` | — | items (proposal, approval, result) and the mobile-friendly page |
-| `triggers` | — | `families`, `inbox` | schedules and GitHub events → main-agent wake-ups |
-| `memory` | `memory` | — | the vault: notes, search and agent tools |
+| `memory` | `memory` | `dishConfig`; reads `dishProjects`, `dishWorkspaces` and `dishJudge` with `ctx.get` | the vault (user and family memory), `remember`, `forget` and `recall`, the message that gives agents the memory indexes and the family's direction, Settings → Memory (step 8). See the [memory spec](specs/memory.md) |
+| `families` | `families` | `dishConfig`, `projects`, `memory`, `dishRuns` | the family chat and its run drivers, the Overview with "Waiting on you" across families, watching runs' PRs, pausing a family (step 9) |
+| `routines` | — | `families` | approved schedules and GitHub events → wake-ups in a family (step 10; formerly `triggers`) |
 | `judge` | `judge` | `dishConfig` (thresholds) | the TypeSafe Jev client, the key settings card, guardrails (approval answerer and result screen, whose `tools.screened` names `pr_feedback` and `browser_*`), `ask_judge` |
 | `web` | — | dsh's `webRuntime` | settings over the tailnet: pages on the trusted host count as the operator's own machine. See the [ops spec](specs/ops.md#settings-over-the-tailnet-dish-web) |
 | `copilot` (done) | `copilotCatalog` | — | Copilot sign-in and the live model catalog |
@@ -159,13 +161,14 @@ Swapping a piece means keeping its service contract. For example:
 | Models | Main and architect strong; others mid-tier; the main agent may override. The reviewer is always cross-family from the coder. |
 | Gates | Declared explicitly per repo, run by the harness, with an escalation ladder (N = 5 rounds). Family-wide gate conventions come later. |
 | Merging | Humans merge. Automerge is left open as a later per-repo option. |
-| Unattended scope | Approved initiatives only, plus standing initiatives fed by events. |
-| Triggers | Schedules and GitHub events. |
+| Families vs goals | A family is a set of repos, not a goal: one direction and one memory cover every stream of work in its repos. Initiatives are replaced by routines and suggested runs. (2026-10-05, after comparing the plan with Claude Code's Projects.) |
+| Unattended scope | Routines you approved, and the PRs of runs you started. Anything else becomes a suggested run. (Was: approved and standing initiatives; revised 2026-10-05.) |
+| Routines | Schedules and GitHub events, each one approved and owned by a family. |
 | Budget | None for now. |
 | Workspaces | One clone per repo on the VM, one worktree per task. |
-| Hosting | VM on Tailscale, Funnel for the webhook path only, inbox page only. |
+| Hosting | VM on Tailscale, Funnel for the webhook path only, no push notifications ("Waiting on you" only). |
 | Sandbox | On the VM, an agent's sandboxed shell can write the home directory, except a protected list: dish's and dsh's own state, the checkout, credentials and git's config, and what runs later outside the sandbox (shell startup files, systemd user units). It is dsh's `runnerCommand` hook on the `sandbox` row, set to `deploy/dish-sandbox` by `install.sh` with `DISH_SANDBOX_HOME=on`. The VM is the boundary. Dev keeps the read-only home. See the [sandbox-home spec](specs/sandbox-home.md). |
-| Memory | A fresh vault in git, backed up to a private GitHub repo. |
+| Memory | A fresh vault in git, backed up to the private `bketelsen/dish-vault`: user memory and family memory, in Claude Code's auto-memory format. Built before families (2026-10-05). |
 | Prompts | Every role's prompt is editable in the web UI and versioned. |
 | Storage | Config and runtime data kept apart; XDG defaults. |
 
@@ -195,7 +198,7 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
   - GPT-5 mini passed an invented route (`openai/gpt-4o-mini`). The child failed after starting and the notice said only "left no closing message", so the main agent retried 67 times.
   - Fix: `delegate` now checks the route synchronously (errors name the valid models), treats empty strings as absent, and caps children per agent.
   - Generalization: anything a model can get wrong that costs quota gets a structural check.
-- **Don't trust the main agent's account of events.** When `delegate` failed to load, the main agent fabricated a plausible results table. The ledger and the inbox must record harness events (delegations, settlements, gate runs), not model claims (step 7: the run's ledger does, from listeners; the main agent's own entries are marked `by: main`).
+- **Don't trust the main agent's account of events.** When `delegate` failed to load, the main agent fabricated a plausible results table. The ledger and the Overview must record harness events (delegations, settlements, gate runs), not model claims (step 7: the run's ledger does, from listeners; the main agent's own entries are marked `by: main`).
 - **Child failure notices hide the cause.** `crew` should attach the child's error to the notice it sends the parent.
 - **The main agent's prompt must say "end your turn, you'll be notified".** In headless mode, without that instruction, it busy-polled `list_agents`. With it, in the web UI, it ended its turn properly.
 - **Children inherit the parent's other delegation tools** (`subagent`, `subagent_fork`, `workflow`). Depth limits make them fail, but they should be filtered out for children.
@@ -215,7 +218,7 @@ Prototype: `plugins/crew` (a `delegate` tool), run in throwaway `spike` (headles
      - Each user needs an identity across sessions.
      - Copilot sign-in is per user, or shared.
      - Commits in the config store need the real author, not just "user".
-     - Approvals and the inbox need routing per user.
+     - Approvals and "Waiting on you" need routing per user.
      - Who may edit prompts, crew and family direction, vs who may only use them?
    - **Cost:** whose Copilot quota pays for whose work?
    - **Where it would go:** the Caddy VM that already fronts your self-hosted services, with its route and the dish Incus instance defined in your GitOps repo `~/projects/fleet`.
