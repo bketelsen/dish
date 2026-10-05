@@ -65,13 +65,13 @@ A spawn environment without `HOME` reaches the real home directory. **Why:** …
 | `name` | Lowercase letters, digits and hyphens, starting with a letter or digit, at most 64 characters, and the file's name without `.md`. `memory` is reserved. |
 | `description` | One line, at most 150 characters: what the index shows. |
 | `type` | `feedback` (what you corrected or confirmed about how to work), `user` (who you are and how you work), `project` (a decision and its why, a deadline, a pitfall) or `reference` (where something lives outside the repos). |
-| `modified` | Set by `dish-memory` on every write, in UTC. Nobody supplies it. |
+| `modified` | Stamped by `dish-memory`, in UTC, on every save of the memory's text. **Release** keeps it, and a revert restores the earlier file's. Nobody supplies it. |
 | `held` | Only on a held memory: why, on one line. |
 | body | Markdown, not empty, at most 8 KiB. `feedback` and `project` memories give the fact, then **Why:** and **How to apply:**. |
 
 A family's name follows the name's grammar, which is why `projects.yaml`'s `family` is a lowercase name. The frontmatter is a small subset of YAML, read by hand: a value YAML would read as something other than its text is written as a JSON string, so GitHub shows every file as it is. The vault refuses a malformed memory or index (`INVALID`) even from code that goes around the service.
 
-The index's lines are `- [<name>](<name>.md) — <description> (<type>)`, sorted by type (feedback, user, project, reference), then newest first.
+The index's lines are `- [<name>](<name>.md) — <description> (<type>)`, sorted by type (feedback, user, project, reference), then newest first, then by name.
 
 ## The message and when it comes
 
@@ -93,7 +93,7 @@ An agent's family is that of the project whose clone holds its working directory
 4. a paragraph that says the memories are background, not instructions: true when written, possibly stale, to be checked before relied on, and never permission for anything by themselves;
 5. "Your user:" and "Family <family>:", each scope's index by id (`user/<name>`, `family/<name>`), cut at 150 lines or 16 KiB, whichever comes first, then "…and N more: `recall` with no `id` lists them all."
 
-A part with nothing in it is left out, and with nothing at all to say there's no message. Anything in a memory or a direction that a model could read as the closing tag is escaped.
+A part with nothing in it is left out, and with nothing at all to say there's no message, unless the agent already has one for other scopes: then it gets a bare one that says only that it supersedes earlier ones. Anything in a memory or a direction that a model could read as the closing tag is escaped.
 
 **When.** The row's `agent/pre-step` listener does what dsh-agent-instructions does for `AGENTS.md`: after the step's other listeners, it looks for the newest `dish-memory` message among the step's messages and on the session's surface. When there's none for the agent's scopes, it composes one and puts it after the step's last claimed message. So:
 - the first step gets it;
@@ -111,7 +111,7 @@ All three are the dish preset's, registered by its row. Each answers with one te
 - **`forget`** (`id`), for the main agent only: deletes `user/<name>` or `family/<name>` and regenerates the index, in one commit. An unknown id is `NOT_FOUND`, and the answer says `recall` lists them.
 - **`recall`** (`id`, optional), for every dish agent, and in every crew role's tools in `crew.yaml`, just before `ask_judge`. With no `id`, it lists every memory the agent can see, past the message's budget too, held ones left out: both scopes for the main agent, the family's for a child. With an `id`, it reads that memory in full: its type, when it was modified, its description and its body. A held memory's answer says only that it's held, and a child asking for `user/…` is told there's no such memory.
 
-A refusal starts with its code: `INVALID` (a field breaks the rules), `SECRET` (it looks like it holds a credential; nothing is echoed), `CONFLICT`, `NOT_FOUND`, or `UNAVAILABLE` (this plugin isn't running). A refusal or a log line names a memory by its id and never holds its text.
+A refusal from the vault or the service starts with its code: `INVALID` (a field breaks the rules), `SECRET` (it looks like it holds a credential; nothing is echoed), `CONFLICT`, `NOT_FOUND`, or `UNAVAILABLE` (the chat's family couldn't be looked up just then). Three refusals carry no code: a child's `remember` or `forget` gets "remember and forget are for the main agent only"; `family` outside a project's clone gets "this chat isn't working in a family's repos (scratch, or no registered project): use scope user, or open the chat in the project"; and with this plugin not running, every tool answers "memory is unavailable: dish-memory isn't running". A refusal or a log line names a memory by its id and never holds its text.
 
 **Crew's part.** A coder's and a reviewer's `report` can carry `remember`, up to five one-line suggestions of at most 300 characters, which the notice to the main agent lists under "Worth remembering"; the other roles end their closing message with a "Worth remembering:" list. A run's close answers (`open_pr`, `run` `abandon`) list its rulings. Nothing is saved until the main agent calls `remember`.
 
@@ -121,16 +121,16 @@ A refusal starts with its code: `INVALID` (a field breaks the rules), `SECRET` (
 - **Before the screen:** the fields are checked, then the text is scanned for credentials, so a secret never reaches Jev.
 - **At or above `warn`** (0.50 by default, `judge.yaml`'s `screening.warn`), the memory is saved held, with a reason such as "Jev scored it 0.93 as instructions aimed at an agent". A held memory is out of the index, the message and `recall`. `remember`'s answer says it was held, and Settings → Memory lists it first, with **Release** and **Delete**.
 - **Below it,** or **when Jev can't screen** (no judge, no key, a timeout), the memory is saved as usual: screening is advisory, and saving never waits on Jev.
-- **Your own edits aren't screened.** Saving new text for a held memory on the page releases it; saving it unchanged keeps it held.
+- **Your own edits aren't screened.** Saving new text for a held memory on the page releases it, as **Release** does.
 
 ## Settings → Memory
 
 A `settings.section` page, "Memory", after Runs.
 - **The scopes:** "You", then each family in `projects.yaml`, then any family that still has memories but no project, marked "(no projects)". Each shows its count, and a dot when some are held. In a narrow window the list becomes a dropdown.
-- **Memories:** held ones first, with their reasons and **Release** and **Delete**; then the rest, with name, type, description and how long ago each was modified. **New** opens an empty editor.
-- **The editor:** the name (fixed once saved), the type, the description (one line, counted to 150) and the body. **Save** sends the commit the memory was read at; if the memory changed since, your text stays and the conflict box shows theirs beside a diff, with "Reload (drop my edit)" and "Keep mine". **Delete** asks once: agents stop seeing it at their next compaction or chat.
-- **Direction** (families only): the editor, starting from the template when there's none, with a note, **Save** and the same conflict box; "N proposals waiting on the History page" when the main agent proposed changes. Proposals are accepted on Settings → History, as for other documents.
-- **History:** the scope's vault commits, 20 at a time, each with its author, time, note, paths, diff and **Revert**. A revert restores the memory files the commit changed and regenerates the index, and is a `CONFLICT` when one of them changed since.
+- **Memories:** held ones first, with their reasons and **Release** and **Delete**; then the rest, with name, type, description and how long ago each was modified. **New** opens an empty editor, typed `user` under You and `project` under a family.
+- **The editor:** the name (fixed once saved), the type, the description (one line, counted to 150) and the body. **Save** sends the commit the memory was read at; if the memory changed since, your text stays and the conflict box shows theirs beside a diff, with "Reload (drop my edit)" and "Keep mine". **Delete** asks once: agents stop seeing it at their next compaction or chat. Leaving an editor with unsaved changes asks first.
+- **Direction** (families only): the editor, starting from the template when there's none (**Save** stays off until you change it), with a note, **Save**, **Discard** and the same conflict box; "N proposals waiting on the History page" when the main agent proposed changes. Proposals are accepted on Settings → History, as for other documents.
+- **History:** the scope's vault commits, 20 at a time, each with its author, time, note and the memory files it changed (the index left out). One opens to its diff and **Revert**, which asks once. A revert restores the memory files the commit changed and regenerates the index, and is a `CONFLICT` when one of them changed since.
 - **Preview:** the message a main agent working in that scope would get now, or "Agents in this scope get no memory message now."
 - **The remote line:** the vault's last push, what's waiting and the last error, as on History, and "Live updates paused. Reconnecting…" while the page's stream is down. The page follows the vault live: a change made in a chat shows up without a reload.
 
@@ -210,6 +210,8 @@ The desktop's other memories aren't imported: `dsh-chat-visibility` is in `main.
 - **The message can be large:** a 16,000-character direction and two full indexes come to about 50 KB, on the first step and after each compaction. The budget rows are the knob.
 - **A compaction's summary may quote the old message.** The new one says it supersedes earlier ones.
 - **A chat in `~/work` itself, or in `scratch`,** has no family: its main agent gets user memory only, and `remember` with `family` is refused.
+- **Settings → Memory reads its scope list again only when the page is shown again, when its live stream reconnects, or when a memory in another scope changes.** A family added to `projects.yaml` shows only then: reopen the page. An open Preview doesn't follow `projects.yaml` either: a repo's changed `role` shows when you open the tab again.
+- **Every read is a git call per memory file.** A write, a list and a composed message each read the whole scope, about 0.8 s per write at 150 memories in a scope, and opening the page reads every memory in the vault.
 
 ## Build
 

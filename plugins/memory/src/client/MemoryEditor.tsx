@@ -42,7 +42,7 @@ export function MemoryEditor({ state, open, actions }: { state: PageState, open:
         <div className="dish-memory-note dish-memory-note-warn" role="note">
           <p className="dish-memory-text">Held: {memory.held}</p>
           <p className="dish-memory-muted">
-            No agent sees it until you release it. Saving it with its text unchanged keeps it held; changing the text releases it.
+            No agent sees it until you release it. Saving a change to its text releases it too.
           </p>
           <div className="dish-memory-actions">
             <Button variant="outline" size="sm" disabled={busy !== undefined} onClick={() => { void actions.release(memory.name) }}>Release</Button>

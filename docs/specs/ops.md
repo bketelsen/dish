@@ -5,6 +5,7 @@ Status: merged 2026-10-02 (`df9c4b1`) and rolled out the same day ([Rollout](#ro
 Since then:
 - **The unit runs dsh's script** under `/opt/dish/node/bin/node`, not the `node_modules/.bin/dsh` shim ([bketelsen/dish#6](https://github.com/bketelsen/dish/pull/6)), so no `NODE_PATH` into the checkout reaches agents. [deploy/README.md](../../deploy/README.md#prod-and-dev) has it.
 - **The VM's sandbox can write the home directory,** less a protected list ([sandbox-home](sandbox-home.md), 2026-10-03). So installs into the home directory (mise's tools, pnpm's store) no longer need an escalation there, which decision 7 and "pnpm" under [The contract](#the-contract) assumed. `sudo` still does.
+- **`install.env` may name the memory vault's remote,** `DISH_VAULT_REMOTE` (step 8), beside the three inputs below: `update.sh` passes it to `install.sh` and warns when it's missing or empty, and `pnpm dev` gives `install.sh` an empty value and keeps the variable from dsh and the watchers. [deploy/README.md](../../deploy/README.md#the-vault) has it.
 
 ## Summary
 

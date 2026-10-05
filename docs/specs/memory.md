@@ -1,6 +1,6 @@
 # Spec: memory and direction (`dish-memory`)
 
-Status: drafted 2026-10-05, with both [questions](#questions-for-you) settled the same day: a flagged memory is held, and the vault's remote is optional. Revised 2026-10-05 from the plan ([docs/plans/2026-10-05-memory.md](../plans/2026-10-05-memory.md), its eight Spec corrections): the service is `dishMemory`; `main.md` gets one bullet and `remember`'s description the rules; base checks and reverts are `dish-memory`'s own; and smaller ones. Built on branch `memory` (2026-10-05); the live check in `pnpm dev` and review are next. This is roadmap step 8, moved ahead of families (step 9) and routines (step 10) after comparing the plan with [Claude Code's Projects](https://code.claude.com/docs/en/claude-projects). It builds on the [design](../design.md) ("Project families", the Memory decision), the [config store](config-store.md), [prompts](prompts.md), [crew](crew.md), the [orchestrator](orchestrator.md) and the [judge](judge.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources; see [Checks](#checks-2026-10-05).
+Status: drafted 2026-10-05, with both [questions](#questions-for-you) settled the same day: a flagged memory is held, and the vault's remote is optional. Revised 2026-10-05 from the plan ([docs/plans/2026-10-05-memory.md](../plans/2026-10-05-memory.md), its ten Spec corrections): the service is `dishMemory`; `main.md` gets one bullet and `remember`'s description the rules; base checks and reverts are `dish-memory`'s own; and smaller ones. Built on branch `memory` (2026-10-05); the live check in `pnpm dev` and review are next. This is roadmap step 8, moved ahead of families (step 9) and routines (step 10) after comparing the plan with [Claude Code's Projects](https://code.claude.com/docs/en/claude-projects). It builds on the [design](../design.md) ("Project families", the Memory decision), the [config store](config-store.md), [prompts](prompts.md), [crew](crew.md), the [orchestrator](orchestrator.md) and the [judge](judge.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources; see [Checks](#checks-2026-10-05).
 
 ## Summary
 
@@ -124,7 +124,7 @@ Every process a dish test spawns gets a scratch `HOME`; an interactive shell als
 | `name` | `[a-z0-9][a-z0-9-]*`, at most 64 characters, and the same as the file's name. `memory` is reserved. |
 | `description` | One line, at most 150 characters. It is what the index shows. |
 | `type` | `user`, `feedback`, `project` or `reference` |
-| `modified` | ISO 8601 in UTC, set by `dish-memory` on every write. An agent never supplies it. |
+| `modified` | ISO 8601 in UTC, stamped by `dish-memory` on every save of a memory's text. **Release** keeps it, and a revert restores the earlier file's. An agent never supplies it. |
 | `held` | Present only on a held memory: the judge's reason, on one line ([Screening](#screening)) |
 | body | Markdown, not empty, at most 8 KiB. `feedback` and `project` memories follow Claude Code's shape: the fact, then **Why:** and **How to apply:**. `[[name]]` links another memory in the same scope or in `user/`. |
 
@@ -132,7 +132,7 @@ Every process a dish test spawns gets a scratch `HOME`; an interactive shell als
 
 `MEMORY.md` is generated and never written by hand:
 - **Each line:** one per memory that isn't held, `- [<name>](<name>.md) — <description> (<type>)`.
-- **Order:** sorted by type (feedback, user, project, reference), then by most recently modified.
+- **Order:** sorted by type (feedback, user, project, reference), then newest first, then by name.
 - **When:** `dish-memory` rewrites it in the same commit as every change to its scope, so the GitHub repository reads well and the index can't drift from the files.
 
 **The budget.** What reaches an agent is cut at 150 lines or 16 KiB per scope, whichever comes first, followed by "…and N more: `recall` with no `id` lists them all." From 80% of the budget, `remember`'s answer tells the agent to merge or forget stale memories. Nothing is refused. (Claude Code allows 200 lines or 25 KB, but for one index; here an agent can get two.)
@@ -141,7 +141,7 @@ Every process a dish test spawns gets a scratch `HOME`; an interactive shell als
 
 - **The document:** `families/<family>/direction.md` in the config store.
 - **The claim.** `dish-memory` claims the namespace `families/`, with agent policy `propose` (the config store spec's [per-namespace defaults](config-store.md#agent-tools)). Its `validate` accepts only `families/<family>/direction.md`, not empty, at most 16,000 characters (Claude's limit for project instructions). Claims can't overlap, so when step 9's `dish-families` needs more under `families/`, the claim moves there. `dish-memory` reads the direction with `dishConfig.read`, which doesn't care who owns it.
-- **Family names become slugs.** `dish-projects` validates `family` as `[a-z0-9][a-z0-9-]*`, at most 64 characters, so it can name a path in both stores. Today it's free text. The rollout checks the VM's `projects.yaml` first.
+- **Family names become slugs.** `dish-projects` validates `family` as `[a-z0-9][a-z0-9-]*`, at most 64 characters, so it can name a path in both stores. It was free text before step 8. The rollout checks the VM's `projects.yaml` first.
 - **The suggested shape**, the editor's template for a new direction: North star, Priorities (ranked), Non-goals, Constraints, and What needs your go-ahead. It's free Markdown.
 - **Agents propose; you accept.** The main agent uses `config_propose` when you ask it to change the direction, and you accept on the History page, as now. A lasting preference you state in a chat is saved first as a `feedback` memory. It goes into the direction only when you say so.
 
@@ -156,7 +156,7 @@ Every process a dish test spawns gets a scratch `HOME`; an interactive shell als
 | crew child | its parent's workspace | the family's direction and repos; family memory. No user memory. |
 | an agent on another preset | anywhere | nothing: memory comes with the dish preset |
 
-**Resolving a family.** The session's working directory (`header.cwd`, canonicalized) is matched against each project's clone (`dishWorkspaces.describe`), equal to it or under it. The matching project's `family` comes from `dishProjects.get`. A crew child shares its parent's working directory, so it resolves to the same family. A project always has a family, since the field is required.
+**Resolving a family.** The session's working directory (`header.cwd`, canonicalized) is matched against the clone (`dishWorkspaces.describe`) of each entry of one `dishProjects.list()`, equal to it or under it. The family is that of the entry whose clone holds the working directory: projects whose family isn't a valid name are skipped, and the deepest matching clone wins. A crew child shares its parent's working directory, so it resolves to the same family. A project always has a family, since the field is required.
 
 ### The message
 
@@ -231,7 +231,7 @@ It creates the memory, or replaces the one with the same name in that scope, and
 - **Screening:** [Screening](#screening).
 - **The commit:** one commit with the file and the scope's regenerated index. The author is `{ kind: 'agent', sessionId, role: 'main' }`, and the description is the note.
 
-**The answer:** "Saved `family/<name>` (new)" or "(updated)", with the short commit id. It adds "Held for your review on Settings → Memory: <reason>" when the memory was held, and the budget warning when the index is near its limit. dsh's generic row shows the call with its arguments, and `remember`'s description tells the main agent to say in its closing message what it saved, so you see it without expanding anything.
+**The answer:** "Saved `family/<name>` (new)" or "(updated)", with the short commit id. It adds "Held for your user's review on Settings → Memory: <reason>. It won't reach any agent until they release it." when the memory was held, and the budget warning when the index is near its limit. dsh's generic row shows the call with its arguments, and `remember`'s description tells the main agent to say in its closing message what it saved, so you see it without expanding anything.
 
 ### `forget` (main agent)
 
@@ -240,7 +240,7 @@ It takes an `id` (`user/<name>` or `family/<name>`), deletes that memory and reg
 ### `recall` (every dish agent)
 
 - **With no `id`** (or `''`): it lists every memory the agent can see. For the main agent that's both scopes; for a child, the family's. Memories past the budget are included; held ones are not.
-- **With an `id`:** it returns that memory's frontmatter and body. A held memory's answer says only that it is held.
+- **With an `id`:** it returns that memory's id, type and modified time on its first line, then its description and its body. A held memory's answer says only that it is held.
 
 ### crew's `report`: `remember`
 
@@ -263,7 +263,7 @@ A helper of their own, `closingRulings`, lists them, so `run` `status` and the R
 
 ## Screening
 
-- **A new judge method.** `dish-judge` gains `screenText({ text, subject, agent })` on its service. It answers `{ verdict: 'clean' | 'warn' | 'withhold', probability }` or `{ verdict: 'unscreened', reason }`. It uses the result screen's injection question, criteria and thresholds (`screening.warn`, 0.50; `screening.withhold`, 0.90), and logs with purpose `screen` and subject `memory:<id>`. Today the question is internal to the screen, and the log's purposes are a closed list.
+- **A new judge method.** `dish-judge` gains `screenText({ text, subject, tool, agent?, signal? })` on its service (`tool` required: `remember` for a memory). It answers `{ verdict: 'clean' | 'warn' | 'withhold', probability }` or `{ verdict: 'unscreened', reason }`. It uses the result screen's injection question, criteria and thresholds (`screening.warn`, 0.50; `screening.withhold`, 0.90), and logs with purpose `screen` and subject `memory:<id>`. Today the question is internal to the screen, and the log's purposes are a closed list.
 - **What `remember` screens:** the description and the body.
   - **At or above `warn`,** the memory is saved with `held: <reason>`. It stays out of the index and out of `recall`, and Settings → Memory lists it first, with **Release** and **Delete**.
   - **Below `warn`,** it's saved as usual.
@@ -370,7 +370,7 @@ You add them on Settings → Memory, or ask the main agent in a chat on the VM t
 - takes `DISH_VAULT_REMOTE`, which `update.sh` passes from `install.env` when it's there. Unset or empty keeps the vault local, and `update.sh` warns when prod has none;
 - runs `pnpm dev` with it empty, always.
 
-**`profile.ts`:** `writeDishRows` learns the second row; today it's hard-wired to `dish-config`. The dish preset's generator (`sync-preset.mjs`) adds `dish-memory/context` after `agent-instructions`.
+**`profile.ts`:** `writeDishRows` learns the second row; before step 8 it was hard-wired to `dish-config`. The dish preset's generator (`sync-preset.mjs`) adds `dish-memory/context` after `agent-instructions`.
 
 **The rollout, for you:**
 1. `gh repo create bketelsen/dish-vault --private`.
