@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { access, chmod, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DEFAULT_GIT_TIMEOUT_MS, GitError, SAFE_FLAGS, git, gitOk, maskUrlPasswords, submoduleProblem } from '../src/git.ts'
@@ -299,6 +299,11 @@ async function withPlantedNested(clone: Clone, dir: string): Promise<{ marker: s
   await runOk('git', ['init', '-q', '-b', 'main', nested], { env: clone.env })
   await writeFile(join(nested, '.gitattributes'), '* filter=evil\n')
   await writeFile(join(nested, 'f'), 'x\n')
+  // An hour old, so no index written below shares a second with them: git never smudges their entries as racily
+  // clean, and what it reads of them later doesn't depend on how fast this ran (see the change to `f` below).
+  const past = new Date(Date.now() - 3_600_000)
+  await utimes(join(nested, '.gitattributes'), past, past)
+  await utimes(join(nested, 'f'), past, past)
   await runOk('git', ['-C', nested, 'add', '-A'], { env: clone.env })
   await runOk('git', ['-C', nested, 'commit', '-q', '-m', 'nested'], { env: clone.env })
   await runOk('git', ['-C', clone.clone, 'add', 'nested'], { env: clone.env })
@@ -307,7 +312,10 @@ async function withPlantedNested(clone: Clone, dir: string): Promise<{ marker: s
   // status runs `git status` inside `nested`, which runs the clean filter on the dirty `f`: that is the planted program.
   await runOk('git', ['-C', nested, 'config', 'filter.evil.clean', script], { env: clone.env })
   await runOk('git', ['-C', nested, 'config', 'filter.evil.smudge', script], { env: clone.env })
-  await writeFile(join(nested, 'f'), 'changed\n')
+  // The same size as before: git has to read `f`, through the filter, to know it changed. A new size it takes for a
+  // change unread, unless the entry was smudged, which depended on `f` and the index being written in the same second
+  // (this fixture's plain status didn't run the filter under load).
+  await writeFile(join(nested, 'f'), 'y\n')
   if (await exists(marker)) throw new Error('the fixture ran the filter itself')
   return { marker, script }
 }
