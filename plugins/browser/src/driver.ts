@@ -24,7 +24,7 @@ export interface Driver {
 }
 
 export interface DriverBrowser {
-  /** A new context with one viewport, downloads off, service workers blocked, every request decided by `route`, and WebSockets to `refuseWebSocket`'s URLs refused. */
+  /** A new context with one viewport, downloads off, service workers allowed (their requests go through `route` too), every request decided by `route`, and WebSockets to `refuseWebSocket`'s URLs refused. */
   newContext(options: { viewport: Viewport, route: RouteDecider, refuseWebSocket: (url: string) => boolean }): Promise<DriverContext>
   /** Called once when Chromium exits or the connection drops, whoever caused it. */
   onDisconnected(listener: () => void): void

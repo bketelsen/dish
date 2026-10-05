@@ -18,7 +18,7 @@ pnpm dsh plugin --profile web add ./plugins/browser
 
 `deploy/install.sh` links it last: it needs no other dish plugin. It reads dsh's `agents`, `sandboxPolicy`, `attachments`, `llm`, `workspaceRegistry` and `webServer`, and crew's `dishCrew`, with `ctx.get` each time it uses them, and injects only `tools`, so there is no order to keep. It provides no service.
 - **Chromium is the system's,** at `executablePath` (`/usr/bin/chromium`, which fleet #43 installs on the VM with `fonts-liberation`). Nothing in dish downloads a browser, and `playwright-core` has no install script.
-- **No Chromium, no tools.** When `executablePath` isn't an executable file, as on the desktop, the plugin logs once `no Chromium at <path>: the browser tools aren't registered, and the Browser tab says so`, registers no tools, and the tab says "No browser on this host: dish-browser found no Chromium at /usr/bin/chromium." crew's allow lists drop the missing names, and `common.md`'s other bullet (a `chromium --headless` screenshot) applies. A Chromium installed later is seen after dsh's next restart.
+- **No Chromium, no tools.** When `executablePath` isn't an executable file, as on the desktop, the plugin logs once `no Chromium at <path>: the browser tools aren't registered, and the Browser tab says so`, registers no tools, and the tab says "No browser on this host: dish-browser found no Chromium at /usr/bin/chromium." crew's allow lists drop the missing names, and `common.md`'s other bullet (a `chromium --headless` screenshot) applies. Chromium is looked for once, when the plugin starts: a Chromium installed later needs a dsh restart (or a reload of the plugin) before the tools appear.
 - **Without the rest:** without dsh's attachment store or `llm`, `browser_screenshot` is refused ([Screenshots](#screenshots)); without `agents`, the address bar can't start a browser; without `sandboxPolicy`, a session's workspace is its own working directory; without `webServer`, dsh's port isn't known, so only the trusted host is refused; without [dish-crew](../crew/), the switcher lists no children.
 
 ## A browser per session
@@ -86,7 +86,7 @@ The page's accessibility tree follows. Refs like [ref=e7] are what browser_click
 - **The cut.** A tree over `snapshotChars` (30,000) is cut at a line end, and followed by "Cut at 30,000 of 93,512 characters: `browser_read` with the ref of a section (a `main`, `list` or `region`) reads that part."
 - **A subtree read** (`browser_read` with `ref`) shows that part, then takes a full snapshot that it doesn't return. Playwright resolves refs against the newest snapshot of each frame, so that keeps every other ref of the page good, and the "Unchanged" check still compares against the full tree the agent last got.
 - **Password fields.** A textbox, searchbox, combobox or spinbutton that shows a value has its ref checked for an `<input type=password>`, by the element's type, never by the word "Password". A password field's line ends "(a password field; its value isn't shown)". A check that fails counts as a password. Past the first 200 such fields on a page, or for one with no ref to check it by (covered, or not visible), the value is left out unchecked: "(its value isn't shown)".
-- **Masked.** Every text from the page (the tree, URLs, titles, console lines, dialog messages, download names) goes through dish-kit's `maskSecrets`, folded to one line and cut where it is worded, and the whole result is masked once more.
+- **Masked.** Every text from the page goes through dish-kit's `maskSecrets`: the tree, cut at `snapshotChars`; and URLs, titles, console lines, dialog messages and download names, each folded to one line and cut where it is worded. The whole result is masked once more.
 - **The notes,** in order: what the user did in the tab, what the page did ([What a page may do](#what-a-page-may-do)), and, outside `browser_read`, the count of new console errors and failed requests ("2 console errors and 1 failed request since your last read: `browser_read` lists them.").
 - **What the user did.** "The user used this browser since your last call: opened http://…; clicked 3 times; typed into the page; pressed keys; scrolled. The page is now http://… — "title"." It lists at most 5 addresses, then "and 2 more", adds "They are using it now." when their last input was less than 10 s ago, and starts "The user started this browser and used it since your last call" when they opened it from the address bar. Never what they typed, nor which keys.
 - **`browser_read`'s lines,** after the page line: "Scrolled 1,400 of 5,200 px.", then "Console errors (3):" and "Failed requests (the newest 10 of 37):", each with a line per entry (`- 404 http://…`, at most 300 characters). It lists the newest 10 of each since the last read; the browser keeps the newest 100.
@@ -114,7 +114,7 @@ Fixed, not configuration:
 **Errors (`isError`)** carry dish's words, and at most the agent's own masked URL, never page text, because the judge doesn't screen errors:
 - **an argument:** "`x7` isn't a ref: refs look like e7 or f1e7, as the snapshot shows them.", "browser_click needs `ref`, or `x` and `y`.", "`x` and `y` must be inside the viewport (1280×800).", "`key` is empty.", "`Ctrl+Q` isn't a key name: use names like Enter, Escape or ArrowDown, or a combination such as Control+a.", "browser_type needs `text`.", "browser_select needs `ref`.", "browser_select needs at least one value.", "browser_wait takes `text` or `gone`, not both.", "browser_wait needs `text`, `gone` or `seconds`.";
 - **a URL the rules refuse** ([URLs](#urls));
-- **the browser:** "No browser on this host: dish-browser found no Chromium at /usr/bin/chromium.", "Chromium wouldn't start: <its first line>", the cap's (above), "The browser closed during this call (the chat was archived). Your next browser call starts a new one.", "The page crashed during this call. Your next browser call gets a new page.";
+- **the browser:** "Chromium wouldn't start: <its first line>", the cap's (above), "The browser closed during this call (the chat was archived). Your next browser call starts a new one.", "The page crashed during this call. Your next browser call gets a new page.";
 - **anything else the browser didn't finish** (a frozen page, an error dish has no words for): "The browser didn't finish this call: the page may be busy or stuck, and what you asked may have happened. `browser_read` shows the page as it is now: check it before you repeat an action."
 
 ### Screenshots
@@ -162,7 +162,7 @@ The same rules for the agent's `browser_navigate`, the tab's address bar, and ev
 
 **What it shows:**
 - **the picture** of the page, scaled to fit the pane, keeping its shape;
-- **a toolbar:** back, forward, reload, the address bar (the page's URL, editable) and Close, which closes this chat's browser, its cookies and sign-ins with it;
+- **a toolbar:** back, forward, reload, the address bar (the page's URL, editable) and Close, which closes the browser shown, its cookies and sign-ins with it;
 - **lines:** "The agent is using this browser." while a call runs, "Chromium runs without its own sandbox on this host." when it does, "Reconnecting…" when the stream is down, and the newest notice (a refused URL, a navigation that failed, a page's event), until you dismiss it;
 - **no browser yet:** "No browser in this chat yet. An agent's first browser call starts one, or open a page here." A URL you open starts the browser while the chat's agent is live (dsh has it loaded). Otherwise the address bar is off and the line ends at "starts one."; a page asked for once the agent has gone gets the notice "A page opens here once this chat's agent is running.";
 - **a browser that closed:** its last picture, dimmed, with "This browser closed (its agent finished). Its cookies and sign-ins are gone. Open a page to start a new one." (the last sentence while the address bar may start one). The reasons: "its agent finished", "the chat was archived", "unused for 15 minutes", "dish closed it to make room, 6 at most", "closed in the Browser tab", "Chromium stopped", "dsh stopped";
@@ -180,7 +180,7 @@ The same rules for the agent's `browser_navigate`, the tab's address bar, and ev
 - **Down:** `hello` first, then `state` (whether there is a browser, its URL and title, loading, back and forward, whether the agent is acting, whether the address bar may start one, Chromium's sandbox, the viewport), at most one every 100 ms; `children`, again 200 ms after any browser opens or closes; `notice`; and `frame`, a JPEG (quality 60) as base64.
 - **Up,** on the stream's uplink: `frames` on or off, `ack`, `navigate`, `back`, `forward`, `reload`, `close`, `mouse`, `wheel`, `key` and `text`. The host reads the uplink as it arrives, never waiting for what an item does, so dsh's 256 KiB inbox doesn't fill. Each item is checked: a known kind, finite numbers (points clamped to the viewport, a wheel turn to ±10,000 px), a key the host replays, a `code` of at most 32 characters, text of 1 to 10,000 characters, an address of at most 4,096. A bad one is dropped, and logged once, with a count of more at the end; the stream stays open.
 - **Frames** come from a CDP screencast that runs only while a watcher has frames on (the tab, while it and the page are visible), shared by all of them. Each watcher gets one frame in flight, the next only after its `ack`, the newest kept, at most 15 a second: a slow connection gets fewer frames, never a backlog. A still page sends nothing, so a new watcher gets the newest frame at once, or a fresh capture.
-- **Who may watch.** dsh is single-user: every stream speaks for the signed-in operator. `watch` refuses an archived chat and an id that isn't one with a `state` of `refused`, then stays open and idle: a thrown refusal would end the stream, and `$stream` would reopen it in a loop. Starting a browser from the address bar needs the chat's agent live (`ctx.agents.get`), so no stream starts one for an id that isn't a running chat.
+- **Who may watch.** dsh is single-user: every stream speaks for the signed-in operator. `watch` refuses an archived chat, and an id that can't be a session's (not a string, empty, or too long), with a `state` of `refused`, then stays open and idle: a thrown refusal would end the stream, and `$stream` would reopen it in a loop. Starting a browser from the address bar needs the chat's agent live (`ctx.agents.get`), so no stream starts one for an id that isn't a running chat.
 
 ## The screenshot's view
 
@@ -197,7 +197,7 @@ It isn't dsh's image gallery (`tool.call.images`), which one toolview declares a
 
 | Field | Default | |
 |---|---|---|
-| `executablePath` | `/usr/bin/chromium` | The Chromium Playwright drives. `''` is the default. |
+| `executablePath` | `/usr/bin/chromium` | The Chromium Playwright drives. `''` means `/usr/bin/chromium`. |
 | `viewport` | `{ width: 1280, height: 800 }` | Every browser's page size: width 320 to 3840, height 240 to 2160. |
 | `maxBrowsers` | `6` | Browsers open at once, over all sessions: 1 to 20. |
 | `idleMinutes` | `15` | A browser with no agent call, no input and no watcher for this long closes: 1 at least. |
@@ -220,7 +220,7 @@ It isn't dsh's image gallery (`tool.call.images`), which one toolview declares a
 - **A dedicated Worker's WebSocket isn't routed:** `routeWebSocket` doesn't see a socket a `new Worker(…)` opens, so one to dsh's address isn't closed. The same cookie applies.
 - **No HTTP cache, and a hop per request.** With a route on the context, Playwright turns its cache off, and every request goes through Node to be checked. Pages load slower in the agent's browser than in yours.
 - **`browser_wait`'s text** is looked for in the main frame, not in iframes.
-- **Titles update** on a navigation and a load. A single-page app that changes its title without navigating shows the old one until its next load.
+- **The tab's title updates** on a navigation and a load: a single-page app that changes its title without navigating shows the old one there until its next load. Tool results read the title fresh.
 - **Bots.** Some sites treat headless Chromium as a bot, or show a CAPTCHA. Agents stop and tell you.
 - **Screenshots are kept** in dsh's attachment store with the chat, as `read_image`'s are.
 - **The tab's picture is lossy JPEG,** and small text can blur. A screenshot is a PNG.

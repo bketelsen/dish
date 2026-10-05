@@ -779,6 +779,17 @@ test('notes: console errors and failed requests are noted only when new; read li
   assert.ok(!(await call(w, 'browser_read')).includes('Console errors'))
 })
 
+test('read lists the newest 10 console errors, and counts the rest', async () => {
+  const w = world()
+  const page = await readOnce(w)
+  for (let i = 0; i < 15; i++) page.emit('consoleError', `boom ${i}`)
+  const read = (await call(w, 'browser_read')).split('\n')
+  const at = read.indexOf('Console errors (the newest 10 of 15):')
+  assert.ok(at > 0, 'the header counts all 15')
+  assert.deepEqual(read.slice(at + 1, at + 11), Array.from({ length: 10 }, (_, i) => `- boom ${5 + i}`))
+  assert.equal(read.filter(line => line.startsWith('- boom')).length, 10)
+})
+
 // --- the calling session ------------------------------------------------------------------------------------------------
 
 test('the calling session: a crew child uses its own browser, with the workspace from the sandbox policy', async () => {
