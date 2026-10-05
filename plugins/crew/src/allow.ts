@@ -17,9 +17,10 @@ import { listed } from './text.ts'
 /**
  * Tools no child gets, whatever `crew.yaml` says a role lists: delegation, whether crew's own or dsh's (only the main agent
  * delegates, and children never nest), the main agent's own controls (dish-workspaces' `worktree` among them: the main
- * agent makes a worktree and binds a coder to it; and dish-orchestrator's run and pull request tools, `run`, `open_pr` and
- * `pr_feedback`: the main agent drives a run, and only it opens the run's pull request and reads what reviewers said on it),
- * and anything that asks you something. Children can't ask: dsh runs them with approval policy `never`.
+ * agent makes a worktree and binds a coder to it; dish-orchestrator's run and pull request tools, `run`, `open_pr` and
+ * `pr_feedback`: the main agent drives a run, and only it opens the run's pull request and reads what reviewers said on it;
+ * and dish-memory's `remember` and `forget`: only the main agent writes memory), and anything that asks you something.
+ * Children can't ask: dsh runs them with approval policy `never`.
  */
 export const NEVER: ReadonlySet<string> = new Set([
   'delegate',
@@ -41,6 +42,8 @@ export const NEVER: ReadonlySet<string> = new Set([
   'run',
   'open_pr',
   'pr_feedback',
+  'remember',
+  'forget',
 ])
 
 /**

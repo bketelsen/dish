@@ -215,6 +215,8 @@ function outcomeOf(report: StructuredReport): string {
  *   `- [<severity>] ` its file (and `:<line>`) as a code span, then `: <summary> Fix: <fix>`; `Checks:` and, for each, the
  *   command as a code span, then ` exit <code>: <summary>`; `Addressed:` and `- <finding>: addressed. <evidence>`, or
  *   `NOT addressed`.
+ * - Both end with `Worth remembering:` and `- <item>` for each of `remember`: what the main agent may keep with dish-memory's
+ *   `remember`, or not.
  *
  * Code spans are `codeSpan`'s: one line, with marks longer than any run of backticks inside.
  */
@@ -230,6 +232,7 @@ export function reportBlock(report: StructuredReport): string {
     list('Rulings:', report.rulings, ruling => [ruling.what, ruling.why, ruling.costIfWrong].map(folded).join(' — '))
     list('Concerns:', report.concerns, folded)
     list('Not fixed:', report.notFixed, item => `${folded(item.finding)} — ${folded(item.why)}`)
+    list('Worth remembering:', report.remember, folded)
   } else {
     lines.push(`Verdict: ${outcomeOf(report)}${report.head === undefined ? '' : `, at ${code(report.head)}`}`, `Summary: ${kept(report.summary)}`)
     const { findings } = report
@@ -242,6 +245,7 @@ export function reportBlock(report: StructuredReport): string {
     }
     list('Checks:', report.checks, check => `${code(check.command)} exit ${check.exitCode}: ${folded(check.summary)}`)
     list('Addressed:', report.addressed, item => `${folded(item.finding)}: ${item.addressed ? 'addressed' : 'NOT addressed'}. ${folded(item.evidence)}`)
+    list('Worth remembering:', report.remember, folded)
   }
   // A blank field leaves no space at the end of its line.
   return lines.map(line => line.trimEnd()).join('\n')

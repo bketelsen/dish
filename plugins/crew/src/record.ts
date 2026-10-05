@@ -161,6 +161,8 @@ export interface CoderReport {
   rulings?: ReportRuling[]
   concerns?: string[]
   notFixed?: NotFixed[]
+  /** What a later agent in this family should know that the code doesn't say, for the main agent to `remember` or not. */
+  remember?: string[]
 }
 
 /** One finding of a review. */
@@ -199,6 +201,8 @@ export interface ReviewerReport {
   findings: ReviewFinding[]
   checks?: ReviewCheck[]
   addressed?: ReviewAddressed[]
+  /** As a coder's. */
+  remember?: string[]
 }
 
 /** What a coder or a reviewer finishes with: crew's `report` tool. */
@@ -525,8 +529,8 @@ function listProblem(path: string, value: unknown, fields?: readonly FieldCheck[
 /**
  * What is wrong with `value` as a `StructuredReport`, or `undefined` if nothing is. Each message starts with the path of the
  * field, such as `findings[2].severity must be one of blocking, should_fix, nit`. Fields it doesn't know are not its concern,
- * and neither are blank strings, the form of `head` or a `blockedOn` for a status other than `done`: those are the `report`
- * tool's checks, and the record takes any well-typed report.
+ * and neither are blank strings, the form of `head`, a `blockedOn` for a status other than `done`, or how many `remember`
+ * items there are and how long: those are the `report` tool's checks, and the record takes any well-typed report.
  */
 export function reportProblem(value: unknown): string | undefined {
   if (!isObject(value)) return 'it is not an object'
@@ -537,7 +541,9 @@ export function reportProblem(value: unknown): string | undefined {
     const problem = fieldProblem('status', value.status, CODER_STATUSES) ?? fieldProblem('summary', value.summary, 'string')
     if (problem !== undefined) return problem
     if (value.blockedOn !== undefined && !isText(value.blockedOn)) return 'blockedOn must be a string when it is given'
-    const lists: Array<[string, readonly FieldCheck[] | undefined]> = [['commits', undefined], ['rulings', RULING_FIELDS], ['concerns', undefined], ['notFixed', NOT_FIXED_FIELDS]]
+    const lists: Array<[string, readonly FieldCheck[] | undefined]> = [
+      ['commits', undefined], ['rulings', RULING_FIELDS], ['concerns', undefined], ['notFixed', NOT_FIXED_FIELDS], ['remember', undefined],
+    ]
     for (const [name, fields] of lists) {
       const listed = value[name] === undefined ? undefined : listProblem(name, value[name], fields)
       if (listed !== undefined) return listed
@@ -548,7 +554,7 @@ export function reportProblem(value: unknown): string | undefined {
     ?? listProblem('findings', value.findings, FINDING_FIELDS)
   if (problem !== undefined) return problem
   if (value.head !== undefined && !isText(value.head)) return 'head must be a string when it is given'
-  for (const [name, fields] of [['checks', CHECK_FIELDS], ['addressed', ADDRESSED_FIELDS]] as const) {
+  for (const [name, fields] of [['checks', CHECK_FIELDS], ['addressed', ADDRESSED_FIELDS], ['remember', undefined]] as const) {
     const listed = value[name] === undefined ? undefined : listProblem(name, value[name], fields)
     if (listed !== undefined) return listed
   }
@@ -557,8 +563,8 @@ export function reportProblem(value: unknown): string | undefined {
 
 /** The fields of each role's report, in the order they are kept, with the item fields of those that are lists of objects. */
 const REPORT_FIELDS: Readonly<Record<ReportRole, ReadonlyArray<readonly [string, (readonly FieldCheck[])?]>>> = {
-  coder: [['role'], ['turn'], ['at'], ['status'], ['summary'], ['commits'], ['blockedOn'], ['rulings', RULING_FIELDS], ['concerns'], ['notFixed', NOT_FIXED_FIELDS]],
-  reviewer: [['role'], ['turn'], ['at'], ['verdict'], ['head'], ['summary'], ['findings', FINDING_FIELDS], ['checks', CHECK_FIELDS], ['addressed', ADDRESSED_FIELDS]],
+  coder: [['role'], ['turn'], ['at'], ['status'], ['summary'], ['commits'], ['blockedOn'], ['rulings', RULING_FIELDS], ['concerns'], ['notFixed', NOT_FIXED_FIELDS], ['remember']],
+  reviewer: [['role'], ['turn'], ['at'], ['verdict'], ['head'], ['summary'], ['findings', FINDING_FIELDS], ['checks', CHECK_FIELDS], ['addressed', ADDRESSED_FIELDS], ['remember']],
 }
 
 /** A new object of `report`'s own fields, nested items too, those absent left out. It checks nothing: see `reportProblem`. */

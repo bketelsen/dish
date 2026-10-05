@@ -43,12 +43,13 @@ interface Base<K extends Kind, B extends 'harness' | 'main'> {
 export interface LedgerCoderReport {
   role: 'coder', turn: number, at: number, status: 'done' | 'blocked' | 'needs_context', summary: string
   commits?: string[], blockedOn?: string, rulings?: { what: string, why: string, costIfWrong: string }[], concerns?: string[]
-  notFixed?: { finding: string, why: string }[]
+  notFixed?: { finding: string, why: string }[], remember?: string[]
 }
 export interface LedgerReviewerReport {
   role: 'reviewer', turn: number, at: number, verdict: 'approved' | 'changes_requested', head?: string
   summary: string, findings: { severity: 'blocking' | 'should_fix' | 'nit', file: string, line?: number, summary: string, fix: string }[]
   checks?: { command: string, exitCode: number, summary: string }[], addressed?: { finding: string, addressed: boolean, evidence: string }[]
+  remember?: string[]
 }
 export type LedgerReport = LedgerCoderReport | LedgerReviewerReport
 

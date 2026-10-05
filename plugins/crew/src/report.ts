@@ -6,9 +6,10 @@
  * A coder or a reviewer (`reportRole`: a child with `reviews` is a reviewer, role `coder` a coder) finishes with `report`, as its
  * last call. Its arguments are the role's structured report (`CoderReport`, `ReviewerReport` in `record.ts`). dsh-tools checks
  * them against the schema before `execute` runs (a mismatch is `invalid arguments: …`, naming the field). `execute` then makes
- * the checks a schema can't: a blank `summary`, a coder that isn't `done` without `blockedOn`, and a reviewer's `head`, when it
+ * the checks a schema can't: a blank `summary`, a coder that isn't `done` without `blockedOn`, a reviewer's `head`, when it
  * gives one, that isn't a full sha (an abbreviated one could match another commit, and `open_pr` compares it with the head it
- * pushes; a review of work outside git gives none, and so never counts for `open_pr`). All of them are
+ * pushes; a review of work outside git gives none, and so never counts for `open_pr`), and a `remember` of more than five
+ * items, or with one that isn't one line of at most 300 characters (each is trimmed, and a blank one dropped). All of them are
  * said at once, and nothing is recorded. Otherwise the report is recorded on the child with `setReport` (masked there), the turn
  * is concluded (`exec.concludeTurn()`), and the tool's value is the stored report. A later call replaces an earlier one.
  *
@@ -89,6 +90,12 @@ const NOT_FIXED = {
   },
 } as const
 
+/** Both roles' `remember`: suggestions the main agent may keep with dish-memory's `remember`. Its limits are checked in `execute`. */
+const REMEMBER = {
+  type: 'array', items: { type: 'string' },
+  description: 'Up to five one-line things a later agent in this family should know that the code doesn\'t say: a pitfall, a flaky test, an undocumented requirement. Leave it out when there is none.',
+} as const
+
 /** A coder's `report` arguments. */
 export const CODER_PARAMETERS = {
   status: {
@@ -101,6 +108,7 @@ export const CODER_PARAMETERS = {
   rulings: { type: 'array', items: RULING, description: 'Your own judgment calls.' },
   concerns: { type: 'array', items: { type: 'string' }, description: 'What the main agent should know: risks, doubts, loose ends.' },
   notFixed: { type: 'array', items: NOT_FIXED, description: 'In a fix round: the findings you didn\'t fix, and why.' },
+  remember: REMEMBER,
 } as const satisfies ParameterSchemaSpec
 
 const FINDING = {
@@ -143,6 +151,7 @@ export const REVIEWER_PARAMETERS = {
   findings: { type: 'array', required: true, items: FINDING, description: 'Every finding; an empty list for a clean review.' },
   checks: { type: 'array', items: CHECK, description: 'The commands you ran, and their exit codes.' },
   addressed: { type: 'array', items: ADDRESSED, description: 'In a re-review: each earlier finding, whether it was addressed, and the evidence.' },
+  remember: REMEMBER,
 } as const satisfies ParameterSchemaSpec
 
 /** The value the tool returns: the stored report. */
@@ -167,12 +176,14 @@ export const CODER_DESCRIPTION = 'Finish your work with this, as your last call:
   + '`status` is `done` when the work is complete and committed: in a worktree, dish then runs the project\'s gate there, and a failure '
   + 'comes back to you to fix, after which you call `report` again. '
   + '`blocked` or `needs_context` when you can\'t go on, with `blockedOn`: the gate is skipped. '
+  + '`remember` holds up to five one-line things a later agent in this family should know that the code doesn\'t say. '
   + 'A later call replaces an earlier one.'
 
 /** What a reviewer reads of `report`. */
 export const REVIEWER_DESCRIPTION = 'Finish your review with this, as your last call: it records your verdict for the main agent and ends your turn. '
   + 'The main agent reads this report, not your last message. '
   + '`head` is the full sha of the commit you reviewed, when the work is in a git repository; `findings` lists every finding (an empty list for a clean review). '
+  + '`remember` holds up to five one-line things a later agent in this family should know that the code doesn\'t say. '
   + 'A later call replaces an earlier one.'
 
 // --- the tool ----------------------------------------------------------------------------------------------------------
@@ -193,6 +204,11 @@ const SUMMARY_EMPTY: Readonly<Record<ReportRole, string>> = {
 const BLOCKED_ON_REQUIRED = 'blockedOn is required when status is blocked or needs_context: say what you\'re blocked on, or what you need'
 const HEAD_NOT_FULL = 'head must be the full sha of the commit you reviewed (40 hex digits): run `git rev-parse HEAD` in the worktree you reviewed, or leave head out when the work isn\'t in a git repository'
 const NOT_A_CHILD = 'dish-crew has no record of you as a crew child, so the report wasn\'t recorded; end your turn with your report as your closing message'
+/** The most `remember` items, and the most characters in one. */
+const REMEMBER_MAX = 5
+const REMEMBER_LINE_MAX = 300
+const REMEMBER_COUNT = `remember holds at most ${REMEMBER_MAX} items`
+const REMEMBER_LINE = `each remember item is one line of at most ${REMEMBER_LINE_MAX} characters`
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -211,6 +227,20 @@ function given<K extends string, V>(name: K, value: V | undefined): { [P in K]?:
   if (typeof value === 'string' && value.trim() === '') return {}
   if (Array.isArray(value) && value.length === 0) return {}
   return { [name]: value } as { [P in K]?: V }
+}
+
+/** `remember`'s items trimmed, the blank ones dropped (models fill every optional parameter), or `undefined` when none is given. */
+function remembered(items: readonly string[] | undefined): string[] | undefined {
+  return items?.map(item => item.trim()).filter(item => item !== '')
+}
+
+/** What is wrong with `remember`'s items, as `execute` says it: too many, and one that isn't one short line. */
+function rememberProblems(items: readonly string[] | undefined): string[] {
+  if (items === undefined) return []
+  const problems: string[] = []
+  if (items.length > REMEMBER_MAX) problems.push(REMEMBER_COUNT)
+  if (items.some(item => /[\r\n]/.test(item) || item.length > REMEMBER_LINE_MAX)) problems.push(REMEMBER_LINE)
+  return problems
 }
 
 export interface ReportToolDeps {
@@ -261,6 +291,8 @@ function coderTool(deps: ReportToolDeps): ToolDefinition {
       const problems: string[] = []
       if (blank(args.summary)) problems.push(SUMMARY_EMPTY.coder)
       if (args.status !== 'done' && blank(args.blockedOn)) problems.push(BLOCKED_ON_REQUIRED)
+      const remember = remembered(args.remember)
+      problems.push(...rememberProblems(remember))
       if (problems.length > 0) throw new Error(problems.join('; '))
       const report: CoderReport = {
         role: 'coder',
@@ -273,6 +305,7 @@ function coderTool(deps: ReportToolDeps): ToolDefinition {
         ...given('rulings', args.rulings),
         ...given('concerns', args.concerns),
         ...given('notFixed', args.notFixed),
+        ...given('remember', remember),
       }
       return await record(deps, report, exec) as InferValue<typeof CODER_OUTPUT>
     },
@@ -295,6 +328,8 @@ function reviewerTool(deps: ReportToolDeps): ToolDefinition {
       // Optional: a review of work outside git (the scratch workspace, a writer's change) has no commit. Given, it is a full sha.
       const head = blank(args.head) ? undefined : args.head!.trim().toLowerCase()
       if (head !== undefined && !FULL_SHA.test(head)) problems.push(HEAD_NOT_FULL)
+      const remember = remembered(args.remember)
+      problems.push(...rememberProblems(remember))
       if (problems.length > 0) throw new Error(problems.join('; '))
       const report: ReviewerReport = {
         role: 'reviewer',
@@ -306,6 +341,7 @@ function reviewerTool(deps: ReportToolDeps): ToolDefinition {
         findings: args.findings,
         ...given('checks', args.checks),
         ...given('addressed', args.addressed),
+        ...given('remember', remember),
       }
       return await record(deps, report, exec) as InferValue<typeof REVIEWER_OUTPUT>
     },
@@ -531,12 +567,14 @@ export class ReportRegistrar {
 
 const STEER_TEXT: Readonly<Record<ReportRole, string>> = {
   coder: 'Finish by calling `report`: `status` (`done` when the work is complete and committed; `blocked` or `needs_context`, with '
-    + '`blockedOn`, when you can\'t go on), a `summary` of what changed, for a person, and `commits`, `rulings`, `concerns` and '
-    + '`notFixed` where they apply. The main agent reads your report, not your last message, and your turn ends when you call it.',
+    + '`blockedOn`, when you can\'t go on), a `summary` of what changed, for a person, and `commits`, `rulings`, `concerns`, '
+    + '`notFixed` and `remember` where they apply. The main agent reads your report, not your last message, and your turn ends '
+    + 'when you call it.',
   reviewer: 'Finish by calling `report`: your `verdict` (`approved` or `changes_requested`), `head` (the full sha of the commit you '
     + 'reviewed, when the work is in a git repository), a `summary`, and `findings`, each with its severity, file, line, summary and fix (an empty list for a clean '
-    + 'review), with the `checks` you ran and, in a re-review, `addressed`. The main agent reads your report, not your last '
-    + 'message, and your turn ends when you call it.',
+    + 'review), with the `checks` you ran, in a re-review `addressed`, and `remember` when a later agent in this family should '
+    + 'know something the code doesn\'t say. The main agent reads your report, not your last message, and your turn ends when '
+    + 'you call it.',
 }
 
 /** What the last steer of a turn adds. */

@@ -98,6 +98,10 @@ const REVIEWER = {
 
 const BLOCKED_ON = 'blockedOn is required when status is blocked or needs_context: say what you\'re blocked on, or what you need'
 const HEAD_FORM = 'head must be the full sha of the commit you reviewed (40 hex digits): run `git rev-parse HEAD` in the worktree you reviewed, or leave head out when the work isn\'t in a git repository'
+const REMEMBER_COUNT = 'remember holds at most 5 items'
+const REMEMBER_LINE = 'each remember item is one line of at most 300 characters'
+const REMEMBER_DESCRIPTION = 'Up to five one-line things a later agent in this family should know that the code doesn\'t say: a pitfall, a flaky test, an undocumented requirement. Leave it out when there is none.'
+const REMEMBER_SENTENCE = '`remember` holds up to five one-line things a later agent in this family should know that the code doesn\'t say.'
 
 /** Every node of a JSON schema, depth first. */
 function nodes(schema: unknown, out: Array<Record<string, unknown>> = []): Array<Record<string, unknown>> {
@@ -254,11 +258,62 @@ test('the body\'s checks: blockedOn when not done, a blank summary, a head that 
 
 test('optional fields that are blank or empty are left out, an extra argument is ignored, and a reviewer\'s empty findings are kept', async (t) => {
   const coder = await fixture(t, 'coder')
-  const result = await coder.call({ status: 'done', summary: 'Done.', commits: [], blockedOn: ' ', rulings: [], concerns: [], notFixed: [], role: 'x', turn: 99 })
+  const result = await coder.call({ status: 'done', summary: 'Done.', commits: [], blockedOn: ' ', rulings: [], concerns: [], notFixed: [], remember: [], role: 'x', turn: 99 })
   assert.deepEqual(result.value, { role: 'coder', turn: 0, at: NOW, status: 'done', summary: 'Done.' })
   const reviewer = await fixture(t, 'reviewer')
-  const clean = await reviewer.call({ verdict: 'approved', head: SHA, summary: 'Clean.', findings: [], checks: [], addressed: [] })
+  const clean = await reviewer.call({ verdict: 'approved', head: SHA, summary: 'Clean.', findings: [], checks: [], addressed: [], remember: [] })
   assert.deepEqual(clean.value, { role: 'reviewer', turn: 0, at: NOW, verdict: 'approved', head: SHA, summary: 'Clean.', findings: [] })
+})
+
+test('remember: at most five one-line items, each at most 300 characters', async (t) => {
+  // The parameter, and the sentence each description gains before its last.
+  for (const [parameters, description] of [[CODER_PARAMETERS, CODER_DESCRIPTION], [REVIEWER_PARAMETERS, REVIEWER_DESCRIPTION]] as const) {
+    const schema = parameterSchemaSpecToJsonSchema(parameters)
+    assert.deepEqual(schema.properties.remember, { type: 'array', items: { type: 'string' }, description: REMEMBER_DESCRIPTION })
+    assert.ok(!(schema.required ?? []).includes('remember'))
+    assert.ok(description.endsWith(`${REMEMBER_SENTENCE} A later call replaces an earlier one.`), description)
+  }
+  const five = ['the login test is flaky under load', 'b', 'c', 'd', 'x'.repeat(300)]
+  for (const [role, args] of [['coder', CODER], ['reviewer', REVIEWER]] as const) {
+    const f = await fixture(t, role)
+    const said = async (extra: Record<string, unknown>): Promise<string | undefined> => {
+      const result = await f.call({ ...args, ...extra })
+      assert.equal(result.concluded, 0, JSON.stringify(extra))
+      return result.error?.message
+    }
+    assert.equal(await said({ remember: [...five, 'f'] }), REMEMBER_COUNT)
+    assert.equal(await said({ remember: ['a', 'x'.repeat(301)] }), REMEMBER_LINE)
+    assert.equal(await said({ remember: ['two\nlines'] }), REMEMBER_LINE)
+    assert.equal(await said({ remember: ['a carriage\rreturn'] }), REMEMBER_LINE)
+    assert.equal(await said({ remember: [...five, 'two\nlines'] }), `${REMEMBER_COUNT}; ${REMEMBER_LINE}`)
+    // With the body's other checks, all of them at once.
+    const others = role === 'coder' ? { status: 'blocked', summary: ' ' } : { summary: ' ', head: 'HEAD' }
+    const first = role === 'coder' ? `summary is empty: say what changed, for a person; ${BLOCKED_ON}` : `summary is empty: say what you found, for a person; ${HEAD_FORM}`
+    assert.equal(await said({ ...others, remember: [...five, 'x'.repeat(301)] }), `${first}; ${REMEMBER_COUNT}; ${REMEMBER_LINE}`)
+    assert.equal(f.setReports(), 0)
+
+    // Five, the longest one line: recorded, and the value has them. White space around an item is trimmed, so a trailing
+    // line break is still one line.
+    const result = await f.call({ ...args, remember: [...five.slice(0, 4), ` ${five[4]}\n`] })
+    assert.equal(result.error, undefined)
+    assert.equal(result.concluded, 1)
+    assert.deepEqual(result.value!.remember, five)
+    assert.deepEqual((await f.records.lookup('c1'))!.record.report!.remember, five)
+  }
+})
+
+test('an empty remember is left out', async (t) => {
+  for (const [role, args] of [['coder', CODER], ['reviewer', REVIEWER]] as const) {
+    const f = await fixture(t, role)
+    for (const remember of [[], [''], [' ', '\n\t']]) {
+      const result = await f.call({ ...args, remember })
+      assert.equal(result.error, undefined, JSON.stringify(remember))
+      assert.equal('remember' in result.value!, false, JSON.stringify(remember))
+    }
+    // A blank item among others is dropped, and doesn't count toward five.
+    const result = await f.call({ ...args, remember: ['', 'a', ' ', 'b', 'c', '', 'd', 'e'] })
+    assert.deepEqual(result.value!.remember, ['a', 'b', 'c', 'd', 'e'])
+  }
 })
 
 test('the turn is the newest the tracker saw for the child\'s session: turn 3 after its turn/start, 0 when none was seen', async (t) => {
@@ -469,8 +524,8 @@ test('the steer: at most two a turn, the last says what happens without it, and 
 })
 
 test('the steer\'s texts, word for word', () => {
-  assert.equal(reportSteerText('coder', 1, 2), 'Finish by calling `report`: `status` (`done` when the work is complete and committed; `blocked` or `needs_context`, with `blockedOn`, when you can\'t go on), a `summary` of what changed, for a person, and `commits`, `rulings`, `concerns` and `notFixed` where they apply. The main agent reads your report, not your last message, and your turn ends when you call it.')
-  assert.equal(reportSteerText('reviewer', 1, 2), 'Finish by calling `report`: your `verdict` (`approved` or `changes_requested`), `head` (the full sha of the commit you reviewed, when the work is in a git repository), a `summary`, and `findings`, each with its severity, file, line, summary and fix (an empty list for a clean review), with the `checks` you ran and, in a re-review, `addressed`. The main agent reads your report, not your last message, and your turn ends when you call it.')
+  assert.equal(reportSteerText('coder', 1, 2), 'Finish by calling `report`: `status` (`done` when the work is complete and committed; `blocked` or `needs_context`, with `blockedOn`, when you can\'t go on), a `summary` of what changed, for a person, and `commits`, `rulings`, `concerns`, `notFixed` and `remember` where they apply. The main agent reads your report, not your last message, and your turn ends when you call it.')
+  assert.equal(reportSteerText('reviewer', 1, 2), 'Finish by calling `report`: your `verdict` (`approved` or `changes_requested`), `head` (the full sha of the commit you reviewed, when the work is in a git repository), a `summary`, and `findings`, each with its severity, file, line, summary and fix (an empty list for a clean review), with the `checks` you ran, in a re-review `addressed`, and `remember` when a later agent in this family should know something the code doesn\'t say. The main agent reads your report, not your last message, and your turn ends when you call it.')
   assert.equal(reportSteerText('coder', 1, 1), `${reportSteerText('coder', 1, 2)} If you end your turn without it, the main agent gets your work without a report.`)
   assert.equal(reportSteerSummary(2, 2), 'Asked to finish with report (2 of 2)')
   assert.ok(reportSteerSummary(999_999, 999_999).length <= 120)

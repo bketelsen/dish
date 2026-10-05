@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
+import { maskSecrets } from 'dish-kit'
 import {
   CODER_STATUSES, CrewRecords, GATE_OUTCOMES, SEVERITIES, STOP_REASON_STATUS, TEMP_GRACE_MS, VERDICTS, closingOf, gateProblem, isRunning, latestGate,
   maskReport, reportContent, reportProblem, reportRole, statusFor,
@@ -1346,7 +1347,7 @@ function coderReport(overrides: Partial<CoderReport> = {}): CoderReport {
   return {
     role: 'coder', turn: 2, at: STARTED + 5000, status: 'done', summary: 'Added the login form; the tests pass.', commits: [SHA],
     rulings: [{ what: 'kept the old route', why: 'callers use it', costIfWrong: 'one more redirect' }], concerns: ['the session store is in memory'],
-    notFixed: [{ finding: 'rename x', why: 'out of scope' }], ...overrides,
+    notFixed: [{ finding: 'rename x', why: 'out of scope' }], remember: ['the login test is flaky under load'], ...overrides,
   }
 }
 
@@ -1360,6 +1361,7 @@ function reviewerReport(overrides: Partial<ReviewerReport> = {}): ReviewerReport
     ],
     checks: [{ command: 'pnpm test', exitCode: 0, summary: 'all pass' }],
     addressed: [{ finding: 'the earlier race', addressed: true, evidence: 'login.ts:40 takes the lock' }],
+    remember: ['the session store must stay in memory: the tests reset it'],
     ...overrides,
   }
 }
@@ -1385,6 +1387,8 @@ const BAD_REPORTS: Array<[string, unknown]> = [
   ['rulings[0].costIfWrong', { ...coderReport(), rulings: [{ what: 'a', why: 'b' }] }],
   ['concerns[0]', { ...coderReport(), concerns: [null] }],
   ['notFixed[0].why', { ...coderReport(), notFixed: [{ finding: 'x', why: 3 }] }],
+  ['remember', { ...coderReport(), remember: 'a pitfall' }],
+  ['remember[1]', { ...coderReport(), remember: ['a pitfall', 5] }],
   ['verdict', { ...reviewerReport(), verdict: 'lgtm' }],
   ['head', { ...reviewerReport(), head: 5 }],
   ['summary', { ...reviewerReport(), summary: null }],
@@ -1397,6 +1401,8 @@ const BAD_REPORTS: Array<[string, unknown]> = [
   ['checks[0].exitCode', reviewerReport({ checks: [{ command: 'pnpm test', exitCode: 'x' as never, summary: 's' }] })],
   ['addressed', { ...reviewerReport(), addressed: 'yes' }],
   ['addressed[0].addressed', reviewerReport({ addressed: [{ finding: 'f', addressed: 'yes' as never, evidence: 'e' }] })],
+  ['remember', { ...reviewerReport(), remember: { pitfall: 'x' } }],
+  ['remember[0]', { ...reviewerReport(), remember: [null] }],
 ]
 
 test('the report enums are frozen, in their order', () => {
@@ -1422,6 +1428,20 @@ test('reportProblem names each wrong field, and nothing for full and minimal rep
     if (path === 'an object') assert.match(problem!, /object/)
   }
   assert.equal(reportProblem(BAD_REPORTS.find(([path]) => path === 'findings[0].severity')![1]), 'findings[0].severity must be one of blocking, should_fix, nit')
+})
+
+test('reportProblem names a remember that isn\'t a list of strings', () => {
+  for (const report of [coderReport(), reviewerReport()]) {
+    assert.equal(reportProblem({ ...report, remember: ['a pitfall', 'a flaky test'] }), undefined)
+    assert.equal(reportProblem({ ...report, remember: [] }), undefined)
+    assert.equal(reportProblem({ ...report, remember: undefined }), undefined)
+    assert.equal(reportProblem({ ...report, remember: 'a pitfall' }), 'remember must be a list')
+    assert.equal(reportProblem({ ...report, remember: { 0: 'a pitfall' } }), 'remember must be a list')
+    assert.equal(reportProblem({ ...report, remember: ['a pitfall', 5] }), 'remember[1] must be a string')
+    assert.equal(reportProblem({ ...report, remember: [{ text: 'a pitfall' }] }), 'remember[0] must be a string')
+  }
+  // How many there are and how long each is are the tool's checks, as blank strings are: the record takes any list of strings.
+  assert.equal(reportProblem(coderReport({ remember: ['x'.repeat(1000), 'two\nlines', '', 'd', 'e', 'f'] })), undefined)
 })
 
 test('maskReport masks every string, nested ones included, and keeps the rest', () => {
@@ -1488,6 +1508,27 @@ test('setReport drops unknown fields, and the caller\'s object can\'t change wha
   assert.deepEqual(minimal, { role: 'coder', turn: 0, at: 1, status: 'done', summary: 'done' })
 })
 
+test('setReport keeps remember for both roles', async () => {
+  const { records, directory, corrupt } = await fixture()
+  await records.addChild('s1', newChild('c1'))
+  await records.addChild('s1', newChild('r1', { role: 'reviewer', reviews: 'c1' }))
+  const remember = ['the e2e suite is flaky on CI', `the staging key is ${TOKEN}`]
+  const expected = ['the e2e suite is flaky on CI', `the staging key is ${maskSecrets(TOKEN)}`]
+  const coder = await records.setReport('c1', coderReport({ remember }))
+  const reviewer = await records.setReport('r1', reviewerReport({ remember }))
+  assert.deepEqual(coder!.remember, expected)
+  assert.deepEqual(reviewer!.remember, expected)
+  assert.ok(!JSON.stringify([coder, reviewer]).includes(TOKEN))
+  // Kept in children.json, and read back after a restart.
+  const again = reopen(directory)
+  assert.deepEqual((await again.records.lookup('c1'))!.record.report!.remember, expected)
+  assert.deepEqual((await again.records.lookup('r1'))!.record.report!.remember, expected)
+  // And on the run, when it ends.
+  const ended = await again.records.endRun('r1', { stopReason: 'completed', closing: 'x' })
+  assert.deepEqual(ended!.run.structured!.remember, expected)
+  assert.deepEqual([...corrupt, ...again.corrupt], [])
+})
+
 test('setReport for a child that is not recorded is undefined, and writes nothing', async () => {
   const { records, directory } = await fixture()
   assert.equal(await records.setReport('nobody', coderReport()), undefined)
@@ -1510,6 +1551,7 @@ test('a malformed report is a TypeError, and the record is left byte for byte', 
     ['line', reviewerReport({ findings: [{ severity: 'nit', file: 'a', line: 1.5, summary: 'b', fix: 'c' }] })],
     ['exitCode', reviewerReport({ checks: [{ command: 'x', exitCode: 'x' as never, summary: 's' }] })],
     ['addressed', reviewerReport({ addressed: [{ finding: 'f', addressed: 'yes' as never, evidence: 'e' }] })],
+    ['remember', coderReport({ remember: [5 as never] })],
     ['turn', coderReport({ turn: -1 })],
   ]
   for (const [field, value] of named) {
