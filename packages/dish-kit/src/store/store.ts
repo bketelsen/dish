@@ -1,0 +1,1288 @@
+import { createHash, randomBytes } from 'node:crypto'
+import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
+import { StoreError } from './errors.ts'
+import { Git, literal, pathProblem } from './git.ts'
+import type { Change, GitIdentity } from './git.ts'
+import { checkContent, secretKind } from './guard.ts'
+import { SerialQueue, acquireLock } from './lock.ts'
+import type { NamespaceRegistry, NamespaceSpec } from './namespaces.ts'
+import { acceptProposal, listProposals, proposeChanges, rejectProposal } from './proposals.ts'
+import type { AcceptMeta, ProposalEvent, ProposalHost, ProposalInfo, ProposalStatus, ProposeMeta, RejectMeta } from './proposals.ts'
+import { DEFAULT_PUSH_TIMEOUT_MS, PushQueue, checkPushOptions, checkRemote, fetchRemoteMain } from './push.ts'
+import type { RemoteStatus } from './push.ts'
+
+export type { Change, GitIdentity }
+export type { AcceptMeta, ProposalEvent, ProposalInfo, ProposalStatus, ProposeMeta, RejectMeta, RemoteStatus }
+
+/**
+ * Who made a commit. `system` is the store's own (the root commit and `seed`);
+ * callers of `write` are `user` or `agent` (`EditAuthor`).
+ */
+export type Author =
+  | { kind: 'user' }
+  | { kind: 'agent', sessionId: string, role?: string }
+  | { kind: 'system' }
+
+/** The authors a caller may write as. */
+export type EditAuthor = Exclude<Author, { kind: 'system' }>
+
+export interface CommitInfo {
+  /** The commit's full object id. */
+  id: string
+  /** Commit time in milliseconds since the epoch (git records seconds). */
+  time: number
+  /** An agent's `role` is always filled in (`main` when the caller gave none), as `Dish-Role` records it. */
+  author: Author
+  /** The whole commit message: subject, blank line, trailers. */
+  message: string
+  /** The normalized note, when there was one. */
+  note?: string
+  /** The paths this commit changed, sorted. */
+  paths: string[]
+}
+
+export interface WriteMeta {
+  author: EditAuthor
+  /** Why, in a line: whitespace is collapsed and it's cut to 200 characters. */
+  note?: string
+  /** Optimistic concurrency: the full id of the `main` commit the editor loaded. */
+  base?: string
+}
+
+/** The arguments of `revert`: those of `write`, without `base` (a revert's base is the commit it reverts). */
+export type RevertMeta = Omit<WriteMeta, 'base'>
+
+/** What `seed` takes beyond the defaults and the owner. */
+export interface SeedOptions {
+  /** Per path: lowercase hex sha256 of earlier shipped texts. A stored document with one of these hashes is replaced. */
+  replace?: Readonly<Record<string, readonly string[]>>
+}
+
+/** What `history` asks for. */
+export interface HistoryQuery {
+  /** Only commits that changed this document. Not with `prefix`. */
+  path?: string
+  /** Only commits that changed something under this path (`prompts/` or `prompts`). Not with `path`. */
+  prefix?: string
+  /** How many commits at most. Default 50, kept between 1 and 500. */
+  limit?: number
+  /** The full id of a commit on `main`: the history starts just below it. */
+  before?: string
+}
+
+/** One file's change between two commits, as git's own patch. */
+export interface FileDiff {
+  path: string
+  status: 'added' | 'modified' | 'deleted'
+  patch: string
+}
+
+export interface StoreOptions {
+  /** The bare repository's directory; created if missing. */
+  repository: string
+  namespaces: NamespaceRegistry
+  /** Git identity for commits authored by a person. */
+  user: GitIdentity
+  /** Git identity for commits authored by an agent, and for the store's own. */
+  agent: GitIdentity
+  /** Per-document size cap in bytes. Default 262144. */
+  maxBytes?: number
+  /** Called after each commit to `main` (`write`, `seed`, `revert`, `accept`; not for the root commit). A throw is reported as a process warning and never fails the write. */
+  onCommit?: (info: CommitInfo) => void
+  /**
+   * Where `main` is pushed after every commit, and at start-up (so the root commit and anything an earlier
+   * run left unpushed goes out): a URL or path git can push to. Never forced; a failed push never fails
+   * a write (see `remoteStatus`). When the repository doesn't exist yet and the remote has a `main`, the
+   * store restores it from there instead of starting a new history; a remote that can't be reached then
+   * is an error. An existing repository never contacts the remote while opening.
+   * @throws a plain `Error` from `open` for a remote that is empty, holds control characters, starts with `-` or uses `ext::`.
+   */
+  remote?: string
+  /** A push, or a start-up `ls-remote` or `fetch`, still running after this many milliseconds is killed. Default 60 000. */
+  pushTimeoutMs?: number
+  /** The wait before each retry of a failed push, in milliseconds, the last repeating. Default 1s, 5s, 30s, 120s, 600s. */
+  pushDelays?: number[]
+  /** Called, in order, after every change to what `remoteStatus` says. A throw is reported as a process warning. */
+  onRemoteStatus?: (status: RemoteStatus) => void
+  /**
+   * Called when a proposal opens (`propose`), turns out stale (an `accept` it refused), or is
+   * accepted or rejected. A throw is reported as a process warning and never fails the call.
+   */
+  onProposal?: (id: string, status: ProposalEvent) => void
+  /** The store's words, in its errors, warnings and root commit. */
+  naming: StoreNaming
+}
+
+/**
+ * What a store calls itself. Only messages change with it: the lock file (`dish.lock`), the temporary
+ * files (`dish-index-*`, `dish-restore-*`), the `Dish-*` trailers and `refs/dish/rejected/` are the same
+ * for every store.
+ */
+export interface StoreNaming {
+  /** `config store`, `vault`: "the <label> is locked by ...", "<label> is closed". */
+  label: string
+  /** `config`, `vault`: "Initialize dish <kind>", "... is not a dish <kind> repository". */
+  kind: string
+  /** `dish-config`, `dish-memory`: "<logName> onCommit callback threw: ...", "<logName> push loop failed: ...". */
+  logName: string
+  /** `DISH_CONFIG`, `DISH_MEMORY`: the warning codes `<warningCode>_ON_COMMIT`, `_ON_PROPOSAL`, `_PROPOSAL` and `_PUSH`. */
+  warningCode: string
+}
+
+const MAIN = 'refs/heads/main'
+const DEFAULT_MAX_BYTES = 262144
+const FULL_COMMIT_ID = /^[0-9a-f]{40}$/
+/** What a session id or a role may look like: no whitespace, no punctuation a log line could trip on. */
+const IDENTIFIER = /^[A-Za-z0-9._:-]{1,128}$/
+const DEFAULT_ROLE = 'main'
+const NOTE_MAX_CHARS = 200
+/** The note on a `seed` commit that replaced at least one stored default. */
+const REPLACED_NOTE = 'updated to the new defaults'
+/** What a hash in `SeedOptions.replace` looks like: sha256, lowercase hex. */
+const SHA256_HEX = /^[0-9a-f]{64}$/
+const SUBJECT_PATHS = 3
+const SHORT_ID_CHARS = 7
+const DEFAULT_HISTORY_LIMIT = 50
+const MAX_HISTORY_LIMIT = 500
+const SYSTEM: Author = { kind: 'system' }
+const CONTROL = /[\x00-\x1f\x7f]/
+/** Control characters as a note may still hold them once whitespace is gone: C0, DEL and C1. */
+const NOTE_CONTROL = /[\x00-\x1f\x7f-\x9f]/
+/** `dish.lock.<pid>.<random>.tmp`: the temporary file `acquireLock` links the lock from. */
+const LOCK_TEMP = /^dish\.lock\.(\d+)\.[0-9a-f]+\.tmp$/
+/** A lock temp file lives for a moment; one this old was left by a crash, not by a process mid-acquire. */
+const STALE_TEMP_MS = 60_000
+/** Everything `git init --bare` puts in a directory. */
+const GIT_INIT_ENTRIES: readonly string[] = ['HEAD', 'branches', 'config', 'description', 'hooks', 'info', 'objects', 'refs']
+/** The files `git init` writes through a lock, which a crash can leave behind and which would make the next `git init` fail. */
+const GIT_INIT_LOCKS: readonly string[] = ['config.lock', 'HEAD.lock']
+/** What a restore from the remote is fetched into, inside the repository directory: `dish-restore-<16 hex>`. */
+const RESTORE_DIR = /^dish-restore-[0-9a-f]{16}$/
+
+/** What `write`, `seed`, `revert` and the proposals hand to `commitPrepared` once every check has passed. Package-internal. */
+export interface Prepared {
+  changes: Change[]
+  author: Author
+  note?: string
+  base?: string
+  /** The subject's text after `<paths>: `. */
+  summary: string
+  /** Replaces the whole subject (`<paths>: <summary>`); gets the paths that changed. */
+  subject?: (changed: string[]) => string
+  /** `Key: value` lines added to the trailers, after the author's and the note. */
+  trailers?: string[]
+}
+
+/** What an agent may do through a call: the namespace policies that allow it, and how an error says it. */
+interface AgentRule {
+  allowed: ReadonlyArray<NamespaceSpec['agent']>
+  verb: string
+}
+
+const AGENT_WRITE: AgentRule = { allowed: ['write'], verb: 'write' }
+const AGENT_PROPOSE: AgentRule = { allowed: ['write', 'propose'], verb: 'propose changes to' }
+
+/** A commit as `git log` printed it, with the trailers the proposals read. Package-internal. */
+export interface LogRecord {
+  info: CommitInfo
+  /** The commit's parents, as git prints them. */
+  parents: string[]
+  /** The `Dish-Proposal` and `Dish-Base` values as git read them (the values of a repeated trailer are joined by U+001F, so none matches a valid id). */
+  proposal: string
+  base: string
+  /** The `Dish-Rejected` value, read as a note is; `undefined` for none, or one that isn't a line. */
+  rejected: string | undefined
+}
+
+function invalid(message: string): StoreError {
+  return new StoreError('INVALID', message)
+}
+
+/** `path` for an error message: quoted, unless it looks like a secret, which must not be echoed. */
+function label(path: string): string {
+  return secretKind(path) === undefined ? JSON.stringify(path) : '(a path that looks like a secret)'
+}
+
+// --- checking what a caller hands in -------------------------------------------------------------
+
+/**
+ * A store's `naming`: four non-empty one-line strings. They go into the root commit's subject, messages
+ * and warning codes, so a newline there could forge a trailer or a log line.
+ * @throws a plain `Error`: a bad naming is a bug in the plugin that opens the store.
+ */
+function checkNaming(naming: unknown): void {
+  if (typeof naming !== 'object' || naming === null) throw new Error('naming must be an object')
+  for (const field of ['label', 'kind', 'logName', 'warningCode'] as const) {
+    const value = (naming as Record<string, unknown>)[field]
+    if (typeof value !== 'string' || value.trim() === '' || CONTROL.test(value)) {
+      throw new Error(`naming.${field} must be a non-empty one-line string`)
+    }
+  }
+}
+
+function checkChange(raw: unknown): Change {
+  if (typeof raw !== 'object' || raw === null) throw invalid('each change must be an object')
+  const { path, text, delete: remove } = raw as Record<string, unknown>
+  if (typeof path !== 'string') throw invalid('a change needs a string path')
+  if (remove !== undefined) {
+    if (remove !== true || text !== undefined) throw invalid(`${label(path)}: a change is either { text } or { delete: true }`)
+    return { path, delete: true }
+  }
+  if (typeof text !== 'string') throw invalid(`${label(path)}: a change needs a string text, or delete: true`)
+  return { path, text }
+}
+
+/** Step 1: a non-empty list of well-formed changes with distinct paths, copied so later steps see what was checked. */
+function checkChanges(changes: unknown): Change[] {
+  if (!Array.isArray(changes) || changes.length === 0) throw invalid('changes must be a non-empty array')
+  const seen = new Set<string>()
+  return changes.map(raw => {
+    const change = checkChange(raw)
+    if (seen.has(change.path)) throw invalid(`${label(change.path)} appears more than once`)
+    seen.add(change.path)
+    return change
+  })
+}
+
+/** Step 2. */
+function checkPaths(changes: Change[]): void {
+  for (const { path } of changes) {
+    const problem = pathProblem(path)
+    if (problem !== undefined) throw invalid(`invalid path ${label(path)}: ${problem}`)
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const prototype: unknown = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+/**
+ * `seed`'s options, checked before anything else: a plain object whose `replace` is a plain object,
+ * every key a path of `defaults` and every value an array of lowercase hex sha256 strings.
+ * Returned as copies, so the caller can't change what was checked.
+ */
+function checkSeedOptions(options: unknown, defaults: Record<string, string>): Map<string, Set<string>> {
+  const replace = new Map<string, Set<string>>()
+  if (options === undefined) return replace
+  if (!isPlainObject(options)) throw invalid('seed options must be an object')
+  const given = options.replace
+  if (given === undefined) return replace
+  if (!isPlainObject(given)) throw invalid('seed replace must be an object of path to hashes')
+  for (const path of Object.keys(given)) {
+    if (!Object.hasOwn(defaults, path)) throw invalid(`seed replace: ${label(path)} is not a path in the defaults`)
+    const hashes = given[path]
+    if (!Array.isArray(hashes)) throw invalid(`seed replace: ${label(path)} must be an array of hashes`)
+    const checked = new Set<string>()
+    for (const hash of hashes as unknown[]) {
+      if (typeof hash !== 'string' || !SHA256_HEX.test(hash)) {
+        throw invalid(`seed replace: ${label(path)} holds a hash that is not 64 lowercase hex characters`)
+      }
+      checked.add(hash)
+    }
+    replace.set(path, checked)
+  }
+  return replace
+}
+
+function sha256(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
+function checkAuthorKind(meta: unknown): EditAuthor {
+  const author = (meta as { author?: unknown } | null | undefined)?.author
+  const kind = (author as { kind?: unknown } | null | undefined)?.kind
+  if (kind !== 'user' && kind !== 'agent') throw invalid('author kind must be "user" or "agent"')
+  return author as EditAuthor
+}
+
+/** An optional agent field (`sessionId`, `role`) that must match `IDENTIFIER`. */
+function checkIdentifier(field: string, value: unknown): string {
+  if (typeof value !== 'string' || !IDENTIFIER.test(value)) {
+    throw invalid(`agent ${field} must match ${String(IDENTIFIER)}`)
+  }
+  return value
+}
+
+/** A one-line text as it will be committed, before any length cap: whitespace collapsed, trimmed, no control characters. `''` for none. */
+function normalizeLine(field: string, value: unknown): string {
+  if (typeof value !== 'string') throw invalid(`${field} must be a string`)
+  const text = value.replace(/\s+/g, ' ').trim()
+  if (NOTE_CONTROL.test(text)) throw invalid(`${field} contains control characters`)
+  return text
+}
+
+/** The note as it will be committed, before the length cap; `undefined` for none (or only whitespace). */
+function normalizeNote(note: unknown): string | undefined {
+  if (note === undefined) return undefined
+  const text = normalizeLine('note', note)
+  return text === '' ? undefined : text
+}
+
+function capLine(text: string, max: number): string {
+  // By code point, so the cut never splits a surrogate pair.
+  const capped = Array.from(text).slice(0, max).join('')
+  return capped.trimEnd()
+}
+
+function capNote(note: string): string {
+  return capLine(note, NOTE_MAX_CHARS)
+}
+
+/**
+ * A required one-line text (a proposal's title, a reason) as it will be committed:
+ * normalized, cut to `max` characters, and refused if it looks like a secret either whole or
+ * as cut (dropping a tail can leave a match). `undefined` if there is no text.
+ */
+function checkLine(field: string, raw: unknown, max: number): string | undefined {
+  const text = normalizeLine(field, raw)
+  if (text === '') return undefined
+  refuseSecret(field, text)
+  const capped = capLine(text, max)
+  refuseSecret(field, capped)
+  return capped
+}
+
+/** Step 6: the author's fields and the note. Returns the author as it will be recorded, and the note as committed. */
+function checkMeta(author: EditAuthor, rawNote: unknown): { author: EditAuthor, note?: string } {
+  const note = normalizeNote(rawNote)
+  let recorded: EditAuthor = author
+  const fields: Array<[string, string]> = []
+  if (author.kind === 'agent') {
+    const sessionId = checkIdentifier('sessionId', author.sessionId)
+    const role = author.role === undefined ? DEFAULT_ROLE : checkIdentifier('role', author.role)
+    recorded = { kind: 'agent', sessionId, role }
+    fields.push(['role', role], ['sessionId', sessionId])
+  }
+  // The whole note is scanned, not just what survives the cap: a token must not slip out half-cut.
+  if (note !== undefined) fields.unshift(['note', note])
+  for (const [field, value] of fields) refuseSecret(field, value)
+  if (note === undefined) return { author: recorded }
+  // And the cut itself is scanned: dropping the tail of a near-miss (AKIA plus 17 characters) can leave a match.
+  const capped = capNote(note)
+  refuseSecret('note', capped)
+  return { author: recorded, note: capped }
+}
+
+function refuseSecret(field: string, value: string): void {
+  const kind = secretKind(value)
+  if (kind !== undefined) throw new StoreError('SECRET', `the ${field} looks like ${kind}`)
+}
+
+// --- commit messages ----------------------------------------------------------------------------
+
+function pathList(paths: string[]): string {
+  const shown = paths.slice(0, SUBJECT_PATHS).join(', ')
+  return paths.length > SUBJECT_PATHS ? `${shown} and ${paths.length - SUBJECT_PATHS} more` : shown
+}
+
+function defaultSummary(author: EditAuthor): string {
+  return author.kind === 'user' ? 'edited in web UI' : `edited by ${author.role ?? DEFAULT_ROLE} agent`
+}
+
+/** The message: `subject`, a blank line, then the `Dish-*` trailers. Every value is single-line by now. */
+function messageFor(subject: string, author: Author, note?: string, extra: string[] = []): string {
+  const trailers = [`Dish-Author-Kind: ${author.kind}`]
+  if (author.kind === 'agent') trailers.push(`Dish-Session: ${author.sessionId}`, `Dish-Role: ${author.role ?? DEFAULT_ROLE}`)
+  if (note !== undefined) trailers.push(`Dish-Note: ${note}`)
+  return `${subject}\n\n${[...trailers, ...extra].join('\n')}\n`
+}
+
+// --- reading commits back ------------------------------------------------------------------------
+
+/** Separates the values of a trailer that appears more than once; no trailer value can hold it unnoticed. */
+const VALUE_SEPARATOR = '\x1f'
+
+function trailerValues(key: string): string {
+  return `%(trailers:key=${key},valueonly,separator=%x1f)`
+}
+
+/**
+ * What `git log` is asked for, one commit per record. Fields are split by NUL
+ * and records end in NUL (`-z`): git cuts a message at its first NUL, so no
+ * message, however forged, can add a field or end a record early. The
+ * trailers are git's own reading of the message's last paragraph; nothing in
+ * the body above it counts.
+ */
+const LOG_FIELDS = [
+  '%H', '%at', '%P',
+  ...['Dish-Author-Kind', 'Dish-Session', 'Dish-Role', 'Dish-Note', 'Dish-Proposal', 'Dish-Base', 'Dish-Rejected'].map(trailerValues),
+  '%B',
+]
+const LOG_FORMAT = LOG_FIELDS.join('%x00')
+
+/**
+ * Who a commit's trailers name. Only what this store writes counts: a commit
+ * made any other way (by hand, or by a clone's remote) is not a user's or an
+ * agent's action, so whatever doesn't read as exactly one valid author is the system's.
+ */
+function authorOf(kind: string, session: string, role: string): Author {
+  if (kind === 'user') return { kind: 'user' }
+  if (kind === 'agent' && IDENTIFIER.test(session) && IDENTIFIER.test(role)) return { kind: 'agent', sessionId: session, role }
+  return SYSTEM
+}
+
+/** A one-line trailer value as `write` would have recorded it: at most `max` characters, never more than one value, never control characters. */
+function lineOf(value: string, max: number): string | undefined {
+  if (value.includes(VALUE_SEPARATOR)) return undefined
+  const text = value.replace(/\s+/g, ' ').trim()
+  if (text === '' || NOTE_CONTROL.test(text)) return undefined
+  return capLine(text, max)
+}
+
+/** A commit's `Dish-Note` as `write` would have recorded it. */
+function noteOf(value: string): string | undefined {
+  return lineOf(value, NOTE_MAX_CHARS)
+}
+
+/** `history`'s query, checked, with its defaults filled in. `before` is passed on unchecked. */
+function checkHistoryQuery(query: unknown): { pathspec: string[], limit: number, before: unknown } {
+  if (typeof query !== 'object' || query === null) throw invalid('history takes an object')
+  const { path, prefix, limit, before } = query as Record<string, unknown>
+  if (path !== undefined && prefix !== undefined) throw invalid('give a path or a prefix, not both')
+  const pathspec: string[] = []
+  for (const [field, value] of [['path', path], ['prefix', prefix]] as const) {
+    if (value === undefined) continue
+    if (typeof value !== 'string') throw invalid(`${field} must be a string`)
+    // A prefix may end in a slash (`prompts/`): what is left must still be a path that could exist.
+    const bare = field === 'prefix' && value.endsWith('/') ? value.slice(0, -1) : value
+    const problem = pathProblem(bare)
+    if (problem !== undefined) throw invalid(`invalid ${field} ${label(value)}: ${problem}`)
+    pathspec.push(literal(bare))
+  }
+  if (limit !== undefined && (typeof limit !== 'number' || Number.isNaN(limit))) throw invalid('limit must be a number')
+  const wanted = limit === undefined ? DEFAULT_HISTORY_LIMIT : Math.trunc(limit as number)
+  return { pathspec, limit: Math.min(MAX_HISTORY_LIMIT, Math.max(1, wanted)), before }
+}
+
+/** Whether anything but directories is at or below `path`: a file, a link, or `path` itself not being a directory. A missing path holds nothing. */
+async function holdsFiles(path: string): Promise<boolean> {
+  let entries
+  try {
+    entries = await readdir(path, { recursive: true, withFileTypes: true })
+  } catch (error) {
+    const code = (error as { code?: string }).code
+    if (code === 'ENOENT') return false
+    // A file (or anything that isn't a directory): not a skeleton directory.
+    if (code === 'ENOTDIR') return true
+    throw error
+  }
+  return entries.some(entry => !entry.isDirectory())
+}
+
+function isOwnLockFile(name: string): boolean {
+  return name === 'dish.lock' || LOCK_TEMP.test(name)
+}
+
+/** Whether no process has `pid`. Any answer but "no such process" (including a pid that isn't valid) counts as alive. */
+function processIsGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error) {
+    return (error as { code?: unknown }).code === 'ESRCH'
+  }
+}
+
+function warn(message: string, code: string): void {
+  process.emitWarning(message, { code })
+}
+
+/**
+ * Run a listener the caller gave. What it was told about has happened, so a throw (or a rejection) is a process warning, not a failure:
+ * `<logName> <name> callback threw: ...`, with the code `<warningCode>_ON_COMMIT` or `_ON_PROPOSAL`.
+ */
+function notify(naming: StoreNaming, name: 'onCommit' | 'onProposal', call: () => unknown): void {
+  const failed = (error: unknown): void => warn(
+    `${naming.logName} ${name} callback threw: ${error instanceof Error ? error.message : String(error)}`,
+    `${naming.warningCode}${name === 'onCommit' ? '_ON_COMMIT' : '_ON_PROPOSAL'}`)
+  try {
+    Promise.resolve(call()).catch(failed)
+  } catch (error) {
+    failed(error)
+  }
+}
+
+/**
+ * A versioned store: one bare git repository, `main` its only branch of
+ * record, driven through git plumbing behind one queue and a process lock.
+ * dish-config's config store is one; any plugin can open another, at its own
+ * path and under its own `naming`.
+ *
+ * Every operation, reads included, runs on the queue, so a read never sees a
+ * write half done. Callers see `StoreError`s for refusals and plain
+ * `Error`s for anything wrong with the environment or with how the store was used.
+ */
+export class VersionedStore {
+  private readonly git: Git
+  private readonly queue = new SerialQueue()
+  private readonly repository: string
+  private readonly options: StoreOptions
+  private readonly naming: StoreNaming
+  private readonly maxBytes: number
+  private readonly release: () => Promise<void>
+  private readonly proposalHost: ProposalHost
+  private readonly pushQueue: PushQueue | undefined
+  private closed = false
+  private closing: Promise<void> | undefined
+
+  /** Only `open` makes a store (`new this(...)`, so a subclass's `open` makes the subclass). */
+  protected constructor(options: StoreOptions, repository: string, release: () => Promise<void>) {
+    this.options = options
+    this.naming = { ...options.naming }
+    this.repository = repository
+    this.git = new Git(repository)
+    this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
+    this.release = release
+    this.proposalHost = this.makeProposalHost()
+    if (options.remote !== undefined) {
+      this.pushQueue = new PushQueue(this.git, options.remote, {
+        delays: options.pushDelays, timeoutMs: options.pushTimeoutMs, onStatus: options.onRemoteStatus, naming: this.naming,
+      })
+    }
+  }
+
+  /**
+   * Open the store at `options.repository`: create the directory, take the
+   * process lock, then make sure the repository is there (restoring it from the
+   * `remote` if the directory is empty and the remote has a `main`, else initializing
+   * it with one root commit) and clear what a crashed run left. With a `remote`, a
+   * first push is then started, in the background.
+   *
+   * It constructs with `new this(...)`, so a subclass's `open` gives the subclass. It isn't
+   * generic over `this`: a `this`-typed static `open` doesn't typecheck with a subclass.
+   * @throws `LOCKED` if another process holds the store; a plain `Error` if the
+   *   directory holds something that isn't a dish repository of this `naming.kind`, the `remote`,
+   *   the push options or the `naming` are unusable, or a first start can't reach the remote.
+   */
+  static async open(options: StoreOptions): Promise<VersionedStore> {
+    const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
+    if (!(maxBytes >= 0)) throw new Error(`maxBytes must be zero or more, got ${String(maxBytes)}`)
+    checkNaming(options.naming)
+    if (options.remote !== undefined) checkRemote(options.remote)
+    checkPushOptions({ delays: options.pushDelays, timeoutMs: options.pushTimeoutMs })
+    const repository = resolve(options.repository)
+    await mkdir(repository, { recursive: true })
+    const release = await acquireLock(repository, process.pid, options.naming.label)
+    try {
+      const store = new this(options, repository, release)
+      await store.ensureRepository()
+      // Not from `onCommit`: the root commit doesn't fire it, and an earlier run may have left commits unpushed.
+      store.pushQueue?.schedule()
+      return store
+    } catch (error) {
+      await release()
+      throw error
+    }
+  }
+
+  /**
+   * Wait for the work already queued, then release the lock. Safe to call
+   * again; operations started after the first call throw a plain `Error`.
+   */
+  close(): Promise<void> {
+    this.closed = true
+    // First, so that no push outlives the lock: one in flight is killed, none is started.
+    this.closing ??= this.closePushes().then(() => this.queue.run(() => this.release())).catch(error => {
+      // A failed release can be tried again.
+      this.closing = undefined
+      throw error
+    })
+    return this.closing
+  }
+
+  private closePushes(): Promise<void> {
+    return this.pushQueue?.close() ?? Promise.resolve()
+  }
+
+  /**
+   * Where the remote copy stands: the commit last pushed (by this process), how many commits on
+   * `main` may be missing there, the last error and when the last attempt began. Without a
+   * `remote` that is `{ pending: 0 }`. Never waits for the network, and a slow push doesn't slow it.
+   */
+  remoteStatus(): Promise<RemoteStatus> {
+    if (this.closed) return Promise.reject(new Error(`${this.naming.label} is closed`))
+    return this.pushQueue?.status() ?? Promise.resolve({ pending: 0 })
+  }
+
+  /** The commit `main` points at. */
+  head(): Promise<string> {
+    return this.run(() => this.mainCommit())
+  }
+
+  /**
+   * The text of the document at `path`, or `undefined` if there is none (or `path` can't be a document).
+   * @param ref - `'main'` or a full 40-hex commit id.
+   * @throws `NOT_FOUND` for any other `ref`, or a commit that doesn't exist.
+   */
+  read(path: string, ref = 'main'): Promise<string | undefined> {
+    return this.run(async () => {
+      const commit = await this.commitFor(ref)
+      if (pathProblem(path) !== undefined) return undefined
+      return this.git.readBlob(commit, path)
+    })
+  }
+
+  /**
+   * Every document path under `prefix` (`prompts/`, `prompts` or `crew.yaml`;
+   * `''` for everything), in git's order.
+   * @param ref - as for `read`.
+   */
+  list(prefix: string, ref = 'main'): Promise<string[]> {
+    return this.run(async () => {
+      const commit = await this.commitFor(ref)
+      // A trailing slash only marks a subtree; what's left must be a path that could exist.
+      const bare = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
+      if (prefix !== '' && pathProblem(bare) !== undefined) return []
+      return this.git.listPaths(commit, bare)
+    })
+  }
+
+  /**
+   * Commit `changes` to `main` as one atomic commit. Checked in this order,
+   * and nothing reaches git until all have passed. First, the author's kind
+   * must be `user` or `agent` (`INVALID`). Then:
+   * 1. a non-empty, well-formed list with no path twice (`INVALID`)
+   * 2. every path usable as a document path (`INVALID`)
+   * 3. every path owned (`UNOWNED`); an agent author needs the namespace's `agent` policy to be `write` (`FORBIDDEN`)
+   * 4. the content guard on every written document (`SECRET`, `TOO_LARGE`)
+   * 5. the namespace's `validate` (`INVALID`, prefixed with the path)
+   * 6. the author and note (`INVALID`, `SECRET`)
+   *
+   * Then: a delete of a missing path is `NOT_FOUND`; with `meta.base`, a path
+   * changed on `main` since then is `CONFLICT` (and `NOT_FOUND` if `base` isn't a commit).
+   * @returns the commit, or `undefined` when the changes leave `main` as it is: no commit is made.
+   */
+  write(changes: Change[], meta: WriteMeta): Promise<CommitInfo | undefined> {
+    return this.run(() => this.commitPrepared(this.prepareWrite(changes, meta)))
+  }
+
+  /**
+   * Write the documents in `defaults` that don't exist yet, as one commit by the
+   * `system` author with the subject `<paths>: <owner> defaults`.
+   * An existing document is never touched, with one exception: `options.replace`
+   * lists, per path, the sha256 (lowercase hex, of the text as UTF-8) of earlier
+   * shipped texts, and a stored document that still has one of those hashes is
+   * overwritten with the new default. That is how an upgrade moves unedited
+   * defaults along while leaving the edited ones alone. A commit that replaced
+   * something carries the note "updated to the new defaults".
+   * Every path must belong to a namespace owned by `owner` (`UNOWNED`); the
+   * guard and validators run as for `write`, but the agent policy doesn't apply.
+   * A malformed `options` (`replace` keys that aren't paths of `defaults`, hashes
+   * that aren't lowercase hex sha256) is `INVALID`, before anything is read.
+   * The commit is built on the head that was read, so a document changed in the
+   * meantime is `CONFLICT`, never overwritten.
+   * @returns the commit, or `undefined` when there was nothing to write or replace.
+   */
+  seed(defaults: Record<string, string>, owner: string, options?: SeedOptions): Promise<CommitInfo | undefined> {
+    return this.run(async () => {
+      if (typeof owner !== 'string' || owner === '' || CONTROL.test(owner)) throw invalid('seed owner must be a one-line string')
+      const replace = checkSeedOptions(options, defaults)
+      const entries = Object.entries(defaults)
+      if (entries.length === 0) return undefined
+      const all = checkChanges(entries.map(([path, text]) => ({ path, text })))
+      checkPaths(all)
+      const owners = this.ownersOf(all)
+      for (const [path, spec] of owners) {
+        if (spec.owner !== owner) throw new StoreError('UNOWNED', `${label(path)} belongs to ${JSON.stringify(spec.owner)}, not ${JSON.stringify(owner)}`)
+      }
+      // Every path is scanned before git sees any of them, not only the ones that turn out to be written.
+      for (const { path } of all) checkContent(path, '', this.maxBytes)
+      const head = await this.mainCommit()
+      const writes: Change[] = []
+      let replaced = 0
+      for (const change of all) {
+        if (!(await this.hasFile(head, change.path))) {
+          writes.push(change)
+          continue
+        }
+        const earlier = replace.get(change.path)
+        if (earlier === undefined || earlier.size === 0 || !('text' in change)) continue
+        const stored = await this.git.readBlob(head, change.path)
+        if (stored === undefined || stored === change.text || !earlier.has(sha256(stored))) continue
+        writes.push(change)
+        replaced++
+      }
+      if (writes.length === 0) return undefined
+      this.checkGuard(writes)
+      this.checkValid(writes, owners)
+      // `base` makes the retry notice a document that appeared, or was edited, in the meantime, instead of overwriting it.
+      const prepared: Prepared = { changes: writes, author: SYSTEM, base: head, summary: `${owner} defaults` }
+      if (replaced > 0) prepared.note = REPLACED_NOTE
+      return this.commitPrepared(prepared)
+    })
+  }
+
+  /**
+   * The commits of `main`, newest first (its first-parent line), each as `write`
+   * returned it: `author` and `note` come from the commit's trailers, and a
+   * commit made any other way is the `system`'s. With `path` or `prefix`, only
+   * the commits that changed it; both at once is `INVALID`. `before` starts the
+   * list just below that commit, so `before` = the last id of a page gives the next.
+   * @throws `INVALID` for a `path`, `prefix` or `limit` that can't be used; `NOT_FOUND`
+   *   if `before` isn't the full id of a commit reachable from `main`.
+   */
+  history(query: HistoryQuery = {}): Promise<CommitInfo[]> {
+    return this.run(async () => {
+      const { pathspec, limit, before } = checkHistoryQuery(query)
+      let start = MAIN
+      if (before !== undefined) {
+        const parent = await this.git.resolve(`${await this.mainCommitFor(before)}^`)
+        if (parent === undefined) return []
+        start = parent
+      }
+      return this.readCommits(['-n', String(limit), start], pathspec)
+    })
+  }
+
+  /**
+   * What changed between two commits, one entry per file with git's own patch,
+   * in path order. External diff programs and textconv filters are never run.
+   * @param from - `'main'`, a full commit id, or the empty tree's id.
+   * @param to - as for `from`.
+   * @param path - only this file, or the files under this directory.
+   * @throws `NOT_FOUND` for any other `from` or `to`; `INVALID` for a `path` that can't exist.
+   */
+  diff(from: string, to: string, path?: string): Promise<FileDiff[]> {
+    return this.run(async () => {
+      let pathspec: string[] = []
+      if (path !== undefined) {
+        const problem = typeof path === 'string' ? pathProblem(path) : 'not a string'
+        if (problem !== undefined) throw invalid(`invalid path ${typeof path === 'string' ? label(path) : typeof path}: ${problem}`)
+        pathspec = [literal(path)]
+      }
+      return this.fileDiffs(await this.diffEnd(from), await this.diffEnd(to), pathspec)
+    })
+  }
+
+  /**
+   * One commit and what it changed: its diff against its parent, or against the
+   * empty tree for a commit with none.
+   * @param id - `'main'` or a full commit id (any commit in the repository, not only one on `main`).
+   * @throws `NOT_FOUND` for anything else.
+   */
+  commit(id: string): Promise<{ info: CommitInfo, diffs: FileDiff[] }> {
+    return this.run(async () => {
+      const found = await this.commitFor(id)
+      const [info] = await this.readCommits(['-n', '1', found], [])
+      const parent = await this.git.resolve(`${found}^`) ?? await this.git.emptyTree()
+      return { info: info!, diffs: await this.fileDiffs(parent, found, []) }
+    })
+  }
+
+  /**
+   * Undo what `commit` changed: every path it touched goes back to its parent's
+   * version (a path the commit added is deleted), as one new commit by the same
+   * pipeline as `write`, with the reverted commit as `base`. So a path changed
+   * since is `CONFLICT`, and an agent author needs `agent: 'write'` on every
+   * namespace involved. The subject is `Revert <short id>: <paths>`, and a
+   * `Dish-Revert: <full id>` trailer names the commit. A path already back at its
+   * parent's version is left out; when none is left (it was reverted before) no
+   * commit is made.
+   * @param commit - the full id of a commit on `main`.
+   * @returns the commit, or `undefined` when there was nothing left to revert.
+   * @throws `NOT_FOUND` if `commit` isn't the full id of a commit on `main`; `INVALID` for the
+   *   first commit, which has nothing to go back to, and for a bad author or note.
+   */
+  revert(commit: string, meta: RevertMeta): Promise<CommitInfo | undefined> {
+    return this.run(async () => {
+      // As `write` does: the author and note are checked before anything is read.
+      checkMeta(checkAuthorKind(meta), meta.note)
+      const target = await this.mainCommitFor(commit)
+      const parent = await this.git.resolve(`${target}^`)
+      if (parent === undefined) throw invalid('nothing to revert: the first commit has no earlier state to go back to')
+      const touched = await this.git.changedPaths(parent, target)
+      // Of those, what still differs from the parent's version is what is left to undo.
+      const pending = (await this.git.changedPaths(parent, await this.mainCommit(), touched)).sort()
+      if (pending.length === 0) return undefined
+      const changes: Change[] = []
+      for (const path of pending) {
+        const text = await this.git.readBlob(parent, path)
+        changes.push(text === undefined ? { path, delete: true } : { path, text })
+      }
+      const prepared = this.prepareWrite(changes, { ...meta, base: target })
+      prepared.subject = changed => `Revert ${target.slice(0, SHORT_ID_CHARS)}: ${pathList(changed)}`
+      prepared.trailers = [`Dish-Revert: ${target}`]
+      return this.commitPrepared(prepared)
+    })
+  }
+
+  /**
+   * Open a proposal: a branch `refs/heads/proposal/<id>` (8 hex characters) holding one commit
+   * whose parent is the `main` commit it was made on and whose tree is that commit's plus
+   * `changes`, deletions before writes. Nothing on `main` changes. The checks are those of
+   * `write`, in its order, except that an agent needs the namespace's `agent` policy to be
+   * `write` or `propose` (`FORBIDDEN`), and users may propose to any namespace; then the
+   * title (one line, whitespace collapsed, cut to 120 characters, not empty) and the
+   * rationale (any lines, at most 8 KiB, no control characters but tab and newline, no line
+   * that starts like a `Dish-` trailer), neither holding git's scissors line, each refused
+   * if it looks like a secret (`INVALID`, `SECRET`). Nothing reaches git before they all pass. A proposal that would
+   * leave the tree as it is is `INVALID`.
+   * @returns the proposal, as `proposals` lists it.
+   */
+  propose(changes: Change[], meta: ProposeMeta): Promise<ProposalInfo> {
+    return this.run(() => proposeChanges(this.proposalHost, changes, meta))
+  }
+
+  /**
+   * The proposals, newest first; `status` picks `open`, `stale` or `rejected` (all three if
+   * omitted; `INVALID` for anything else). Stale means a path the proposal changes conflicts with
+   * `main`: changed there to something other than the proposal's version, or no longer fitting
+   * its tree (a file where it needs a directory, or the reverse). Computed on every call. A ref under `proposal/` or
+   * `refs/dish/rejected/` that holds no well-formed proposal is left out, not an error.
+   */
+  proposals(status?: ProposalStatus): Promise<ProposalInfo[]> {
+    return this.run(() => listProposals(this.proposalHost, status))
+  }
+
+  /**
+   * Put a proposal on `main` and delete its branch. Only a user may (`FORBIDDEN`). If the proposal
+   * is stale (see `proposals`): `STALE`, `onProposal(id, 'stale')`, nothing merged, the branch kept.
+   * Otherwise the tip's version of each path still as it was at the proposal's base (a deletion where
+   * the tip has none; what `main` already has as proposed is left out) goes through the pipeline of
+   * `write`, so ownership, the guard and the validators apply as they are now, as one commit
+   * `Accept proposal <id>: <title>` with `Dish-Proposal` and (for an agent's proposal)
+   * `Dish-Proposer-Session` and `Dish-Proposer-Role` trailers. The title, session and role are
+   * scanned for secrets first (`SECRET`, the branch kept); the rationale is never copied.
+   * @returns the commit, or `undefined` when nothing was left to apply: the branch is deleted all the same.
+   * @throws `NOT_FOUND` if there is no such proposal.
+   */
+  accept(id: string, meta: AcceptMeta): Promise<CommitInfo | undefined> {
+    return this.run(() => acceptProposal(this.proposalHost, id, meta))
+  }
+
+  /**
+   * Reject a proposal, with a reason (a line: whitespace collapsed, cut to 200 characters, not
+   * empty, no secret). A user may reject any, stale ones included; an agent only withdraws one
+   * from its own session (`FORBIDDEN`). The proposal moves to `refs/dish/rejected/<id>`, on a
+   * commit `Rejected: <reason>` with the same tree and the trailers `Dish-Rejected` and
+   * `Dish-Proposal`, and `proposals('rejected')` lists it with its `reason`.
+   * @throws `NOT_FOUND` if there is no such open or stale proposal.
+   */
+  reject(id: string, reason: string, meta: RejectMeta): Promise<void> {
+    return this.run(() => rejectProposal(this.proposalHost, id, reason, meta))
+  }
+
+  // --- the queue ---------------------------------------------------------------------------------
+
+  /** Run `task` on the queue; once `close()` has been called, nothing new starts. */
+  private run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.closed) return Promise.reject(new Error(`${this.naming.label} is closed`))
+    return this.queue.run(task)
+  }
+
+  // --- opening -----------------------------------------------------------------------------------
+
+  /**
+   * Make sure `<repository>` holds a dish repository (of this `naming.kind`) with a `main`.
+   *
+   * With the lock held and git agreeing the directory is a repository, it is
+   * cleaned of what a crashed run left, and finished if the root commit is missing.
+   * Otherwise it is created, but only in a directory that holds nothing except what
+   * `git init --bare` makes (and the `config.lock` and `HEAD.lock` it works through,
+   * which are removed first): that also finishes a first start that crashed inside
+   * `git init`, which writes `config` before `HEAD` and `HEAD` before `objects/`.
+   *
+   * With a `remote` and no repository yet, the remote's `main` is fetched first, and the
+   * directory becomes a copy of it (see `restoreFromRemote`); only a remote with no `main`
+   * leaves the directory to be initialized. A directory that already is a repository never
+   * contacts the remote here.
+   */
+  private async ensureRepository(): Promise<void> {
+    await this.removeStaleRestores()
+    // A stray `HEAD` file doesn't make a repository: it is whatever git itself accepts.
+    const check = await this.git.run(['rev-parse', '--git-dir'], { allowFail: true })
+    if (check.code === 0) {
+      await this.removeStaleFiles()
+      if ((await this.git.resolve(MAIN)) === undefined) await this.completeInitialization()
+      return
+    }
+    await this.initialize(check.stderr.trim())
+  }
+
+  /** @param why - what git said about the directory, for the message when it can't be initialized. */
+  private async initialize(why: string): Promise<void> {
+    const entries = await readdir(this.repository, { withFileTypes: true })
+    // The init lock files are only leftovers if they are files; a directory by that name is somebody's.
+    const isInitLock = (entry: { name: string, isFile(): boolean }): boolean => entry.isFile() && GIT_INIT_LOCKS.includes(entry.name)
+    const others = entries.filter(entry => !isOwnLockFile(entry.name) && !GIT_INIT_ENTRIES.includes(entry.name) && !isInitLock(entry))
+    if (others.length > 0) {
+      throw new Error(`${this.repository} is not a dish ${this.naming.kind} repository, refusing to initialize over existing files${why === '' ? '' : ` (git: ${why})`}`)
+    }
+    // This process holds `dish.lock`, so no git of ours is running: whatever lock `git init` left is a crash's.
+    await Promise.all(entries.filter(isInitLock).map(entry => rm(join(this.repository, entry.name), { force: true })))
+    if (this.options.remote !== undefined && await this.restoreFromRemote(entries.map(entry => entry.name))) return
+    // Safe on what a crashed `git init` left: it fills in whatever is missing and changes nothing else.
+    await this.git.initBare('main')
+    await this.completeInitialization()
+  }
+
+  /**
+   * Make `<repository>` a copy of the remote's `main`. It is fetched into a new bare repository in a
+   * directory of its own inside this one (`dish-restore-<hex>`: the same filesystem, whatever is mounted
+   * where, and under our lock; SHA-1 and loose refs whatever the user's git config says, `main` only, no
+   * remote configured in it) and checked there; then each of its entries is moved up into this directory,
+   * `refs` and `HEAD` last, and the restore directory is removed. It is removed when anything fails too,
+   * and nothing has been touched by then.
+   *
+   * This directory may hold what a crashed `git init` or an earlier restore's first renames left
+   * (`entries`), which is replaced, unless `objects` or `refs` hold a file: that could be commits.
+   * @returns `true` once restored; `false` if the remote is reachable but has no `main`.
+   * @throws a plain `Error` if the remote can't be reached or what it has isn't usable, or the directory holds more than leftovers.
+   */
+  private async restoreFromRemote(entries: string[]): Promise<boolean> {
+    const remote = this.options.remote!
+    const leftovers = entries.filter(name => GIT_INIT_ENTRIES.includes(name))
+    for (const name of ['objects', 'refs']) {
+      if (leftovers.includes(name) && await holdsFiles(join(this.repository, name))) {
+        throw new Error(`${this.repository} is not a repository but holds parts of one (${name}), refusing to replace them from the remote; remove ${name} (or the whole directory) to restore`)
+      }
+    }
+    const temp = join(this.repository, `dish-restore-${randomBytes(8).toString('hex')}`)
+    try {
+      const fetched = new Git(temp)
+      await fetched.initBare('main')
+      if (!(await fetchRemoteMain(remote, fetched, this.options.pushTimeoutMs ?? DEFAULT_PUSH_TIMEOUT_MS))) return false
+      // Only now is anything in the directory touched; what is removed holds no files.
+      await Promise.all(leftovers.map(name => rm(join(this.repository, name), { recursive: true, force: true })))
+      const names = (await readdir(temp)).filter(name => name !== 'refs' && name !== 'HEAD')
+      // `refs` carries `main` and `HEAD` makes it a repository. Until the last rename it is none, and a crash after the
+      // first `objects` leaves files that the next start refuses to guess about (see above).
+      for (const name of [...names, 'refs', 'HEAD']) await rename(join(temp, name), join(this.repository, name))
+      return true
+    } finally {
+      await rm(temp, { recursive: true, force: true })
+    }
+  }
+
+  /**
+   * Delete the restore directories a crashed restore left in the repository directory
+   * (`dish-restore-<16 hex>`, directories only). Safe: this process holds the lock, and only a restore makes them.
+   * Runs before anything decides what the directory is, so a leftover is never mistaken for someone's file.
+   */
+  private async removeStaleRestores(): Promise<void> {
+    const entries = await readdir(this.repository, { withFileTypes: true })
+    const stale = entries.filter(entry => entry.isDirectory() && RESTORE_DIR.test(entry.name))
+    await Promise.all(stale.map(entry => rm(join(this.repository, entry.name), { recursive: true, force: true })))
+  }
+
+  /**
+   * Make the root commit in a repository that has no `main`. The only one this
+   * store will touch is a freshly initialized one with `HEAD` on `main` and no refs
+   * at all (`git init` finished, the root commit didn't); anything else isn't its own.
+   */
+  private async completeInitialization(): Promise<void> {
+    const head = (await this.git.run(['symbolic-ref', '-q', 'HEAD'], { allowFail: true })).stdout.trim()
+    const refs = (await this.git.run(['for-each-ref', '--count=1'])).stdout.trim()
+    if (head !== MAIN || refs !== '') {
+      throw new Error(`${this.repository} has no ${MAIN}, and isn't a fresh repository; refusing to modify it`)
+    }
+    await this.createRootCommit()
+  }
+
+  private async createRootCommit(): Promise<void> {
+    const tree = await this.git.emptyTree()
+    const id = await this.git.commitTree(tree, [], messageFor(`Initialize dish ${this.naming.kind}`, SYSTEM), this.options.agent)
+    if (!(await this.git.casRef(MAIN, id, null))) throw new Error(`${MAIN} appeared while initializing ${this.repository}`)
+  }
+
+  /**
+   * Delete what a crashed process leaves behind, now that this one holds the lock:
+   * temporary indexes (`dish-index-*`, `.lock` variants included), lock temp files
+   * of dead processes, and the ref and packed-refs locks that would make every ref
+   * update fail. A lock temp file is only taken for a leftover when its process is
+   * gone and it is old: a second process starting up right now has one for a moment
+   * (its `acquireLock` is about to fail with `LOCKED`), and must not lose it.
+   */
+  private async removeStaleFiles(): Promise<void> {
+    const stale: string[] = []
+    for (const entry of await readdir(this.repository, { withFileTypes: true })) {
+      if (!entry.isFile()) continue
+      const { name } = entry
+      const path = join(this.repository, name)
+      if (name.startsWith('dish-index-') || name === 'packed-refs.lock' || (await this.isStaleLockTemp(name, path))) stale.push(path)
+    }
+    try {
+      for (const entry of await readdir(join(this.repository, 'refs'), { recursive: true, withFileTypes: true })) {
+        if (entry.isFile() && entry.name.endsWith('.lock')) stale.push(join(entry.parentPath, entry.name))
+      }
+    } catch (error) {
+      if ((error as { code?: unknown }).code !== 'ENOENT') throw error
+    }
+    await Promise.all(stale.map(path => rm(path, { force: true })))
+  }
+
+  private async isStaleLockTemp(name: string, path: string): Promise<boolean> {
+    const match = LOCK_TEMP.exec(name)
+    if (match === null) return false
+    const pid = Number(match[1])
+    if (pid === process.pid || !processIsGone(pid)) return false
+    try {
+      return Date.now() - (await stat(path)).mtimeMs > STALE_TEMP_MS
+    } catch (error) {
+      if ((error as { code?: unknown }).code === 'ENOENT') return false
+      throw error
+    }
+  }
+
+  // --- refs and commits --------------------------------------------------------------------------
+
+  private async mainCommit(): Promise<string> {
+    const head = await this.git.resolve(MAIN)
+    if (head === undefined) throw new Error(`${MAIN} is missing from ${this.repository}`)
+    return head
+  }
+
+  /** `'main'` or a full commit id, as a commit. Never hands a caller's string to git as a ref name. */
+  private async commitFor(ref: string): Promise<string> {
+    if (ref === 'main') return this.mainCommit()
+    if (FULL_COMMIT_ID.test(ref)) {
+      const commit = await this.git.resolve(ref)
+      if (commit !== undefined) return commit
+    }
+    throw new StoreError('NOT_FOUND', `no such ref ${JSON.stringify(ref)}: use "main" or a full commit id`)
+  }
+
+  /** A full commit id that is reachable from `main`, as a commit; `NOT_FOUND` for anything else. */
+  private async mainCommitFor(id: unknown): Promise<string> {
+    const found = typeof id === 'string' && FULL_COMMIT_ID.test(id) ? await this.git.resolve(id) : undefined
+    if (found !== undefined) {
+      const result = await this.git.run(['merge-base', '--is-ancestor', found, MAIN], { allowFail: true })
+      if (result.code === 0) return found
+      // 1 is "not an ancestor"; anything else is git failing.
+      if (result.code !== 1) throw new Error(`git merge-base --is-ancestor failed (exit ${result.code}): ${result.stderr.trim()}`)
+    }
+    throw new StoreError('NOT_FOUND', `no such commit on main: ${typeof id === 'string' ? JSON.stringify(id) : typeof id}; use a full commit id`)
+  }
+
+  /** One end of a diff: the empty tree, or `commitFor`. */
+  private async diffEnd(ref: string): Promise<string> {
+    return ref === await this.git.emptyTree() ? ref : this.commitFor(ref)
+  }
+
+  /** Whether `commit` has a file at `path` (a directory doesn't count). */
+  private async hasFile(commit: string, path: string): Promise<boolean> {
+    return (await this.git.listPaths(commit, path)).includes(path)
+  }
+
+  private identity(author: Author): GitIdentity {
+    return author.kind === 'user' ? this.options.user : this.options.agent
+  }
+
+  /**
+   * `git log` over `revisions` (see `LOG_FORMAT`), as `CommitInfo`s, newest first.
+   * `paths` come from the diff against the first parent, or the empty tree for a first commit.
+   */
+  private async readCommits(revisions: string[], pathspec: string[]): Promise<CommitInfo[]> {
+    return (await this.readRecords(revisions, pathspec)).map(record => record.info)
+  }
+
+  /** `readCommits`, with each commit's parents and the trailers the proposals read. */
+  private async readRecords(revisions: string[], pathspec: string[]): Promise<LogRecord[]> {
+    // Options and config so that nothing in a user's git config changes the records: `log.showSignature`, `i18n.logOutputEncoding`,
+    // `log.follow` (a single path would follow renames), `core.commentChar`/`commentString` (a `Dish-` or `D` comment string
+    // would make git skip every trailer line, and so turn every author into the system) and `trailer.separators` (`=` alone
+    // would make `Dish-Author-Kind: user` no trailer at all).
+    const args = [
+      '-c', 'core.commentChar=#', '-c', 'trailer.separators=:', 'log', '-z', '--first-parent', '--no-follow', '--no-show-signature', '--encoding=UTF-8',
+      `--format=${LOG_FORMAT}`,
+    ]
+    const fields = (await this.git.run([...args, ...revisions, '--', ...pathspec])).stdout.split('\0')
+    fields.pop() // what follows the last record's NUL
+    if (fields.length % LOG_FIELDS.length !== 0) throw new Error('git log printed something other than whole records')
+    const records: LogRecord[] = []
+    let empty: string | undefined
+    for (let at = 0; at < fields.length; at += LOG_FIELDS.length) {
+      const [id, time, parentIds, kind, session, role, noteValue, proposal, base, rejected, message] = fields.slice(at, at + LOG_FIELDS.length) as
+        [string, string, string, string, string, string, string, string, string, string, string]
+      const parents = parentIds === '' ? [] : parentIds.split(' ')
+      const before = parents[0] ?? (empty ??= await this.git.emptyTree())
+      const paths = (await this.git.changedPaths(before, id)).sort()
+      const info: CommitInfo = { id, time: (Number(time) || 0) * 1000, author: authorOf(kind, session, role), message, paths }
+      const note = noteOf(noteValue)
+      if (note !== undefined) info.note = note
+      records.push({ info, parents, proposal, base, rejected: noteOf(rejected) })
+    }
+    return records
+  }
+
+  /** The files that differ between `from` and `to` (commits or trees), with their patches. Runs no external program: see `diff`. */
+  private async fileDiffs(from: string, to: string, pathspec: string[]): Promise<FileDiff[]> {
+    // A user's global git config can name an external diff command or a textconv filter, and git would run it for every file.
+    // Its other diff settings must not change the output either: the path prefixes (`diff.noprefix`, `diff.mnemonicPrefix`),
+    // the order of the files (`diff.orderFile`, which `-O/dev/null` empties) and whether a path in a header is quoted (`core.quotePath`).
+    const base = [
+      '-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames',
+      '--src-prefix=a/', '--dst-prefix=b/', '-O/dev/null',
+    ]
+    const listing = (await this.git.run([...base, '--name-status', '-z', from, to, '--', ...pathspec])).stdout.split('\0')
+    const diffs: FileDiff[] = []
+    for (let at = 0; at + 1 < listing.length; at += 2) {
+      const status = listing[at]!
+      const path = listing[at + 1]!
+      const full = (await this.git.run([...base, from, to, '--', literal(path)])).stdout
+      // A literal pathspec still names a directory's whole subtree, so the patch for a file that has become a directory goes on
+      // into its children's. Every file's patch starts with `diff --git ` and no line inside one can (hunk lines begin with
+      // a space, `+`, `-` or `\`), so a patch ends where the next one begins.
+      const next = full.indexOf('\ndiff --git ', 1)
+      const patch = next === -1 ? full : full.slice(0, next + 1)
+      diffs.push({ path, status: status === 'A' ? 'added' : status === 'D' ? 'deleted' : 'modified', patch })
+    }
+    return diffs
+  }
+
+  // --- checks before git -------------------------------------------------------------------------
+
+  /**
+   * Steps 1 to 6 of `write` (the same for a proposal, with the agent policy `rule` it asks).
+   * Synchronous: nothing here waits on git, so nothing here can be raced.
+   */
+  private prepareWrite(changes: Change[], meta: WriteMeta, rule: AgentRule = AGENT_WRITE): Prepared {
+    const asked = checkAuthorKind(meta)
+    const checked = checkChanges(changes)
+    checkPaths(checked)
+    const owners = this.ownersOf(checked)
+    if (asked.kind === 'agent') this.requireAgentMay(owners, rule)
+    this.checkGuard(checked)
+    this.checkValid(checked, owners)
+    const { author, note } = checkMeta(asked, meta.note)
+    const prepared: Prepared = { changes: checked, author, summary: note ?? defaultSummary(author) }
+    if (note !== undefined) prepared.note = note
+    if (meta.base !== undefined) prepared.base = meta.base
+    return prepared
+  }
+
+  /** Step 3: the namespace that owns each path. */
+  private ownersOf(changes: Change[]): Map<string, NamespaceSpec> {
+    const owners = new Map<string, NamespaceSpec>()
+    for (const { path } of changes) {
+      const spec = this.options.namespaces.ownerOf(path)
+      if (spec === undefined) throw new StoreError('UNOWNED', `no namespace owns ${label(path)}`)
+      owners.set(path, spec)
+    }
+    return owners
+  }
+
+  private requireAgentMay(owners: Map<string, NamespaceSpec>, rule: AgentRule): void {
+    for (const [path, spec] of owners) {
+      if (!rule.allowed.includes(spec.agent)) {
+        // `none` allows nothing, so "allows agents to none only" would read as an odd kind of permission.
+        const why = spec.agent === 'none' ? 'is closed to agents' : `allows agents to "${spec.agent}" only`
+        throw new StoreError('FORBIDDEN', `agents may not ${rule.verb} ${label(path)}: the ${spec.owner} namespace ${why}`)
+      }
+    }
+  }
+
+  /** Step 4. A delete has no text, but its path still goes into the subject, so the path is scanned. */
+  private checkGuard(changes: Change[]): void {
+    for (const change of changes) checkContent(change.path, 'text' in change ? change.text : '', this.maxBytes)
+  }
+
+  /** Step 5. */
+  private checkValid(changes: Change[], owners: Map<string, NamespaceSpec>): void {
+    for (const change of changes) {
+      if (!('text' in change)) continue
+      const spec = owners.get(change.path)!
+      const problem: unknown = spec.validate(change.path, change.text)
+      if (problem === undefined) continue
+      if (typeof problem !== 'string') {
+        throw new Error(`the validate function of ${JSON.stringify(spec.prefix)} must return a string or undefined`)
+      }
+      throw invalid(`${change.path}: ${problem === '' ? 'invalid' : problem}`)
+    }
+  }
+
+  // --- committing --------------------------------------------------------------------------------
+
+  /**
+   * Build the commit on the current head and move `main` to it, compare-and-swap.
+   * If `main` moved in between (outside interference: inside this process the
+   * queue keeps it still), rebuild on the new head, checking `base` again, and
+   * try once more.
+   */
+  private async commitPrepared(prepared: Prepared): Promise<CommitInfo | undefined> {
+    const paths = prepared.changes.map(change => change.path)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const head = await this.mainCommit()
+      if (prepared.base !== undefined) await this.checkBase(prepared.base, head, paths)
+      const tree = await this.applyChanges(head, prepared.changes)
+      const changed = (await this.git.changedPaths(head, tree)).sort()
+      if (changed.length === 0) return undefined
+      const subject = prepared.subject?.(changed) ?? `${pathList(changed)}: ${prepared.summary}`
+      const message = messageFor(subject, prepared.author, prepared.note, prepared.trailers)
+      const id = await this.git.commitTree(tree, [head], message, this.identity(prepared.author))
+      // Read before the ref moves, so a failure here can't leave a commit the caller was told failed.
+      const time = Number((await this.git.run(['log', '-1', '--format=%at', id, '--'])).stdout.trim()) * 1000
+      if (await this.git.casRef(MAIN, id, head)) {
+        const info: CommitInfo = { id, time, author: prepared.author, message, paths: changed }
+        if (prepared.note !== undefined) info.note = prepared.note
+        this.announce(info)
+        return info
+      }
+    }
+    throw new StoreError('CONFLICT', 'main kept moving while the change was being committed; nothing was written')
+  }
+
+  /**
+   * The tree of `base` with `changes` applied. Removals go first, so a file can give way to a
+   * directory of the same name (or the reverse) in one commit.
+   * @throws `NOT_FOUND` for a removal of a document `base` doesn't have.
+   */
+  private async applyChanges(base: string, changes: Change[]): Promise<string> {
+    for (const change of changes) {
+      if (!('delete' in change)) continue
+      if (!(await this.hasFile(base, change.path))) {
+        throw new StoreError('NOT_FOUND', `cannot delete ${label(change.path)}: it does not exist`)
+      }
+    }
+    const ordered = [...changes.filter(change => 'delete' in change), ...changes.filter(change => !('delete' in change))]
+    return this.git.buildTree(base, ordered)
+  }
+
+  /** `base` must be a commit, and none of `paths` may have changed between it and `head`. */
+  private async checkBase(base: string, head: string, paths: string[]): Promise<void> {
+    if (base === head) return
+    if (!FULL_COMMIT_ID.test(base) || (await this.git.resolve(base)) === undefined) {
+      throw new StoreError('NOT_FOUND', `base ${JSON.stringify(base)} is not a commit: pass the full id of a main commit`)
+    }
+    const changed = await this.git.changedPaths(base, head, paths)
+    if (changed.length > 0) {
+      throw new StoreError('CONFLICT', `${pathList(changed)} changed since ${base.slice(0, 7)}`)
+    }
+  }
+
+  /** Push the new `main` (in the background), and tell `onCommit`. The commit has landed, so a failing listener is a warning, not a failed write. */
+  private announce(info: CommitInfo): void {
+    this.pushQueue?.schedule()
+    const { onCommit } = this.options
+    if (onCommit !== undefined) notify(this.naming, 'onCommit', () => onCommit(info))
+  }
+
+  // --- proposals ---------------------------------------------------------------------------------
+
+  /** What `proposals.ts` may use of this store: see `ProposalHost`. */
+  private makeProposalHost(): ProposalHost {
+    return {
+      git: this.git,
+      mainCommit: () => this.mainCommit(),
+      identity: author => this.identity(author),
+      prepare: (changes, meta, mode) => this.prepareWrite(changes, meta, mode === 'propose' ? AGENT_PROPOSE : AGENT_WRITE),
+      tree: (base, changes) => this.applyChanges(base, changes),
+      commit: prepared => this.commitPrepared(prepared),
+      author: meta => checkMeta(checkAuthorKind(meta), undefined).author,
+      line: checkLine,
+      scan: refuseSecret,
+      tidy: lineOf,
+      message: (subject, author, extra) => messageFor(subject, author, undefined, extra),
+      read: revisions => this.readRecords(revisions, []),
+      notify: (id, status) => {
+        const { onProposal } = this.options
+        if (onProposal !== undefined) notify(this.naming, 'onProposal', () => onProposal(id, status))
+      },
+      warn: message => warn(message, `${this.naming.warningCode}_PROPOSAL`),
+      pathList,
+    }
+  }
+}
