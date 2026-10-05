@@ -487,8 +487,9 @@ test('compose throws: the decision unchanged and one warning per agent, without 
   assert.equal(await w.step(main, [], { step: 2, decision }), decision)
   assert.deepEqual(rowLogs(w), ['[dish-memory] warn: no memory message for main-1: the vault is locked'])
 
-  // Another agent gets its own warning, and so does a scopesFor that throws.
-  memory.failing = { scopesFor: new Error('the projects can\'t be listed') }
+  // Another agent gets its own warning, and so does a scopesFor that throws. (compose fails too, so that the user's
+  // memory alone, which a main agent with no message gets while its family can't be looked up, isn't delivered either.)
+  memory.failing = { scopesFor: new Error('the projects can\'t be listed'), compose: new Error('the vault is locked') }
   assert.equal(await w.step(w.agent('main-2'), [prompt], { decision }), decision)
   assert.equal(await w.step(w.agent('main-2'), [prompt], { decision }), decision)
   assert.deepEqual(rowLogs(w), [
@@ -544,6 +545,73 @@ test('a step whose family can\'t be looked up keeps the message the agent has', 
   real.services.set({ projects: [{ name: 'acme/widget', family: 'acme' }] })
   assert.equal(await w.step(other, [], { step: 3, decision: next }), next)
   assert.equal(rowLogs(w).length, 2)
+})
+
+test('while the family can\'t be looked up, a main agent with no message gets the user\'s alone; one with a message keeps it; a child gets nothing', async () => {
+  const outage = new Error('dish-projects isn\'t running, so the chat\'s family isn\'t known')
+  const memory = fakeMemory({ user: ['talk-first'], families: { acme: ['release-friday'] } })
+  memory.failing.scopesFor = outage
+  const w = await world(memory)
+  const main = w.agent('main-1')
+  const first = delivered(entered(await w.turn(main, [typed('Hello.')])))
+  assert.deepEqual(first.map(message => message.source), [{ kind: 'dish-memory', form: 'instructions', identity: 'user' }])
+  assert.equal(textOf(first[0]!), composed(memory, { user: true }))
+  assert.deepEqual(memory.options, [{ complete: true }])
+  assert.deepEqual(rowLogs(w), ['[dish-memory] warn: no memory message for main-1: dish-projects isn\'t running, so the chat\'s family isn\'t known'])
+  // While it lasts, the user's message stands, and nothing more is composed or said.
+  const next: PreStepDecision = { kind: 'enter', messages: [] }
+  assert.equal(await w.step(main, [], { step: 2, decision: next }), next)
+  assert.equal(rowLogs(w).length, 1)
+  assert.deepEqual(memory.calls.compose, ['user'])
+  // Once the family is known, its message supersedes the user's.
+  memory.failing = {}
+  memory.scopes.set('main-1', { user: true, family: 'acme' })
+  const family = delivered(entered(await w.turn(main, [], 3)))
+  assert.deepEqual(family.map(message => message.source), [{ kind: 'dish-memory', form: 'instructions', identity: 'user+family:acme' }])
+  assert.equal(textOf(family[0]!), composed(memory, { user: true, family: 'acme' }))
+
+  // An agent that has a message keeps it, on its surface or among the step's own: nothing is composed.
+  memory.failing.scopesFor = outage
+  const prompt = typed('Hi.')
+  const decision: PreStepDecision = { kind: 'enter', messages: [prompt] }
+  const kept = w.agent('main-2')
+  kept.session.enter([memoryMessage('user+family:acme', '<dish-memory>\nThe family\'s.\n</dish-memory>')])
+  assert.equal(await w.step(kept, [prompt], { decision }), decision)
+  const own: PreStepDecision = { kind: 'enter', messages: [prompt, memoryMessage('family:acme', 'Composed by an earlier listener.')] }
+  assert.equal(await w.step(w.agent('main-3'), [prompt], { decision: own }), own)
+  // A child, which never sees the user's memory, gets nothing.
+  assert.equal(await w.step(w.agent('child-1', { delegationDepth: 1, origin: 'subagent' }, main), [prompt], { decision }), decision)
+  assert.deepEqual(memory.calls.compose, ['user', 'user+family:acme'])
+  assert.deepEqual(rowLogs(w).slice(1), [
+    '[dish-memory] warn: no memory message for main-2: dish-projects isn\'t running, so the chat\'s family isn\'t known',
+    '[dish-memory] warn: no memory message for main-3: dish-projects isn\'t running, so the chat\'s family isn\'t known',
+    '[dish-memory] warn: no memory message for child-1: dish-projects isn\'t running, so the chat\'s family isn\'t known',
+  ])
+})
+
+test('a new chat in a family\'s clone gets its user memory while dish-projects is gone, and its family\'s message when it\'s back', async () => {
+  const root = await realpath(await tempDir())
+  const clone = join(root, 'work', 'acme', 'widget')
+  await mkdir(clone, { recursive: true })
+  const projects = [{ name: 'acme/widget', family: 'acme' }]
+  const real = await memoryWorld({ projects, clones: { 'acme/widget': clone }, config: true })
+  await real.memory.write(USER, input('talk-first'), AS_USER)
+  await real.memory.write(ACME, input('release-friday'), AS_USER)
+  const w = await world(real.memory)
+  real.services.set({ projects: undefined })
+  const main = w.agent('main-1', { cwd: clone })
+  const first = delivered(entered(await w.turn(main, [typed('Hello.')])))
+  assert.deepEqual(first.map(message => message.source), [{ kind: 'dish-memory', form: 'instructions', identity: 'user' }])
+  assert.equal(textOf(first[0]!), await real.memory.compose({ user: true }))
+  assert.deepEqual(rowLogs(w), ['[dish-memory] warn: no memory message for main-1: dish-projects isn\'t running, so the chat\'s family isn\'t known'])
+
+  // Back: nothing was cached, so the next step finds the family at once.
+  real.services.set({ projects })
+  const family = delivered(entered(await w.turn(main, [], 2)))
+  assert.deepEqual(family.map(message => message.source), [{ kind: 'dish-memory', form: 'instructions', identity: 'user+family:acme' }])
+  assert.match(textOf(family[0]!), /user\/talk-first[\s\S]*family\/release-friday/)
+  assert.equal(rowLogs(w).length, 1)
+  assert.deepEqual(real.warnings, [])
 })
 
 test('a message that couldn\'t be read whole isn\'t delivered: one warning, and a later step delivers it whole', async () => {

@@ -499,6 +499,16 @@ test('escapeFrame escapes a closing tag in any case', () => {
     // Both at once.
     ['\u{FF1C}\u{FF0F}dish-memory>', '\u{FF1C}\\\u{FF0F}dish-memory>'],
     ['\u{FE64}\u{200B}\u{29F8}Dish-Memory>', '\u{FE64}\u{200B}\\\u{29F8}Dish-Memory>'],
+    // The whole tag in fullwidth forms, lowercase and uppercase, and mixed with ASCII.
+    ['\u{FF1C}\u{FF0F}\u{FF44}\u{FF49}\u{FF53}\u{FF48}\u{FF0D}\u{FF4D}\u{FF45}\u{FF4D}\u{FF4F}\u{FF52}\u{FF59}\u{FF1E}',
+      '\u{FF1C}\\\u{FF0F}\u{FF44}\u{FF49}\u{FF53}\u{FF48}\u{FF0D}\u{FF4D}\u{FF45}\u{FF4D}\u{FF4F}\u{FF52}\u{FF59}\u{FF1E}'],
+    ['</\u{FF24}\u{FF29}\u{FF33}\u{FF28}\u{FF2D}\u{FF25}\u{FF2D}\u{FF2F}\u{FF32}\u{FF39}>', '<\\/\u{FF24}\u{FF29}\u{FF33}\u{FF28}\u{FF2D}\u{FF25}\u{FF2D}\u{FF2F}\u{FF32}\u{FF39}>'],
+    ['</d\u{FF49}sh-mem\u{FF4F}ry>', '<\\/d\u{FF49}sh-mem\u{FF4F}ry>'],
+    // Dashes and underscores that only look like ASCII's: minus, small hyphen-minus, fullwidth hyphen-minus and low line.
+    ['</dish\u{FF0D}memory>', '<\\/dish\u{FF0D}memory>'],
+    ['</dish\u{2212}memory>', '<\\/dish\u{2212}memory>'],
+    ['</dish\u{FE63}memory>', '<\\/dish\u{FE63}memory>'],
+    ['</dish\u{FF3F}memory>', '<\\/dish\u{FF3F}memory>'],
   ]
   for (const [variant, escaped] of variants) {
     assert.equal(escapeFrame(variant), escaped, JSON.stringify(variant))
@@ -511,7 +521,8 @@ test('escapeFrame escapes a closing tag in any case', () => {
   for (const same of ['', 'plain', 'dish-memory', 'the dish-memory message', '<dish-memory>', '<\\/dish-memory>', '</dish-mem>',
     '</other>', '</div>', '</dish>', '</memory>', '</dishy-memory>', 'a < b / dish-memory', `<${' '.repeat(9)}/dish-memory>`,
     `</${' '.repeat(9)}dish-memory>`, '</dish----memory>', '</dish.memory>', '\u{FF1C}/other>', '<\u{2215}div>', 'a \u{2044} dish-memory',
-    '1\u{2044}2 dish-memory', '\u{FF0F}dish-memory', '<\\\u{FF0F}dish-memory>']) {
+    '1\u{2044}2 dish-memory', '\u{FF0F}dish-memory', '<\\\u{FF0F}dish-memory>', '</\u{FF44}\u{FF49}\u{FF53}\u{FF48}\u{FF59}-memory>',
+    '</dish\u{FF0E}memory>']) {
     assert.equal(escapeFrame(same), same, JSON.stringify(same))
   }
 })

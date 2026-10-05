@@ -99,7 +99,8 @@ A part with nothing in it is left out, and with nothing at all to say there's no
 - the first step gets it;
 - a resumed session finds it on its surface, and doesn't get it again;
 - a compaction summarizes it away, so the next step gets it again, from the vault as it is then;
-- a session whose scopes change gets a new one, which supersedes the old.
+- a session whose scopes change gets a new one, which supersedes the old;
+- while the chat's family can't be looked up (a sibling plugin reloading, a broken `projects.yaml`), an agent keeps the message it has, and the trouble is logged once per agent; a main agent with no message at all gets your user memory alone, which its family's message supersedes once the family is known, and a child gets nothing until then.
 
 A running agent doesn't see another session's new memories until its next compaction, or a new chat. What it saved itself, it was told. The service caches the composed text until the next vault commit or config change, so a step that needs no message only scans the surface.
 
@@ -120,7 +121,7 @@ A refusal from the vault or the service starts with its code: `INVALID` (a field
 - **What is screened:** an agent's memory, its description and body together, by `dishJudge.screenText`, with the result screen's injection question and thresholds. The judge's log shows it with purpose `screen` and subject `memory:<id>`.
 - **Before the screen:** the fields are checked, then the text is scanned for credentials, so a secret never reaches Jev.
 - **At or above `warn`** (0.50 by default, `judge.yaml`'s `screening.warn`), the memory is saved held, with a reason such as "Jev scored it 0.93 as instructions aimed at an agent". A held memory is out of the index, the message and `recall`. `remember`'s answer says it was held, and Settings → Memory lists it first, with **Release** and **Delete**.
-- **Below it,** or **when Jev can't screen** (no judge, no key, a timeout), the memory is saved as usual: screening is advisory, and saving never waits on Jev. The exception is a held memory an agent changes while Jev can't screen it: it's saved, but stays held ("a held memory changed while Jev couldn't screen it") until you release it or Jev screens a later change clean.
+- **Below it,** or **when Jev can't screen** (no judge, no key, a timeout), the memory is saved as usual: screening is advisory, and saving never waits on Jev. The exception is a held memory an agent changes while Jev can't screen it: it's saved, but stays held ("a held memory changed while Jev couldn't screen it") until you release it or Jev screens its new text clean, when an agent next saves it, unchanged or not.
 - **Your own edits aren't screened.** Saving new text for a held memory on the page releases it, as **Release** does.
 
 ## Settings → Memory

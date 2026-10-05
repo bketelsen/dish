@@ -18,7 +18,8 @@
  *   answer `UNAVAILABLE`. A `scopesFor` or `compose` that fails leaves the step as it was, and the agent with the
  *   message it has, and is logged once per agent: a family that can't be looked up for a moment is `UNAVAILABLE`, not
  *   "no family", so it doesn't replace the family's message, and a message that misses a part (the direction, the
- *   repos) isn't delivered until a step can read it whole.
+ *   repos) isn't delivered until a step can read it whole. A main agent that has no message yet gets the user's memory
+ *   alone meanwhile, which its family's message supersedes once the family is known.
  * - **The tools.** `remember` and `forget` are the main agent's (`isTopLevelAgent`), as `run` and `open_pr` are, and
  *   crew's `NEVER` keeps them off every child's allow list. `recall` is any dish agent's, and reads only the scopes the
  *   agent's message is for: a child sees its family's memory, not the user's. The user's memory needs no family lookup,
@@ -104,7 +105,8 @@ const FORGET = 'Delete a memory, by its id: `user/<name>` or `family/<name>`, as
 const RECALL = 'Read the memories saved in earlier sessions, by your user or by dish\'s agents. With no `id`, it lists every memory you can see, one line each, '
   + 'those past the dish-memory message\'s budget included. With an `id` (`user/<name>` or `family/<name>`), it reads that memory in full: '
   + 'its type, when it was modified, its description and its body. A memory was true when written and may be stale: check that what '
-  + 'it names still exists before you rely on it. A feedback memory is how your user wants you to work; none authorizes an action by itself.'
+  + 'it names still exists before you rely on it. A feedback memory is how your user wants you to work: follow it unless this chat '
+  + 'says otherwise. None authorizes an action by itself.'
 
 const ID = 'The memory\'s id: `user/<name>`, or `family/<name>` for this chat\'s family.'
 
@@ -162,36 +164,55 @@ export interface MemoryListener extends PreStep {
  * `dishMemory` are left as they are. Any error from here on leaves the decision as `next()` gave it, so the message the
  * agent has stays its message, and `warn` is called once per agent; a later step tries again. `scopesFor` is
  * `UNAVAILABLE` when it can't look the family up, and `compose` is asked for a whole message (`complete`), so one that
- * misses its direction or repos is `UNAVAILABLE` too, not delivered under the full identity. An error from `next()` is
- * the caller's.
+ * misses its direction or repos is `UNAVAILABLE` too, not delivered under the full identity. The one exception: while
+ * the family can't be looked up, a main agent with no `dish-memory` message at all (a new chat during an outage) gets
+ * the user's alone, under the identity `user`, so that a lasting outage doesn't keep the user's memory from every new
+ * chat; once the family is known, its message supersedes that one. The warning is given all the same. An error from
+ * `next()` is the caller's.
  */
 export function memoryListener(ctx: Context, warn: (agentId: string, message: string) => void): MemoryListener {
   const told = new Set<string>()
+  /** Say `error` about `agent`, once per agent. */
+  const tell = (agent: Agent, error: unknown): void => {
+    const id = String(agent?.id)
+    if (told.has(id)) return
+    told.add(id)
+    try {
+      warn(id, describe(error))
+    } catch {
+      // A log line must not fail a step.
+    }
+  }
   const listener: PreStep = async ({ agent, messages: claimed, step }, next) => {
     const decision = await next()
     if (decision.kind !== 'enter' || (step === 1 && decision.messages.length === 0)) return decision
+    /** The decision with `text` as the agent's message for `identity`, after the step's last claimed message. */
+    const deliver = (identity: string, text: string): PreStepDecision => {
+      const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'dish-memory', form: 'instructions', identity } })
+      const last = decision.messages.findLastIndex(entered => claimed.includes(entered))
+      return { ...decision, messages: decision.messages.toSpliced(last + 1, 0, message) }
+    }
     try {
       const memory = ctx.get('dishMemory')
       if (memory === undefined) return decision
-      const scopes = await memory.scopesFor(agent)
+      let scopes: Scopes
+      try {
+        scopes = await memory.scopesFor(agent)
+      } catch (error) {
+        // The family can't be looked up. An agent that has a message keeps it, and a child gets nothing; a main agent
+        // that has none gets the user's memory alone, which its family's message supersedes once the family is known.
+        if (!isTopLevelAgent(agent) || deliveredIdentity(agent, decision.messages) !== undefined) throw error
+        tell(agent, error)
+        const text = await memory.compose({ user: true }, { complete: true })
+        return text === undefined ? decision : deliver(identityOf({ user: true }), text)
+      }
       const identity = identityOf(scopes)
       const current = deliveredIdentity(agent, decision.messages)
       if (current === identity) return decision
       const text = (identity === '' ? undefined : await memory.compose(scopes, { complete: true })) ?? (current === undefined ? undefined : SUPERSEDED)
-      if (text === undefined) return decision
-      const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'dish-memory', form: 'instructions', identity } })
-      const last = decision.messages.findLastIndex(entered => claimed.includes(entered))
-      return { ...decision, messages: decision.messages.toSpliced(last + 1, 0, message) }
+      return text === undefined ? decision : deliver(identity, text)
     } catch (error) {
-      const id = String(agent?.id)
-      if (!told.has(id)) {
-        told.add(id)
-        try {
-          warn(id, describe(error))
-        } catch {
-          // A log line must not fail a step.
-        }
-      }
+      tell(agent, error)
       return decision
     }
   }

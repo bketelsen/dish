@@ -316,6 +316,46 @@ test('an agent\'s changed save of a held memory stays held while Jev can\'t scre
   assert.equal((await w.memory.write(USER, input('again', { body: 'Reworded by the user.' }), AS_USER)).held, undefined)
 })
 
+test('a hold kept only because Jev couldn\'t screen is lifted when Jev screens the same text clean; a flagged one isn\'t', async () => {
+  const CLEAN = { verdict: 'clean', probability: 0.1 } as const
+  const w = await memoryWorld({ judge: fakeJudge([WARN]) })
+  // Flagged, then changed by an agent while Jev is down: held, for want of a screen.
+  assert.equal((await w.memory.write(USER, input('flagged'), AS_AGENT)).held, HELD_WARN)
+  w.services.set({ judge: undefined })
+  w.clock.now += 1000
+  const reworded = input('flagged', { body: 'Reworded while Jev was down.' })
+  assert.equal((await w.memory.write(USER, reworded, AS_AGENT)).held, HELD_UNSCREENED)
+  assert.equal(await w.store.read('user/MEMORY.md'), undefined)
+  // The user's unchanged save isn't screened, so it doesn't lift it either.
+  w.clock.now += 1000
+  assert.equal((await w.memory.write(USER, reworded, AS_USER)).held, HELD_UNSCREENED)
+  // Jev is back, and an agent saves the same text again: screened clean, it's released and listed.
+  const judge = fakeJudge([CLEAN])
+  w.services.set({ judge })
+  w.clock.now += 1000
+  const released = await w.memory.write(USER, reworded, AS_AGENT)
+  assert.equal(released.held, undefined)
+  assert.equal(released.count, 1)
+  assert.equal(judge.requests.length, 1)
+  assert.equal((await w.memory.read(USER, 'flagged'))?.held, undefined)
+  assert.equal(await w.store.read('user/MEMORY.md'), `- [flagged](flagged.md) — About flagged (feedback)\n`)
+  assert.ok((await w.memory.compose({ user: true }))?.includes('- user/flagged — About flagged (feedback)'))
+
+  // A hold from a real flag stays on an unchanged re-save, whatever Jev says now.
+  w.services.set({ judge: fakeJudge([WARN, CLEAN]) })
+  assert.equal((await w.memory.write(USER, input('odd'), AS_AGENT)).held, HELD_WARN)
+  w.clock.now += 1000
+  assert.equal((await w.memory.write(USER, input('odd'), AS_AGENT)).held, HELD_WARN)
+  // And an unscreened re-save of the same text keeps a for-want-of-a-screen hold.
+  w.services.set({ judge: fakeJudge([WARN]) })
+  assert.equal((await w.memory.write(USER, input('other'), AS_AGENT)).held, HELD_WARN)
+  w.services.set({ judge: undefined })
+  const changed = input('other', { body: 'Changed while Jev was down.' })
+  assert.equal((await w.memory.write(USER, changed, AS_AGENT)).held, HELD_UNSCREENED)
+  w.clock.now += 1000
+  assert.equal((await w.memory.write(USER, changed, AS_AGENT)).held, HELD_UNSCREENED)
+})
+
 test('base: CONFLICT when the memory changed since; another memory\'s change is no conflict', async () => {
   const w = await memoryWorld()
   const first = await w.memory.write(USER, input('a'), AS_USER)

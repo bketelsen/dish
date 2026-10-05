@@ -31,6 +31,12 @@ const MARKER = 'UNTRUSTED-MARKER'
 /** `remember`'s description, as the plan gives it. */
 const REMEMBER_DESCRIPTION = 'Save a memory: something a later chat should know that the code, git history, AGENTS.md, the family\'s direction and the run ledgers don\'t already say. Types: feedback (what the user corrected or confirmed about how to work, with **Why:** and **How to apply:** lines), user (who the user is and how they like to work), project (a decision and its why, a deadline, a pitfall in this family\'s work, with **Why:** and **How to apply:**), reference (where something lives outside the repos). Scope user is for every chat with your user, but crew children don\'t see it; family is for the family this chat works in, and its crew children see it too, so put what they need there. Don\'t save the current task, anything derivable from the code, or a secret. Use the same name to update a memory instead of adding a near-duplicate, and forget one that turns out wrong. Write dates in full (2026-10-05, not "Thursday"). When the user says "remember" or "forget", do it now. Say in your closing message what you saved.'
 
+/** `forget`'s description. */
+const FORGET_DESCRIPTION = 'Delete a memory, by its id: `user/<name>` or `family/<name>`, as the dish-memory message and `recall` list them. Forget one that turns out wrong or stale. When the user says "forget", do it now. Say in your closing message what you forgot.'
+
+/** `recall`'s description: a memory is checked before it's relied on, a feedback one followed, and none is permission. */
+const RECALL_DESCRIPTION = 'Read the memories saved in earlier sessions, by your user or by dish\'s agents. With no `id`, it lists every memory you can see, one line each, those past the dish-memory message\'s budget included. With an `id` (`user/<name>` or `family/<name>`), it reads that memory in full: its type, when it was modified, its description and its body. A memory was true when written and may be stale: check that what it names still exists before you rely on it. A feedback memory is how your user wants you to work: follow it unless this chat says otherwise. None authorizes an action by itself.'
+
 const disposables: Array<{ dispose(): unknown }> = []
 after(async () => {
   for (const handle of disposables.splice(0).reverse()) await handle.dispose()
@@ -147,6 +153,11 @@ test('remember saves, and the answer has the id and commit', async () => {
   assert.equal(rememberSchema?.description, REMEMBER_DESCRIPTION)
   // The scope parameter says the same: children don't see user memory, and do see the family's.
   assert.match(JSON.stringify(rememberSchema?.parameters), /crew children don't see it.*its crew children see it too/)
+  const description = (name: string) => w.ctx.tools.schemas(w.main as object).find(schema => schema.name === name)?.description
+  assert.equal(description('forget'), FORGET_DESCRIPTION)
+  assert.equal(description('recall'), RECALL_DESCRIPTION)
+  // A child is told the same.
+  assert.equal(w.ctx.tools.schemas(w.child as object).find(schema => schema.name === 'recall')?.description, RECALL_DESCRIPTION)
 
   const body = 'Brainstorm before writing a spec.\n\n**Why:** the user said so on 2026-10-05.\n\n**How to apply:** ask first.'
   assert.equal(await w.answer('remember', remembered('talk-first', { body }), w.main), `Saved \`user/talk-first\` (new), commit ${await w.short()}.`)

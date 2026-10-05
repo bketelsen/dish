@@ -13,8 +13,8 @@
  *   (`SECRET`), then an agent's is screened by the judge, in that order: a credential never reaches the judge. One the
  *   judge scores at `warn` or above is saved held: out of the index, the message and `recall`, until the user releases
  *   it. With no judge, or one that can't screen, it is saved as usual, but a held memory an agent changes then stays
- *   held, since nothing screened the new text. A person's own writes aren't screened, and keep a held memory held only
- *   while its text is what was held (`heldAfter`).
+ *   held, since nothing screened the new text, until an agent's save of that text (or a later one) is screened clean. A
+ *   person's own writes aren't screened, and keep a held memory held only while its text is what was held (`heldAfter`).
  * - **Untrusted text.** A memory's description and body, and a direction, go only into the vault, the config store and
  *   what the service returns. No error, warning or event carries them: errors name a memory by its id.
  * - **The caches.** `scopesFor` is cached per agent until the next config change (one without a family for a minute
@@ -160,14 +160,15 @@ type Screened = { kind: 'flagged', reason: string } | { kind: 'clean' } | { kind
 
 /**
  * Why a memory is held once it's written, or `undefined`. A flagged one is held, with the judge's reason. Otherwise a
- * held memory saved with its text unchanged stays held, as it was. A changed one is released by the user's write, or by
- * an agent's that Jev screened clean; an agent's that Jev couldn't screen keeps it held (`HELD_UNSCREENED`), so that a
- * hold is never lifted with nothing screened. `screened` is `undefined` for the user's writes, which aren't screened.
+ * held memory saved with its text unchanged stays held, as it was, unless its only reason was the screen it missed
+ * (`HELD_UNSCREENED`) and an agent's save of it is now screened clean. A changed one is released by the user's write, or
+ * by an agent's that Jev screened clean; an agent's that Jev couldn't screen keeps it held (`HELD_UNSCREENED`), so that
+ * a hold is never lifted with nothing screened. `screened` is `undefined` for the user's writes, which aren't screened.
  */
 function heldAfter(existing: MemoryFile | undefined, input: MemoryInput, screened: Screened | undefined): string | undefined {
   if (screened?.kind === 'flagged') return screened.reason
   if (existing?.held === undefined) return undefined
-  if (sameText(existing, input)) return existing.held
+  if (sameText(existing, input)) return existing.held === HELD_UNSCREENED && screened?.kind === 'clean' ? undefined : existing.held
   return screened?.kind === 'unscreened' ? HELD_UNSCREENED : undefined
 }
 

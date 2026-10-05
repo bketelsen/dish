@@ -197,6 +197,7 @@ This follows dsh's agent-instructions pattern, which is how dsh keeps `AGENTS.md
 - **A resume** finds it still on the surface, so it isn't sent again.
 - **A compaction** replaces it with a summary, so the next step composes it afresh from the vault as it is then. This is the refresh: dsh publishes `agent/created` only for `startup` and `resume`, never for a compaction, so no event could drive one.
 - **Identity.** The message records its scopes (`user`, `family:frostyard`), which decide whether it's still the right one: a newer vault reaches the agent at its next compaction. If the session's scopes change (its project moved to another family), a new message supersedes the old one.
+- **An outage.** While the chat's family can't be looked up (a sibling plugin reloading, a broken `projects.yaml`), "no family" would be a guess, so an agent keeps the message it has. A main agent with none yet gets the user's memory alone, which its family's message supersedes once the family is known; a child gets nothing until then.
 
 **Why not a system-prompt section?** dsh renders the system prompt at every step and records any change. A change rewrites the prompt's head, which breaks providers' prefix caches unless the model takes updates in its history, and only DeepSeek's does. Memory that changes during a chat would therefore cost the cache each time.
 

@@ -441,25 +441,50 @@ export function validateDirection(path: string, text: string): string | undefine
 
 // --- the message ----------------------------------------------------------------------------------------------------
 
+/** The tag's `<`: `<`, the fullwidth less-than sign (U+FF1C) or the small one (U+FE64). */
+const LESS_THAN = String.raw`[<\u{FF1C}\u{FE64}]`
+/** The tag's `/`, or a character that looks like one: the fullwidth solidus (U+FF0F), the division slash (U+2215), the fraction slash (U+2044) or the big solidus (U+29F8). */
+const SLASH = String.raw`[/\u{FF0F}\u{2215}\u{2044}\u{29F8}]`
+/** Whitespace, or an invisible character: the zero-width spaces, joiners and marks (U+200B to U+200F), the word joiner (U+2060) and the BOM (U+FEFF). */
+const BLANK = String.raw`[\s\u{200B}-\u{200F}\u{2060}\u{FEFF}]`
+/**
+ * What may stand between `dish` and `memory`: a `BLANK`, `_`, `-`, the soft hyphen (U+00AD), Unicode's hyphens and
+ * dashes (U+2010 to U+2015), and the minus sign (U+2212), the small hyphen-minus (U+FE63), the fullwidth hyphen-minus
+ * (U+FF0D) and the fullwidth low line (U+FF3F).
+ */
+const SEPARATOR = String.raw`[\s_\-\u{AD}\u{2010}-\u{2015}\u{2212}\u{FE63}\u{FF0D}\u{FF3F}\u{200B}-\u{200F}\u{2060}\u{FEFF}]`
+
+/**
+ * `word` (lowercase ASCII letters) as a pattern whose every letter may be either case, in ASCII or in fullwidth form
+ * (U+FF21 to U+FF3A, U+FF41 to U+FF5A): `d` is `[dD\u{FF24}\u{FF44}]`.
+ */
+function anyWidth(word: string): string {
+  return [...word].map((letter) => {
+    const offset = letter.charCodeAt(0) - 'a'.charCodeAt(0)
+    const fullwidth = (base: number): string => `\\u{${(base + offset).toString(16).toUpperCase()}}`
+    return `[${letter}${letter.toUpperCase()}${fullwidth(0xFF21)}${fullwidth(0xFF41)}]`
+  }).join('')
+}
+
 /**
  * A closing tag a model could read as `</dish-memory>`, in any case: `<`, then `/`, then `dish` and `memory`.
- * - The `<` may be `<`, the fullwidth less-than sign (U+FF1C) or the small one (U+FE64).
- * - The `/` may be `/`, or a character that looks like one: the fullwidth solidus (U+FF0F), the division slash
- *   (U+2215), the fraction slash (U+2044) or the big solidus (U+29F8).
- * - Between `<` and `/`, and between `/` and `dish`, up to 8 characters may stand that are whitespace or invisible:
- *   the zero-width spaces, joiners and marks (U+200B to U+200F), the word joiner (U+2060) and the BOM (U+FEFF).
- * - Between `dish` and `memory`, up to 3 separators may stand: those characters, `_`, `-`, the soft hyphen (U+00AD)
- *   and Unicode's hyphens and dashes (U+2010 to U+2015).
+ * - The `<` is a `LESS_THAN` and the `/` a `SLASH`: either may be a lookalike.
+ * - Between `<` and `/`, and between `/` and `dish`, up to 8 `BLANK`s may stand.
+ * - Between `dish` and `memory`, up to 3 `SEPARATOR`s may stand.
+ * - Each letter of `dish` and `memory` may be fullwidth (`anyWidth`).
  *
  * The first group is everything before the `/`, and the second the `/`: the escape puts both back as they were.
  */
-const CLOSING_TAG = /([<\u{FF1C}\u{FE64}][\s\u{200B}-\u{200F}\u{2060}\u{FEFF}]{0,8})([/\u{FF0F}\u{2215}\u{2044}\u{29F8}])(?=[\s\u{200B}-\u{200F}\u{2060}\u{FEFF}]{0,8}dish[\s_\-\u{AD}\u{2010}-\u{2015}\u{200B}-\u{200F}\u{2060}\u{FEFF}]{0,3}memory)/giu
+const CLOSING_TAG = new RegExp(
+  `(${LESS_THAN}${BLANK}{0,8})(${SLASH})(?=${BLANK}{0,8}${anyWidth('dish')}${SEPARATOR}{0,3}${anyWidth('memory')})`,
+  'giu',
+)
 
 /**
  * `text` with every closing tag a model could read as the frame's (`CLOSING_TAG`) made harmless: a `\` goes before its
  * `/` (or the character that looks like one), so `</dish-memory` reads `<\/dish-memory`, `< /DISH memory` reads
- * `< \/DISH memory`, and a fullwidth `<` and `/` (U+FF1C, U+FF0F) get a `\` between them. Everything else, case
- * included, stays as it was.
+ * `< \/DISH memory`, and a fullwidth `<` and `/` (U+FF1C, U+FF0F) get a `\` between them. Everything else, case and
+ * width included, stays as it was.
  */
 export function escapeFrame(text: string): string {
   return text.replace(CLOSING_TAG, '$1\\$2')
