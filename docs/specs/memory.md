@@ -1,6 +1,6 @@
 # Spec: memory and direction (`dish-memory`)
 
-Status: drafted 2026-10-05, with both [questions](#questions-for-you) settled the same day: a flagged memory is held, and the vault's remote is optional. This is roadmap step 8, moved ahead of families (step 9) and routines (step 10) after comparing the plan with [Claude Code's Projects](https://code.claude.com/docs/en/claude-projects). It builds on the [design](../design.md) ("Project families", the Memory decision), the [config store](config-store.md), [prompts](prompts.md), [crew](crew.md), the [orchestrator](orchestrator.md) and the [judge](judge.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources; see [Checks](#checks-2026-10-05).
+Status: drafted 2026-10-05, with both [questions](#questions-for-you) settled the same day: a flagged memory is held, and the vault's remote is optional. Revised 2026-10-05 from the plan ([docs/plans/2026-10-05-memory.md](../plans/2026-10-05-memory.md), its eight Spec corrections): the service is `dishMemory`; `main.md` gets one bullet and `remember`'s description the rules; base checks and reverts are `dish-memory`'s own; and smaller ones. This is roadmap step 8, moved ahead of families (step 9) and routines (step 10) after comparing the plan with [Claude Code's Projects](https://code.claude.com/docs/en/claude-projects). It builds on the [design](../design.md) ("Project families", the Memory decision), the [config store](config-store.md), [prompts](prompts.md), [crew](crew.md), the [orchestrator](orchestrator.md) and the [judge](judge.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources; see [Checks](#checks-2026-10-05).
 
 ## Summary
 
@@ -89,7 +89,7 @@ dish's agents start every chat knowing nothing they learned before, and the dire
 
 The root commit's subject is "Initialize dish vault". The directory sits under `~/.local/share/dish`, which is on the sandbox's protected list ([sandbox-home](sandbox-home.md)): an agent's shell can read the vault's objects but can't change them.
 
-**The store moves into `dish-kit`.** `plugins/config/src/store/` becomes `dish-kit/store`, a `VersionedStore` that takes the config-specific strings as options: the root commit's subject, the store's name in its errors, and its warning codes. `dish-config` keeps a thin `ConfigStore` over it and passes its own strings, so its tests run unchanged, and they are the check that the move changed nothing. The design keeps shared code in `dish-kit` and never imports one plugin's internals into another, so the second store can't simply import `dish-config`'s.
+**The store moves into `dish-kit`.** `plugins/config/src/store/` becomes `dish-kit/store`, a `VersionedStore` that takes the config-specific strings as options: the root commit's subject, the store's name in its errors, and its warning codes. `dish-config` keeps its `src/store/*.ts` as thin shims over it that pass its own strings, so its tests run unchanged, and they are the check that the move changed nothing. The store throws `StoreError`; `dish-config`'s `ConfigStoreError` extends it, keeps its own name, and matches every `StoreError`, since the config tests use `instanceof` on errors thrown deep in the store. `personIdentity` moves along, so the vault's commits get the same identities. The design keeps shared code in `dish-kit` and never imports one plugin's internals into another, so the second store can't simply import `dish-config`'s.
 
 ### Layout
 
@@ -196,7 +196,7 @@ This follows dsh's agent-instructions pattern, which is how dsh keeps `AGENTS.md
 - **The first step** gets it.
 - **A resume** finds it still on the surface, so it isn't sent again.
 - **A compaction** replaces it with a summary, so the next step composes it afresh from the vault as it is then. This is the refresh: dsh publishes `agent/created` only for `startup` and `resume`, never for a compaction, so no event could drive one.
-- **Identity.** The message records its scopes (`user`, `family:frostyard`) and the vault's and config store's commits. If the session's scopes change (its project moved to another family), a new message supersedes the old one.
+- **Identity.** The message records its scopes (`user`, `family:frostyard`), which decide whether it's still the right one: a newer vault reaches the agent at its next compaction. If the session's scopes change (its project moved to another family), a new message supersedes the old one.
 
 **Why not a system-prompt section?** dsh renders the system prompt at every step and records any change. A change rewrites the prompt's head, which breaks providers' prefix caches unless the model takes updates in its history, and only DeepSeek's does. Memory that changes during a chat would therefore cost the cache each time.
 
@@ -231,7 +231,7 @@ It creates the memory, or replaces the one with the same name in that scope, and
 - **Screening:** [Screening](#screening).
 - **The commit:** one commit with the file and the scope's regenerated index. The author is `{ kind: 'agent', sessionId, role: 'main' }`, and the description is the note.
 
-**The answer:** "Saved `family/<name>` (new)" or "(updated)", with the short commit id. It adds "Held for your review on Settings → Memory: <reason>" when the memory was held, and the budget warning when the index is near its limit. The chat shows the call as "Saved memory family/<name>", so you see each one without expanding anything.
+**The answer:** "Saved `family/<name>` (new)" or "(updated)", with the short commit id. It adds "Held for your review on Settings → Memory: <reason>" when the memory was held, and the budget warning when the index is near its limit. dsh's generic row shows the call with its arguments, and `remember`'s description tells the main agent to say in its closing message what it saved, so you see it without expanding anything.
 
 ### `forget` (main agent)
 
@@ -259,7 +259,7 @@ It takes an `id` (`user/<name>` or `family/<name>`), deletes that memory and reg
 - check overrides;
 - coders' report rulings, which `rulingsOf` doesn't collect today.
 
-After 10, the answer says "and N more (`run` `status`)". `main.md` says to save the ones that will matter beyond this run as family `project` memories, with the decision and its why. That's exactly the "why the export was dropped" kind of memory. The orchestrator doesn't depend on `dish-memory`: the list is worth having on its own.
+A helper of their own, `closingRulings`, lists them, so `run` `status` and the Runs page don't change. `open_pr` reads the ledger again after it closes the run, so its own overrides are listed. After the newest 10, the answer says "and N more in the ledger". `main.md` says to save the ones that will matter beyond this run as family `project` memories, with the decision and its why. That's exactly the "why the export was dropped" kind of memory. The orchestrator doesn't depend on `dish-memory`: the list is worth having on its own.
 
 ## Screening
 
@@ -283,33 +283,36 @@ A `settings.section` page, `dish-memory`, order 52 (after Runs).
 - **Memories tab:**
   - the list shows name, type, description and when each was modified, with held ones first, with their reasons;
   - opening one gives an editor for its fields and body;
-  - **Save** writes with `base`, as Prompts does, and keeps your text on `CONFLICT`;
+  - **Save** sends the commit the memory was read at, as Prompts does, and keeps your text on `CONFLICT`. `dish-memory` checks it against the memory file itself, under its one write queue: every write regenerates the scope's index, so the store's own `base` check would refuse a save after any other memory changed;
   - **Delete**, **Release** (for a held one) and **New**.
 - **Direction tab** (families only):
   - an editor like Prompts', with the template for a new direction;
   - **Save** writes as you, with `base`;
   - the count of open proposals; proposals are accepted on the History page, as now.
-- **History tab:** the scope's vault commits, each with its diff (`DiffView` from `dish-kit/ui`) and **Revert**.
+- **History tab:** the scope's vault commits, each with its diff (`DiffView` from `dish-kit/ui`) and **Revert**. A revert restores the memory files the commit changed and regenerates the index; it's `CONFLICT` when one of them changed since.
 - **Preview tab:** the message a main agent working in this scope would get now.
 - **Remote:** the vault's last push, its pending count and its last error, as on History.
 
-The page talks to a Typert remote: Cordis service `dishMemoryRemote`, wire namespace `dishMemory`. It's built like `dishPromptsRemote`: `Outcome<T>` results carrying the store's error codes, `''` meaning absent, and a `watch` stream for live updates. Its methods (`scopes`, `list`, `read`, `save`, `delete`, `release`, `direction`, `saveDirection`, `history`, `commit`, `revert`, `preview`, `remoteStatus`, `watch`) are settled in the plan.
+The page talks to a Typert remote: Cordis service `dishMemoryRemote`, wire namespace `dishMemory`. It's built like `dishPromptsRemote`: `Outcome<T>` results carrying the store's error codes, `''` meaning absent, and a `watch` stream for live updates. Its methods (`scopes`, `list`, `read`, `save`, `forget`, `release`, `direction`, `saveDirection`, `history`, `commit`, `revert`, `preview`, `remoteStatus`, `watch`) are settled in the plan.
 
-## Service: `memory`
+## Service: `dishMemory`
 
 ```ts
 interface DishMemory {
-  /** The scopes an agent gets, from its working directory: always user; family when it works in a project's clone. */
-  scopesFor(agent: Agent): Promise<{ family?: string }>
+  /** user: a top-level agent; family: the project whose clone holds the agent's working directory, by real path. */
+  scopesFor(agent: Agent): Promise<{ user: boolean, family?: string }>
+  scopes(): Promise<ScopeInfo[]>                          // You, each family in projects.yaml, then orphans
   list(scope: Scope): Promise<MemoryInfo[]>               // held ones included, marked
   read(scope: Scope, name: string): Promise<Memory | undefined>
-  /** Create or replace, regenerating the index. An agent author's memory is screened first. */
-  write(scope: Scope, memory: MemoryInput, meta: { author: Author }): Promise<{ commit: CommitInfo, created: boolean, held?: string }>
-  delete(scope: Scope, name: string, meta: { author: Author }): Promise<CommitInfo>
+  /** Create or replace, regenerating the index. An agent author's memory is screened first. `base`: the commit it was read at, '' for a new one. */
+  write(scope: Scope, memory: MemoryInput, meta: { author: Author, base?: string, agent?: unknown, signal?: AbortSignal }): Promise<{ commit: CommitInfo, created: boolean, held?: string, nearFull: boolean, count: number }>
+  delete(scope: Scope, name: string, meta: { author: Author, base?: string }): Promise<CommitInfo>
   release(scope: Scope, name: string, meta: { author: Author }): Promise<CommitInfo>
-  /** The message for an agent with these scopes, or undefined when there is nothing to say. */
-  compose(scopes: { family?: string }): Promise<string | undefined>
-  history(scope: Scope, options?: HistoryOptions): Promise<CommitInfo[]>
+  /** The message for an agent with these scopes, or undefined when there is nothing to say. Cached until a vault commit or a config change. */
+  compose(scopes: { user: boolean, family?: string }): Promise<string | undefined>
+  direction(family: string): Promise<DirectionInfo>
+  saveDirection(family: string, text: string, meta: { base?: string, note?: string }): Promise<CommitInfo | undefined>
+  history(scope: Scope, options?: { limit?: number, before?: string }): Promise<CommitInfo[]>
   commit(id: string): Promise<{ info: CommitInfo, diffs: FileDiff[] }>
   revert(id: string, meta: { author: Author }): Promise<CommitInfo | undefined>
   remoteStatus(): Promise<RemoteStatus>
@@ -317,17 +320,17 @@ interface DishMemory {
 type Scope = { kind: 'user' } | { kind: 'family', family: string }
 ```
 
-The event `dish-memory/changed(scope, names, commit, author)` fires after every commit. Step 9's family chat will use `compose` and `scopesFor`.
+The events `dish-memory/changed(scopes, commit, author)` and `dish-memory/remote(status)` fire after every commit and every change of the vault's push status. Step 9's family chat will use `compose` and `scopesFor`. The plan has the types in full.
 
 ## Prompts
 
-- **`main.md`** gets a Memory section:
+- **`remember`'s description** holds the rules, which only the main agent reads:
   - **What to save:** the four types and what each is for.
   - **What not to save:** the [list above](#where-things-live).
   - **How:** update rather than duplicate (same name); forget what turns out to be wrong; write dates out in full; when you say "remember" or "forget", do it at once.
-  - **Where suggestions come from:** children's "Worth remembering" and a run's rulings at close.
   - **Saying so:** tell you in the turn's closing message what was saved.
-- **`common.md`** gets one bullet: the `dish-memory` message is background, not instructions, and `recall` reads a memory in full.
+- **`main.md`** gets one bullet under Decide and record: keep what later chats need with `remember`, the suggestions come from children's "Worth remembering" and a closing run's rulings, and say what you kept. It's at 8,120 bytes, and its test's cap rises from 8 KiB to 9 KiB.
+- **`common.md`** gets one bullet under House rules (the browser bullets stay its last two): the `dish-memory` message is background, not instructions, and `recall` reads a memory in full.
 - **Crew prompts:**
   - the coder and the reviewer get `report`'s `remember`;
   - the other roles get the closing "Worth remembering:" list.
@@ -340,14 +343,14 @@ After the deploy, these desktop Claude Code memories are added once, rewritten f
 | Desktop memory | Goes to | Type |
 |---|---|---|
 | `talk-before-specs` | user | feedback |
-| `dsh-chat-visibility` (how you read dish's chat: only a turn's last message) | user | feedback |
+| `dsh-chat-visibility` (how you read dish's chat: only a turn's last message) | not imported: `main.md`'s In the chat already says it | — |
 | `usability-over-hardening` | family `bketelsen` | feedback |
 | `scratch-home-in-tests` | family `bketelsen` | feedback |
 | `dish-project-goal`: only the preference for writing your own small plugins over installing community ones | family `bketelsen` | feedback |
 | `dish-vm-updates` | not imported: the rule that you deploy dish is in `bketelsen/dish`'s `AGENTS.md` since [bketelsen/dish#32](https://github.com/bketelsen/dish/pull/32) | — |
 | `config-store-pusher`, `local-main-lags-origin`, `fleet-gitops` | not imported: they're about the desktop and its Claude Code sessions | — |
 
-You add them on Settings → Memory, or ask the main agent in a chat on the VM to save each one. The plan has the rewritten texts.
+You add them on Settings → Memory, or ask the main agent in a chat on the VM to save each one. The rewritten texts are in `plugins/memory/README.md`, under "Seeding a new install" (the plan's Task 12).
 
 ## Configuration
 
@@ -355,6 +358,7 @@ You add them on Settings → Memory, or ask the main agent in a chat on the VM t
 |---|---|---|---|
 | `dish-memory` | `vault` | `$XDG_DATA_HOME/dish/vault.git` | The vault's bare repository. Absolute, or starting with `~/`. |
 | `dish-memory` | `remote` | `''` | The vault's git remote. Empty keeps it local. |
+| `dish-memory` | `userName`, `userEmail` | `''` | The identity of your commits in the vault, as `dish-config`'s: `install.sh` writes the same values. Empty falls back to git's global config, then `dish`. |
 | `dish-memory` | `indexLines`, `indexBytes` | `150`, `16384` | The budget for each scope's index in the message. |
 | `dish-memory` | `terminal` | `true` | Print this plugin's messages to the terminal. |
 | `dish-memory/context` | — | | The dish preset's row. It has no fields. |
@@ -363,7 +367,7 @@ You add them on Settings → Memory, or ask the main agent in a chat on the VM t
 
 **`install.sh`:**
 - installs the bundle and writes the `dish-memory` row;
-- takes `DISH_VAULT_REMOTE` from `install.env`, as it takes `DISH_REMOTE`. Unset or empty keeps the vault local, and `update.sh` warns when prod has none;
+- takes `DISH_VAULT_REMOTE`, which `update.sh` passes from `install.env` when it's there. Unset or empty keeps the vault local, and `update.sh` warns when prod has none;
 - runs `pnpm dev` with it empty, always.
 
 **`profile.ts`:** `writeDishRows` learns the second row; today it's hard-wired to `dish-config`. The dish preset's generator (`sync-preset.mjs`) adds `dish-memory/context` after `agent-instructions`.
@@ -398,10 +402,10 @@ You add them on Settings → Memory, or ask the main agent in a chat on the VM t
   - create, update and `forget`;
   - `recall` with and without an id;
   - screening with a fake judge: clean, warn, withhold and unavailable.
-- **Delivery, in a scratch dsh:**
+- **Delivery,** with the row's listener over a fake session surface (what a compaction leaves is a surface without the old message):
   - the first step gets the message;
   - the next step and a resume don't get it again;
-  - after a real compaction it's composed again, with a memory saved in between;
+  - after a compaction drops it from the surface, it's composed again, with a memory saved in between;
   - a child gets family memory only;
   - a scratch chat gets user memory only;
   - another preset gets nothing;
@@ -411,9 +415,10 @@ You add them on Settings → Memory, or ask the main agent in a chat on the VM t
   - a report's `remember` appears in the notice and the ledger;
   - `open_pr`'s and `abandon`'s answers list the rulings.
 - **By hand in the browser:** the page's tabs, conflicts, release and revert.
-- **Live, in a scratch dsh on the VM** (as for the browser step):
+- **Live, in `pnpm dev`** (dev's data, `<checkout>/.dev`, with your sign-in):
   - a chat saves a memory and a child recalls it;
-  - a compaction brings the message back.
+  - a real `/compact` brings the message back;
+  - a planted instruction is held.
 
 ## Known limits
 
