@@ -540,7 +540,7 @@ test('scopes: You, the families, orphans', async () => {
   assert.deepEqual(w.warnings, [])
 })
 
-test('scopes, compose and scopesFor go on without the projects when dishProjects fails', async () => {
+test('scopes and compose go on without the projects when dishProjects fails; scopesFor is UNAVAILABLE, and keeps nothing', async () => {
   const dirs = await workTree()
   const w = await memoryWorld({
     projects: [{ name: 'acme/widget', family: 'acme', role: 'The widget' }, { name: 'beta/x', family: 'beta' }],
@@ -566,18 +566,31 @@ test('scopes, compose and scopesFor go on without the projects when dishProjects
   assert.ok(without?.includes('Family acme:\n- family/x — About x (feedback)') && !without.includes('Repos in acme'), without)
   assert.equal(w.warnings.length, 2)
 
-  // scopesFor: no family, for a minute.
+  // scopesFor: UNAVAILABLE, not "no family", which would give the chat a message that supersedes its family's. The
+  // caller says so (the row warns once per agent); the service adds no warning of its own.
   const agent = agentAt(dirs.clone)
-  assert.deepEqual(await w.memory.scopesFor(agent), { user: true })
-  assert.equal(w.warnings.length, 3)
+  await assert.rejects(w.memory.scopesFor(agent),
+    refusal('UNAVAILABLE', 'could not list the projects, so the chat\'s family isn\'t known: projects.yaml is unreadable'))
+  assert.equal(w.warnings.length, 2)
   assert.ok(w.warnings.every(warning => !warning.includes(MARKER)), w.warnings.join('\n'))
 
+  // Nothing was kept: with dishProjects well again, the family is found at once.
   w.services.set({ projectsError: undefined })
   assert.ok((await w.memory.compose({ user: true, family: 'acme' }))?.includes('Repos in acme:\n- acme/widget — The widget'))
-  assert.deepEqual(await w.memory.scopesFor(agent), { user: true })
-  w.clock.now += 61_000
   assert.deepEqual(await w.memory.scopesFor(agent), { user: true, family: 'acme' })
-  assert.equal(w.warnings.length, 3)
+
+  // A describe that throws is UNAVAILABLE too, and keeps nothing either.
+  const workspaces = w.services.workspaces
+  w.services.workspaces = () => ({ describe: () => { throw new Error('the workspaces are reloading') } })
+  const other = agentAt(dirs.worktree)
+  await assert.rejects(w.memory.scopesFor(other),
+    refusal('UNAVAILABLE', 'could not look up the clone of acme/widget, so the chat\'s family isn\'t known: the workspaces are reloading'))
+  w.services.workspaces = workspaces
+  assert.deepEqual(await w.memory.scopesFor(other), { user: true, family: 'acme' })
+  // A clone that doesn't resolve is an answer, not a failure: no family.
+  w.services.set({ clones: { 'acme/widget': join(dirs.work, 'missing') } })
+  assert.deepEqual(await w.memory.scopesFor(agentAt(dirs.worktree)), { user: true })
+  assert.equal(w.warnings.length, 2)
 })
 
 test('direction: the template when missing; pendingProposals counts its path', async () => {

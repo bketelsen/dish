@@ -17,7 +17,8 @@
  * - **Untrusted text.** A memory's description and body, and a direction, go only into the vault, the config store and
  *   what the service returns. No error, warning or event carries them: errors name a memory by its id.
  * - **The caches.** `scopesFor` is cached per agent until the next config change (one without a family for a minute
- *   only, so a clone onboarded later is found), and `compose` per identity until a vault commit or a config change.
+ *   only, so a clone onboarded later is found; a lookup that fails is `UNAVAILABLE`, and not cached), and `compose` per
+ *   identity until a vault commit or a config change.
  *   The plugin calls `clearCaches` on `dish-config/changed`; the service clears `compose`'s on its own commits.
  *
  * @module dish-memory/service
@@ -49,6 +50,8 @@ export interface DishMemory {
   /**
    * user: a top-level agent (`isTopLevelAgent`); family: the project whose clone holds the working directory, by real
    * path. Cached per agent id (and working directory) until a config change; one without a family for 60 seconds only.
+   * UNAVAILABLE, and nothing cached, when the family can't be looked up (dishProjects' `list` or dishWorkspaces'
+   * `describe` throws).
    */
   scopesFor(agent: AgentLike): Promise<Scopes>
   /**
@@ -325,7 +328,12 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
     }
   }
 
-  /** The family whose project's clone holds `cwd`, by real path, or `undefined`. The deepest clone wins. */
+  /**
+   * The family whose project's clone holds `cwd`, by real path, or `undefined`. The deepest clone wins. No family is an
+   * answer: no clone holds `cwd`, `cwd` is missing or doesn't resolve, or dishProjects or dishWorkspaces isn't running.
+   * @throws `UNAVAILABLE` when the lookup itself fails (`projects.list()` or `workspaces.describe()` throws): "no family"
+   * would then be a guess, and a message for it would supersede the family's.
+   */
   const familyAt = async (cwd: unknown): Promise<string | undefined> => {
     if (typeof cwd !== 'string' || cwd === '') return undefined
     const projects = services.projects()
@@ -341,18 +349,23 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
     try {
       list = await projects.list()
     } catch (error) {
-      warn(`could not list the projects, so no family is known: ${describe(error)}`)
-      return undefined
+      throw new MemoryError('UNAVAILABLE', `could not list the projects, so the chat's family isn't known: ${describe(error)}`)
     }
     let found: { clone: string, family: string } | undefined
     for (const project of list) {
       if (typeof project.family !== 'string' || !NAME.test(project.family)) continue
+      let where: unknown
+      try {
+        where = workspaces.describe(project.name)?.clone
+      } catch (error) {
+        throw new MemoryError('UNAVAILABLE', `could not look up the clone of ${project.name}, so the chat's family isn't known: ${describe(error)}`)
+      }
+      if (typeof where !== 'string' || where === '') continue
       let clone: string
       try {
-        const where = workspaces.describe(project.name)?.clone
-        if (typeof where !== 'string' || where === '') continue
         clone = await realpath(where)
       } catch {
+        // A clone that isn't there holds nothing.
         continue
       }
       const inside = real === clone || real.startsWith(clone.endsWith('/') ? clone : `${clone}/`)
