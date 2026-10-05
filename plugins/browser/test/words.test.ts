@@ -340,6 +340,25 @@ test('readExtra: the scroll, then the console errors and failed requests, each s
   assert.equal(hostile[1]!.length, 2 + 300)
 })
 
+test('readExtra lists the newest 10 of each (the logs come oldest first), and counts the rest', () => {
+  const kept = Array.from({ length: 37 }, (_, i) => `error ${i}`)
+  const requests = Array.from({ length: 12 }, (_, i) => `404 http://h/${i}.js`)
+  const lines = readExtra(undefined, { console: kept, requests, moreConsole: 0, moreRequests: 0 })
+  assert.deepEqual(lines, [
+    'Console errors (the newest 10 of 37):',
+    ...Array.from({ length: 10 }, (_, i) => `- error ${27 + i}`),
+    'Failed requests (the newest 10 of 12):',
+    ...Array.from({ length: 10 }, (_, i) => `- 404 http://h/${2 + i}.js`),
+  ])
+  // The whole ring, with more it no longer holds.
+  const ring = Array.from({ length: 100 }, (_, i) => `error ${i}`)
+  const full = readExtra(undefined, { console: ring, requests: [], moreConsole: 50, moreRequests: 0 })
+  assert.equal(full[0], 'Console errors (the newest 10 of 150):')
+  assert.equal(full.length, 11)
+  assert.equal(full[1], '- error 90')
+  assert.equal(full[10], '- error 99')
+})
+
 test('screenshotText: the viewport, scaled, an element, with notes', () => {
   const plain = screenshotText({ notes: [], url: 'http://h/', title: 'Home', width: 1280, height: 800, viewport: VIEWPORT })
   assert.equal(plain, [
