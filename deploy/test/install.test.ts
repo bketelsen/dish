@@ -9,7 +9,7 @@
  * The property that matters most is that the install never opens the real config store, and the checks on it are:
  * every dsh process the install starts has its four XDG directories pointed at a throwaway directory (a spy loaded
  * through NODE_OPTIONS records each one), the throwaway directory is gone afterwards, and the scratch "real"
- * XDG directories hold no `dish` directory, so no `config.git`. Under `pnpm dev` the launcher sets DSH_DISH_HOME, which
+ * XDG directories hold no `dish` directory, so no `config.git` and no memory vault. Under `pnpm dev` the launcher sets DSH_DISH_HOME, which
  * moves dish's directories ahead of XDG_*: the scratch sets it too, and the spy checks that no dsh process sees it.
  * The throwaway directories must not take pnpm's store with them, which is the other check: the profile records the
  * account's own store, so a later install can add to it.
@@ -34,7 +34,8 @@ const SKIP = INTEGRATION ? false : 'set DISH_INSTALL_TEST=1 to run the install a
 const REMOTE = 'git@github-dish-config.invalid:example/store.git'
 const USER_NAME = 'Dish Test'
 const USER_EMAIL = 'dish-test@example.invalid'
-const BUNDLES = ['dish-copilot', 'dish-config', 'dish-prompts', 'dish-skills', 'dish-crew', 'dish-judge', 'dish-web', 'dish-projects', 'dish-workspaces', 'dish-gates', 'dish-orchestrator', 'dish-browser']
+const BUNDLES = ['dish-copilot', 'dish-config', 'dish-prompts', 'dish-skills', 'dish-crew', 'dish-judge', 'dish-web', 'dish-projects', 'dish-workspaces', 'dish-gates', 'dish-orchestrator', 'dish-browser', 'dish-memory']
+const VAULT_REMOTE = 'git@github-dish-vault.invalid:example/vault.git'
 
 const execFileAsync = promisify(execFile)
 
@@ -241,7 +242,8 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(first.code, 0, first.stderr)
   assert.match(first.stdout, /install: profile web at .*: created/)
   assert.match(first.stdout, /install: dish rows \(.*\): updated/)
-  assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge web projects workspaces gates orchestrator browser; already linked: none/)
+  assert.match(first.stdout, /bundles added: copilot config prompts skills crew judge web projects workspaces gates orchestrator browser memory; already linked: none/)
+  assert.match(first.stdout, /^install: memory vault: none, the vault stays local$/m, 'DISH_VAULT_REMOTE is optional')
   assert.match(first.stdout, /^install: sandbox home: off$/m)
   assert.match(first.stdout, /^install: the profile's pnpm installs copy: updated$/m)
   assert.match(first.stdout, /^install: links into pnpm's store replaced by copies: \d+$/m)
@@ -266,7 +268,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(second.code, 0, second.stderr)
   assert.match(second.stdout, /install: profile web at .*: existing/)
   assert.match(second.stdout, /install: dish rows \(.*\): unchanged/)
-  assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge web projects workspaces gates orchestrator browser/)
+  assert.match(second.stdout, /bundles added: none; already linked: copilot config prompts skills crew judge web projects workspaces gates orchestrator browser memory/)
   assert.match(second.stdout, /install: no changes to the profile/)
   assert.match(second.stdout, /^install: the profile's pnpm installs copy: unchanged$/m)
   assert.match(second.stdout, /^install: links into pnpm's store replaced by copies: 0$/m)
@@ -301,7 +303,7 @@ test('install.sh twice changes nothing the second time, and then repairs a missi
   assert.equal(removal.code, 0, removal.stderr)
   const repair = await run(INSTALL, [], scratch)
   assert.equal(repair.code, 0, repair.stderr)
-  assert.match(repair.stdout, /bundles added: judge; already linked: copilot config prompts skills crew web projects workspaces gates orchestrator browser\n/)
+  assert.match(repair.stdout, /bundles added: judge; already linked: copilot config prompts skills crew web projects workspaces gates orchestrator browser memory\n/)
   assert.match(repair.stdout, /install: dish rows \(.*\): unchanged/)
   const repairCalls = dshCalls(scratch).slice(1 + BUNDLES.length)
   assert.equal(repairCalls.length, 2, 'the removal, and one `plugin add`')
@@ -391,5 +393,92 @@ test('install.sh names the step that failed, and cleans up', { skip: SKIP, timeo
   assert.match(result.stderr, /install: FAILED at step: writing dish's rows into .*cordis\.patch\.yml/)
   assert.match(result.stderr, /userEmail must be a single line/)
   assert.deepEqual(await readdir(scratch.tmp), [], "the throwaway directory is removed after a failure too")
+  await assertNoStore(scratch)
+})
+
+// --- the memory vault's remote ---------------------------------------------------------------------------------------
+
+type PatchRow = { id: string; name?: string; config?: Record<string, unknown> }
+
+/** The rows of the profile's patch file. */
+async function patchRows(scratch: Scratch, profile = 'web'): Promise<PatchRow[]> {
+  return parse(await readFile(join(scratch.dshHome, 'profiles', profile, 'cordis.patch.yml'), 'utf8')) as PatchRow[]
+}
+
+/** dish's three rows, in the order the file has them. */
+function dishRowIds(rows: PatchRow[]): string[] {
+  return rows.map((row) => row.id).filter((id) => ['dish-config', 'agent-preset-registry', 'dish-memory'].includes(id))
+}
+
+/** A regular expression for `text`, as it stands. */
+function literal(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * One install with DISH_VAULT_REMOTE set, which the two tests below share, since an install takes minutes: the first
+ * checks it, the second runs install.sh again on it without the remote. Either one makes it when it runs first.
+ */
+let vaultInstall: Promise<{ scratch: Scratch; first: Result }> | undefined
+function installWithVault(): Promise<{ scratch: Scratch; first: Result }> {
+  vaultInstall ??= (async () => {
+    const scratch = await makeScratch({ DISH_VAULT_REMOTE: VAULT_REMOTE })
+    return { scratch, first: await run(INSTALL, [], scratch) }
+  })()
+  return vaultInstall
+}
+
+test('install.sh writes the vault\'s remote to the dish-memory row, and says so', { skip: SKIP, timeout: 900_000 }, async () => {
+  const { scratch, first } = await installWithVault()
+  assert.equal(first.code, 0, first.stderr)
+  const lines = first.stdout.split('\n')
+  const rowsLine = lines.findIndex((line) => /^install: dish rows \(.*\): updated$/.test(line))
+  assert.ok(rowsLine >= 0, first.stdout)
+  assert.equal(lines[rowsLine], `install: dish rows (${REMOTE}): updated`, 'the rows line is the config store\'s, as before')
+  assert.equal(lines[rowsLine + 1], `install: memory vault: ${VAULT_REMOTE}`, 'the vault\'s line follows it')
+  assert.match(first.stdout, /bundles added: .* browser memory; already linked: none/)
+
+  const rows = await patchRows(scratch)
+  assert.deepEqual(dishRowIds(rows), ['dish-config', 'agent-preset-registry', 'dish-memory'])
+  assert.deepEqual(rows.find((row) => row.id === 'dish-memory'), {
+    id: 'dish-memory', name: 'dish-memory', config: { remote: VAULT_REMOTE, userName: USER_NAME, userEmail: USER_EMAIL },
+  })
+  assertIsolated(scratch, dshCalls(scratch))
+
+  // What dsh makes of it: the bundle's row, patched with the remote and the identity.
+  const throwaway = join(scratch.dir, 'throwaway')
+  const dump = await run('pnpm', ['exec', 'dsh', '--profile', 'web', '--dump-config'], scratch, {
+    ...scratch.env,
+    DSH_DISH_HOME: undefined,
+    XDG_CONFIG_HOME: join(throwaway, 'config'),
+    XDG_STATE_HOME: join(throwaway, 'state'),
+    XDG_DATA_HOME: join(throwaway, 'data'),
+    XDG_CACHE_HOME: join(throwaway, 'cache'),
+  })
+  assert.equal(dump.code, 0, dump.stderr)
+  assert.doesNotMatch(dump.stderr, /not found/, 'no row is left without its bundle')
+  assert.match(dump.stdout, new RegExp(`^# == dish-memory, patched by .*cordis\\.patch\\.yml\\n- id: dish-memory\\n  name: dish-memory\\n  config:\\n    remote: ${literal(VAULT_REMOTE)}\\n    userName: ${literal(USER_NAME)}\\n    userEmail: ${literal(USER_EMAIL)}\\n`, 'm'))
+
+  // Nothing booted, so there is no vault, as there is no store.
+  await assertNoStore(scratch)
+})
+
+test('without DISH_VAULT_REMOTE the vault row has an empty remote and the line says the vault stays local', { skip: SKIP, timeout: 900_000 }, async () => {
+  const { scratch, first } = await installWithVault()
+  assert.equal(first.code, 0, first.stderr)
+
+  const unset = await run(INSTALL, [], scratch, { ...scratch.env, DISH_VAULT_REMOTE: undefined })
+  assert.equal(unset.code, 0, unset.stderr)
+  assert.match(unset.stdout, /^install: memory vault: none, the vault stays local$/m)
+  assert.match(unset.stdout, new RegExp(`^install: dish rows \\(${literal(REMOTE)}\\): updated$`, 'm'))
+  assert.match(unset.stdout, /^install: profile changed$/m)
+  assert.deepEqual((await patchRows(scratch)).find((row) => row.id === 'dish-memory')?.config, { remote: '', userName: USER_NAME, userEmail: USER_EMAIL })
+
+  // Empty is the same as unset: nothing more changes.
+  const empty = await run(INSTALL, [], scratch, { ...scratch.env, DISH_VAULT_REMOTE: '' })
+  assert.equal(empty.code, 0, empty.stderr)
+  assert.match(empty.stdout, /^install: memory vault: none, the vault stays local$/m)
+  assert.match(empty.stdout, /^install: no changes to the profile$/m)
+  assert.deepEqual(dishRowIds(await patchRows(scratch)), ['dish-config', 'agent-preset-registry', 'dish-memory'], 'no second row')
   await assertNoStore(scratch)
 })

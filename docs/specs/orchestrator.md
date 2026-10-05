@@ -68,7 +68,7 @@ A run is a change on its way to a PR: a goal, a branch, an optional plan, its ta
 
 **Ending a run.**
 - **`open_pr`** ends it with `state: pr` ([The PR](#the-pr)).
-- **`run` `action: abandon`,** with a reason, ends it without one. Its worktrees are left for the main agent or the sweep to remove, and the ledger keeps everything.
+- **`run` `action: abandon`,** with a reason, ends it without one. Its worktrees are left for the main agent or the sweep to remove, and the ledger keeps everything. Since step 8 its answer ends, as `open_pr`'s does, with the run's rulings ([The PR](#the-pr), step 7).
 - **Review feedback on its PR** reopens it: `run` `action: resume` on a run in state `pr` makes it `open` again, keeping its PR, while its worktree is still one dish made (the sweep removes it once the PR merges). It is recorded as `run.resumed` with `reopened`. `pr_feedback` reads what the PR got ([The tools](#the-tools)). Fixes go through rounds as before, and `open_pr` again pushes to the same PR ([The PR](#the-pr)).
 - **Bringing the branch up to date is a merge.** When the run's branch is behind its default branch, or GitHub's `dish/<slug>` has commits it lacks (an "Update branch", a committed suggestion, a push of the user's own), a coder in the reopened worktree runs `git fetch origin` and merges `origin/<default>`, and `origin/dish/<slug>` when it moved, resolving any conflicts; the gate runs as usual. Never a rebase, an amend or a squash: dish never force-pushes. `open_pr` still needs the final review's approval of the new head: a scoped re-review, or, for a clean merge of the default branch alone, `reviewRuling` ("Ruling: merge of origin/main only, no conflicts — …").
 
@@ -128,6 +128,7 @@ A run is a change on its way to a PR: a goal, a branch, an optional plan, its ta
 | `rulings` | `{ what, why, costIfWrong }[]` | its own judgment calls |
 | `concerns` | string[] | |
 | `notFixed` | `{ finding, why }[]` | in a fix round: findings it didn't fix, and why |
+| `remember` | string[] | up to five items, each one line of at most 300 characters: what a later agent in this family should know that the code doesn't say. The notice shows them to the main agent as "Worth remembering", and it decides what to keep with `remember` ([memory spec](memory.md)). Masked, as the whole report is. Added in step 8 |
 
 **The reviewer's schema:**
 
@@ -139,6 +140,7 @@ A run is a change on its way to a PR: a goal, a branch, an optional plan, its ta
 | `findings` | `{ severity: blocking \| should_fix \| nit, file, line?, summary, fix }[]` | required (empty for a clean review) |
 | `checks` | `{ command, exitCode, summary }[]` | what it ran |
 | `addressed` | `{ finding, addressed: boolean, evidence }[]` | in a re-review |
+| `remember` | string[] | as the coder's: up to five one-line items of at most 300 characters, shown as "Worth remembering", masked. Added in step 8 |
 
 The schemas use only what dsh-tools supports: `enum`, nested objects with `required: true`, arrays of objects, explicit `additionalProperties`. No `oneOf` (its errors don't say which field is wrong), no lengths or patterns.
 
@@ -178,7 +180,7 @@ The schemas use only what dsh-tools supports: `enum`, nested objects with `requi
 4. **`pr.checked`** is recorded, with what was found and any overrides.
 5. **The push:** dish-workspaces pushes the run's branch with a write token it mints in memory for this push only, to the project's HTTPS URL (never `origin`, which an agent can repoint), with an explicit refspec and never with force, and only at the head the checks ran on: a branch that moved since is refused. A rejected push (the branch moved on GitHub, or the token lacks a permission, such as Workflows for a change under `.github/workflows/`) fails the tool with GitHub's reason, and nothing more happens. For a branch that moved, the answer says: "The branch on GitHub has commits this one doesn't: have a coder merge `origin/dish/<slug>` into the run's worktree, then call `open_pr` again. dish never forces a push."
 6. **The PR:** dish-workspaces opens it (`POST /repos/{owner}/{repo}/pulls`, base the project's default branch, head the run's branch), with the main agent's body, plus, only if a check was overridden, one line at the end: "⚠ dish: opened past a failing gate. Ruling: …" or "⚠ dish: opened without an approved final review of this head. Ruling: …". A PR that already exists for the branch is reported, not opened again, and its title and body aren't changed: an override's line is posted on it as a comment instead (`POST /repos/{owner}/{repo}/issues/{n}/comments`).
-7. **`pr.opened`** (or **`pr.updated`**, for a PR that was already open) and **`run.closed`** are recorded, and the run's state becomes `pr`. The answer gives the PR's URL.
+7. **`pr.opened`** (or **`pr.updated`**, for a PR that was already open) and **`run.closed`** are recorded, and the run's state becomes `pr`. The answer gives the PR's URL. Since step 8 it ends, after a blank line, with "Rulings in this run:" and a line for each, masked and cut to 300 characters, from the ledger read again after the close, so this call's overrides are among them: the main agent's `ruling` entries, `ladder.ruled`, check overrides and coders' report rulings, the newest 10, then "and N more in the ledger" ([memory spec](memory.md#rulings-at-the-end-of-a-run)). `abandon`'s answer ends the same way. A run with no rulings gets no block, and a ledger that can't be read is logged and leaves the block out; the run is closed either way.
 
 **Review feedback.** A run reopened with `run` `resume` (see [Ending a run](#runs)) goes through the same steps: the same checks on its new head, then the push to the same branch. Before the gate it asks whether GitHub's `dish/<slug>` has commits the run's branch lacks, and refuses with the merge hint if so. The PR is already open, so the ledger gets `pr.updated`. Its title and body stay, unless `title` or `body` is given: then dish updates them (`PATCH /repos/{owner}/{repo}/pulls/{n}`, masked, with a Pull requests write token). An override's line is always posted as a comment, never put in the body.
 

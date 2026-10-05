@@ -12,7 +12,7 @@ pnpm dev            # installs dish into dev's profile and serves it on 127.0.0.
 ```
 
 `pnpm dev` is dish in dev, from this checkout:
-- **The install.** It runs `deploy/install.sh` every time, which is idempotent: the dependencies and the build, then on the first run dev's profile, and any new bundle later. Dev's config store never has a remote, so it can never push over prod's.
+- **The install.** It runs `deploy/install.sh` every time, which is idempotent: the dependencies and the build, then on the first run dev's profile, and any new bundle later. Dev's config store and memory vault never have a remote, so they can never push over prod's.
 - **The server.** It starts the plugins' client watchers and `dsh web` on `127.0.0.1:3090` (`pnpm dev --port <n>` changes it; 0 lets dsh pick), and prints `dev: open <url>` after dsh's sign-in line. Open that link.
 - **Stopping it.** Ctrl-C. A second Ctrl-C forces dsh out, as dsh does itself. Ctrl-\ stops it too, but pnpm gives the prompt back before dsh has stopped, so prefer Ctrl-C. Ctrl-Z pauses only `pnpm dev`: dsh and the watchers keep running until you `fg` and stop it. From another shell, SIGTERM the `node scripts/dev.ts` process, not the outer `pnpm`, which doesn't pass signals on. A SIGKILL leaves dsh and the watchers running. After a signal n, `scripts/dev.ts` exits 128+n (130 for Ctrl-C). Its header has the details, and why.
 
@@ -36,6 +36,7 @@ pnpm dsh plugin --profile web add ./plugins/workspaces
 pnpm dsh plugin --profile web add ./plugins/gates
 pnpm dsh plugin --profile web add ./plugins/orchestrator
 pnpm dsh plugin --profile web add ./plugins/browser
+pnpm dsh plugin --profile web add ./plugins/memory
 pnpm dsh web        # prints the UI URL (with its access token)
 ```
 
@@ -69,6 +70,7 @@ Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, termin
 | [`gates`](plugins/gates) | The harness's check on a coder's work: when a crew coder bound to a worktree is about to finish, the project's gate runs in that worktree through dsh's sandbox, and a failure goes back to the coder (up to 3 gate runs a turn). Crew records each result, the finish notice says how the gate ended, and a review of work whose gate didn't pass needs the main agent's ruling. |
 | [`orchestrator`](plugins/orchestrator) | Runs: every change that ends in a pull request is a run, owned by its project, driven by one chat at a time, and reopened for review feedback. A ledger per run that the harness writes, and the main agent's tools: `run` (open, resume, status, rulings), `open_pr`, which pushes the run's branch and opens the pull request only when the gate passes on its head and the final review approved that head (or a ruling overrides), and `pr_feedback`, which reads a pull request's reviews, comments and checks. Settings → Runs shows each run and its ledger, read-only. |
 | [`browser`](plugins/browser) | A shared browser: one headless Chromium on the host, a browser of its own for each chat and each crew child, and ten `browser_*` tools to open a page, read it as an accessibility tree with refs, click, type, press keys, choose options, scroll, wait, go back and take a screenshot the model sees. The main agent, the coder, the reviewer and the writer have them, and the judge screens what they return. The Browser tab in the right sidebar shows the page live, and you can click and type in it: the agent's next call says what you did, never what you typed. Screenshots render in the chat. Without Chromium on the host, no tools. |
+| [`memory`](plugins/memory) | Memory and direction. The vault, a git repository of what dish's agents learn, in Claude Code's auto-memory format: your memory for every chat, and each family's for every agent in its repos. Each family's direction in the config store, with its repos' roles. One `<dish-memory>` message brings them to an agent before its first step and again after a compaction, as dsh brings `AGENTS.md`. The main agent keeps memories with `remember` and `forget`, every dish agent reads them with `recall`, and the judge screens what an agent saves, holding a suspect one for you. Settings → Memory browses, edits, releases and reverts them, and edits the directions. |
 | [`web`](plugins/web) | Settings over the tailnet. On your trusted host (`--trusted-host`), pages count as the operator's own machine, so Settings → Models, provider sign-ins and durable UI preferences work there as they do on `127.0.0.1`. Host-only, with no browser half. |
 
 ## Deploying

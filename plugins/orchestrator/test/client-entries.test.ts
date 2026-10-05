@@ -107,6 +107,36 @@ test('tasks and children: opened, removed, started, a follow-up, a round, a fina
   }), 'changes requested', 'not yet', 'the race', 'still there')
 })
 
+test('a report\'s remember is shown, one line per item, for a coder and a reviewer', () => {
+  const coder = describeEntry(line('child.ended', {
+    child: 'c3', role: 'coder', stopReason: 'completed', reportFile: '/r.md', head: SHA_B,
+    report: { role: 'coder', turn: 1, at: NOW, status: 'done', summary: 'done', concerns: ['a loose end'], remember: ['the fixture clock is UTC', 'pnpm test needs a scratch HOME'] },
+  }))
+  assert.deepEqual(coder.text.filter(part => part.startsWith('worth remembering: ')), [
+    'worth remembering: the fixture clock is UTC', 'worth remembering: pnpm test needs a scratch HOME',
+  ])
+  // After what the report already said.
+  assert.ok(coder.text.indexOf('concern: a loose end') < coder.text.indexOf('worth remembering: the fixture clock is UTC'), coder.text.join(' | '))
+
+  const reviewer = describeEntry(line('child.ended', {
+    child: 'r3', role: 'reviewer', stopReason: 'completed', reportFile: '/r.md', head: SHA_C,
+    report: { role: 'reviewer', turn: 1, at: NOW, verdict: 'approved', head: SHA_C, summary: 'fine', findings: [], remember: ['the e2e suite flakes on CI'] },
+  }))
+  assert.deepEqual(reviewer.text.filter(part => part.startsWith('worth remembering: ')), ['worth remembering: the e2e suite flakes on CI'])
+
+  // Only strings count; anything else in the list is left out, and a list that isn't one shows nothing.
+  const odd = describeEntry(line('child.ended', {
+    child: 'c4', role: 'coder', stopReason: 'completed', reportFile: '/r.md', head: SHA_B,
+    report: { role: 'coder', turn: 1, at: NOW, status: 'done', summary: 'done', remember: ['kept', 7, { item: 'x' }] },
+  }))
+  assert.deepEqual(odd.text.filter(part => part.startsWith('worth remembering: ')), ['worth remembering: kept'])
+  const notAList = describeEntry(line('child.ended', {
+    child: 'c5', role: 'coder', stopReason: 'completed', reportFile: '/r.md', head: SHA_B,
+    report: { role: 'coder', turn: 1, at: NOW, status: 'done', summary: 'done', remember: 'one string' },
+  }))
+  assert.ok(!notAList.text.some(part => part.startsWith('worth remembering')), notAList.text.join(' | '))
+})
+
 test('gates, verdicts and the ladder', () => {
   const lines = everyKind(ID).map(toLine)
   assertHas(lines.find(each => each.kind === 'gate.result')!, 'passed', 'exit 0', '1.2 s', SHA_B.slice(0, 7), '/logs/gate-1.log')

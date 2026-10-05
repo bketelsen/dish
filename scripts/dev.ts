@@ -7,13 +7,14 @@
  *    agent could write (`agentPath`), and no `NODE_PATH`. dsh is started as its own script (`dshEntry`) by the node
  *    that runs this, not through its `node_modules/.bin` shim, which would set a `NODE_PATH` naming the checkout. `pnpm`
  *    and install.sh's tools are the account's, from that `PATH`.
- * 2. Run `deploy/install.sh` under that environment, with `DISH_REMOTE=''` whatever the environment says (dev's config
- *   store never has a remote, so it can never push over prod's) and the checkout's git identity. It is idempotent, so
- *   every run does it: the install, the build, and on the first run the profile, then any new bundle.
+ * 2. Run `deploy/install.sh` under that environment, with `DISH_REMOTE=''` and `DISH_VAULT_REMOTE=''` whatever the
+ *   environment says (dev's config store and memory vault never have a remote, so they can never push over prod's) and
+ *   the checkout's git identity. It is idempotent, so every run does it: the install, the build, and on the first run
+ *   the profile, then any new bundle.
  * 3. Start the plugins' client bundle watchers (`pnpm ... run dev`) and `dsh web` on `127.0.0.1:<port>` (3090), and print
- *   `dev: open <url>` after dsh's own sign-in line. Neither gets install.sh's inputs (`DISH_REMOTE`, `DISH_USER_NAME`,
- *   `DISH_USER_EMAIL`, `DISH_PROFILE`), set here or inherited: dsh passes its environment on to agent shells, where an
- *   install.sh run by hand would find an inherited remote and make dev's store push to it.
+ *   `dev: open <url>` after dsh's own sign-in line. Neither gets install.sh's inputs (`DISH_REMOTE`, `DISH_VAULT_REMOTE`,
+ *   `DISH_USER_NAME`, `DISH_USER_EMAIL`, `DISH_PROFILE`), set here or inherited: dsh passes its environment on to agent
+ *   shells, where an install.sh run by hand would find an inherited remote and make dev's store push to it.
  *
  * When one of the two stops, the other is stopped. The exit code is the first non-zero code of the two, or 128+n when
  * this process was itself sent signal n.
@@ -114,11 +115,15 @@ export async function gitIdentity(root: string, env: NodeJS.ProcessEnv = process
   return { name: name ?? 'dish dev', email: email ?? 'dev@dish.invalid' }
 }
 
-/** `devEnv` plus DISH_REMOTE='' (always, whatever is inherited), DISH_USER_NAME, DISH_USER_EMAIL and DISH_PROFILE=web. */
+/**
+ * `devEnv` plus DISH_REMOTE='' and DISH_VAULT_REMOTE='' (always, whatever is inherited: dev's config store and memory
+ * vault never have a remote), DISH_USER_NAME, DISH_USER_EMAIL and DISH_PROFILE=web.
+ */
 export function installEnvironment(devEnv: NodeJS.ProcessEnv, identity: { name: string, email: string }): NodeJS.ProcessEnv {
   return {
     ...devEnv,
     DISH_REMOTE: '',
+    DISH_VAULT_REMOTE: '',
     DISH_USER_NAME: identity.name,
     DISH_USER_EMAIL: identity.email,
     DISH_PROFILE: 'web',
@@ -126,7 +131,7 @@ export function installEnvironment(devEnv: NodeJS.ProcessEnv, identity: { name: 
 }
 
 /** install.sh's inputs, which dsh and the watchers never get (`serverEnvironment`). */
-const INSTALL_INPUTS = ['DISH_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL', 'DISH_PROFILE'] as const
+const INSTALL_INPUTS = ['DISH_REMOTE', 'DISH_VAULT_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL', 'DISH_PROFILE'] as const
 
 /**
  * `devEnv` less install.sh's inputs, whatever it inherited: what dsh and the watchers get. dsh passes its environment on

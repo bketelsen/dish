@@ -43,13 +43,15 @@ export const INPUTS = {
   DISH_REMOTE: 'git@github-dish-config:example/dish-config.git',
   DISH_USER_NAME: 'Dish Test',
   DISH_USER_EMAIL: 'dish-test@example.invalid',
+  DISH_VAULT_REMOTE: 'git@github-dish-vault:example/dish-vault.git',
 }
 
-/** install.env as fleet writes it. */
+/** install.env as fleet writes it, with the vault's remote (optional: without it, update.sh warns). */
 export const INSTALL_ENV = `# Managed by fleet (test host). update.sh reads this; the unit never loads it.
 DISH_REMOTE=${INPUTS.DISH_REMOTE}
 DISH_USER_NAME=${INPUTS.DISH_USER_NAME}
 DISH_USER_EMAIL=${INPUTS.DISH_USER_EMAIL}
+DISH_VAULT_REMOTE=${INPUTS.DISH_VAULT_REMOTE}
 `
 
 export const DEPLOY_ENV = 'DISH_TRUSTED_HOST=dish.example.ts.net\n'

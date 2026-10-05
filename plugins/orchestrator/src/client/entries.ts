@@ -90,6 +90,7 @@ function reportLines(report: unknown): string[] {
       const finding = str(item.finding)
       if (finding !== undefined) lines.push(`not fixed: ${finding}${str(item.why) === undefined ? '' : ` — ${str(item.why)}`}`)
     }
+    for (const item of strings(report.remember)) lines.push(`worth remembering: ${item}`)
   } else if (report.role === 'reviewer') {
     const verdict = str(report.verdict)
     const head = [verdict === undefined ? undefined : verdictLabel(verdict), report.head === undefined ? undefined : `at ${sha(report.head)}`].filter(part => part !== undefined).join(' ')
@@ -114,6 +115,7 @@ function reportLines(report: unknown): string[] {
       const state = item.addressed === true ? 'addressed' : item.addressed === false ? 'not addressed' : 'addressed?'
       lines.push(`${state}: ${finding}${str(item.evidence) === undefined ? '' : ` — ${str(item.evidence)}`}`)
     }
+    for (const item of strings(report.remember)) lines.push(`worth remembering: ${item}`)
   }
   return lines
 }

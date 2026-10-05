@@ -95,13 +95,14 @@ test('parseDevArgs: a bad port, a missing value, a repeat and an unknown argumen
 
 // ---- installEnvironment -----------------------------------------------------------------------------------------
 
-test('installEnvironment: the remote is always empty, the profile is web, the identity passes through', () => {
+test('installEnvironment: the remotes are always empty, the profile is web, the identity passes through', () => {
   const devEnv: NodeJS.ProcessEnv = {
     PATH: BASE_PATH,
     DSH_HOME: '/r/.dev/dsh',
     DSH_DISH_HOME: '/r/.dev',
     DISH_ENV: 'dev',
     DISH_REMOTE: 'git@github-dish-config:bketelsen/dish-config.git',
+    DISH_VAULT_REMOTE: 'git@github-dish-vault:bketelsen/dish-vault.git',
     DISH_PROFILE: 'other',
     DISH_USER_NAME: 'inherited',
     DISH_USER_EMAIL: 'inherited@example.com',
@@ -112,6 +113,8 @@ test('installEnvironment: the remote is always empty, the profile is web, the id
   assert.deepEqual(devEnv, before, 'the input is not modified')
   assert.equal(result.DISH_REMOTE, '', 'an inherited remote becomes empty')
   assert.ok('DISH_REMOTE' in result, 'set but empty, which keeps the store local')
+  assert.equal(result.DISH_VAULT_REMOTE, '', 'an inherited vault remote becomes empty: dev\'s vault stays local')
+  assert.ok('DISH_VAULT_REMOTE' in result)
   assert.equal(result.DISH_PROFILE, 'web')
   assert.equal(result.DISH_USER_NAME, 'Ada Lovelace')
   assert.equal(result.DISH_USER_EMAIL, 'ada@example.com')
@@ -122,20 +125,22 @@ test('installEnvironment: the remote is always empty, the profile is web, the id
   assert.equal(result.PATH, BASE_PATH)
 })
 
-test('installEnvironment: adds exactly its four names to an environment that has none of them', () => {
+test('installEnvironment: adds exactly its five names to an environment that has none of them', () => {
   const result = installEnvironment({ PATH: BASE_PATH }, { name: 'n', email: 'e@x' })
-  assert.deepEqual(Object.keys(result).sort(), ['DISH_PROFILE', 'DISH_REMOTE', 'DISH_USER_EMAIL', 'DISH_USER_NAME', 'PATH'])
+  assert.deepEqual(Object.keys(result).sort(), ['DISH_PROFILE', 'DISH_REMOTE', 'DISH_USER_EMAIL', 'DISH_USER_NAME', 'DISH_VAULT_REMOTE', 'PATH'])
+  assert.equal(result.DISH_VAULT_REMOTE, '')
 })
 
 // ---- serverEnvironment ------------------------------------------------------------------------------------------
 
-test('serverEnvironment: install.sh\'s four inputs are taken out, whatever their values, and nothing else is', () => {
+test('serverEnvironment: install.sh\'s five inputs are taken out, whatever their values, and nothing else is', () => {
   const devEnv: NodeJS.ProcessEnv = {
     PATH: BASE_PATH,
     DSH_HOME: '/r/.dev/dsh',
     DSH_DISH_HOME: '/r/.dev',
     DISH_ENV: 'dev',
     DISH_REMOTE: 'git@github-dish-config:bketelsen/dish-config.git',
+    DISH_VAULT_REMOTE: '',
     DISH_PROFILE: 'web',
     DISH_USER_NAME: 'inherited',
     DISH_USER_EMAIL: '',
@@ -361,7 +366,7 @@ setInterval(() => {}, 1000)
 /** Logs the variables install.sh is told about, as `NAME=[value]`, or `NAME=` when unset, and exits `STUB_INSTALL_EXIT`. */
 const INSTALL_SOURCE = `
 const fs = require('node:fs')
-const names = ['DISH_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL', 'DISH_PROFILE', 'DSH_HOME', 'DSH_DISH_HOME', 'DISH_ENV', 'PATH', 'NODE_PATH']
+const names = ['DISH_REMOTE', 'DISH_VAULT_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL', 'DISH_PROFILE', 'DSH_HOME', 'DSH_DISH_HOME', 'DISH_ENV', 'PATH', 'NODE_PATH']
 const seen = names.map(name => name + '=' + (process.env[name] === undefined ? '' : '[' + process.env[name] + ']'))
 fs.appendFileSync(process.env.STUB_LOG + '/install.log', seen.join(' ') + ' cwd=' + process.cwd() + '\\n')
 if (process.env.STUB_INSTALL_HOLD) {
@@ -561,9 +566,10 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
     },
     pnpm: { print: ['watchers: built'], printErr: ['watchers: a line on stderr'] },
   })
-  // install.sh's inputs, as a shell or an .envrc on the desktop might have them: the real remote among them.
+  // install.sh's inputs, as a shell or an .envrc on the desktop might have them: the real remotes among them.
   Object.assign(fixture.env, {
     DISH_REMOTE: 'git@github-dish-config:bketelsen/dish-config.git',
+    DISH_VAULT_REMOTE: 'git@github-dish-vault:bketelsen/dish-vault.git',
     DISH_USER_NAME: 'Inherited Name',
     DISH_USER_EMAIL: 'inherited@example.com',
     DISH_PROFILE: 'inherited-profile',
@@ -576,6 +582,7 @@ test('main: installs, then starts the watchers and dsh with the dev environment,
 
     const [install] = await readLog(fixture, 'install')
     assert.ok(install!.includes('DISH_REMOTE=[] '), `an inherited remote is emptied: ${install}`)
+    assert.ok(install!.includes('DISH_VAULT_REMOTE=[] '), `an inherited vault remote is emptied: ${install}`)
     assert.ok(install!.includes('DISH_PROFILE=[web]'), install)
     assert.ok(/DISH_USER_NAME=\[[^\]]+\]/.test(install!) && /DISH_USER_EMAIL=\[[^\]]+@[^\]]+\]/.test(install!), install)
     assert.ok(!install!.includes('nherited'), `the identity is the checkout's, not the inherited one: ${install}`)

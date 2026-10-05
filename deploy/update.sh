@@ -27,8 +27,10 @@
 #
 # Inputs:
 # - ~/.config/dish/install.env, written by fleet, and never loaded by the unit: exactly DISH_REMOTE, DISH_USER_NAME and
-#   DISH_USER_EMAIL, one NAME=value line each, the value verbatim. Blank lines and lines starting with # are ignored. All
-#   three must be non-empty. An empty remote is refused: prod always pushes its store, and install.sh would remove it.
+#   DISH_USER_EMAIL, and optionally DISH_VAULT_REMOTE, one NAME=value line each, the value verbatim. Blank lines and lines
+#   starting with # are ignored. The three must be non-empty. An empty remote is refused: prod always pushes its store,
+#   and install.sh would remove it. DISH_VAULT_REMOTE, the memory vault's remote, may be missing or empty: the vault then
+#   stays on this machine, which is warned about, and the update goes on.
 # - ~/.config/dish/deploy.env, the unit's: exactly one DISH_TRUSTED_HOST=<host> line, a bare host[:port].
 # - The checkout's deploy/dish-web.service.
 # DISH_UPDATE_WAIT sets how many seconds to wait for dsh (default 120); the tests use it.
@@ -83,7 +85,7 @@ wait_seconds=120
 self='' checkout='' account='' uid='' home=''
 clean=()
 state_dir='' install_env='' deploy_env=''
-remote='' user_name='' user_email=''
+remote='' user_name='' user_email='' vault_remote=''
 head='' branch='' target='' target_name='' target_path='' target_unit=''
 node_version='' pnpm_version=''
 active_state=''
@@ -333,18 +335,19 @@ read_the_inputs() {
     name=${line%%=*}
     value=${line#*=}
     case $name in
-      DISH_REMOTE | DISH_USER_NAME | DISH_USER_EMAIL) ;;
-      *) fail "$install_env line $number: only DISH_REMOTE, DISH_USER_NAME and DISH_USER_EMAIL belong there" ;;
+      DISH_REMOTE | DISH_VAULT_REMOTE | DISH_USER_NAME | DISH_USER_EMAIL) ;;
+      *) fail "$install_env line $number: only DISH_REMOTE, DISH_VAULT_REMOTE, DISH_USER_NAME and DISH_USER_EMAIL belong there" ;;
     esac
     if [[ $seen == *" $name "* ]]; then fail "$install_env has $name more than once"; fi
     seen+="$name "
     if [ -z "$value" ] && [ "$name" = DISH_REMOTE ]; then
       fail "DISH_REMOTE is empty in $install_env: prod always pushes its store, and install.sh would remove the remote"
     fi
-    if [ -z "$value" ]; then fail "$name is empty in $install_env"; fi
+    if [ -z "$value" ] && [ "$name" != DISH_VAULT_REMOTE ]; then fail "$name is empty in $install_env"; fi
     if [[ $value == *[[:cntrl:]]* ]]; then fail "$name in $install_env has a control character"; fi
     case $name in
       DISH_REMOTE) remote=$value ;;
+      DISH_VAULT_REMOTE) vault_remote=$value ;;
       DISH_USER_NAME) user_name=$value ;;
       DISH_USER_EMAIL) user_email=$value ;;
     esac
@@ -352,6 +355,10 @@ read_the_inputs() {
   for name in DISH_REMOTE DISH_USER_NAME DISH_USER_EMAIL; do
     if [[ $seen != *" $name "* ]]; then fail "$install_env has no $name line"; fi
   done
+  # Optional: the vault works without a remote, so its absence is said, never refused.
+  if [ -z "$vault_remote" ]; then
+    warn 'install.env has no DISH_VAULT_REMOTE: the memory vault stays on this machine (deploy/README.md, The vault)'
+  fi
 
   # The unit can't start without its trusted host, so an update would stop at the wait. The rule is url.sh's.
   if [ ! -f "$deploy_env" ]; then fail "$deploy_env is missing; fleet writes it"; fi
@@ -574,7 +581,8 @@ run_install() {
   begin 'running deploy/install.sh'
   local line last='' hidden=0
   env -u DISH_UPDATE_CLEAN -u DISH_UPDATE_WAIT "PATH=$target_path" \
-    "DISH_REMOTE=$remote" "DISH_USER_NAME=$user_name" "DISH_USER_EMAIL=$user_email" DISH_SANDBOX_HOME=on \
+    "DISH_REMOTE=$remote" "DISH_VAULT_REMOTE=$vault_remote" "DISH_USER_NAME=$user_name" "DISH_USER_EMAIL=$user_email" \
+    DISH_SANDBOX_HOME=on \
     "$checkout/deploy/install.sh" </dev/null 9>&- 2>&1 |
     while IFS= read -r line || [ -n "$line" ]; do
       last=$line

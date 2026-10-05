@@ -689,3 +689,136 @@ test('the sandbox row alone: --patch with only a sandbox flag leaves every other
   }
   assert.equal(await readFile(path, 'utf8'), on, 'a refused run writes nothing')
 })
+
+// --- the dish-memory row ---------------------------------------------------------------------------------------------
+
+const VAULT_REMOTE = 'git@github-dish-vault:example/vault.git'
+
+/** The dish-memory row as dish writes it into a profile with none, with `remote` as the vault's remote. */
+function memoryRow(remote = VAULT_REMOTE): string {
+  return `- id: dish-memory
+  name: dish-memory
+  config:
+    remote: ${remote === '' ? '""' : remote}
+    userName: Test User
+    userEmail: test@example.invalid
+`
+}
+
+/** The dish-memory row of a patch file's text. */
+function memoryOf(text: string): Record<string, any> | undefined {
+  return rows(text).find((row) => row.id === 'dish-memory')
+}
+
+test('with vaultRemote, an empty file gets dish-config, agent-preset-registry and dish-memory, in that order', () => {
+  const out = writeDishRows('', { ...OPTIONS, vaultRemote: VAULT_REMOTE })
+  assert.equal(out, DISH_ROWS + memoryRow())
+  assert.equal(writeDishRows(out, { ...OPTIONS, vaultRemote: VAULT_REMOTE }), out, 'a second run changes nothing')
+  assert.equal(writeDishRows(FIXTURE, { ...OPTIONS, vaultRemote: VAULT_REMOTE }), FIXTURE + DISH_ROWS + memoryRow(), "dsh's rows are kept byte for byte")
+  // An empty one is a vault that stays local: the row is written all the same, with an empty remote.
+  assert.equal(writeDishRows('', { ...OPTIONS, vaultRemote: '' }), DISH_ROWS + memoryRow(''))
+  // The sandbox row, when there is one to add, comes after it.
+  assert.deepEqual(rows(writeDishRows('', { ...OPTIONS, vaultRemote: VAULT_REMOTE, sandboxRunner: RUNNER })).map((row) => row.id), [
+    'dish-config', 'agent-preset-registry', 'dish-memory', 'sandbox',
+  ])
+  // A profile that already has the other rows gets the new one at the end.
+  assert.equal(writeDishRows(DISH_ROWS + sandboxRow(), { ...OPTIONS, vaultRemote: VAULT_REMOTE }), DISH_ROWS + sandboxRow() + memoryRow())
+})
+
+test('vaultRemote sets the dish-memory row\'s remote, userName and userEmail, and an existing row keeps its other keys', () => {
+  const own = `- id: dish-memory
+  name: dish-memory
+  config:
+    vault: ~/elsewhere/vault.git # set by hand
+    remote: git@old.example.invalid:someone/vault.git
+    indexLines: 100
+    userName: Someone Else
+`
+  const out = writeDishRows(DISH_ROWS + own, { ...OPTIONS, vaultRemote: VAULT_REMOTE })
+  assert.deepEqual(memoryOf(out), {
+    id: 'dish-memory',
+    name: 'dish-memory',
+    config: { vault: '~/elsewhere/vault.git', remote: VAULT_REMOTE, indexLines: 100, userName: 'Test User', userEmail: 'test@example.invalid' },
+  })
+  assert.ok(out.includes('    vault: ~/elsewhere/vault.git # set by hand\n'), out)
+  assert.equal(rows(out).length, 3, 'no second row')
+  // An empty one takes the remote away again, and keeps the rest.
+  assert.deepEqual(memoryOf(writeDishRows(out, { ...OPTIONS, vaultRemote: '' }))?.config, {
+    vault: '~/elsewhere/vault.git', remote: '', indexLines: 100, userName: 'Test User', userEmail: 'test@example.invalid',
+  })
+  // A row without a config, or with an empty one, gets the three keys.
+  for (const config of ['', '  config:\n', '  config: {}\n']) {
+    const bare = writeDishRows(`${DISH_ROWS}- id: dish-memory\n  name: dish-memory\n${config}`, { ...OPTIONS, vaultRemote: VAULT_REMOTE })
+    assert.deepEqual(memoryOf(bare)?.config, { remote: VAULT_REMOTE, userName: OPTIONS.userName, userEmail: OPTIONS.userEmail }, JSON.stringify(config))
+  }
+  // Rows are matched as dsh's config editor matches them: the last one, never an insert, only by name.
+  const matched = rows(writeDishRows(`${DISH_ROWS}- id: dish-memory
+  name: dish-memory
+  config:
+    remote: first
+- insert:
+    - id: dish-memory
+      name: dish-memory
+- id: dish-memory
+  name: some-other-plugin
+  config:
+    remote: other plugin
+- id: dish-memory
+  name: dish-memory
+  config:
+    remote: last
+`, { ...OPTIONS, vaultRemote: VAULT_REMOTE }))
+  assert.deepEqual(matched.slice(2).map((row) => row.config?.remote), ['first', undefined, 'other plugin', VAULT_REMOTE])
+  // Without vaultRemote the row is left exactly as it is, whatever it holds.
+  assert.equal(writeDishRows(DISH_ROWS + own, OPTIONS), DISH_ROWS + own)
+  // And a vaultRemote that can't be written as one line is refused.
+  assert.throws(() => writeDishRows('', { ...OPTIONS, vaultRemote: ' ' }), /vaultRemote/)
+  assert.throws(() => writeDishRows('', { ...OPTIONS, vaultRemote: 'a\nb' }), /vaultRemote/)
+})
+
+test('the CLI: --vault-remote, --no-vault-remote, both refused, an empty --vault-remote refused, neither leaves the row alone', async () => {
+  const path = await patchFile()
+  const set = await cli(path, [`--vault-remote=${VAULT_REMOTE}`])
+  assert.deepEqual({ code: set.code, stdout: set.stdout.trim() }, { code: 0, stdout: 'updated' })
+  assert.equal(await readFile(path, 'utf8'), DISH_ROWS + memoryRow())
+
+  // Neither flag: the row stays as it is.
+  const neither = await cli(path)
+  assert.deepEqual({ code: neither.code, stdout: neither.stdout.trim() }, { code: 0, stdout: 'unchanged' })
+  assert.equal(await readFile(path, 'utf8'), DISH_ROWS + memoryRow())
+
+  const local = await cli(path, ['--no-vault-remote'])
+  assert.deepEqual({ code: local.code, stdout: local.stdout.trim() }, { code: 0, stdout: 'updated' })
+  assert.equal(await readFile(path, 'utf8'), DISH_ROWS + memoryRow(''))
+  const again = await cli(path, ['--no-vault-remote'])
+  assert.deepEqual({ code: again.code, stdout: again.stdout.trim() }, { code: 0, stdout: 'unchanged' })
+
+  for (const args of [
+    ['--vault-remote', VAULT_REMOTE, '--no-vault-remote'],
+    ['--vault-remote='],
+    ['--vault-remote', ''],
+    ['--vault-remote', 'two\nlines'],
+  ]) {
+    const result = await cli(path, args)
+    assert.equal(result.code, 2, JSON.stringify(args))
+    assert.match(result.stderr, /usage: node deploy\/profile\.ts/, JSON.stringify(args))
+    assert.equal(result.stdout, '', JSON.stringify(args))
+  }
+  assert.match((await cli(path, ['--vault-remote='])).stderr, /--vault-remote must not be empty; use --no-vault-remote to keep the vault local/)
+  assert.match((await cli(path, ['--vault-remote', VAULT_REMOTE, '--no-vault-remote'])).stderr, /give one of --vault-remote or --no-vault-remote, not both/)
+  assert.equal(await readFile(path, 'utf8'), DISH_ROWS + memoryRow(''), 'a refused run writes nothing')
+})
+
+test('a sandbox-only call with a vault flag is not sandbox-only', async () => {
+  const path = await patchFile(FIXTURE)
+  for (const args of [
+    ['--patch', path, '--no-sandbox-runner', `--vault-remote=${VAULT_REMOTE}`],
+    ['--patch', path, `--sandbox-runner=${RUNNER}`, '--no-vault-remote'],
+    ['--patch', path, '--no-vault-remote'],
+  ]) {
+    const result = await run(args)
+    assert.equal(result.code, 2, args.join(' '))
+    assert.match(result.stderr, /--user-name is required/, args.join(' '))
+  }
+  assert.equal(await readFile(path, 'utf8'), FIXTURE, 'nothing was written')
+})
