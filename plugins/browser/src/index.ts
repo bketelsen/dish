@@ -6,9 +6,9 @@
  * - **the core** (`browsers.ts`): Chromium, every session's browser, the limits and the watchers, over the real driver
  *   (`playwright.ts`), the URL rules (`urls.ts`) and the keys (`keys.ts`);
  * - **the listeners,** registered at once: `agent/created` and `agent/disposed` (a watch's `canStart`, and a disposed
- *   agent's browser), and `workspace/session-stop` (an archived chat's). It never answers `workspace/session-activity`:
- *   an open browser isn't work to wait for;
- * - **the sweep,** every minute: an archived chat's browser, and an idle one;
+ *   agent's browser), and `workspace/session-stop` (a chat stopped and archived). It never answers
+ *   `workspace/session-activity`: an open browser isn't work to wait for;
+ * - **the sweep,** every minute: an archived chat's browser (archiving an idle chat sends no event), and an idle one;
  * - **the tools,** through `ctx.inject(['tools'])`, only when there is Chromium at `executablePath`;
  * - **the remote** (`remote.ts`), mounted either way: without Chromium, the tab says so.
  *

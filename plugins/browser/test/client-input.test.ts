@@ -5,6 +5,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { addressInput } from '../src/client/address.ts'
 import {
@@ -98,6 +99,30 @@ test('toViewport maps a point in the drawn image to the page, scaled', () => {
   // Nothing drawn, or a point that isn't one.
   assert.equal(toViewport(100, 50, { left: 100, top: 50, width: 0, height: 400 }, VIEWPORT), undefined)
   assert.equal(toViewport(Number.NaN, 60, drawn, VIEWPORT), undefined)
+})
+
+test('the picture sits at the top of its area, as a browser shows a page under its address bar; a point maps from the image\'s own box', () => {
+  // `styles.ts` adds its sheet to the document when loaded, so its text is read here. The picture's box is a flex row: the
+  // image is drawn at the box's top (it was centred, with blank room above it in a tall pane), centred across.
+  const styles = readFileSync(new URL('../src/client/styles.ts', import.meta.url), 'utf8')
+  const rule = /\n\.dish-browser-picture \{\n([^}]*)\}/.exec(styles)
+  assert.ok(rule, 'the .dish-browser-picture rule')
+  assert.match(rule[1]!, /^ {2}align-items: flex-start;$/m)
+  assert.match(rule[1]!, /^ {2}justify-content: center;$/m)
+  // `Picture` maps a point through the image's own client box (`getBoundingClientRect`), wherever the box puts it: a tall
+  // pane's image at the box's top, a wide pane's centred across, half size.
+  const room = { left: 10, top: 120, width: 1000, height: 900 }
+  const size = fit(room, VIEWPORT)
+  assert.deepEqual(size, { width: 1000, height: 625 })
+  const tall = { left: room.left, top: room.top, ...size }
+  assert.deepEqual(toViewport(room.left, room.top, tall, VIEWPORT), { x: 0, y: 0 })
+  assert.deepEqual(toViewport(room.left + 500, room.top + 312.5, tall, VIEWPORT), { x: 640, y: 400 })
+  // Below the image, in the box's empty room: ignored.
+  assert.equal(toViewport(room.left + 500, room.top + 626, tall, VIEWPORT), undefined)
+  const wide = { left: 10 + (1000 - 640) / 2, top: 120, width: 640, height: 400 }
+  assert.deepEqual(fit({ width: 1000, height: 400 }, VIEWPORT), { width: 640, height: 400 })
+  assert.deepEqual(toViewport(wide.left + 320, 120 + 200, wide, VIEWPORT), { x: 640, y: 400 })
+  assert.equal(toViewport(wide.left - 1, 130, wide, VIEWPORT), undefined)
 })
 
 test('buttonOf: the three buttons a page knows, and nothing else', () => {

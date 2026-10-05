@@ -1,7 +1,7 @@
 /**
- * The live picture: the newest frame, drawn as large as the pane allows (keeping its shape), and the place where you use the
- * page. It is focusable; while it has focus, the pointer and the keys go to the page. What goes up, and when, is the pacer's
- * (`createInputPacer` in `input.ts`, tested there); this file turns events into its calls.
+ * The live picture: the newest frame, drawn as large as the pane allows (keeping its shape) at the top of its area, and the
+ * place where you use the page. It is focusable; while it has focus, the pointer and the keys go to the page. What goes up,
+ * and when, is the pacer's (`createInputPacer` in `input.ts`, tested there); this file turns events into its calls.
  *
  * - **The pointer.** `pointerdown` focuses the picture and captures the pointer (a drag that leaves it still ends in it).
  *   The press itself comes from `mousedown`, whose `detail` is the click count (a pointer event's is always 0). A point

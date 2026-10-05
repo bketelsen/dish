@@ -99,7 +99,7 @@ Ten global tools, registered by `dish-browser` through `ctx.inject(['tools'])`, 
 - **Empty strings are absent,** and `false` is the default: models fill every optional field (the design's lessons). So are zeros where a zero means nothing: `x` and `y` when both are 0, `dx` and `dy` when both are 0, and `seconds`. `dialog` is `accept` or `dismiss` (the default).
 - **What the agent typed** isn't repeated in `browser_type`'s result.
 - **Cancelling:** each call honours `exec.signal`.
-- **The row in the chat:** each tool's `presentCall` gives dsh's generic row a title, such as "Browser: open http://127.0.0.1:5173".
+- **The row in the chat:** dsh's generic row: "Tool call", then the tool's name and the call's first non-empty string argument, such as "browser_navigate · http://127.0.0.1:5173". dsh web never reads a tool's `presentCall` (dsh-client-ui-tool README: host `presentCall` values never enter the client); the tools keep theirs for host-side consumers.
 
 **Timeouts.** These are fixed, not configuration:
 - a navigation: 30 s to `domcontentloaded`, then up to 3 s more for `load`;
@@ -271,7 +271,7 @@ A `tool.call.toolview` view, keyed `browser_screenshot`, as dsh's deliverables p
 - **Not dsh's image gallery.** The gallery is the `tool.call.images` child slot, which one toolview declares and no other may, so this view draws its own `<img>`.
 - **As text.** Everything from the page (the title, the URL) is rendered as text, never as markup or a link, as Settings → Runs does.
 - **An error, or a result the judge withheld,** has no image. The view shows "Browser: screenshot" and the result's text, as text. dsh's generic row isn't available to it: a keyed toolview replaces the row for its key (the slot's fallback renders only for a key nobody registered, dsh-client-ui-tool `lib/client.js:1863-1869`), and `GenericToolCard` isn't exported.
-- **The other nine tools** use dsh's generic row, with their `presentCall` titles.
+- **The other nine tools** use dsh's generic row: "Tool call", the tool's name and its first string argument.
 
 ## Untrusted text
 
@@ -532,6 +532,7 @@ The WebSocket leg, the same for every stream, is the end-to-end run's.
 - **Every Playwright call that doesn't time out by itself is bounded** (the mouse and keyboard, `title`, `count`, `evaluate`, CDP), by 5 s or the action's own time, so a frozen page (a script in an endless loop) fails a call with an error, never a hang. A page's snapshot has 10 s, and typing without a ref 5 s and 25 ms a character.
 - **An error keeps only the first line of Playwright's message:** the call log under it names the page's elements and what was typed.
 - **A failure dish has no words for** is an error that says the action may have happened: "The browser didn't finish this call: the page may be busy or stuck, and what you asked may have happened. `browser_read` shows the page as it is now: check it before you repeat an action."
+- **No capture is lost to a navigation** (the end-to-end dry run, where the agent's `browser_screenshot` took 9.9 s). Chromium never answers a capture (`Page.captureScreenshot`) asked for a few ms before the main frame commits a new document, and under load it fails one at once ("Unable to capture screenshot", "Not attached to an active page"); Playwright takes a page's screenshots one at a time, so the tab's lost capture held the agent's screenshot for its 10 s. The driver asks at most three times in all, within the 10 s: at once when the main frame commits while a capture is pending (aborting it, which lets Playwright's queue go), and after a failure at the next commit or 100 ms. The tab's capture goes over the page's CDP session, outside Playwright's queue.
 
 **The plugin.** Chromium is looked for once, when the plugin starts: a Chromium installed later needs a dsh restart (or a reload of the plugin) before the tools appear. An empty `executablePath` (`''`) means `/usr/bin/chromium`.
 
@@ -542,11 +543,16 @@ The WebSocket leg, the same for every stream, is the end-to-end run's.
 - **A refused main-frame navigation** goes to `about:blank` once the route's abort is through, since Chromium commits its error page after it. A popup's first navigation reaches the route as not the session's own page, so a refused popup is closed and noted with the address it tried: "The page opened a new window at an address dish doesn't allow (<what>); dish closed it."
 - **The workspace** is the sandbox policy's `workspaceRoot`, else the session's own working directory (`header.cwd`), real-pathed.
 - **Log lines hold no address at all,** not even an origin: Chromium's own messages have theirs replaced by `<address>`.
+- **Archiving an idle chat sends no event** a plugin hears: dsh's web client archives it without `stopActivity`, so there is no `workspace/session-stop`, and its agent isn't disposed (dsh-client-ui-workspace `lib/client.js:4197-4227`; dsh-workspace `lib/index.js:524-540`, `:619-621`). Its browser closes at the next sweep, within a minute. Stopping and archiving a working chat sends `workspace/session-stop`, which closes it at once.
 
 **The stream and the tab.**
 - **A refused watch's reasons** are "That isn't a chat." and "This chat is archived.", in `words.ts` with the other sentences.
 - **The tab acks every frame it gets,** drawn or not (the source it already shows, or one it can't draw), so the host needs no ack timeout.
 - **Each new generation of the stream** is told again whether the tab wants frames; a watch starts with frames off. A stream that fails for good is opened again after 1 s, doubling to 30 s.
 - **The client's own sentences live in the client,** not in `words.ts` as the plan's contracts said: the tab's lines and its empty and closed states in `src/client/TabView.tsx`, the toolview's in `ScreenshotView.tsx`, the header button's in `HeaderButton.tsx`. `words.ts` imports dish-kit's host entry and the URL rules (`node:fs`), which the browser bundle can't load. Everything the host words (a closed browser's reason, a notice, a refusal, every tool result) comes from `words.ts`.
+
+**The rows in the chat.** dsh web never reads a tool's `presentCall` (dsh-tools README; dsh-client-ui-tool README: host `presentCall` values never enter the client). The nine tools without a view show dsh's generic row, "Tool call", the tool's name and the call's first non-empty string argument, not the "Browser: …" titles this spec first said ([The tools](#the-tools)); the tools keep their `presentCall` for host-side consumers.
+
+**The picture** sits at the top of the tab's area, under the toolbar, as a browser shows a page; it was centred, with blank room above it in a tall pane.
 
 **End to end:** (to come: the end-to-end run on the VM)

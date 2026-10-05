@@ -21,8 +21,8 @@ import { DriverBadArgument, DriverClosed, DriverTimeout } from '../src/driver.ts
 import type {
   Driver, DriverBrowser, DriverContext, DriverDialog, DriverPage, DriverPopup, FailedRequest, RouteDecider, RouteRequest, ScreencastFrame,
 } from '../src/driver.ts'
-import { playwrightDriver } from '../src/playwright.ts'
-import { REF_MS } from '../src/types.ts'
+import { acrossCommits, playwrightDriver } from '../src/playwright.ts'
+import { REF_MS, SHOT_MS } from '../src/types.ts'
 import { chromiumPath, launchForTests, pageServer, processesHolding, scratchTmp } from './chromium.ts'
 import type { PageServer, TestPage } from './chromium.ts'
 
@@ -289,6 +289,192 @@ test('launchForTests falls back to no sandbox only for want of one (a fake drive
   const asked: boolean[] = []
   await assert.rejects(launchForTests(fake('error while loading shared libraries: libnss3.so', asked), '/usr/bin/chromium'), /libnss3/)
   assert.deepEqual(asked, [true])
+})
+
+/** A fake page's main-frame commits, for `acrossCommits`: `commit()` calls every listener subscribed now. */
+function commits(): { onCommit: (listener: () => void) => () => void, commit: () => void, listening: () => number } {
+  const listeners = new Set<() => void>()
+  return {
+    onCommit: listener => {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    commit: () => { for (const listener of [...listeners]) listener() },
+    listening: () => listeners.size,
+  }
+}
+
+/** An attempt that never answers unless its signal aborts (as Chromium's lost capture), and says when it started. */
+function lost(started: Array<{ timeoutMs: number }>): (signal: AbortSignal, timeoutMs: number) => Promise<string> {
+  return (signal, timeoutMs) => {
+    started.push({ timeoutMs })
+    return new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+  }
+}
+
+test('acrossCommits: a capture pending when the main frame commits is asked for again (fakes: this runs without Chromium)', async (t) => {
+  await t.test('a commit while it is pending: abandoned (its signal aborts) and tried again; the second answer is the result', async () => {
+    const page = commits()
+    const started: Array<{ timeoutMs: number }> = []
+    const signals: AbortSignal[] = []
+    const result = acrossCommits(async (signal, timeoutMs) => {
+      signals.push(signal)
+      if (started.length === 0) return lost(started)(signal, timeoutMs)
+      started.push({ timeoutMs })
+      return 'the second'
+    }, page.onCommit, { timeoutMs: 10_000 })
+    await sleep(5)
+    assert.equal(started.length, 1)
+    page.commit()
+    assert.equal(await result, 'the second')
+    assert.equal(started.length, 2)
+    assert.equal(signals[0]!.aborted, true)
+    assert.equal(signals[1]!.aborted, false)
+    assert.ok(started[1]!.timeoutMs <= 10_000 && started[1]!.timeoutMs > 9_000, 'the second try gets what is left of the time')
+    assert.equal(page.listening(), 0, 'no listener is left')
+  })
+
+  await t.test('no commit: one try, and its error as it was', async () => {
+    const page = commits()
+    let tries = 0
+    const failure = new DriverTimeout('not done within 10000 ms')
+    await assert.rejects(acrossCommits(async () => { tries++; throw failure }, page.onCommit, { timeoutMs: 10_000 }), error => error === failure)
+    assert.equal(tries, 1)
+    assert.equal(page.listening(), 0)
+  })
+
+  await t.test('a commit after it answered changes nothing', async () => {
+    const page = commits()
+    let tries = 0
+    assert.equal(await acrossCommits(async () => { tries++; return 'shot' }, page.onCommit, { timeoutMs: 10_000 }), 'shot')
+    page.commit()
+    assert.equal(tries, 1)
+  })
+
+  await t.test('at most `tries`: the last try isn\'t abandoned at a commit, and runs to its time', async () => {
+    const page = commits()
+    const started: Array<{ timeoutMs: number }> = []
+    let lastSignal: AbortSignal | undefined
+    const result = outcome(acrossCommits((signal, timeoutMs) => {
+      lastSignal = signal
+      return lost(started)(signal, timeoutMs)
+    }, page.onCommit, { timeoutMs: 10_000, tries: 3 }), 300)
+    for (let commit = 0; commit < 5; commit++) {
+      await sleep(5)
+      page.commit()
+    }
+    assert.equal(await result, 'hung', 'the third try is still waiting for its answer')
+    assert.equal(started.length, 3)
+    assert.equal(lastSignal!.aborted, false)
+  })
+
+  await t.test('the caller\'s signal ends it at once: the try\'s signal aborts with its reason, and nothing more is tried', async () => {
+    const page = commits()
+    const started: Array<{ timeoutMs: number }> = []
+    const caller = new AbortController()
+    const result = outcome(acrossCommits(lost(started), page.onCommit, { timeoutMs: 10_000, signal: caller.signal }), 1_000)
+    await sleep(5)
+    const reason = new Error('the agent cancelled')
+    caller.abort(reason)
+    const ended = await result
+    assert.notEqual(ended, 'hung', 'the caller\'s signal ended it')
+    assert.ok(ended !== 'hung' && 'error' in ended && ended.error === reason, 'it rejects with the signal\'s reason')
+    page.commit()
+    await sleep(5)
+    assert.equal(started.length, 1)
+    assert.equal(page.listening(), 0)
+    // A signal that aborted already: nothing is tried.
+    await assert.rejects(acrossCommits(lost(started), page.onCommit, { timeoutMs: 10_000, signal: caller.signal }), error => error === reason)
+    assert.equal(started.length, 1)
+  })
+
+  await t.test('a commit with no time left: a DriverTimeout, not another try', async () => {
+    const page = commits()
+    const started: Array<{ timeoutMs: number }> = []
+    const result = outcome(acrossCommits(lost(started), page.onCommit, { timeoutMs: 20 }), 1_000)
+    await sleep(40)
+    page.commit()
+    const ended = await result
+    assert.notEqual(ended, 'hung', 'the commit ended it')
+    assert.ok(ended !== 'hung' && 'error' in ended && ended.error instanceof DriverTimeout, 'a DriverTimeout')
+    assert.equal(started.length, 1)
+  })
+
+  await t.test('a capture Chromium fails for a commit ("Unable to capture screenshot", "Not attached to an active page") is asked again at the next commit', async () => {
+    for (const words of ['Unable to capture screenshot', 'Not attached to an active page']) {
+      const page = commits()
+      const asked: number[] = []
+      const start = Date.now()
+      const result = outcome(acrossCommits(async () => {
+        asked.push(Date.now() - start)
+        if (asked.length === 1) throw new Error(`page.screenshot: Protocol error (Page.captureScreenshot): ${words}`)
+        return 'the second'
+      }, page.onCommit, { timeoutMs: 10_000 }), 1_000)
+      // The error came first; the commit comes after it.
+      await sleep(10)
+      page.commit()
+      assert.deepEqual(await result, { value: 'the second' }, words)
+      assert.equal(asked.length, 2)
+      assert.ok(asked[1]! < 90, `asked again at the commit, not after the pause: ${asked[1]} ms`)
+      assert.equal(page.listening(), 0)
+    }
+  })
+
+  await t.test('such a failure with no commit after it: asked again after 100 ms', async () => {
+    const page = commits()
+    const asked: number[] = []
+    const start = Date.now()
+    const result = outcome(acrossCommits(async () => {
+      asked.push(Date.now() - start)
+      if (asked.length === 1) throw new Error('Protocol error (Page.captureScreenshot): Unable to capture screenshot')
+      return 'shot'
+    }, page.onCommit, { timeoutMs: 10_000 }), 1_000)
+    assert.deepEqual(await result, { value: 'shot' })
+    assert.equal(asked.length, 2)
+    assert.ok(asked[1]! >= 95 && asked[1]! < 500, `asked again after the pause: ${asked[1]} ms`)
+  })
+
+  await t.test('another error isn\'t asked again: Chromium\'s other words, a timeout, a closed page', async () => {
+    for (const failure of [new Error('Protocol error (Page.captureScreenshot): Something else'), new DriverTimeout('not done within 10000 ms'), new DriverClosed('Target page, context or browser has been closed')]) {
+      const page = commits()
+      let tries = 0
+      const result = outcome(acrossCommits(async () => { tries++; throw failure }, page.onCommit, { timeoutMs: 10_000 }), 1_000)
+      assert.deepEqual(await result, { error: failure })
+      assert.equal(tries, 1, failure.message)
+    }
+  })
+
+  await t.test('failures for commits stay within `tries` and the time: the last one is the caller\'s', async () => {
+    const failure = (n: number) => new Error(`Protocol error (Page.captureScreenshot): Unable to capture screenshot (${n})`)
+    // Within `tries`: three in all, then the third's error.
+    let page = commits()
+    let tries = 0
+    let result = outcome(acrossCommits(async () => { tries++; throw failure(tries) }, page.onCommit, { timeoutMs: 10_000, tries: 3 }), 1_000)
+    let ended = await result
+    assert.ok(ended !== 'hung' && 'error' in ended && String(ended.error).includes('(3)'), ended === 'hung' ? 'hung' : 'error' in ended ? String(ended.error) : 'a value')
+    assert.equal(tries, 3)
+    // Within the time: a pause never runs past it, and a failure with no time left is the caller's.
+    page = commits()
+    tries = 0
+    const start = Date.now()
+    result = outcome(acrossCommits(async () => { tries++; throw failure(tries) }, page.onCommit, { timeoutMs: 50, tries: 10 }), 1_000)
+    ended = await result
+    const took = Date.now() - start
+    assert.ok(ended !== 'hung' && 'error' in ended && /Unable to capture screenshot/.test(String(ended.error)), ended === 'hung' ? 'hung' : 'error' in ended ? String(ended.error) : 'a value')
+    assert.ok(took < 150, `within the time: ${took} ms`)
+    // The time ends it, not `tries`: a timer can fire a few ms early under load, so a second try is allowed.
+    assert.ok(tries < 10, `the time ended it: ${tries} tries`)
+    // The caller's signal ends the pause.
+    page = commits()
+    const caller = new AbortController()
+    const reason = new Error('the agent cancelled')
+    result = outcome(acrossCommits(async () => { throw failure(1) }, page.onCommit, { timeoutMs: 10_000, signal: caller.signal }), 1_000)
+    await sleep(10)
+    caller.abort(reason)
+    ended = await result
+    assert.ok(ended !== 'hung' && 'error' in ended && ended.error === reason, 'the signal\'s reason, during the pause')
+    assert.equal(page.listening(), 0)
+  })
 })
 
 test('launch: with Chromium\'s sandbox, or the fallback (says which)', async (t) => {
@@ -810,6 +996,44 @@ test('screencast: frames arrive with the viewport\'s size while started, none af
   const captured = await page.capture(60)
   assert.deepEqual({ width: captured.width, height: captured.height }, VIEWPORT)
   assertJpeg(captured.data)
+})
+
+test('a capture or a screenshot asked for as the page commits a navigation never stalls, and the tab\'s capture never holds up a screenshot', async (t) => {
+  if (skipped(t)) return
+  // The end-to-end dry run's 9.9 s screenshot. Chromium loses a capture asked for a few ms before the main frame commits a
+  // new document (a reload, back, a link): it never answers. Playwright takes a page's screenshots one at a time, so the
+  // tab's capture, lost that way, held the agent's screenshot for the capture's 10 s. Under load (the gate and this file
+  // pinned to two CPUs), Chromium fails such a capture at once instead: "Unable to capture screenshot". Each round asks
+  // for one just before a navigation, sweeping the lead across the window where Chromium loses it (on the desktop, mostly
+  // 4–10 ms before). Before the fix, 25 of these 64 rounds stalled; it stops at 3.
+  const { server, page } = await open(t)
+  await page.goto(`${server.origin}/second.html`, NAV)
+  const ROUNDS = 64
+  const stalls: string[] = []
+  for (let round = 0; round < ROUNDS && stalls.length < 3; round++) {
+    const lead = 2 + (round % 16)
+    const tab = round % 2 === 0
+    const back = round % 4 >= 2
+    if (back) await page.goto(`${server.origin}/form.html`, NAV)
+    const early = outcome<unknown>(tab ? page.capture(60) : page.screenshot({ timeoutMs: SHOT_MS }), 3_000)
+    await sleep(lead)
+    if (back) assert.equal(await page.back(NAV), true)
+    else await page.reload(NAV)
+    const start = Date.now()
+    const after = await outcome(page.screenshot({ timeoutMs: SHOT_MS }), SHOT_MS + 2_000)
+    const took = Date.now() - start
+    const result = await early
+    const what = `round ${round}: ${tab ? 'the tab\'s capture' : 'a screenshot'} ${lead} ms before ${back ? 'back' : 'a reload'}`
+    // The tab's capture is asked again after such a failure too, but may still fail (three in a row): the screencast's
+    // next frame stands in for it. It mustn't hang.
+    if (result === 'hung') stalls.push(`${what} never came`)
+    else if ('error' in result) { if (!tab) stalls.push(`${what} failed: ${String(result.error)}`) }
+    else if (!tab) pngSize(result.value as Uint8Array)
+    if (after === 'hung' || 'error' in after) stalls.push(`${what}: the screenshot after it failed (${after === 'hung' ? 'hung' : String(after.error)})`)
+    else if (took > 2_000) stalls.push(`${what}: the screenshot after it took ${took} ms`)
+    else pngSize(after.value)
+  }
+  assert.deepEqual(stalls, [])
 })
 
 test('input: mouse down and up on a button increments its counter; keyDown and keyUp; insertText; wheel scrolls', async (t) => {
