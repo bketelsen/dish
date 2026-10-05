@@ -16,8 +16,9 @@
  * - **A page** reports its events in dish's terms (`PageEvents`), and keeps one CDP session (`newCDPSession`, :10325)
  *   for its history, the screencast and the tab's capture.
  * - **No capture is lost to a navigation.** Chromium never answers a capture asked for just before the main frame commits
- *   a new document, so a screenshot or a capture pending at a commit is asked for again (`acrossCommits`). The tab's
- *   capture goes over CDP, outside the queue Playwright keeps a page's screenshots in, so it never holds up the agent's.
+ *   a new document, or under load fails it at once, so a screenshot or a capture a commit loses or fails is asked for
+ *   again (`acrossCommits`). The tab's capture goes over CDP, outside the queue Playwright keeps a page's screenshots in,
+ *   so it never holds up the agent's.
  * - **Errors.** An action maps Playwright's errors to the driver's: a timeout (`errors.TimeoutError`, :18779) is a
  *   `DriverTimeout`, and so is a ref that resolves to nothing at once (its frame is gone), as `stale ref`; a closed or
  *   crashed target is `DriverClosed`; an unknown key, a `selectOption` on what isn't a `<select>` and a `fill` that the
@@ -147,16 +148,32 @@ function bounded<T>(work: Promise<T>, timeoutMs: number, signal?: AbortSignal): 
   })
 }
 
-/** How many times a capture is asked for in all when the main frame commits while it's pending (`acrossCommits`). */
+/** How many times a capture is asked for in all when a commit loses it or fails it (`acrossCommits`). */
 const CAPTURE_TRIES = 3
+/**
+ * Chromium's words for a capture it failed at once because a commit came: under load, it fails one asked for just
+ * before a commit rather than losing it, and the error reaches Node before the commit's `framenavigated`.
+ */
+const CAPTURE_FAILED = ['Unable to capture screenshot', 'Not attached to an active page']
+/** After such a failure, the most `acrossCommits` waits for the commit before it asks again. */
+const CAPTURE_RETRY_MS = 100
+
+/** Whether Chromium failed a capture for a commit (`CAPTURE_FAILED`). */
+function captureFailed(error: unknown): boolean {
+  const message = messageOf(error)
+  return CAPTURE_FAILED.some(words => message.includes(words))
+}
 
 /**
- * A screenshot or a capture that a commit can't stall. Chromium loses a capture asked for just before the main frame
- * commits a new document: `Page.captureScreenshot` never answers, with or without Playwright around it (the end-to-end
- * dry run's 9.9 s screenshot; a repro lost 25 of 64 asked for 2–17 ms before a reload or a back started, most of those
- * at 4–10 ms). So `attempt` gets a signal that aborts when the main frame commits while it's pending, and is asked
- * again, up to `tries` times in all, within the one `timeoutMs`; the last try runs to its time. The caller's `signal`
- * aborts the try with its own reason, and nothing more is tried. A commit with no time left is a `DriverTimeout`.
+ * A screenshot or a capture that a commit can't stall or fail. Chromium loses a capture asked for just before the main
+ * frame commits a new document: `Page.captureScreenshot` never answers, with or without Playwright around it (the
+ * end-to-end dry run's 9.9 s screenshot; a repro lost 25 of 64 asked for 2–17 ms before a reload or a back started,
+ * most of those at 4–10 ms). Under load it fails one at once instead (`CAPTURE_FAILED`). So `attempt` gets a signal
+ * that aborts when the main frame commits while it's pending; a try abandoned that way is asked again at once, and a
+ * try Chromium failed for a commit after the next commit or `CAPTURE_RETRY_MS`; up to `tries` in all, within the one
+ * `timeoutMs`. The last try runs to its time, and any other error is the caller's at once. The caller's `signal` aborts
+ * the try, or the wait, with its own reason, and nothing more is tried. With no time left, a commit is a
+ * `DriverTimeout`, and a failure is its own error.
  *
  * @param onCommit - subscribes to the page's main-frame commits; gives the unsubscribe.
  */
@@ -170,24 +187,63 @@ export async function acrossCommits<T>(
   const deadline = Date.now() + options.timeoutMs
   for (let tried = 1; ; tried++) {
     signal?.throwIfAborted()
+    const last = tried >= tries
     const controller = new AbortController()
     let committed = false
+    let failure: unknown
     const onAbort = () => controller.abort(signal?.reason)
     signal?.addEventListener('abort', onAbort, { once: true })
-    const unsubscribe = tried >= tries ? undefined : onCommit(() => {
+    const unsubscribe = last ? undefined : onCommit(() => {
       committed = true
       controller.abort(new DriverTimeout('the page committed a navigation'))
     })
     try {
       return await attempt(controller.signal, Math.max(1, deadline - Date.now()))
     } catch (error) {
-      if (!committed || signal?.aborted) throw error
-      if (Date.now() >= deadline) throw new DriverTimeout(`not done within ${options.timeoutMs} ms`)
+      if (signal?.aborted || last || !(committed || captureFailed(error))) throw error
+      if (committed) {
+        if (Date.now() >= deadline) throw new DriverTimeout(`not done within ${options.timeoutMs} ms`)
+      } else {
+        failure = error
+      }
     } finally {
       unsubscribe?.()
       signal?.removeEventListener('abort', onAbort)
     }
+    if (failure !== undefined) {
+      await commitOrPause(onCommit, Math.min(CAPTURE_RETRY_MS, deadline - Date.now()), signal)
+      if (Date.now() >= deadline) throw failure
+    }
   }
+}
+
+/** Resolves at the page's next main-frame commit, or after `milliseconds`; rejects with `signal`'s reason when it aborts. */
+function commitOrPause(onCommit: (listener: () => void) => () => void, milliseconds: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason)
+      return
+    }
+    let unsubscribe: () => void = () => {}
+    const finish = (): void => {
+      clearTimeout(timer)
+      unsubscribe()
+      signal?.removeEventListener('abort', onAbort)
+    }
+    const onAbort = (): void => {
+      finish()
+      reject(signal?.reason)
+    }
+    const timer = setTimeout(() => {
+      finish()
+      resolve()
+    }, Math.max(0, milliseconds))
+    unsubscribe = onCommit(() => {
+      finish()
+      resolve()
+    })
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 /** A Playwright timeout: never 0, which Playwright reads as "no timeout". */
