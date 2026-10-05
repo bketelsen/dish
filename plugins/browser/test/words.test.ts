@@ -252,6 +252,14 @@ test('refusal', () => {
   assert.equal(refusal.noRoute, 'dish can\'t tell which model you run on, so it can\'t show you an image: use `browser_read`.')
   assert.equal(refusal.noAttachments, 'Screenshots need dsh\'s attachment store, which isn\'t running here.')
   assert.equal(refusal.noPng, 'This deployment doesn\'t accept PNG images, so dish can\'t take a screenshot.')
+  assert.equal(refusal.selectRefNeeds, 'browser_select needs `ref`.')
+  assert.equal(refusal.unfinished,
+    'The browser didn\'t finish this call: the page may be busy or stuck, and what you asked may have happened. '
+    + '`browser_read` shows the page as it is now: check it before you repeat an action.')
+  assert.ok(!/try again/i.test(refusal.unfinished), 'no invitation to repeat an action that may have happened')
+  assert.equal(refusal.notStored('IMAGE_TOO_LARGE'),
+    'dsh\'s attachment store didn\'t take the screenshot (IMAGE_TOO_LARGE): try one element by `ref`, or `browser_read`.')
+  assert.equal(refusal.notStored(undefined), 'dsh\'s attachment store didn\'t take the screenshot: try one element by `ref`, or `browser_read`.')
 })
 
 test('urlRefusal: the words urls.ts gives', () => {

@@ -63,16 +63,6 @@ export const TOOL_NAMES: readonly string[] = [
   'browser_scroll', 'browser_wait', 'browser_screenshot',
 ]
 
-// --- dish's own words that words.ts has no function for -----------------------------------------------------------------
-
-/** A failure of the browser's that dish has no words for: a snapshot that never came, a driver error it doesn't know. */
-export const FAILED = 'The browser didn\'t finish this call: the page may be busy or stuck. Try again, or `browser_navigate` to load it afresh.'
-
-/** dsh's attachment store didn't take the screenshot; `code` is the store's own error code, when it gave one. */
-export function notStored(code: string | undefined): string {
-  return `dsh's attachment store didn't take the screenshot${code === undefined ? '' : ` (${code})`}: try one element by \`ref\`, or \`browser_read\`.`
-}
-
 // --- the limits of a call -------------------------------------------------------------------------------------------------
 
 /** The time for a page's snapshot: a big page takes a while; a stuck one never answers. */
@@ -214,7 +204,7 @@ async function failureOf(error: unknown, browser: SessionBrowser | undefined, li
     const reason = browser?.closedReason
     return new Refusal(reason !== undefined ? errorText('closed', reason, limits) : errorText('crashed', '', limits))
   }
-  return new Refusal(FAILED)
+  return new Refusal(refusal.unfinished)
 }
 
 class Tools {
@@ -424,7 +414,18 @@ class Tools {
       } else {
         await page.type(text, { timeoutMs: REF_MS + text.length * TYPE_CHAR_MS, signal })
       }
-      if (submit) await page.press('Enter', { ...ref === undefined ? {} : { ref }, timeoutMs: REF_MS, signal })
+      if (submit && ref !== undefined) {
+        // The field is filled; an Enter that finds it gone or stuck is "Not done:" on it, with the page as it is.
+        let failed: string | undefined
+        try {
+          await page.press('Enter', { ref, timeoutMs: REF_MS, signal })
+        } catch (error) {
+          failed = refFailure(error, ref, signal)
+        }
+        if (failed !== undefined) return { text: (await this.pageResult(call, { done: failed, failed: true })).text }
+      } else if (submit) {
+        await page.press('Enter', { timeoutMs: REF_MS, signal })
+      }
       await page.settle(SETTLE_MS)
       return { text: (await this.pageResult(call, { done: done.typed(words, submit) + moved(before, page) })).text }
     })
@@ -458,7 +459,7 @@ class Tools {
 
   async select(args: { ref: string, values: string[] }, exec: ToolRunContext): Promise<{ text: string }> {
     const ref = refArg(args.ref)
-    if (ref === undefined) throw new Refusal(refusal.badRef(String(args.ref ?? '')))
+    if (ref === undefined) throw new Refusal(refusal.selectRefNeeds)
     const values = Array.isArray(args.values) ? args.values.filter(value => typeof value === 'string') : []
     if (values.length === 0) throw new Refusal(refusal.selectNeeds)
     return this.onPage(exec, async call => {
@@ -589,7 +590,7 @@ class Tools {
     } catch (error) {
       if (signal.aborted) throw signal.reason ?? error
       const code = (error as { code?: unknown } | null)?.code
-      throw new Refusal(notStored(typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : undefined))
+      throw new Refusal(refusal.notStored(typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : undefined))
     }
     return {
       attachmentId: ref.attachmentId,
@@ -647,14 +648,19 @@ async function onRef(page: DriverPage, ref: string, signal: AbortSignal, act: ()
     await act()
     return undefined
   } catch (error) {
-    if (signal.aborted) throw error
-    if (error instanceof DriverTimeout) return error.message === STALE_REF ? notDone.stale(ref) : notDone.slow(ref)
-    if (!(error instanceof DriverBadArgument)) throw error
-    if (error.what === 'select') return notDone.notSelect(ref)
-    if (error.what === 'fill') return notDone.notFillable(ref)
-    if (error.what === 'key' && key !== undefined) throw new Refusal(refusal.badKey(key))
-    return notDone.stale(ref)
+    return refFailure(error, ref, signal, key)
   }
+}
+
+/** An action's failure on `ref` as its "Not done:" line; rethrown when it isn't the page's (a close, the signal). @throws */
+function refFailure(error: unknown, ref: string, signal: AbortSignal, key?: string): string {
+  if (signal.aborted) throw error
+  if (error instanceof DriverTimeout) return error.message === STALE_REF ? notDone.stale(ref) : notDone.slow(ref)
+  if (!(error instanceof DriverBadArgument)) throw error
+  if (error.what === 'select') return notDone.notSelect(ref)
+  if (error.what === 'fill') return notDone.notFillable(ref)
+  if (error.what === 'key' && key !== undefined) throw new Refusal(refusal.badKey(key))
+  return notDone.stale(ref)
 }
 
 /** `ms` on the clock, or the signal's reason when it aborts first. */
@@ -678,9 +684,12 @@ function arg(text: unknown): string {
   return quoted(String(text ?? ''), ARG_MAX)
 }
 
-/** `[ref=e7]` for a call's title. */
-function refTitle(ref: string): string {
-  return `[ref=${arg(ref)}]`
+/** `[ref=e7]` for a call's title, from any form `refArg` takes (`e7`, `[ref=e7]`, `ref=e7`); never throws. */
+function refTitle(ref: unknown): string {
+  const text = String(ref ?? '')
+  const match = REF_FORMS.exec(text)
+  const bare = match === null ? text : match[1] ?? match[2] ?? match[3] ?? text
+  return `[ref=${arg(bare)}]`
 }
 
 function view(title: string, kind: 'fetch' | 'read' | 'other') {
@@ -719,7 +728,7 @@ export function browserTools(deps: ToolDeps): ToolDefinition[] {
       },
       output: { schema: TEXT_OUTPUT, render: textBlock },
       execute: (args, exec) => tools.read(args, exec),
-      presentCall: args => view(given(args.ref) === undefined ? 'read' : `read ${refTitle(args.ref!)}`, 'read'),
+      presentCall: args => view(given(args.ref) === undefined ? 'read' : `read ${refTitle(args.ref)}`, 'read'),
     }),
     defineTool({
       name: 'browser_click',
@@ -750,7 +759,7 @@ export function browserTools(deps: ToolDeps): ToolDefinition[] {
       },
       output: { schema: TEXT_OUTPUT, render: textBlock },
       execute: (args, exec) => tools.type(args, exec),
-      presentCall: args => view(given(args.ref) === undefined ? 'type' : `type into ${refTitle(args.ref!)}`, 'other'),
+      presentCall: args => view(given(args.ref) === undefined ? 'type' : `type into ${refTitle(args.ref)}`, 'other'),
     }),
     defineTool({
       name: 'browser_press',
@@ -773,7 +782,7 @@ export function browserTools(deps: ToolDeps): ToolDefinition[] {
       },
       output: { schema: TEXT_OUTPUT, render: textBlock },
       execute: (args, exec) => tools.select(args, exec),
-      presentCall: args => view(`choose in ${refTitle(args.ref)}`, 'other'),
+      presentCall: args => view(given(args.ref) === undefined ? 'choose' : `choose in ${refTitle(args.ref)}`, 'other'),
     }),
     defineTool({
       name: 'browser_scroll',
@@ -785,7 +794,7 @@ export function browserTools(deps: ToolDeps): ToolDefinition[] {
       },
       output: { schema: TEXT_OUTPUT, render: textBlock },
       execute: (args, exec) => tools.scroll(args, exec),
-      presentCall: args => view(given(args.ref) === undefined ? 'scroll' : `scroll ${refTitle(args.ref!)} into view`, 'other'),
+      presentCall: args => view(given(args.ref) === undefined ? 'scroll' : `scroll ${refTitle(args.ref)} into view`, 'other'),
     }),
     defineTool({
       name: 'browser_wait',

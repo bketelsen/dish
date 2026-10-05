@@ -350,6 +350,22 @@ test('type: fills by ref and presses Enter; never repeats the text', async () =>
   assert.ok(!result.includes('secret words'))
 })
 
+test('type: submit\'s Enter on a ref that went stale, or didn\'t respond, is "Not done:" with the fresh tree', async () => {
+  const w = world()
+  const page = await readOnce(w)
+  page.failNext('press', new DriverTimeout('stale ref'))
+  const stale = await call(w, 'browser_type', { text: 'a', ref: 'e3', submit: true })
+  assert.equal(stale, lines(
+    'Not done: [ref=e3] isn\'t on the page now (it changed since your snapshot). Use a ref from the snapshot below.',
+    `Page: ${ITEMS} — "Items"`, LEAD, SHOWN))
+  page.failNext('press', new DriverTimeout('Timeout 5000ms exceeded.'))
+  const slow = await call(w, 'browser_type', { text: 'a', ref: 'e3', submit: true })
+  assert.equal(slow, lines(
+    'Not done: [ref=e3] didn\'t respond within 5 s (covered, disabled or off the page?).', `Page: ${ITEMS} — "Items"`, LEAD, SHOWN))
+  assert.equal(page.callsOf('fill').length, 2)
+  assert.equal(page.callsOf('press').length, 2)
+})
+
 test('type: without a ref, into the focused element, with time for long text', async () => {
   const w = world()
   const page = await readOnce(w)
@@ -505,7 +521,7 @@ test('screenshot: the store refusing the image is an error in dish\'s words', as
     saveImage: async () => { throw Object.assign(new Error(`too large: ${TOKEN} http://x/`), { code: 'IMAGE_TOO_LARGE' }) },
   })
   const message = await refused(w, 'browser_screenshot')
-  assert.match(message, /IMAGE_TOO_LARGE/)
+  assert.equal(message, refusal.notStored('IMAGE_TOO_LARGE'))
   assert.ok(!message.includes('http://x/') && !message.includes(TOKEN))
 })
 
@@ -570,6 +586,7 @@ test('refusals: each is an error with dish\'s exact words, before any browser st
     ['browser_press', { key: '' }, refusal.emptyKey],
     ['browser_select', { ref: 'e5', values: [] }, refusal.selectNeeds],
     ['browser_select', { ref: 'nope', values: ['a'] }, refusal.badRef('nope')],
+    ['browser_select', { ref: '', values: ['a'] }, refusal.selectRefNeeds],
     ['browser_wait', { text: 'a', gone: 'b' }, refusal.waitBoth],
     ['browser_wait', {}, refusal.waitNeeds],
     ['browser_wait', { text: '', gone: '', seconds: 0 }, refusal.waitNeeds],
@@ -880,7 +897,11 @@ test('the core\'s errors: an unknown driver failure is an error in dish\'s words
   const page = await readOnce(w)
   page.failNext('snapshot', new Error(`page.ariaSnapshot: something odd at ${ITEMS} ${TOKEN}`))
   const message = await refused(w, 'browser_scroll', {})
+  assert.equal(message, refusal.unfinished)
   assert.ok(!message.includes(ITEMS) && !message.includes(TOKEN) && !message.includes('odd'), message)
+  // A point click whose action may have happened: the words don't invite a second click.
+  page.failNext('click', new DriverTimeout('Timeout 5000ms exceeded.'))
+  assert.equal(await refused(w, 'browser_click', { x: 10, y: 10 }), refusal.unfinished)
 })
 
 // --- presentCall ----------------------------------------------------------------------------------------------------------
@@ -901,6 +922,14 @@ test('presentCall: each tool\'s title and kind, its arguments masked and cut', (
   assert.equal(title('browser_type', { text: 'secret', ref: '' }), 'Browser: type')
   assert.equal(title('browser_press', { key: 'Enter' }), 'Browser: press Enter')
   assert.equal(title('browser_select', { ref: 'e7', values: ['a'] }), 'Browser: choose in [ref=e7]')
+  // A ref copied as the snapshot shows it, or as ref=…, is titled as a ref; one that isn't a ref is shown as given, masked.
+  assert.equal(title('browser_click', { ref: '[ref=e7]' }), 'Browser: click [ref=e7]')
+  assert.equal(title('browser_read', { ref: ' ref=f1e7 ' }), 'Browser: read [ref=f1e7]')
+  assert.equal(title('browser_type', { text: 'a', ref: '[ref=f2e3]' }), 'Browser: type into [ref=f2e3]')
+  assert.equal(title('browser_select', { ref: '[ref=e7]', values: ['a'] }), 'Browser: choose in [ref=e7]')
+  assert.equal(title('browser_select', { ref: '', values: ['a'] }), 'Browser: choose')
+  assert.equal(title('browser_scroll', { ref: 'ref=e9' }), 'Browser: scroll [ref=e9] into view')
+  assert.equal(title('browser_click', { ref: `bad ${TOKEN}` }), `Browser: click [ref=bad ${MASK}]`)
   assert.equal(title('browser_scroll', { ref: 'e7' }), 'Browser: scroll [ref=e7] into view')
   assert.equal(title('browser_scroll', { dx: 0, dy: 400 }), 'Browser: scroll')
   assert.equal(title('browser_wait', { text: 'Saved' }), 'Browser: wait for "Saved"')

@@ -427,6 +427,16 @@ export const refusal = {
   noRoute: 'dish can\'t tell which model you run on, so it can\'t show you an image: use `browser_read`.',
   noAttachments: 'Screenshots need dsh\'s attachment store, which isn\'t running here.',
   noPng: 'This deployment doesn\'t accept PNG images, so dish can\'t take a screenshot.',
+  selectRefNeeds: 'browser_select needs `ref`.',
+  /**
+   * A failure of the browser's that dish has no words for: a snapshot that never came, a driver error it doesn't know. The
+   * action may have happened (a click that timed out after it landed), so it doesn't invite a repeat.
+   */
+  unfinished: 'The browser didn\'t finish this call: the page may be busy or stuck, and what you asked may have happened. '
+    + '`browser_read` shows the page as it is now: check it before you repeat an action.',
+  /** dsh's attachment store didn't take the screenshot; `code` is the store's own error code, when it gave one. */
+  notStored: (code: string | undefined): string =>
+    `dsh's attachment store didn't take the screenshot${code === undefined ? '' : ` (${code})`}: try one element by \`ref\`, or \`browser_read\`.`,
 }
 
 /** The URL rules' refusals (`urls.ts`), for the agent's errors and the tab's notices. */
