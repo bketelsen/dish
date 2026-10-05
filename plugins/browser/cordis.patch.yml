@@ -1,0 +1,13 @@
+# The shared browser's host plugin. It runs one headless Chromium, gives each
+# agent session a browser of its own, registers the ten `browser_*` tools, and
+# serves the stream the Browser tab watches. It reads dsh's `agents`,
+# `sandboxPolicy`, `attachments`, `llm`, `workspaceRegistry` and `webServer`,
+# and crew's `dishCrew`, with `ctx.get` on each use, and gets `tools` through
+# `ctx.inject`, so there is no order to keep. Without Chromium at
+# `executablePath` it registers no tools. Config rows: `executablePath`
+# (Chromium; /usr/bin/chromium), `viewport` (1280×800), `maxBrowsers` (6),
+# `idleMinutes` (15), `snapshotChars` (30000) and `terminal` (print the
+# plugin's own log lines to the terminal).
+- insert:
+    - id: dish-browser
+      name: dish-browser

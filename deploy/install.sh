@@ -119,9 +119,9 @@ run_dsh() {
 }
 
 # Each after what it builds on: projects after config (its store), workspaces after projects (whose types it imports),
-# gates after them (it reads crew, projects and workspaces), and orchestrator last (it reads crew, gates, workspaces and
-# projects).
-bundles=(copilot config prompts skills crew judge web projects workspaces gates orchestrator)
+# gates after them (it reads crew, projects and workspaces), orchestrator after them (it reads crew, gates, workspaces and
+# projects), and browser last (it needs no other dish plugin).
+bundles=(copilot config prompts skills crew judge web projects workspaces gates orchestrator browser)
 profile_dir="${DSH_HOME:-$HOME/.dsh}/profiles/$profile"
 patch="$profile_dir/cordis.patch.yml"
 changed=0

@@ -1,6 +1,6 @@
 # Spec: browser (`dish-browser`)
 
-Status: Draft 2026-10-04, from the brainstorm (the user's six answers are under Decisions), with the four [Questions for you](#questions-for-you) answered the same day (decisions 8–11) and the spike's results in [Checks](#checks-2026-10-04); waiting for your review. It is the backlog row "A shared browser (step-sized)" in [ROADMAP.md](../../ROADMAP.md#backlog), and it covers the row before it, "Dev-server previews": you see an agent's dev server in the Browser tab. It builds on [crew](crew.md) (role tool lists), the [judge](judge.md) (the result screen) and [prompts](prompts.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources, and every claim about Playwright against the spike on the VM or a local copy of playwright-core 1.62.1's types; see [Checks](#checks-2026-10-04). Revised 2026-10-04 from the plan ([docs/plans/2026-10-04-browser.md](../plans/2026-10-04-browser.md), its Spec corrections, checked against playwright-core 1.63.0's published package); items 4 (service workers) and 15 (how the end-to-end run is driven) there are for your review.
+Status: approved 2026-10-04, from the brainstorm (the user's six answers are under Decisions), with the four [Questions for you](#questions-for-you) answered the same day (decisions 8–11) and the spike's results in [Checks](#checks-2026-10-04); merged with the plan the same day. It was the backlog row "A shared browser (step-sized)", now step 7a in [ROADMAP.md](../../ROADMAP.md), and it covers the row before it, "Dev-server previews": you see an agent's dev server in the Browser tab. It builds on [crew](crew.md) (role tool lists), the [judge](judge.md) (the result screen) and [prompts](prompts.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources, and every claim about Playwright against the spike on the VM or a local copy of playwright-core 1.62.1's types; see [Checks](#checks-2026-10-04). Revised 2026-10-04 from the plan ([docs/plans/2026-10-04-browser.md](../plans/2026-10-04-browser.md), its Spec corrections, checked against playwright-core 1.63.0's published package); items 4 (service workers) and 15 (how the end-to-end run is driven) there are for your review. Built on branch `browser` (2026-10-04), its real-Chromium tests run in the VM's gate, and checked end to end in a scratch dsh on the VM; awaiting review and the rollout. What the build added is under [Notes from the build](#notes-from-the-build); it reversed item 4: service workers are allowed.
 
 ## Summary
 
@@ -43,7 +43,7 @@ Agents can screenshot a page today only through `chromium --headless --screensho
 - **The host half** runs in dsh's process, as the `dish` account, outside the agent sandbox. It drives Chromium through `playwright-core`, registers the tools, and serves the tab's stream.
 - **The client half** registers the tab type, its body and title, a header button, and the screenshot's inline view.
 - **What it reads, with `ctx.get` on each use:** dsh's `tools`, `agents`, `sandboxPolicy`, `attachments`, `llm` and `workspaceRegistry`, and crew's `dishCrew` for a child's label. Nothing from dish is required. It provides no service of its own in v1.
-- **Nothing of its own on disk.** Cookies live in memory, and screenshots go to dsh's attachment store, as `read_image`'s do. Playwright puts Chromium's temporary profile in `os.tmpdir()` (the spike saw `playwright_chromiumdev_profile-*` and `playwright-artifacts-*` there, removed at `close()`; Chromium leaves one small `org.chromium.Chromium.*` directory), which on the VM is dsh's `TMPDIR`, `~/.cache/dish/tmp` (`deploy/dish-web.service:55`), protected from agents' writes. The unit's start removes anything there older than 10 days.
+- **Nothing of its own on disk.** Cookies live in memory, and screenshots go to dsh's attachment store, as `read_image`'s do. Playwright puts Chromium's temporary profile in `os.tmpdir()` (the spike saw `playwright_chromiumdev_profile-*` and `playwright-artifacts-*` there, removed at `close()`; Chromium may leave a small `org.chromium.Chromium.*` directory), which on the VM is dsh's `TMPDIR`, `~/.cache/dish/tmp` (`deploy/dish-web.service:55`), protected from agents' writes. The unit's start removes anything there older than 10 days.
 
 **One Chromium process.** `chromium.launch({ executablePath, chromiumSandbox: true, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false })`, started on first need: an agent's first browser call, or an address bar.
 - It stops 60 s after the last browser closes, and when the plugin stops. systemd's default kill mode takes it with `dish-web.service`.
@@ -53,7 +53,7 @@ Agents can screenshot a page today only through `chromium --headless --screensho
 
 **One browser per agent session.** A browser is a `BrowserContext` with one page, keyed by the agent's session id (dsh's agent id is its session id).
 - **Its viewport** is fixed at `viewport` (1280×800). The tab scales the picture; it never resizes the page. So you and the agent see the same layout, and screenshots stay comparable.
-- **Context options:** `acceptDownloads: false`, and `serviceWorkers: 'block'`, since a service worker's own requests bypass the context's route. Nothing else differs from Playwright's defaults.
+- **Context options:** `acceptDownloads: false`, and `serviceWorkers: 'allow'`, Playwright's default, set explicitly: with it, the context's route sees a service worker's script and its fetches, and aborts a refused one ([Notes from the build](#notes-from-the-build)). Nothing else differs from Playwright's defaults.
 - **What it remembers:** its session's workspace root, the last snapshot it gave the agent, your input since the agent's last call, the console errors and failed requests since the last read, and when it was last used. It keeps no parent: the switcher reads crew's record.
 - **The workspace root** is `ctx.sandboxPolicy.resolve({ session }).workspaceRoot`: the session's cwd, canonical. It is what the sandbox enforces and what `bash` uses, and dish-judge reads it the same way. A crew child works in its parent's workspace, so a coder's browser can open files anywhere in the project's clone, its worktrees included.
 
@@ -73,6 +73,7 @@ Agents can screenshot a page today only through `chromium --headless --screensho
 - **Memory.** Chromium itself takes about 150 MB, and each browser a renderer of tens to hundreds of MB. Six at most fits the VM's 7.7 GB alongside dsh and agents' builds.
 - **Crashes.**
   - **A page that crashes** (`page.on('crash')`) is replaced at once by a new page in the same context. Cookies stay. The agent's next result says "The page crashed; this is a new page."
+  - **A page that stops responding** (a script that never ends) is replaced the same way, once an agent's call times out on it and it doesn't answer a trivial script within 5 s, as long as an action gets; a page that answers is only slow, and stays. The call fails: "The page stopped responding (a script that never ends?), so dish replaced it with a new, blank page in the same browser; cookies and sign-ins stay. Open it again with `browser_navigate`." `browser_navigate` asks first, giving the page 1 s since it leaves it anyway, so it replaces such a page at once and opens its URL on the new one, with that sentence's first part as a note ([Notes from the build](#notes-from-the-build)).
   - **Chromium crashing or exiting** (`browser.on('disconnected')`) loses every browser. The next need relaunches it, and each session's next result says "The browser restarted; this page is new, and cookies and sign-ins are gone."
 - **A restart of dsh** loses every browser. Cookies were never on disk.
 
@@ -99,7 +100,7 @@ Ten global tools, registered by `dish-browser` through `ctx.inject(['tools'])`, 
 - **Empty strings are absent,** and `false` is the default: models fill every optional field (the design's lessons). So are zeros where a zero means nothing: `x` and `y` when both are 0, `dx` and `dy` when both are 0, and `seconds`. `dialog` is `accept` or `dismiss` (the default).
 - **What the agent typed** isn't repeated in `browser_type`'s result.
 - **Cancelling:** each call honours `exec.signal`.
-- **The row in the chat:** each tool's `presentCall` gives dsh's generic row a title, such as "Browser: open http://127.0.0.1:5173".
+- **The row in the chat:** dsh's generic row: "Tool call", then the tool's name and the call's first non-empty string argument, such as "browser_navigate · http://127.0.0.1:5173". dsh web never reads a tool's `presentCall` (dsh-client-ui-tool README: host `presentCall` values never enter the client); the tools keep theirs for host-side consumers.
 
 **Timeouts.** These are fixed, not configuration:
 - a navigation: 30 s to `domcontentloaded`, then up to 3 s more for `load`;
@@ -108,14 +109,14 @@ Ten global tools, registered by `dish-browser` through `ctx.inject(['tools'])`, 
 - `browser_wait`: what it asks, 30 s at most;
 - a screenshot: 10 s.
 
-**Actions return the new snapshot.** Every tool but `browser_screenshot` ends with the page as it is now. When an action's snapshot is byte-identical to the last one this agent got, it says "Unchanged since your last snapshot (`browser_read` shows it again)." instead. `browser_read` always returns it.
+**Actions return the new snapshot.** Every tool but `browser_screenshot` ends with the page as it is now. When an action's whole snapshot, past the cut too, is byte-identical to the last one this agent got, it says "Unchanged since your last snapshot (`browser_read` shows it again)." instead. `browser_read` always returns it.
 - **Why:** after almost every action the agent's next step needs fresh refs, and a stale ref is the most common failure otherwise. Each extra `browser_read` is a model round trip: seconds of latency, and one more model request. Playwright's own MCP server does the same by default (in 1.62.1: `setIncludeSnapshot`, "full").
 - **The cost:** tokens. The cap below bounds each result, and the "unchanged" line covers scrolls and waits. dsh's compaction handles old results as it does any tool's.
 - **Not in v1:** a diff against the last snapshot. If Playwright's refs prove stable for an element that stays, a later version could send only what changed.
 
 **The snapshot.** `page.ariaSnapshot({ mode: 'ai' })`, or `page.locator('aria-ref=<ref>').ariaSnapshot({ mode: 'ai' })` for one subtree. It is YAML with refs, such as `- textbox "Name" [ref=e7]` and `- link "First link" [ref=e4] [cursor=pointer]` (the spike), and it takes in iframes.
 - **A subtree read re-arms the refs.** Playwright resolves `aria-ref=` only against the newest snapshot of each frame (`_lastAriaSnapshotForQuery` in its injected script). So after `browser_read` with `ref`, dish takes a full snapshot of the page and doesn't return it. An element keeps its ref while its role and name stay, so the agent's refs stay good.
-- **Cut at `snapshotChars`** (30,000), at a line end. That keeps a result under dsh's spill cap (`maxInlineTokens: 12500`): dsh estimates 30,000 characters at about 7,500 tokens ([Checks](#checks-2026-10-04)), so the agent and the judge get it whole, not a spilled file. A cut says "Cut at 30,000 of 93,512 characters: `browser_read` with the ref of a section (a `main`, `list` or `region`) reads that part."
+- **Cut at `snapshotChars`** (30,000), at a line end. That keeps a result under dsh's spill cap (`maxInlineTokens: 12500`): dsh estimates 30,000 characters at about 7,500 tokens ([Checks](#checks-2026-10-04)), so the agent and the judge get it whole, not a spilled file. A cut names the sections past it, which a read with their ref reaches: "Cut at 30,000 of 166,311 characters: `browser_read` with a section's ref reads that part. Sections past the cut: region "Bottom" [ref=e3002], list [ref=e3005]." With none past it: "Cut at 30,000 of 93,512 characters: `browser_read` with the ref of a section (a `main`, `list` or `region`) reads that part." ([Notes from the build](#notes-from-the-build))
 - **Masked** with dish-kit's `maskSecrets`, as is every text the tools return: URLs, titles, console lines, dialog text.
 - **Password fields.** The snapshot shows a password field's value (the spike: `textbox "Password" [ref=e5]: hunter2-SECRET`). dish blanks it: a password field's line ends at its name and ref, with `(a password field; its value isn't shown)`.
   - **How dish tells:** for each textbox line that shows a value, by the element's type, never by the word "Password": `locator('aria-ref=<ref>').evaluate(el => el.tagName === 'INPUT' && el.type.toLowerCase() === 'password')`, in its own frame.
@@ -138,15 +139,15 @@ The page's accessibility tree follows. Refs like [ref=e7] are what browser_click
 - **If you started the browser,** it says so.
 
 **Failures.**
-- **Errors** (`isError`) carry only dish's words and a masked URL, never page text, because the judge doesn't screen errors. They are: an argument that's wrong (both `text` and `gone`, a `ref` that isn't a ref); a URL the rules refuse; no browser on the host; Chromium that won't start ("Chromium wouldn't start: <its first line>", tried again on the next call); and, for `browser_screenshot`, a model that doesn't take images.
+- **Errors** (`isError`) carry only dish's words and a masked URL, never page text, because the judge doesn't screen errors. They are: an argument that's wrong (both `text` and `gone`, a `ref` that isn't a ref); a URL the rules refuse; Chromium that won't start ("Chromium wouldn't start: <its first line>", tried again on the next call); the browser closing, or its page crashing, during the call; a page that stopped responding, which dish replaces ("The page stopped responding (a script that never ends?), so dish replaced it with a new, blank page in the same browser; cookies and sign-ins stay. Open it again with `browser_navigate`."); every browser busy at the cap for 30 s; a failure dish has no words for ([Notes from the build](#notes-from-the-build)); and, for `browser_screenshot`, a model that doesn't take images, or no attachment store. With no Chromium on the host the tools aren't registered, so no call meets that ([Configuration](#configuration)).
 - **What fails on the page is a result, not an error,** led by "Not done:" and followed by the page as it is, so the agent has fresh refs at once:
   - a stale ref: "Not done: [ref=e7] isn't on the page now (it changed since your snapshot). Use a ref from the snapshot below.";
-  - a timeout: "Not done: [ref=e7] didn't respond within 5 s (covered, disabled or off the page?).";
+  - a timeout: "Not done: [ref=e7] didn't respond within 5 s (covered, disabled or off the page?)."; for `browser_select`, whose wait for a matching option looks the same, "Not done: [ref=e7] has no option "Purple" by label or value, or didn't respond within 5 s. Its options are in the tree below.";
   - a navigation error. One worth naming: `net::ERR_CONNECTION_REFUSED` on `127.0.0.1` reads "Nothing is listening at 127.0.0.1:5173. Start the dev server first, with `bash` and `run_in_background: true`."
 
 **`browser_read`** adds, after the page line:
-- how far the page is scrolled ("scrolled 1,400 of 5,200 px");
-- the newest 10 console errors and uncaught exceptions, and the newest 10 failed requests (network errors, and responses of 400 and up), since the last read, each one line of at most 300 characters. A count of what wasn't listed follows.
+- how far the page is scrolled ("Scrolled 1,400 of 5,200 px.");
+- the newest 10 console errors and uncaught exceptions, and the newest 10 failed requests (network errors, and responses of 400 and up), since the last read, each one line of at most 300 characters. A header counts them all: "Failed requests (the newest 10 of 37):".
 
 **`browser_screenshot`** returns two blocks, as `read_image` does: a text block and an image block.
 - **The image** is a PNG of the viewport (or of `ref`'s element), saved with `ctx.attachments.saveImage`.
@@ -155,7 +156,7 @@ The page's accessibility tree follows. Refs like [ref=e7] are what browser_click
 
 ## What a page may do
 
-- **One page per session.** A popup or a `target=_blank` link (`page.on('popup')`) is followed in the session's own page, if the URL rules allow it, and the popup is closed. The result notes "The page opened a new window; dish followed it here." A popup with no URL of its own (`about:blank` filled by script) is closed and noted.
+- **One page per session.** A popup or a `target=_blank` link (`page.on('popup')`) is followed in the session's own page, if the URL rules allow it, and the popup is closed. The result notes "The page opened a new window; dish followed it here." A popup with no URL of its own (`about:blank` filled by script) is closed and noted. Any other window, such as one that popup opened before dish closed it, or one a service worker opened, is closed at once (the context's `page` event).
 - **Dialogs** (`alert`, `confirm`, `prompt`) are answered at once: dismissed, or accepted when the action that opened them said `dialog: "accept"`. `beforeunload` is always accepted, so navigations go through. The result notes "The page showed a confirm: «text» (dismissed)", with the text masked and cut to 500 characters.
 - **Downloads are off** (`acceptDownloads: false`). The result notes "The page started a download of <name>; dish doesn't download files."
 - **File uploads aren't supported in v1.** dish listens for the file chooser, so none opens, and notes "The page asked for a file to upload; dish can't upload files yet."
@@ -177,7 +178,7 @@ The same rules apply to the agent's `browser_navigate` and to your address bar.
 
 **`file://` confinement.**
 - The path is taken from the URL, its real path is resolved (`realpath`), and it must be the workspace root's real path or under it, or `/tmp` or under it (decision 9), on a `/` boundary. `/tmp` counts only where agents share the machine's `/tmp`: when `realpath(os.tmpdir())`, dsh's own `TMPDIR`, is neither `/tmp` nor under it. That is the VM (`~/.cache/dish/tmp`), where `deploy/dish-sandbox` binds the machine's `/tmp` for every command. In dev, a command's `/tmp` is its own, and the host's `/tmp` holds other programs' files, so it stays out. A symbolic link that leads out is refused, and so is a path that doesn't exist.
-- A refusal names the workspace: "file:///etc/hosts is outside this chat's workspace (/home/dish/work/bketelsen/clippy)."
+- A refusal names the workspace, and `/tmp` where it counts. On the VM: "file:///etc/hosts is outside this chat's workspace (/home/dish/work/bketelsen/clippy) and /tmp."
 - Chromium lists a directory, so a `file://` directory inside the workspace opens as a listing.
 - **From the address bar,** a `file://` URL needs the session's workspace. dish knows it once the session's agent has used the browser, or while that agent is live. Otherwise it is refused, with that reason.
 
@@ -196,7 +197,7 @@ The same rules apply to the agent's `browser_navigate` and to your address bar.
 - **How dish knows the address:**
   - **the port** is `ctx.get('webServer').port`, on every loopback name: `localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`, and `0.0.0.0` and `[::]`, which reach `127.0.0.1` on Linux;
   - **the trusted host** is `DISH_TRUSTED_HOST`, from the unit's `deploy.env` (`deploy/dish-web.service:25`), on any port. dsh's connection service keeps its own list private.
-- **WebSockets** to that address are refused too, with `context.routeWebSocket`, since the route doesn't see them.
+- **WebSockets** to that address are refused too, with `context.routeWebSocket`, since the route doesn't see them. Workers' own connections aren't all seen ([Known limits](#known-limits)).
 - Nothing an agent needs goes there. dish working on itself runs a dev dsh on another port.
 
 ## The Browser tab
@@ -271,7 +272,7 @@ A `tool.call.toolview` view, keyed `browser_screenshot`, as dsh's deliverables p
 - **Not dsh's image gallery.** The gallery is the `tool.call.images` child slot, which one toolview declares and no other may, so this view draws its own `<img>`.
 - **As text.** Everything from the page (the title, the URL) is rendered as text, never as markup or a link, as Settings → Runs does.
 - **An error, or a result the judge withheld,** has no image. The view shows "Browser: screenshot" and the result's text, as text. dsh's generic row isn't available to it: a keyed toolview replaces the row for its key (the slot's fallback renders only for a key nobody registered, dsh-client-ui-tool `lib/client.js:1863-1869`), and `GenericToolCard` isn't exported.
-- **The other nine tools** use dsh's generic row, with their `presentCall` titles.
+- **The other nine tools** use dsh's generic row: "Tool call", the tool's name and its first string argument.
 
 ## Untrusted text
 
@@ -324,16 +325,16 @@ The shipped defaults change, and `previous.json` is regenerated for each (dish-p
 | `viewport` | `{ width: 1280, height: 800 }` | Every browser's page size. |
 | `maxBrowsers` | 6 | Browsers open at once, over all sessions. |
 | `idleMinutes` | 15 | A browser with no agent call, no input and no watcher for this long closes. |
-| `snapshotChars` | 30000 | The most snapshot text in one result. Keep it under dsh's spill cap. |
+| `snapshotChars` | 30000 | The most snapshot text in one result, 2000–34000. Keep it under dsh's spill cap: 34,000 and a result's other parts (about 15,000 characters) stay under it. |
 | `terminal` | true | Print this plugin's messages. |
 
 - **Fixed in code:** the timeouts, the JPEG quality (60), the frame cap (15 a second), Chromium's stop after 60 s, and the 10 s for "they are using it now".
 - **Nothing in the config store.**
-- **The log** gets launches, crashes, evictions and closes, by session id and reason. A URL appears only as its origin, never with its path or query.
+- **The log** gets launches, crashes, evictions and closes, by session id and reason. No address appears in it, not even an origin: Chromium's own messages have theirs replaced by `<address>` ([Notes from the build](#notes-from-the-build)).
 
 **No Chromium on the host** (dev on the desktop, which has none).
 - At start, dish checks that `executablePath` is an executable file. If it isn't, dish logs it once, registers no tools, and the tab says there's no browser. Nothing else changes: crew's lists drop the names, and the prompts' second bullet applies.
-- Chromium installed later is seen after dsh's next restart.
+- Chromium is looked for once, when the plugin starts: a Chromium installed later is seen after dsh's next restart, or a reload of the plugin.
 - **Chromium that's there but won't start** fails the call with its reason, and the next call tries again.
 
 ## Install
@@ -393,7 +394,10 @@ The shipped defaults change, and `previous.json` is regenerated for each (dish-p
 - **Screenshots are kept** in dsh's attachment store with the session, as `read_image`'s are.
 - **The tab's picture is lossy JPEG,** and small text can blur. A screenshot is a PNG.
 - **No HTTP cache, and a hop per request.** With a route on the context, Playwright turns its cache off, and every request goes through Node to be checked. Pages load slower in the agent's browser than in yours.
-- **No service workers** in the agent's browser: a dev server's offline caching or PWA behaviour can't be checked there.
+- **Redirects aren't routed.** Playwright's route sees only the first URL of a redirect chain (playwright-core 1.63.0 `types/types.d.ts`, `route`'s notes). A subresource that redirects to dsh's own address isn't aborted; a main-frame redirect there is caught after it lands (`framenavigated`), and the page is sent to `about:blank`.
+- **Host names that resolve to loopback,** such as `127.0.0.1.nip.io`, reach dsh's port: the rules know loopback by name and address, not by what a name resolves to. dsh still needs its browser-session cookie.
+- **Workers' own connections aren't all routed:** `routeWebSocket` sees no WebSocket a worker opens (dedicated, shared or service), and the context's route sees no request a shared worker makes, so one to dsh's address isn't stopped. A dedicated or service worker's requests are routed. The same cookie applies.
+- **A popup's address is loaded twice:** in the popup, before dish learns where it went, then in the session's page. A one-time link opened in a new window can be spent by the first load, and a form posted to a new window is opened again with GET.
 - **`browser_wait`'s text** is looked for in the main frame, not in iframes.
 - **Browsers live in memory.** A restart closes every browser, and crew children's browsers last one run (decision 10).
 
@@ -489,5 +493,84 @@ Against dsh 0.2.0-rc.2's sources, under `node_modules/.pnpm/@deepseek-ai+<packag
 3. **`file://` subresources:** `context.route('**/*')` saw a workspace page's `file:///etc/hostname` image and `file:///etc/os-release` iframe; without a route, the iframe's text reached the snapshot.
 4. **A source-mode stream's uplink** through dsh's gateway: not checked (it needs a running dsh). The plan's first task checks it in process, through dsh's real `TypertGatewayService`: the gateway reads a source-mode method's uplink with its default JSON codec and gives the method `this.ctx.invocation` (dsh-api-gateway `lib/index.js:972-985`). If that fails, the plan's fallback takes input as unary calls.
 5. **Popups, downloads, the screencast:** `page.on('popup')` fires for a `target=_blank` link, with its URL; with `acceptDownloads: false`, `download` fires with a failure ("Pass { acceptDownloads: true } …") and nothing is saved; `Page.screencastFrame`'s metadata has `deviceWidth`, `deviceHeight`, `pageScaleFactor`, `scrollOffsetX/Y` and `offsetTop`.
-6. **The temporary profile** goes to `TMPDIR` (`playwright_chromiumdev_profile-*`, `playwright-artifacts-*`), removed at `close()`; Chromium leaves one `org.chromium.Chromium.*` directory, which the unit's 10-day aging removes.
+6. **The temporary profile** goes to `TMPDIR` (`playwright_chromiumdev_profile-*`, `playwright-artifacts-*`), removed at `close()`; Chromium may leave an `org.chromium.Chromium.*` directory, which the unit's 10-day aging removes.
 7. **Size:** dsh estimates a text block at `ceil(chars / 4) + 4` tokens (`dsh-token-meter`'s `estimateContent`, `CHARS_PER_TOKEN = 4`, `BLOCK_OVERHEAD = 4`), so 30,000 characters is about 7,500 of the 12,500. A list of 1,500 links gave a 209,697-character snapshot: the cut is needed.
+
+## Notes from the build
+
+What the build decided beyond this spec as revised on 2026-10-04 (the plan's Spec corrections are in the text above), from the controller's ledger and the tasks' reports and reviews. Each was checked against the code. [plugins/browser/README.md](../../plugins/browser/README.md) has the plugin as built.
+
+**The gateway check** (the plan's Task 0). A source-mode stream's uplink works through dsh's real `TypertGatewayService`, in process (`plugins/browser/test/gateway.test.ts`): the method gets `this.ctx.invocation`, uplink items arrive as the JSON values sent, one by one and in order, and aborting the call's signal ends the stream. So the plan's fallback, unary calls for the tab's input, wasn't needed. Two rules came with it:
+- **No remote parameter is named `session` or `agent`.** Source mode matches dsh's lookups by parameter name, so `watch` takes `sessionId`, which stays a JSON value.
+- **The uplink is read as it arrives.** dsh's inbox (262,144 bytes a stream) fails the stream when it overflows, so `watch` reads its uplink into a queue of its own and never waits for what an item does: a navigation can take about 33 s.
+
+The WebSocket leg, the same for every stream, is the end-to-end run's.
+
+**Service workers are allowed: correction 4 reversed** (the controller's decision, in Task 2).
+- **The plan** blocked them (`serviceWorkers: 'block'`), so that the context's route would see every request.
+- **Building the driver showed `'block'` doesn't do that.** In playwright-core 1.63.0 it only replaces the usual `navigator.serviceWorker.register`: a page that calls the container's own method (`ServiceWorkerContainer.prototype.register.call(…)`) still registers a worker. And with `'block'`, Playwright stops watching service workers, so that worker's requests would bypass the route.
+- **With `'allow'`,** Playwright routes a service worker's script and its fetches through the context's route, which aborts a refused one. A real-Chromium test registers a worker both ways, and checks that the route saw its script and its fetches, and that a refused fetch never reached the server.
+- **So the context allows service workers** ([The plugin](#the-plugin)). A dev server's offline caching or PWA works in the agent's browser, and Known limits no longer says it doesn't. The plan's Risks line about blocked workers stays as the plan wrote it.
+
+**Known limits the build found** (the first three now under [Known limits](#known-limits); the fourth is a rule for the deploy):
+- **Redirects:** Playwright's route sees only the first URL of a redirect chain. A subresource that redirects to dsh's own address isn't aborted; a main-frame redirect there is caught by `framenavigated` after it lands.
+- **Loopback host names:** a name that resolves to loopback, such as `127.0.0.1.nip.io`, reaches dsh's port.
+- **Workers' own connections:** a WebSocket any worker opens, and a shared worker's requests, aren't seen by `routeWebSocket` or the route.
+- **`TMPDIR`'s length:** Chromium's singleton socket goes in an `org.chromium.Chromium.*` directory under `TMPDIR`, and a socket's path holds at most 107 bytes, so a long `TMPDIR` keeps Chromium from starting ("Socket path too long"). The VM's `~/.cache/dish/tmp` is short; `deploy/README.md` (The state) and the plugin's README (Tests) say so.
+
+**Refs.**
+- **Main-frame refs change form after a navigation.** After a page's second new document, Playwright numbers the main frame anew, and its refs carry a frame part: `e7` becomes something like `f1e2`. Chromium's error page's refs do too. `REF` takes both forms, and the tools' texts say "such as e7 or f1e7".
+- **A stale ref is "Not done:" at once,** without the 5 s wait: `hasRef` is asked first, and a ref whose frame is gone, or that matches nothing, is the driver's `DriverTimeout('stale ref')` at once.
+- **Refs from a subtree `browser_read` stay usable outside it** (correction 1): the full snapshot taken after it re-arms them. The agent's last snapshot stays the full tree it last got, so the next action's "Unchanged" check compares against that.
+- **A ref copied with its brackets** (`[ref=e7]`) or as `ref=e7` is taken too.
+
+**The snapshot.**
+- **Password values are blanked on more than a textbox's line:** any textbox, searchbox, combobox or spinbutton that shows a value, inline or in a block (with a placeholder, the value is on a `- text:` line under it). Task 1's review found three shapes that leaked.
+- **A field with no ref to check it by** (covered, or not visible) has its value left out unchecked, as "(its value isn't shown)", and so does any field past the first 200 checked.
+- **Every pattern runs in time linear in the line,** since a page controls the text: a crafted line took 26 s before the review's fix, and 0.7 ms after.
+- **The password check fails with fixed words,** since the page's own script can throw inside it, and the scroll position is read over CDP (`Page.getLayoutMetrics`), with no script of the page.
+- **A cut tree names the sections past the cut** (the final review: on a page of 1,500 links, no ref of the "Bottom" region past the cut was anywhere in the result, so the cut note's advice couldn't be followed). Up to 20 `main`, `navigation`, `region`, `form`, `complementary`, `article`, `list`, `table` or `dialog` lines past the cut are named, the shallowest first and listed in page order, then "and N more". Their names take at most a sixteenth of `snapshotChars`, and the tree what they leave, so the two stay within it.
+- **"Unchanged" compares the whole tree,** not the cut part, by a SHA-256 digest: a click whose effect lay past the cut read "Unchanged". The browser keeps the whole tree up to 4× `snapshotChars` (120,000 characters at the default), and its last subtree read's the same way, to name the element an action acts on: "Clicked button "Add at bottom" [ref=e3004].", where it said "Clicked [ref=e3004].".
+
+**The driver.**
+- **Every Playwright call that doesn't time out by itself is bounded** (the mouse and keyboard, `title`, `count`, `evaluate`, CDP), by 5 s or the action's own time, so a frozen page (a script in an endless loop) fails a call with an error, never a hang. A page's snapshot has 10 s, and typing without a ref 5 s and 25 ms a character.
+- **An error keeps only the first line of Playwright's message:** the call log under it names the page's elements and what was typed.
+- **A failure dish has no words for** is an error that says the action may have happened: "The browser didn't finish this call: the page may be busy or stuck, and what you asked may have happened. `browser_read` shows the page as it is now: check it before you repeat an action."
+- **No capture is lost to a navigation** (the end-to-end dry run, where the agent's `browser_screenshot` took 9.9 s). Chromium never answers a capture (`Page.captureScreenshot`) asked for a few ms before the main frame commits a new document, and under load it fails one at once ("Unable to capture screenshot", "Not attached to an active page"); Playwright takes a page's screenshots one at a time, so the tab's lost capture held the agent's screenshot for its 10 s. The driver asks at most three times in all, within the 10 s: at once when the main frame commits while a capture is pending (aborting it, which lets Playwright's queue go), and after a failure at the next commit or 100 ms. The tab's capture goes over the page's CDP session, outside Playwright's queue.
+- **A frozen page is told by a probe.** `responds` runs a trivial script in the main frame (`page.evaluate(() => 1)`), bounded by 5 s after a call's timeout, so that a long task on a live page (a big bundle booting) ends first, and by 1 s before every `browser_navigate`, which leaves the page anyway; a page that doesn't answer is replaced as a crashed one is ([Lifecycle and limits](#lifecycle-and-limits)). On Chrome for Testing 151 a read of a frozen page now ends in about 15 s (the snapshot's 10 s, then the probe's 5 s) and a navigate away from one in about 1 s; before, every call failed after 10 to 40 s, and the page stayed stuck until the tab's Close, since failing calls kept it from idling.
+- **Windows nobody follows are closed** (the final review: a popup's script opened a window before dish closed the popup, and that window ran hidden, sending requests, for the browser's life). The context's `page` event closes every page that `newPage` didn't make and whose opener isn't the session's page, once any `newPage` in flight has settled. The session's own popups, `noopener` ones too, still reach it through `popup`, which follows and closes them.
+- **A choice that times out names its values:** Playwright's `selectOption` waits for a matching option to appear (a script may fill the list), so a missing option and a stuck element can't be told apart at once: "Not done: [ref=e7] has no option "Purple" by label or value, or didn't respond within 5 s. Its options are in the tree below."
+
+**The plugin.** Chromium is looked for once, when the plugin starts: a Chromium installed later needs a dsh restart (or a reload of the plugin) before the tools appear. An empty `executablePath` (`''`) means `/usr/bin/chromium`.
+
+**The core.**
+- **A call that waited 30 s at the cap** fails with "All 6 browsers dish keeps are in use by other calls; try again in a moment.", not the eviction's words. An address bar's opening at the cap gets it at once, as a notice.
+- **A close for idleness or by the tab's Close** leaves a note for the session's next browser too, as eviction and Chromium's restart do: "dish closed this browser after 15 minutes unused; this page is new, and cookies and sign-ins are gone." and "The user closed this browser; this page is new, and cookies and sign-ins are gone." A close because the agent was disposed, the chat archived or dsh stopped leaves none.
+- **One of the tab's navigations counts as in use,** as a call does: neither eviction nor the sweep takes its browser meanwhile.
+- **A refused main-frame navigation** goes to `about:blank` once the route's abort is through, since Chromium commits its error page after it. A popup's first navigation reaches the route as not the session's own page, so a refused popup is closed and noted with the address it tried: "The page opened a new window at an address dish doesn't allow (<what>); dish closed it."
+- **The workspace** is the sandbox policy's `workspaceRoot`, else the session's own working directory (`header.cwd`), real-pathed.
+- **Log lines hold no address at all,** not even an origin: Chromium's own messages have theirs replaced by `<address>`.
+- **Archiving an idle chat sends no event** a plugin hears: dsh's web client archives it without `stopActivity`, so there is no `workspace/session-stop`, and its agent isn't disposed (dsh-client-ui-workspace `lib/client.js:4197-4227`; dsh-workspace `lib/index.js:524-540`, `:619-621`). Its browser closes at the next sweep, within a minute. Stopping and archiving a working chat sends `workspace/session-stop`, which closes it at once.
+- **A result's notes are bounded:** the newest 10 of the page's events (dialogs, popups, downloads, file choosers, refused addresses), after "140 earlier page events (dialogs, popups, downloads) aren't listed; the newest 10 follow." when there were more, and every note of a reopened, crashed or replaced page. 150 alerts of 600 characters had made one result 54,487 characters, past dsh's spill cap.
+- **The errors note counts since the last read,** as it says: when new console errors or failed requests came since the last result, it counts all of them since the last `browser_read`. It had counted only those since the last result: a navigate said 2, a click then 1, and the read listed 3.
+- **The URL refusals** add "or /tmp" where `/tmp` counts, and a `file://` URL with a host has words of its own: "file://nas/ addresses (a file on another machine) aren't opened here: only file:/// paths in this chat's workspace."
+- **`snapshotChars` is at most 34,000** (it was 48,000): 34,000 and a result's other parts, about 15,000 characters, stay under dsh's spill cap.
+
+**The stream and the tab.**
+- **A refused watch's reasons** are "That isn't a chat." and "This chat is archived.", in `words.ts` with the other sentences.
+- **The tab acks every frame it gets,** drawn or not (the source it already shows, or one it can't draw), so the host needs no ack timeout.
+- **Each new generation of the stream** is told again whether the tab wants frames; a watch starts with frames off. A stream that fails for good is opened again after 1 s, doubling to 30 s.
+- **The client's own sentences live in the client,** not in `words.ts` as the plan's contracts said: the tab's lines and its empty and closed states in `src/client/TabView.tsx`, the toolview's in `ScreenshotView.tsx`, the header button's in `HeaderButton.tsx`. `words.ts` imports dish-kit's host entry and the URL rules (`node:fs`), which the browser bundle can't load. Everything the host words (a closed browser's reason, a notice, a refusal, every tool result) comes from `words.ts`.
+
+**The rows in the chat.** dsh web never reads a tool's `presentCall` (dsh-tools README; dsh-client-ui-tool README: host `presentCall` values never enter the client). The nine tools without a view show dsh's generic row, "Tool call", the tool's name and the call's first non-empty string argument, not the "Browser: …" titles this spec first said ([The tools](#the-tools)); the tools keep their `presentCall` for host-side consumers.
+
+**The picture** sits at the top of the tab's area, under the toolbar, as a browser shows a page; it was centred, with blank room above it in a tall pane.
+
+**End to end (2026-10-05).** The plan's run, on the VM as `dish`, at the branch's tip (18aeb15): a scratch root under `/var/tmp`, a scratch install of all twelve bundles, a scripted model and a stub Jev on 127.0.0.1, `dsh web` on port 0, and a Playwright driver clicking dsh's own UI. Debian's Chromium 154, launched with its sandbox on. Every one of the 33 checks passed, and again at the final tip (fd0d583), after the final review's fixes:
+- **The coder's calls:** navigate (0.35 s), click "Add item" by ref, type "Ada" with Enter ("Hello, Ada" in the tree), click the `target=_blank` link (the popup followed, "Second page"), back, a screenshot (a text block and an image block, and an image part in the model's next request), a `browser_wait` of 30 s whose note said the user clicked once and typed into the page, a read, the workspace page and the `/tmp` page opened, `file:///etc/hostname` refused ("…outside this chat's workspace (…/work/e2e) and /tmp."), and the planted page withheld by the judge (p 0.97). Every call but the wait took under 0.4 s.
+- **The main agent:** "Not done: nothing is listening at 127.0.0.1:5199…" (the coder's dev server ended with its run), then "Your model doesn't take images…" for a model without image input.
+- **The password** the driver typed into the picture appears in no session, no store file, and neither stub's log; the read shows the field as "(a password field; its value isn't shown)".
+- **The lifecycle:** the coder's browser closed "(agent)" only once the tab let it go, the main agent's "(archived)" at the sweep after the archive, and Chromium closed with dsh. No process held the scratch root after `SIGTERM`, and its `TMPDIR` held nothing of Chromium's (no `playwright_*` or `org.chromium.Chromium.*` directory).
+- **The shots** show the picture under the toolbar with the switcher on "coder: check page" and the address bar on the site, "The agent is using this browser." while the coder worked, and the screenshot's toolview with its URL and title.
+
+**How the run was driven** (spec correction 15): the plan's steps, with what dsh needed: `--patch` goes before `web`'s own flags (`dsh web --patch <overlay> --host …`); the model's key is an `Authorization` header in the overlay; a new chat opens in dish-workspaces' `scratch`, so the driver adds the workspace through the UI; the coder's session is opened in a second window, since leaving the chat closes the tab; dsh's session files are several zstd frames, decoded one by one. A first full run on the desktop (Chrome for Testing 151) found the lost capture and the picture's placement above. The scripts aren't committed.

@@ -5,7 +5,7 @@
   - Confident and safe commands run.
   - Anything else asks you (the main agent) or is refused (a crew child).
 - **An approval answerer.** It answers dsh's approval requests for crew children, which can't wait on you. A child gets `allowed-once` only for an escalation the gate already judged for that call; everything else is refused.
-- **A result screen.** Web and MCP results, and `pr_feedback`'s read of a pull request, are checked for instructions aimed at an agent.
+- **A result screen.** Web and MCP results, `pr_feedback`'s read of a pull request, and the browser tools' pages are checked for instructions aimed at an agent.
   - Clear injections are withheld and kept in the log for you.
   - Doubtful ones get a warning in front.
   - When the judge can't be reached, results are marked "not screened".
@@ -42,10 +42,12 @@ screening:
   chunkChars: 24000        # longer content is screened in chunks
 tools:
   gated: [bash, pwsh]
-  screened: [web_search, web_fetch, read_mcp_resource, "mcp__*", pr_feedback]
+  screened: [web_search, web_fetch, read_mcp_resource, "mcp__*", pr_feedback, "browser_*"]
 ```
 
 **`pr_feedback`** ([dish-orchestrator](../orchestrator/README.md#pr_feedback), step 7) is the main agent's read of a pull request's reviews and comments, which anyone with access to the repository can write, so the shipped list screens it. The judge seeds only a missing `judge.yaml`, so one already in a config store doesn't gain it on its own: add `pr_feedback` to the screened tools on Settings → Judge.
+
+**`browser_*`** ([dish-browser](../browser/README.md)) are the agents' browser tools: their results carry a page's own text, which anyone who can put a page in front of the agent writes, so the shipped list screens them. A screenshot's image isn't screened; its text block is. As for `pr_feedback`, a `judge.yaml` already in a config store doesn't gain it on its own: add `browser_*` on Settings → Judge.
 
 **What runs at these values,** measured live on jev-1.13.0:
 - **Runs:** `git status`, `npm test`, `npm run build`, `pnpm install`, `git push --dry-run`.

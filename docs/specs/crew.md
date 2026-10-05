@@ -62,11 +62,11 @@ limits:
   perSession: 30          # delegations a session may start, ever
 roles:
   architect:  { tier: strong, family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
-  coder:      { tier: mid,    family: anthropic, writes: true,  tools: [read, read_image, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
-  reviewer:   { tier: mid,    reviews: true,                    tools: [read, read_image, glob, grep, bash, job_output, job_list, job_kill, web_fetch, skill, todo_write, send_message, ask_judge] }
+  coder:      { tier: mid,    family: anthropic, writes: true,  tools: [read, read_image, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_fetch, browser_navigate, browser_back, browser_read, browser_click, browser_type, browser_press, browser_select, browser_scroll, browser_wait, browser_screenshot, skill, todo_write, send_message, ask_judge] }
+  reviewer:   { tier: mid,    reviews: true,                    tools: [read, read_image, glob, grep, bash, job_output, job_list, job_kill, web_fetch, browser_navigate, browser_back, browser_read, browser_click, browser_type, browser_press, browser_select, browser_scroll, browser_wait, browser_screenshot, skill, todo_write, send_message, ask_judge] }
   researcher: { tier: mid,    family: anthropic,                tools: [read, glob, grep, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
   ops:        { tier: mid,    family: anthropic, writes: true,  tools: [read, glob, grep, write, edit, bash, job_output, job_list, job_kill, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
-  writer:     { tier: mid,    family: anthropic, writes: true,  tools: [read, read_image, glob, grep, write, edit, web_search, web_fetch, skill, todo_write, send_message, ask_judge] }
+  writer:     { tier: mid,    family: anthropic, writes: true,  tools: [read, read_image, glob, grep, write, edit, web_search, web_fetch, browser_navigate, browser_back, browser_read, browser_click, browser_type, browser_press, browser_select, browser_scroll, browser_wait, browser_screenshot, skill, todo_write, send_message, ask_judge] }
 ```
 
 **With direct API keys, a family can have a provider of its own.** The shipped file sends both families through the top-level `provider`, because Copilot serves Claude and GPT alike. With direct keys, Claude comes through an `anthropic` provider and GPT through an `openai` one, so each family says so, next to its tiers. A family without a `provider` runs on the top-level one, which stays required. This is an alternative example, not the shipped file; the `limits` and `roles` are as above.
