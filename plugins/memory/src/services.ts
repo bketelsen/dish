@@ -16,9 +16,13 @@ import type { DishWorkspaces } from 'dish-workspaces'
 /** What the service uses of the config store: a family's direction, read and written, and the proposals waiting on it. */
 export type DishConfigLike = Pick<DishConfigService, 'read' | 'head' | 'write' | 'proposals'>
 
-/** What it uses of dish-projects: each project's family and role. */
+/**
+ * What it uses of dish-projects: each project's family and role, and why `projects.yaml` doesn't parse (`list()` is
+ * `[]` then, as it is without the config store).
+ */
 export interface ProjectsReader {
   list(): Promise<{ name: string, family: string, role: string }[]>
+  problem(): Promise<string | undefined>
 }
 
 /** What it uses of dish-workspaces: where a project's clone is. */

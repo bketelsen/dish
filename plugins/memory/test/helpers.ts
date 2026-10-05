@@ -143,15 +143,22 @@ export interface FakeServices extends Services {
   calls: { list: number, describe: number, screenText: number }
   /**
    * Change what the services are: a field given replaces that one (`undefined` takes the service away). With
-   * `projectsError`, `dishProjects.list()` rejects with it, until it's set to `undefined`.
+   * `projectsError`, `dishProjects.list()` rejects with it; with `projectsProblem`, `dishProjects.problem()` says it
+   * (and `list()` gives `[]`, as dish-projects does for a broken `projects.yaml`); with `configReadError`,
+   * `dishConfig.read()` rejects with it. Each lasts until it's set to `undefined`.
    */
-  set(changes: { projects?: FakeProject[], projectsError?: Error, clones?: Record<string, string>, judge?: FakeJudge, config?: VersionedStore }): void
+  set(changes: {
+    projects?: FakeProject[], projectsError?: Error, projectsProblem?: string, clones?: Record<string, string>, judge?: FakeJudge,
+    config?: VersionedStore, configReadError?: Error,
+  }): void
 }
 
 /** dish's services as the service reads them, faked, but for the config store, which is a real store in a temporary directory. */
 export async function fakeServices(options: FakeServicesOptions = {}): Promise<FakeServices> {
   let { projects, clones, judge } = options
   let projectsError: Error | undefined
+  let projectsProblem: string | undefined
+  let configReadError: Error | undefined
   let store = options.config === true ? await openTestConfig() : options.config === false ? undefined : options.config
   const calls = { list: 0, describe: 0, screenText: 0 }
   const services: FakeServices = {
@@ -160,16 +167,33 @@ export async function fakeServices(options: FakeServicesOptions = {}): Promise<F
     set(changes) {
       if ('projects' in changes) projects = changes.projects
       if ('projectsError' in changes) projectsError = changes.projectsError
+      if ('projectsProblem' in changes) projectsProblem = changes.projectsProblem
       if ('clones' in changes) clones = changes.clones
       if ('judge' in changes) judge = changes.judge
       if ('config' in changes) store = changes.config
+      if ('configReadError' in changes) configReadError = changes.configReadError
     },
-    config: () => store,
+    config: () => {
+      const real = store
+      if (real === undefined || configReadError === undefined) return real
+      const failure = configReadError
+      return {
+        head: () => real.head(),
+        read: async () => { throw failure },
+        write: (changes, meta) => real.write(changes, meta),
+        proposals: () => real.proposals(),
+      }
+    },
     projects: () => projects === undefined ? undefined : {
       list: async () => {
         calls.list++
         if (projectsError !== undefined) throw projectsError
+        if (projectsProblem !== undefined) return []
         return (projects ?? []).map(project => ({ name: project.name, family: project.family, role: project.role ?? '' }))
+      },
+      problem: async () => {
+        if (projectsError !== undefined) throw projectsError
+        return projectsProblem
       },
     },
     workspaces: () => clones === undefined ? undefined : {

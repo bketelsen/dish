@@ -120,8 +120,10 @@ interface FakeMemory {
   failing: { scopesFor?: Error, compose?: Error }
   /** Who `scopesFor` was asked about, and the identities `compose` was asked for, in order. */
   calls: { scopesFor: string[], compose: string[] }
+  /** The options each `compose` was given, in order. */
+  options: Array<{ complete?: boolean } | undefined>
   scopesFor(agent: { id: unknown }): Promise<Scopes>
-  compose(scopes: Scopes): Promise<string | undefined>
+  compose(scopes: Scopes, options?: { complete?: boolean }): Promise<string | undefined>
 }
 
 /** The message the fake composes for `scopes`: the real format, over its memories, with no direction and no repos. */
@@ -141,13 +143,15 @@ function fakeMemory(options: { user?: string[], families?: Record<string, string
     families: new Map(Object.entries(options.families ?? {})),
     failing: {},
     calls: { scopesFor: [], compose: [] },
+    options: [],
     async scopesFor(agent) {
       fake.calls.scopesFor.push(String(agent.id))
       if (fake.failing.scopesFor !== undefined) throw fake.failing.scopesFor
       return { ...fake.scopes.get(String(agent.id)) ?? { user: true } }
     },
-    async compose(scopes) {
+    async compose(scopes, options) {
       fake.calls.compose.push(identityOf(scopes))
+      fake.options.push(options)
       if (fake.failing.compose !== undefined) throw fake.failing.compose
       return composed(fake, scopes)
     },
@@ -231,6 +235,8 @@ test('the first step gets the message after the claimed messages', async () => {
   assert.match(text, /^<dish-memory>\nThis message supersedes earlier dish-memory messages\.\n[\s\S]*- user\/talk-first — About talk-first \(feedback\)\n<\/dish-memory>$/)
   assert.deepEqual(message.content, [{ type: 'text', text }])
   assert.deepEqual(memory.calls, { scopesFor: ['main-1'], compose: ['user'] })
+  // Only a whole message is delivered: one that misses a part waits for a step that can read it all.
+  assert.deepEqual(memory.options, [{ complete: true }])
 
   // A step that claimed none of its messages gets it first.
   const lone = typed('Not claimed.')
@@ -393,7 +399,7 @@ test('a child gets family memory only; a scratch chat user memory only', async (
   const clone = join(root, 'work', 'acme', 'widget')
   const scratch = join(root, 'work', 'scratch')
   for (const dir of [clone, scratch]) await mkdir(dir, { recursive: true })
-  const real = await memoryWorld({ projects: [{ name: 'acme/widget', family: 'acme', role: 'The widget service' }], clones: { 'acme/widget': clone } })
+  const real = await memoryWorld({ projects: [{ name: 'acme/widget', family: 'acme', role: 'The widget service' }], clones: { 'acme/widget': clone }, config: true })
   await real.memory.write(USER, input('talk-first'), AS_USER)
   await real.memory.write(ACME, input('release-friday', { type: 'project' }), AS_USER)
   const w = await world(real.memory)
@@ -504,7 +510,7 @@ test('a step whose family can\'t be looked up keeps the message the agent has', 
   const root = await realpath(await tempDir())
   const clone = join(root, 'work', 'acme', 'widget')
   await mkdir(clone, { recursive: true })
-  const real = await memoryWorld({ projects: [{ name: 'acme/widget', family: 'acme' }], clones: { 'acme/widget': clone } })
+  const real = await memoryWorld({ projects: [{ name: 'acme/widget', family: 'acme' }], clones: { 'acme/widget': clone }, config: true })
   await real.memory.write(USER, input('talk-first'), AS_USER)
   await real.memory.write(ACME, input('release-friday'), AS_USER)
   const w = await world(real.memory)
@@ -525,6 +531,48 @@ test('a step whose family can\'t be looked up keeps the message the agent has', 
   real.services.set({ projectsError: undefined })
   assert.equal(await w.step(main, [], { step: 4, decision: next }), next)
   assert.equal(rowLogs(w).length, 1)
+
+  // dish-projects reloading (its service gone for a moment) is the same: the family isn't known, so nothing changes.
+  real.memory.clearCaches()
+  real.services.set({ projects: undefined })
+  const other = w.agent('main-2', { cwd: clone })
+  other.session.enter([memoryMessage('user+family:acme', '<dish-memory>\nThe family\'s.\n</dish-memory>')])
+  assert.equal(await w.step(other, [], { step: 2, decision: next }), next)
+  assert.deepEqual(rowLogs(w).slice(1), [
+    '[dish-memory] warn: no memory message for main-2: dish-projects isn\'t running, so the chat\'s family isn\'t known',
+  ])
+  real.services.set({ projects: [{ name: 'acme/widget', family: 'acme' }] })
+  assert.equal(await w.step(other, [], { step: 3, decision: next }), next)
+  assert.equal(rowLogs(w).length, 2)
+})
+
+test('a message that couldn\'t be read whole isn\'t delivered: one warning, and a later step delivers it whole', async () => {
+  const root = await realpath(await tempDir())
+  const clone = join(root, 'work', 'acme', 'widget')
+  await mkdir(clone, { recursive: true })
+  const real = await memoryWorld({ projects: [{ name: 'acme/widget', family: 'acme' }], clones: { 'acme/widget': clone }, config: true })
+  await real.memory.write(USER, input('talk-first'), AS_USER)
+  await real.services.store!.write([{ path: 'families/acme/direction.md', text: 'Ship the widget.\n' }], AS_USER)
+  const w = await world(real.memory)
+  const main = w.agent('main-1', { cwd: clone })
+
+  // The direction can't be read: a message without it would stand, under the full identity, until a compaction.
+  real.services.set({ configReadError: new Error('the config store is busy') })
+  assert.deepEqual(delivered(entered(await w.turn(main, [typed('Hello.')]))), [])
+  const next: PreStepDecision = { kind: 'enter', messages: [] }
+  assert.equal(await w.step(main, [], { step: 2, decision: next }), next)
+  assert.deepEqual(rowLogs(w), [
+    '[dish-memory] warn: no memory message for main-1: the message for user+family:acme isn\'t complete: could not read family acme\'s direction: the config store is busy',
+  ])
+
+  // Readable again: the next step delivers it whole, with the direction, without a compaction.
+  real.services.set({ configReadError: undefined })
+  const messages = delivered(entered(await w.turn(main, [], 3)))
+  assert.deepEqual(messages.map(message => message.source), [{ kind: 'dish-memory', form: 'instructions', identity: 'user+family:acme' }])
+  assert.match(textOf(messages[0]!), /Direction for family acme, written by your user\. Work within it\.\nShip the widget\./)
+  assert.equal(textOf(messages[0]!), await real.memory.compose({ user: true, family: 'acme' }))
+  assert.equal(rowLogs(w).length, 1)
+  assert.deepEqual(real.warnings, [])
 })
 
 test('odd agents (no session, no surface, an eventAt that throws) leave the decision unchanged, with one warning each', async () => {

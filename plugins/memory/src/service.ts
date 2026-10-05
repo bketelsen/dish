@@ -12,13 +12,15 @@
  * - **Before anything is written,** a memory's fields are checked (`INVALID`), then it is scanned for credentials
  *   (`SECRET`), then an agent's is screened by the judge, in that order: a credential never reaches the judge. One the
  *   judge scores at `warn` or above is saved held: out of the index, the message and `recall`, until the user releases
- *   it. With no judge, or one that can't screen, it is saved as usual. A person's own writes aren't screened, and keep a
- *   held memory held only while its text is what was held.
+ *   it. With no judge, or one that can't screen, it is saved as usual, but a held memory an agent changes then stays
+ *   held, since nothing screened the new text. A person's own writes aren't screened, and keep a held memory held only
+ *   while its text is what was held (`heldAfter`).
  * - **Untrusted text.** A memory's description and body, and a direction, go only into the vault, the config store and
  *   what the service returns. No error, warning or event carries them: errors name a memory by its id.
  * - **The caches.** `scopesFor` is cached per agent until the next config change (one without a family for a minute
- *   only, so a clone onboarded later is found; a lookup that fails is `UNAVAILABLE`, and not cached), and `compose` per
- *   identity until a vault commit or a config change.
+ *   only, so a clone onboarded later is found; a lookup that can't say, a sibling service gone or a broken
+ *   `projects.yaml` included, is `UNAVAILABLE`, and not cached), and `compose` per identity until a vault commit or a
+ *   config change (a message that misses a part isn't cached, and is `UNAVAILABLE` to a caller that wants it whole).
  *   The plugin calls `clearCaches` on `dish-config/changed`; the service clears `compose`'s on its own commits.
  *
  * @module dish-memory/service
@@ -49,9 +51,10 @@ export interface WriteResult { commit: CommitInfo, created: boolean, held?: stri
 export interface DishMemory {
   /**
    * user: a top-level agent (`isTopLevelAgent`); family: the project whose clone holds the working directory, by real
-   * path. Cached per agent id (and working directory) until a config change; one without a family for 60 seconds only.
-   * UNAVAILABLE, and nothing cached, when the family can't be looked up (dishProjects' `list` or dishWorkspaces'
-   * `describe` throws).
+   * path. No family when the working directory is missing or doesn't resolve, or no clone holds it. Cached per agent id
+   * (and working directory) until a config change; one without a family for 60 seconds only. UNAVAILABLE, and nothing
+   * cached, when the family can't be looked up: dishProjects, dishWorkspaces or dishConfig isn't running,
+   * `projects.yaml` doesn't parse, or dishProjects' `list` or `problem` or dishWorkspaces' `describe` throws.
    */
   scopesFor(agent: AgentLike): Promise<Scopes>
   /**
@@ -71,8 +74,13 @@ export interface DishMemory {
   delete(scope: Scope, name: string, meta: { author: Author, base?: string }): Promise<CommitInfo>
   /** NOT_FOUND; a memory that isn't held is INVALID. */
   release(scope: Scope, name: string, meta: { author: Author }): Promise<CommitInfo>
-  /** The message for an agent with these scopes, or undefined when there is nothing to say. Cached per identity until a vault commit or a config change. */
-  compose(scopes: Scopes): Promise<string | undefined>
+  /**
+   * The message for an agent with these scopes, or undefined when there is nothing to say. Cached per identity until a
+   * vault commit or a config change, only when every part could be read (a family's direction and its repos need
+   * dishConfig and dishProjects). One that misses a part is the message as far as it goes, or, with `complete`,
+   * UNAVAILABLE, saying which part and why: what an agent is given must be whole, or it would stand until a compaction.
+   */
+  compose(scopes: Scopes, options?: { complete?: boolean }): Promise<string | undefined>
   /** The direction at the config store's head, or the template (`missing`). UNAVAILABLE without dishConfig. */
   direction(family: string): Promise<DirectionInfo>
   /** Write the direction as the user; the store checks `base`. UNAVAILABLE without dishConfig. */
@@ -135,11 +143,41 @@ const FAMILY_RULE = 'family must be a lowercase name: letters, digits and hyphen
 const NAME_RULE = 'name must be lowercase letters, digits and hyphens, starting with a letter or digit, at most 64 characters'
 const SCOPE_RULE = 'a scope is the user\'s or a family\'s'
 
+/** Why an agent's held memory stays held when its text changed and Jev couldn't screen the new one. */
+const HELD_UNSCREENED = 'a held memory changed while Jev couldn\'t screen it'
+
 /** A memory file as read: its text, and what it says. */
 interface Entry { text: string, memory: MemoryFile }
 
+/** A part of the message that couldn't be read: which and why, and whether its read failed (else its service is gone). */
+interface Gap { reason: string, failed: boolean }
+
+/** A message as `compose` builds it: its text, and the parts it misses. */
+interface Built { text: string | undefined, gaps: Gap[] }
+
+/** The judge's verdict on an agent's memory, as `write` uses it. */
+type Screened = { kind: 'flagged', reason: string } | { kind: 'clean' } | { kind: 'unscreened' }
+
+/**
+ * Why a memory is held once it's written, or `undefined`. A flagged one is held, with the judge's reason. Otherwise a
+ * held memory saved with its text unchanged stays held, as it was. A changed one is released by the user's write, or by
+ * an agent's that Jev screened clean; an agent's that Jev couldn't screen keeps it held (`HELD_UNSCREENED`), so that a
+ * hold is never lifted with nothing screened. `screened` is `undefined` for the user's writes, which aren't screened.
+ */
+function heldAfter(existing: MemoryFile | undefined, input: MemoryInput, screened: Screened | undefined): string | undefined {
+  if (screened?.kind === 'flagged') return screened.reason
+  if (existing?.held === undefined) return undefined
+  if (sameText(existing, input)) return existing.held
+  return screened?.kind === 'unscreened' ? HELD_UNSCREENED : undefined
+}
+
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Names as a sentence lists them: `a`, `a and b`, `a, b and c`. */
+function listed(names: readonly string[]): string {
+  return names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)!}`
 }
 
 function checkFamily(family: unknown): string {
@@ -233,8 +271,8 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
   // tells an answer worked out before a clear from one after it, so the older one isn't kept.
   const agents = new Map<string, { scopes: Scopes, until?: number }>()
   let generation = 0
-  // compose's messages by identity, as promises, so that callers at once share one.
-  const composed = new Map<string, Promise<string | undefined>>()
+  // compose's builds by identity, as promises, so that callers at once share one. Only a whole one is kept.
+  const composed = new Map<string, Promise<Built>>()
 
   const clearCaches = (): void => {
     agents.clear()
@@ -306,10 +344,13 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
     return info
   }
 
-  /** Why an agent's memory is held, or `undefined`: the judge's verdict. No judge, or one that can't screen, holds nothing. */
-  const screen = async (id: string, input: MemoryInput, meta: { agent?: unknown, signal?: AbortSignal }): Promise<string | undefined> => {
+  /**
+   * The judge's verdict on an agent's memory: `flagged` (at `warn` or above, with why it's held), `clean`, or
+   * `unscreened` (no judge, or one that can't screen).
+   */
+  const screen = async (id: string, input: MemoryInput, meta: { agent?: unknown, signal?: AbortSignal }): Promise<Screened> => {
     const judge = services.judge()
-    if (judge === undefined) return undefined
+    if (judge === undefined) return { kind: 'unscreened' }
     try {
       const result = await judge.screenText({
         text: `${input.description}\n\n${input.body}`,
@@ -318,38 +359,52 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
         ...(meta.agent === undefined ? {} : { agent: meta.agent }),
         ...(meta.signal === undefined ? {} : { signal: meta.signal }),
       })
-      if (result.verdict !== 'warn' && result.verdict !== 'withhold') return undefined
+      if (result.verdict === 'clean') return { kind: 'clean' }
+      if (result.verdict !== 'warn' && result.verdict !== 'withhold') return { kind: 'unscreened' }
       const p = Number(result.probability)
-      return `Jev scored it ${Number.isFinite(p) ? p.toFixed(2) : 'high'} as instructions aimed at an agent`
+      return { kind: 'flagged', reason: `Jev scored it ${Number.isFinite(p) ? p.toFixed(2) : 'high'} as instructions aimed at an agent` }
     } catch {
       // screenText never throws; one that does is a judge that can't screen, and its error may quote what it was given.
-      warn(`could not screen ${id}, so it is saved as usual: the screen failed`)
-      return undefined
+      warn(`could not screen ${id}, so it is saved unscreened: the screen failed`)
+      return { kind: 'unscreened' }
     }
   }
 
   /**
    * The family whose project's clone holds `cwd`, by real path, or `undefined`. The deepest clone wins. No family is an
-   * answer: no clone holds `cwd`, `cwd` is missing or doesn't resolve, or dishProjects or dishWorkspaces isn't running.
-   * @throws `UNAVAILABLE` when the lookup itself fails (`projects.list()` or `workspaces.describe()` throws): "no family"
-   * would then be a guess, and a message for it would supersede the family's.
+   * answer when `cwd` is missing or doesn't resolve (no service is asked), or when no clone holds it.
+   * @throws `UNAVAILABLE` when the lookup can't say: dishProjects, dishWorkspaces or dishConfig isn't running (dish
+   * installs its plugins together, so one that's gone is a reload or the boot, not a setup without projects), or
+   * `projects.yaml` doesn't parse (`problem()`; `list()` is `[]` then), or `list()`, `problem()` or `describe()` throws.
+   * "No family" would then be a guess, and a message for it would supersede the family's.
    */
   const familyAt = async (cwd: unknown): Promise<string | undefined> => {
     if (typeof cwd !== 'string' || cwd === '') return undefined
-    const projects = services.projects()
-    const workspaces = services.workspaces()
-    if (projects === undefined || workspaces === undefined) return undefined
     let real: string
     try {
       real = await realpath(cwd)
     } catch {
       return undefined
     }
+    const projects = services.projects()
+    const workspaces = services.workspaces()
+    const missing = [
+      projects === undefined ? 'dish-projects' : undefined,
+      workspaces === undefined ? 'dish-workspaces' : undefined,
+      services.config() === undefined ? 'the config store' : undefined,
+    ].filter(name => name !== undefined)
+    if (projects === undefined || workspaces === undefined || missing.length > 0) {
+      throw new MemoryError('UNAVAILABLE', `${listed(missing)} ${missing.length === 1 ? 'isn\'t' : 'aren\'t'} running, so the chat's family isn't known`)
+    }
+    const unknown = (why: string): MemoryError => new MemoryError('UNAVAILABLE', `could not list the projects, so the chat's family isn't known: ${why}`)
     let list: Awaited<ReturnType<typeof projects.list>>
     try {
+      const problem = await projects.problem()
+      if (problem !== undefined) throw unknown(problem)
       list = await projects.list()
     } catch (error) {
-      throw new MemoryError('UNAVAILABLE', `could not list the projects, so the chat's family isn't known: ${describe(error)}`)
+      if (error instanceof MemoryError) throw error
+      throw unknown(describe(error))
     }
     let found: { clone: string, family: string } | undefined
     for (const project of list) {
@@ -374,11 +429,14 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
     return found?.family
   }
 
-  /** The message's parts, and whether every part could be read: one that couldn't isn't cached. */
-  const build = async (scopes: Scopes): Promise<{ text: string | undefined, complete: boolean }> => {
+  /**
+   * The message, and the parts it couldn't read (`gaps`, empty when it's whole): each says which and why, and `failed`
+   * marks one whose read threw, rather than a service that isn't running. One with a gap isn't cached.
+   */
+  const build = async (scopes: Scopes): Promise<Built> => {
     const head = await store.head()
     const parts: MessageParts = { repos: [] }
-    let complete = true
+    const gaps: Gap[] = []
     if (scopes.user) parts.user = budgeted(memoriesOf(await readScope(USER, head)), 'user', budget)
     if (scopes.family !== undefined && scopes.family !== '') {
       const family = checkFamily(scopes.family)
@@ -386,19 +444,18 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
       parts.familyMemory = budgeted(memoriesOf(await readScope({ kind: 'family', family }, head)), 'family', budget)
       const config = services.config()
       if (config === undefined) {
-        complete = false
+        gaps.push({ reason: `family ${family}'s direction: ${NO_CONFIG}`, failed: false })
       } else {
         try {
           const direction = await config.read(directionPath(family))
           if (direction !== undefined) parts.direction = direction
         } catch (error) {
-          complete = false
-          warn(`could not read family ${family}'s direction: ${describe(error)}`)
+          gaps.push({ reason: `could not read family ${family}'s direction: ${describe(error)}`, failed: true })
         }
       }
       const projects = services.projects()
       if (projects === undefined) {
-        complete = false
+        gaps.push({ reason: `family ${family}'s repos: dish-projects isn't running`, failed: false })
       } else {
         try {
           parts.repos = (await projects.list())
@@ -406,12 +463,11 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
             .map(project => ({ name: project.name, role: project.role }))
             .sort((a, b) => byText(a.name, b.name))
         } catch (error) {
-          complete = false
-          warn(`could not list family ${family}'s repos: ${describe(error)}`)
+          gaps.push({ reason: `could not list family ${family}'s repos: ${describe(error)}`, failed: true })
         }
       }
     }
-    return { text: messageText(parts), complete }
+    return { text: messageText(parts), gaps }
   }
 
   const service: DishMemory & { clearCaches(): void } = {
@@ -509,7 +565,7 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
       const kind = secretKind(description) ?? secretKind(body) ?? secretKind(note)
         ?? secretKind(serializeMemory({ name, description, type, modified: stamp(now()), body }))
       if (kind !== undefined) throw new MemoryError('SECRET', `the memory looks like it holds a credential (${kind}); never save secrets`)
-      const flagged = author.kind === 'agent' ? await screen(id, input, meta) : undefined
+      const screened = author.kind === 'agent' ? await screen(id, input, meta) : undefined
       // A call cancelled while it was screened saves nothing.
       meta.signal?.throwIfAborted()
       return queue.run(async () => {
@@ -517,8 +573,7 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
         const files = await readScope(checked, head)
         const existing = files.get(name)
         await checkBase(checked, name, existing?.text, meta.base)
-        const unchanged = existing !== undefined && sameText(existing.memory, input)
-        const held = flagged ?? (unchanged ? existing.memory.held : undefined)
+        const held = heldAfter(existing?.memory, input, screened)
         const memory: MemoryFile = { name, description, type, modified: stamp(now()), body }
         if (held !== undefined) memory.held = held
         const text = serializeMemory(memory)
@@ -568,19 +623,28 @@ export function createMemory(options: MemoryOptions): DishMemory & { clearCaches
       })
     },
 
-    async compose(scopes) {
+    async compose(scopes, options = {}) {
       const identity = identityOf(scopes)
       if (identity === '') return undefined
-      const cached = composed.get(identity)
-      if (cached !== undefined) return cached
-      const building = build(scopes)
-      const text = building.then(built => built.text)
-      composed.set(identity, text)
-      const forget = (): void => {
-        if (composed.get(identity) === text) composed.delete(identity)
+      let building = composed.get(identity)
+      if (building === undefined) {
+        const started = build(scopes)
+        building = started
+        composed.set(identity, started)
+        const forget = (): void => {
+          if (composed.get(identity) === started) composed.delete(identity)
+        }
+        started.then(built => { if (built.gaps.length > 0) forget() }, forget)
       }
-      building.then(built => { if (!built.complete) forget() }, forget)
-      return text
+      const built = await building
+      if (built.gaps.length === 0) return built.text
+      // The caller that wants a whole message is told why there's none, and says so itself; any other gets the message
+      // as far as it goes, and a read that failed is logged.
+      if (options.complete === true) {
+        throw new MemoryError('UNAVAILABLE', `the message for ${identity} isn't complete: ${built.gaps.map(gap => gap.reason).join('; ')}`)
+      }
+      for (const gap of built.gaps) if (gap.failed) warn(gap.reason)
+      return built.text
     },
 
     async direction(family) {

@@ -63,7 +63,7 @@ test('the plugin provides dishMemory and claims families/ in dishConfig', async 
     const clone = join(dir, 'clone')
     await mkdir(clone)
     let family = 'acme'
-    stubs.push(provideStub(ctx, 'dishProjects', { list: async () => [{ name: 'acme/widget', family, role: 'The widget' }] }))
+    stubs.push(provideStub(ctx, 'dishProjects', { list: async () => [{ name: 'acme/widget', family, role: 'The widget' }], problem: async () => undefined }))
     stubs.push(provideStub(ctx, 'dishWorkspaces', { describe: (project: string) => project === 'acme/widget' ? { clone } : undefined }))
     await Promise.all(stubs)
     const agent = agentAt(clone)
@@ -183,6 +183,8 @@ test('the vault restores from the remote on first start', async () => {
     assert.equal(kept?.body, 'What kept says.')
     assert.deepEqual((await service.history(ACME)).map(commit => commit.id), [written])
     assert.ok((await service.compose({ user: false, family: 'acme' }))?.includes('- family/kept — About kept (project)'))
+    // Without dishConfig and dishProjects that message misses parts: asked for a whole one, the service says so.
+    await assert.rejects(service.compose({ user: false, family: 'acme' }, { complete: true }), refusal('UNAVAILABLE', /^the message for family:acme isn't complete: /))
   } finally {
     await secondHandle.dispose()
   }

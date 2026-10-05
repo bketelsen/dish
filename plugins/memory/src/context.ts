@@ -17,10 +17,12 @@
  *   holds it to that. `dishMemory` is read with `ctx.get` on each use. Without it there's no message, and the tools
  *   answer `UNAVAILABLE`. A `scopesFor` or `compose` that fails leaves the step as it was, and the agent with the
  *   message it has, and is logged once per agent: a family that can't be looked up for a moment is `UNAVAILABLE`, not
- *   "no family", so it doesn't replace the family's message.
+ *   "no family", so it doesn't replace the family's message, and a message that misses a part (the direction, the
+ *   repos) isn't delivered until a step can read it whole.
  * - **The tools.** `remember` and `forget` are the main agent's (`isTopLevelAgent`), as `run` and `open_pr` are, and
  *   crew's `NEVER` keeps them off every child's allow list. `recall` is any dish agent's, and reads only the scopes the
- *   agent's message is for: a child sees its family's memory, not the user's.
+ *   agent's message is for: a child sees its family's memory, not the user's. The user's memory needs no family lookup,
+ *   so one that fails costs only the family's half: `recall`'s list says family memory is unavailable right now.
  * - **Untrusted text.** A memory's description and body reach an agent only in the message (framed and escaped by
  *   `format.ts`) and in `recall`'s answers. A refusal is an `Error` that starts with its code (`CONFLICT: ...`), and its
  *   message is the service's or the vault's, which names a memory by its id and never holds its text. A log line holds
@@ -56,8 +58,8 @@ export const Config: Schema<Config> = Schema.object({})
 /** What `remember` and `forget` answer anyone but the main agent. */
 export const MAIN_ONLY = 'remember and forget are for the main agent only'
 
-/** What every tool answers while `dishMemory` isn't there. */
-export const UNAVAILABLE = 'memory is unavailable: dish-memory isn\'t running'
+/** What every tool answers while `dishMemory` isn't there (its plugin is reloading, or running with a vault that didn't open). */
+export const UNAVAILABLE = 'memory is unavailable right now'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -78,7 +80,12 @@ const UNLIMITED = { lines: Number.POSITIVE_INFINITY, bytes: Number.POSITIVE_INFI
  * closing, with nothing between.
  */
 const SUPERSEDED = '<dish-memory>\nThis message supersedes earlier dish-memory messages.\n</dish-memory>'
+/** What `remember` answers scope family outside a family's repos. */
 const NO_FAMILY = 'this chat isn\'t working in a family\'s repos (scratch, or no registered project): use scope user, or open the chat in the project'
+/** What `forget` and `recall` answer a `family/` id outside a family's repos. */
+const NO_FAMILY_MEMORY = 'this chat isn\'t working in a family\'s repos (scratch, or no registered project), so family memory isn\'t available here'
+/** `recall`'s line, under the user's memory, while the chat's family can't be looked up. */
+const FAMILY_UNAVAILABLE = 'Family memory is unavailable right now: this chat\'s family can\'t be looked up. Try again later.'
 const BAD_ID = 'INVALID: an id is user/<name> or family/<name>'
 const NOTHING_SAVED = 'No memories saved yet.'
 
@@ -86,9 +93,10 @@ const REMEMBER = 'Save a memory: something a later chat should know that the cod
   + 'and the run ledgers don\'t already say. Types: feedback (what the user corrected or confirmed about how to work, with **Why:** and '
   + '**How to apply:** lines), user (who the user is and how they like to work), project (a decision and its why, a deadline, a pitfall '
   + 'in this family\'s work, with **Why:** and **How to apply:**), reference (where something lives outside the repos). Scope user is '
-  + 'for every chat; family is for the family this chat works in. Don\'t save the current task, anything derivable from the code, or a '
-  + 'secret. Use the same name to update a memory instead of adding a near-duplicate, and forget one that turns out wrong. Write dates '
-  + 'in full (2026-10-05, not "Thursday"). When the user says "remember" or "forget", do it now. Say in your closing message what you saved.'
+  + 'for every chat with your user, but crew children don\'t see it; family is for the family this chat works in, and its crew children '
+  + 'see it too, so put what they need there. Don\'t save the current task, anything derivable from the code, or a secret. Use the '
+  + 'same name to update a memory instead of adding a near-duplicate, and forget one that turns out wrong. Write dates in full '
+  + '(2026-10-05, not "Thursday"). When the user says "remember" or "forget", do it now. Say in your closing message what you saved.'
 
 const FORGET = 'Delete a memory, by its id: `user/<name>` or `family/<name>`, as the dish-memory message and `recall` list them. '
   + 'Forget one that turns out wrong or stale. When the user says "forget", do it now. Say in your closing message what you forgot.'
@@ -151,9 +159,11 @@ export interface MemoryListener extends PreStep {
  * scopes. When the scopes have nothing to say (no identity, or `compose` gives nothing), an agent that was given a
  * message for other scopes gets `SUPERSEDED` under its new identity, and one that never was gets nothing. A step that
  * is rejected, the first step with nothing to enter (as dsh-agent-instructions leaves it), and a world without
- * `dishMemory` are left as they are. Any error from here on (`scopesFor` is `UNAVAILABLE` when it can't look the family
- * up) leaves the decision as `next()` gave it, so the message the agent has stays its message, and `warn` is called
- * once per agent. An error from `next()` is the caller's.
+ * `dishMemory` are left as they are. Any error from here on leaves the decision as `next()` gave it, so the message the
+ * agent has stays its message, and `warn` is called once per agent; a later step tries again. `scopesFor` is
+ * `UNAVAILABLE` when it can't look the family up, and `compose` is asked for a whole message (`complete`), so one that
+ * misses its direction or repos is `UNAVAILABLE` too, not delivered under the full identity. An error from `next()` is
+ * the caller's.
  */
 export function memoryListener(ctx: Context, warn: (agentId: string, message: string) => void): MemoryListener {
   const told = new Set<string>()
@@ -167,7 +177,7 @@ export function memoryListener(ctx: Context, warn: (agentId: string, message: st
       const identity = identityOf(scopes)
       const current = deliveredIdentity(agent, decision.messages)
       if (current === identity) return decision
-      const text = (identity === '' ? undefined : await memory.compose(scopes)) ?? (current === undefined ? undefined : SUPERSEDED)
+      const text = (identity === '' ? undefined : await memory.compose(scopes, { complete: true })) ?? (current === undefined ? undefined : SUPERSEDED)
       if (text === undefined) return decision
       const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'dish-memory', form: 'instructions', identity } })
       const last = decision.messages.findLastIndex(entered => claimed.includes(entered))
@@ -257,15 +267,19 @@ function memoryTools(ctx: Context): ToolDefinition[] {
     return memory
   }
 
-  /** The scopes a call's agent sees: its message's. No agent sees none. */
-  const scopesOf = async (memory: DishMemory, agent: Agent | undefined): Promise<Scopes> =>
-    agent === undefined ? { user: false } : memory.scopesFor(agent)
+  /**
+   * The family a call's agent works in, as its message has it, or `undefined` (and for no agent). The user's memory needs
+   * no lookup: an agent sees it when it's the main agent (`isTopLevelAgent`), as `scopesFor` says too.
+   * @throws `scopesFor`'s `UNAVAILABLE` when the family can't be looked up.
+   */
+  const familyFor = async (memory: DishMemory, agent: Agent | undefined): Promise<string | undefined> =>
+    agent === undefined ? undefined : familyOf(await memory.scopesFor(agent))
 
-  /** The scope `kind` names for this agent. @throws the scope error for a family outside one. */
-  const scopeFor = async (memory: DishMemory, agent: Agent | undefined, kind: Scope['kind']): Promise<Scope> => {
+  /** The scope `kind` names for this agent. @throws `outside` for a family outside one. */
+  const scopeFor = async (memory: DishMemory, agent: Agent | undefined, kind: Scope['kind'], outside: string): Promise<Scope> => {
     if (kind === 'user') return USER
-    const family = familyOf(await scopesOf(memory, agent))
-    if (family === undefined) throw new Error(NO_FAMILY)
+    const family = await familyFor(memory, agent)
+    if (family === undefined) throw new Error(outside)
     return { kind: 'family', family }
   }
 
@@ -273,7 +287,11 @@ function memoryTools(ctx: Context): ToolDefinition[] {
     name: 'remember',
     description: REMEMBER,
     parameters: {
-      scope: { type: 'string', enum: ['user', 'family'], required: true, description: 'user, for every chat; or family, for the family this chat works in (only in a project\'s repos).' },
+      scope: {
+        type: 'string', enum: ['user', 'family'], required: true,
+        description: 'user, for every chat with your user, but crew children don\'t see it; or family, for the family this chat works in '
+          + '(only in a project\'s repos), and its crew children see it too.',
+      },
       name: { type: 'string', required: true, description: 'Lowercase letters, digits and hyphens, at most 64 characters, such as `talk-before-specs`. An existing name in the scope is replaced.' },
       type: { type: 'string', enum: TYPES, required: true, description: 'feedback, user, project or reference: see above.' },
       description: { type: 'string', required: true, description: `One line of at most ${DESCRIPTION_MAX} characters: what the memory says, as the list in the dish-memory message shows it.` },
@@ -284,7 +302,7 @@ function memoryTools(ctx: Context): ToolDefinition[] {
       const agent = mainAgent(exec)
       const memory = service()
       return refusals(async () => {
-        const scope = await scopeFor(memory, agent, args.scope)
+        const scope = await scopeFor(memory, agent, args.scope, NO_FAMILY)
         const result = await memory.write(scope, { name: args.name, type: args.type, description: args.description, body: args.body }, {
           author: { kind: 'agent', sessionId: String(agent.id), role: 'main' }, agent, signal: exec.signal,
         })
@@ -306,7 +324,7 @@ function memoryTools(ctx: Context): ToolDefinition[] {
       return refusals(async () => {
         const { kind, name: memoryName } = parseId(args.id)
         const id = memoryId(kind, memoryName)
-        const scope = await scopeFor(memory, agent, kind)
+        const scope = await scopeFor(memory, agent, kind, NO_FAMILY_MEMORY)
         try {
           const info = await memory.delete(scope, memoryName, { author: { kind: 'agent', sessionId: String(agent.id), role: 'main' } })
           return { text: `Forgot \`${id}\`, commit ${short(info.id)}.` }
@@ -328,21 +346,30 @@ function memoryTools(ctx: Context): ToolDefinition[] {
     async execute(args, exec) {
       const memory = service()
       return refusals(async () => {
-        const scopes = await scopesOf(memory, exec.agent)
+        // The user's memory is the main agent's, as its message is: no family lookup is needed for it.
+        const user = isTopLevelAgent(exec.agent)
         const wanted = args.id?.trim() ?? ''
         if (wanted === '') {
-          const family = familyOf(scopes)
+          // A family that can't be looked up costs only the family's half: the user's is listed, with a line about it.
+          let family: string | undefined
+          let unavailable = false
+          try {
+            family = await familyFor(memory, exec.agent)
+          } catch {
+            unavailable = true
+          }
           const groups = [
-            scopes.user ? listed('Your user:', 'user', await memory.list(USER)) : undefined,
+            user ? listed('Your user:', 'user', await memory.list(USER)) : undefined,
             family === undefined ? undefined : listed(`Family ${family}:`, 'family', await memory.list({ kind: 'family', family })),
+            unavailable ? FAMILY_UNAVAILABLE : undefined,
           ].filter(group => group !== undefined)
           return { text: groups.length === 0 ? NOTHING_SAVED : groups.join('\n\n') }
         }
         const { kind, name: memoryName } = parseId(wanted)
         const id = memoryId(kind, memoryName)
         // User memory is only for the agents whose message has it: for the others, there's no such memory.
-        if (kind === 'user' && !scopes.user) throw new Error(notFound(id))
-        const found = await memory.read(await scopeFor(memory, exec.agent, kind), memoryName)
+        if (kind === 'user' && !user) throw new Error(notFound(id))
+        const found = await memory.read(await scopeFor(memory, exec.agent, kind, NO_FAMILY_MEMORY), memoryName)
         if (found === undefined) throw new Error(notFound(id))
         if (found.held !== undefined) return { text: `\`${id}\` is held for the user's review and can't be read.` }
         return { text: `\`${id}\` (${found.type}, modified ${found.modified})\n\n${found.description}\n\n${found.body}` }

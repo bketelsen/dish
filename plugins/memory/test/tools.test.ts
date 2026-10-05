@@ -19,6 +19,9 @@ import { ACME, AS_AGENT, AS_USER, USER, agentAt, fakeJudge, input, memoryWorld, 
 import type { FakeJudge, MemoryWorld } from './helpers.ts'
 
 const NO_FAMILY = 'this chat isn\'t working in a family\'s repos (scratch, or no registered project): use scope user, or open the chat in the project'
+/** What `forget` and `recall` answer a `family/` id outside a family. */
+const NO_FAMILY_MEMORY = 'this chat isn\'t working in a family\'s repos (scratch, or no registered project), so family memory isn\'t available here'
+const FAMILY_UNAVAILABLE = 'Family memory is unavailable right now: this chat\'s family can\'t be looked up. Try again later.'
 const BAD_ID = 'INVALID: an id is user/<name> or family/<name>'
 const WARN = { verdict: 'warn', probability: 0.734 } as const
 const CLEAN = { verdict: 'clean', probability: 0.02 } as const
@@ -26,7 +29,7 @@ const CLEAN = { verdict: 'clean', probability: 0.02 } as const
 const MARKER = 'UNTRUSTED-MARKER'
 
 /** `remember`'s description, as the plan gives it. */
-const REMEMBER_DESCRIPTION = 'Save a memory: something a later chat should know that the code, git history, AGENTS.md, the family\'s direction and the run ledgers don\'t already say. Types: feedback (what the user corrected or confirmed about how to work, with **Why:** and **How to apply:** lines), user (who the user is and how they like to work), project (a decision and its why, a deadline, a pitfall in this family\'s work, with **Why:** and **How to apply:**), reference (where something lives outside the repos). Scope user is for every chat; family is for the family this chat works in. Don\'t save the current task, anything derivable from the code, or a secret. Use the same name to update a memory instead of adding a near-duplicate, and forget one that turns out wrong. Write dates in full (2026-10-05, not "Thursday"). When the user says "remember" or "forget", do it now. Say in your closing message what you saved.'
+const REMEMBER_DESCRIPTION = 'Save a memory: something a later chat should know that the code, git history, AGENTS.md, the family\'s direction and the run ledgers don\'t already say. Types: feedback (what the user corrected or confirmed about how to work, with **Why:** and **How to apply:** lines), user (who the user is and how they like to work), project (a decision and its why, a deadline, a pitfall in this family\'s work, with **Why:** and **How to apply:**), reference (where something lives outside the repos). Scope user is for every chat with your user, but crew children don\'t see it; family is for the family this chat works in, and its crew children see it too, so put what they need there. Don\'t save the current task, anything derivable from the code, or a secret. Use the same name to update a memory instead of adding a near-duplicate, and forget one that turns out wrong. Write dates in full (2026-10-05, not "Thursday"). When the user says "remember" or "forget", do it now. Say in your closing message what you saved.'
 
 const disposables: Array<{ dispose(): unknown }> = []
 after(async () => {
@@ -80,6 +83,7 @@ async function world(options: { service?: boolean, wrap?: (memory: DishMemory) =
   const memory = await memoryWorld({
     projects: [{ name: 'acme/widget', family: 'acme' }],
     clones: { 'acme/widget': clone },
+    config: true,
     ...options.judge === undefined ? {} : { judge: options.judge },
     ...options.budget === undefined ? {} : { budget: options.budget },
   })
@@ -139,7 +143,10 @@ test('remember saves, and the answer has the id and commit', async () => {
     assert.ok(names(w.child).includes(name), name)
     assert.ok(!names(w.outside).includes(name), name)
   }
-  assert.equal(w.ctx.tools.schemas(w.main as object).find(schema => schema.name === 'remember')?.description, REMEMBER_DESCRIPTION)
+  const rememberSchema = w.ctx.tools.schemas(w.main as object).find(schema => schema.name === 'remember')
+  assert.equal(rememberSchema?.description, REMEMBER_DESCRIPTION)
+  // The scope parameter says the same: children don't see user memory, and do see the family's.
+  assert.match(JSON.stringify(rememberSchema?.parameters), /crew children don't see it.*its crew children see it too/)
 
   const body = 'Brainstorm before writing a spec.\n\n**Why:** the user said so on 2026-10-05.\n\n**How to apply:** ask first.'
   assert.equal(await w.answer('remember', remembered('talk-first', { body }), w.main), `Saved \`user/talk-first\` (new), commit ${await w.short()}.`)
@@ -229,7 +236,7 @@ test('forget, an unknown id, a malformed id', async () => {
   for (const id of ['talk-first', 'team/talk-first', 'user/', 'user/Talk', 'user/memory', '']) {
     assert.equal(await w.refused('forget', { id }, w.main), `Error: ${BAD_ID}`, id)
   }
-  assert.equal(await w.refused('forget', { id: 'family/release-friday' }, w.scratch), `Error: ${NO_FAMILY}`)
+  assert.equal(await w.refused('forget', { id: 'family/release-friday' }, w.scratch), `Error: ${NO_FAMILY_MEMORY}`)
   assert.equal(await w.memory.store.head(), head)
 })
 
@@ -268,13 +275,40 @@ test('recall with an id; a held one can\'t be read', async () => {
   assert.equal(await w.refused('recall', { id: 'user/none' }, w.main), 'Error: NOT_FOUND: no memory user/none; recall with no id lists them')
   // User memory isn't in a child's scopes: for it, there's no such memory.
   assert.equal(await w.refused('recall', { id: 'user/talk-first' }, w.child), 'Error: NOT_FOUND: no memory user/talk-first; recall with no id lists them')
-  assert.equal(await w.refused('recall', { id: 'family/release-friday' }, w.scratch), `Error: ${NO_FAMILY}`)
+  assert.equal(await w.refused('recall', { id: 'family/release-friday' }, w.scratch), `Error: ${NO_FAMILY_MEMORY}`)
   assert.equal(await w.refused('recall', { id: 'release-friday' }, w.main), `Error: ${BAD_ID}`)
+})
+
+test('while the family can\'t be looked up, user memory still works; recall lists it and says family memory is unavailable', async () => {
+  const w = await world()
+  await w.memory.memory.write(USER, input('talk-first'), AS_USER)
+  await w.memory.memory.write(ACME, input('release-friday'), AS_USER)
+  w.memory.services.set({ projectsError: new Error('the config store is busy') })
+  const lookup = 'Error: UNAVAILABLE: could not list the projects, so the chat\'s family isn\'t known: the config store is busy'
+
+  // recall with no id: the user half, and a line, not an error. A child sees only the line.
+  assert.equal(await w.answer('recall', {}, w.main), `Your user:\n- user/talk-first — About talk-first (feedback)\n\n${FAMILY_UNAVAILABLE}`)
+  assert.equal(await w.answer('recall', {}, w.child), FAMILY_UNAVAILABLE)
+  // A user id reads; a family id is UNAVAILABLE.
+  assert.match(await w.answer('recall', { id: 'user/talk-first' }, w.main), /^`user\/talk-first` \(feedback/)
+  assert.equal(await w.refused('recall', { id: 'user/talk-first' }, w.child), 'Error: NOT_FOUND: no memory user/talk-first; recall with no id lists them')
+  assert.equal(await w.refused('recall', { id: 'family/release-friday' }, w.main), lookup)
+  // remember and forget in scope user go on; in scope family they're UNAVAILABLE.
+  assert.equal(await w.answer('remember', remembered('pitfall'), w.main), `Saved \`user/pitfall\` (new), commit ${await w.short()}.`)
+  assert.equal(await w.answer('forget', { id: 'user/pitfall' }, w.main), `Forgot \`user/pitfall\`, commit ${await w.short()}.`)
+  assert.equal(await w.refused('forget', { id: 'family/release-friday' }, w.main), lookup)
+
+  // With no user memory, the line alone.
+  await w.memory.memory.delete(USER, 'talk-first', AS_USER)
+  assert.equal(await w.answer('recall', {}, w.main), FAMILY_UNAVAILABLE)
+  // Well again: both halves.
+  w.memory.services.set({ projectsError: undefined })
+  assert.equal(await w.answer('recall', {}, w.main), 'Family acme:\n- family/release-friday — About release-friday (feedback)')
 })
 
 test('no service: UNAVAILABLE from all three', async () => {
   const w = await world({ service: false })
-  assert.equal(UNAVAILABLE, 'memory is unavailable: dish-memory isn\'t running')
+  assert.equal(UNAVAILABLE, 'memory is unavailable right now')
   assert.equal(await w.refused('remember', remembered('talk-first'), w.main), `Error: ${UNAVAILABLE}`)
   assert.equal(await w.refused('forget', { id: 'user/talk-first' }, w.main), `Error: ${UNAVAILABLE}`)
   assert.equal(await w.refused('recall', {}, w.main), `Error: ${UNAVAILABLE}`)

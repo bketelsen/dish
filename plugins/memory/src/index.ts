@@ -198,7 +198,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     write: (scope, input, meta) => service.write(scope, input, meta),
     delete: (scope, memoryName, meta) => service.delete(scope, memoryName, meta),
     release: (scope, memoryName, meta) => service.release(scope, memoryName, meta),
-    compose: scopes => service.compose(scopes),
+    compose: (scopes, options) => service.compose(scopes, options),
     direction: family => service.direction(family),
     saveDirection: (family, direction, meta) => service.saveDirection(family, direction, meta),
     history: (scope, options) => service.history(scope, options),

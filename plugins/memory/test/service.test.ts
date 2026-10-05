@@ -17,6 +17,7 @@ import type { FakeJudge } from './helpers.ts'
 
 const WARN = { verdict: 'warn', probability: 0.734 } as const
 const HELD_WARN = 'Jev scored it 0.73 as instructions aimed at an agent'
+const HELD_UNSCREENED = 'a held memory changed while Jev couldn\'t screen it'
 /** Text that must never reach an error, a warning or a log line. */
 const MARKER = 'UNTRUSTED-MARKER'
 
@@ -269,6 +270,52 @@ test('an agent\'s unchanged save of a held memory keeps it held, whether the jud
   assert.equal(await w.store.read('user/MEMORY.md'), `${indexLine('flagged')}\n`)
 })
 
+test('an agent\'s changed save of a held memory stays held while Jev can\'t screen it: unscreened, a judge that throws, or no judge', async () => {
+  const judge = fakeJudge([WARN, { verdict: 'unscreened', reason: 'the judge is unavailable' }, new Error('the judge broke'), { verdict: 'clean', probability: 0.1 }])
+  const w = await memoryWorld({ judge })
+  assert.equal((await w.memory.write(USER, input('flagged'), AS_AGENT)).held, HELD_WARN)
+  await w.memory.write(USER, input('plain'), AS_USER)
+  const steps: Array<[string, () => void]> = [
+    ['unscreened', () => {}],
+    ['thrown', () => {}],
+    ['no judge', () => { w.services.set({ judge: undefined }) }],
+  ]
+  for (const [what, before] of steps) {
+    before()
+    w.clock.now += 1000
+    const body = `Reworded while Jev couldn't screen it (${what}).`
+    const saved = await w.memory.write(USER, input('flagged', { body }), AS_AGENT)
+    assert.equal(saved.held, HELD_UNSCREENED, what)
+    assert.equal(saved.count, 1, what)
+    const read = await w.memory.read(USER, 'flagged')
+    assert.equal(read?.held, HELD_UNSCREENED, what)
+    assert.equal(read?.body, body, what)
+    // Out of the index and the message.
+    assert.equal(await w.store.read('user/MEMORY.md'), `${indexLine('plain')}\n`, what)
+    const message = await w.memory.compose({ user: true })
+    assert.ok(message?.includes('user/plain') && !message.includes('user/flagged'), message)
+  }
+  // Only the judge's verdict is said about it: a warning for the screen that failed, and never the memory's text.
+  assert.equal(w.warnings.length, 1)
+  assert.match(w.warnings[0]!, /user\/flagged/)
+
+  // Once Jev screens a changed text clean, it's released, as a new memory would be.
+  w.services.set({ judge })
+  w.clock.now += 1000
+  const clean = await w.memory.write(USER, input('flagged', { body: 'Reworded once more.' }), AS_AGENT)
+  assert.equal(clean.held, undefined)
+  assert.equal(await w.store.read('user/MEMORY.md'), `${indexLine('flagged')}\n${indexLine('plain')}\n`)
+
+  // A memory that isn't held is saved as usual when Jev can't screen its change.
+  w.services.set({ judge: undefined })
+  assert.equal((await w.memory.write(USER, input('plain', { body: 'Changed, unscreened.' }), AS_AGENT)).held, undefined)
+  // And a user's change of a held one still clears it: the user wrote what is there now.
+  w.services.set({ judge: fakeJudge([WARN]) })
+  assert.equal((await w.memory.write(USER, input('again'), AS_AGENT)).held, HELD_WARN)
+  w.services.set({ judge: undefined })
+  assert.equal((await w.memory.write(USER, input('again', { body: 'Reworded by the user.' }), AS_USER)).held, undefined)
+})
+
 test('base: CONFLICT when the memory changed since; another memory\'s change is no conflict', async () => {
   const w = await memoryWorld()
   const first = await w.memory.write(USER, input('a'), AS_USER)
@@ -371,6 +418,7 @@ test('scopesFor: a clone, a worktree under it, a sibling with a shared prefix, s
   const w = await memoryWorld({
     projects: [{ name: 'acme/widget', family: 'acme' }, { name: 'beta/gone', family: 'beta' }],
     clones: { 'acme/widget': dirs.clone, 'beta/gone': join(dirs.work, 'beta', 'gone') },
+    config: true,
   })
   const scopes = (cwd: string | undefined, depth = 0) => w.memory.scopesFor(agentAt(cwd, { depth }))
   assert.deepEqual(await scopes(dirs.clone), { user: true, family: 'acme' })
@@ -392,19 +440,47 @@ test('scopesFor: a clone, a worktree under it, a sibling with a shared prefix, s
   w.services.set({ clones: { 'acme/widget': dirs.link } })
   w.memory.clearCaches()
   assert.deepEqual(await scopes(dirs.worktree), { user: true, family: 'acme' })
+})
 
-  // Without dishProjects or dishWorkspaces, there's no family.
+test('scopesFor: a missing service or a broken projects.yaml is UNAVAILABLE, not "no family", and keeps nothing', async () => {
+  const dirs = await workTree()
+  const projects = [{ name: 'acme/widget', family: 'acme' }]
+  const w = await memoryWorld({ projects, clones: { 'acme/widget': dirs.clone }, config: true })
+  const config = w.services.store!
+  const agent = agentAt(dirs.worktree)
+  // dish installs its plugins together: a service that isn't there is a gap for a moment (a reload, the boot), and "no
+  // family" would give the chat a message that supersedes its family's.
+  const gaps: Array<[string, () => void, string]> = [
+    ['no dishProjects', () => { w.services.set({ projects: undefined }) }, 'dish-projects isn\'t running, so the chat\'s family isn\'t known'],
+    ['no dishWorkspaces', () => { w.services.set({ clones: undefined }) }, 'dish-workspaces isn\'t running, so the chat\'s family isn\'t known'],
+    ['no dishConfig', () => { w.services.set({ config: undefined }) }, 'the config store isn\'t running, so the chat\'s family isn\'t known'],
+    ['none of them', () => { w.services.set({ projects: undefined, clones: undefined, config: undefined }) },
+      'dish-projects, dish-workspaces and the config store aren\'t running, so the chat\'s family isn\'t known'],
+    ['a broken projects.yaml', () => { w.services.set({ projectsProblem: 'projects.yaml: line 3: a project needs a family' }) },
+      'could not list the projects, so the chat\'s family isn\'t known: projects.yaml: line 3: a project needs a family'],
+  ]
+  for (const [what, gap, message] of gaps) {
+    gap()
+    await assert.rejects(w.memory.scopesFor(agent), refusal('UNAVAILABLE', message), what)
+    // A cwd that is missing, or doesn't resolve, needs no service: no family.
+    assert.deepEqual(await w.memory.scopesFor(agentAt(undefined)), { user: true }, what)
+    assert.deepEqual(await w.memory.scopesFor(agentAt(join(dirs.root, 'missing'))), { user: true }, what)
+    // Nothing was kept: with the gap closed, the family is found at once, without a config change.
+    w.services.set({ projects, clones: { 'acme/widget': dirs.clone }, config, projectsProblem: undefined })
+    assert.deepEqual(await w.memory.scopesFor(agent), { user: true, family: 'acme' }, what)
+    w.memory.clearCaches()
+  }
+  // Scratch is "no family" only when the lookup could say so.
   w.services.set({ projects: undefined })
-  w.memory.clearCaches()
-  assert.deepEqual(await scopes(dirs.clone), { user: true })
-  w.services.set({ projects: [{ name: 'acme/widget', family: 'acme' }], clones: undefined })
-  w.memory.clearCaches()
-  assert.deepEqual(await scopes(dirs.clone), { user: true })
+  await assert.rejects(w.memory.scopesFor(agentAt(dirs.scratch)), refusal('UNAVAILABLE'))
+  w.services.set({ projects })
+  assert.deepEqual(await w.memory.scopesFor(agentAt(dirs.scratch)), { user: true })
+  assert.deepEqual(w.warnings, [])
 })
 
 test('scopesFor is cached until a dish-config change', async () => {
   const dirs = await workTree()
-  const w = await memoryWorld({ projects: [{ name: 'acme/widget', family: 'acme' }], clones: { 'acme/widget': dirs.clone } })
+  const w = await memoryWorld({ projects: [{ name: 'acme/widget', family: 'acme' }], clones: { 'acme/widget': dirs.clone }, config: true })
   const agent = agentAt(dirs.worktree)
   assert.deepEqual(await w.memory.scopesFor(agent), { user: true, family: 'acme' })
   const asked = w.services.calls.list
@@ -502,6 +578,55 @@ test('compose doesn\'t cache a message it couldn\'t read every part of', async (
   // A whole one is kept: a change behind the service's back doesn't show until the caches clear.
   await config.write([{ path: 'families/acme/direction.md', text: 'Keep it smaller.\n' }], AS_USER)
   assert.equal(await w.memory.compose({ user: false, family: 'acme' }), back)
+})
+
+test('compose with complete: UNAVAILABLE for a message it couldn\'t read every part of, without memory text', async () => {
+  const projects = [{ name: 'acme/api', family: 'acme', role: 'The API' }]
+  const w = await memoryWorld({ projects, config: true })
+  const config = w.services.store!
+  await config.write([{ path: 'families/acme/direction.md', text: 'Keep it small.\n' }], AS_USER)
+  await w.memory.write(ACME, input('x', { description: MARKER, body: MARKER }), AS_USER)
+  const whole = messageText({
+    family: 'acme', direction: 'Keep it small.\n', repos: [{ name: 'acme/api', role: 'The API' }],
+    familyMemory: { lines: [`- family/x — ${MARKER} (feedback)`], more: 0, nearFull: false },
+  })
+  const gaps: Array<[string, () => void, string]> = [
+    ['no dishConfig', () => { w.services.set({ config: undefined }) }, 'family acme\'s direction: the config store isn\'t running'],
+    ['a direction that can\'t be read', () => { w.services.set({ configReadError: new Error('the config store is busy') }) },
+      'could not read family acme\'s direction: the config store is busy'],
+    ['no dishProjects', () => { w.services.set({ projects: undefined }) }, 'family acme\'s repos: dish-projects isn\'t running'],
+    ['projects that can\'t be listed', () => { w.services.set({ projectsError: new Error('projects.yaml is unreadable') }) },
+      'could not list family acme\'s repos: projects.yaml is unreadable'],
+  ]
+  for (const [what, gap, reason] of gaps) {
+    gap()
+    const warned = w.warnings.length
+    await assert.rejects(w.memory.compose({ user: true, family: 'acme' }, { complete: true }), (error: unknown) => {
+      refusal('UNAVAILABLE', `the message for user+family:acme isn't complete: ${reason}`)(error)
+      assert.ok(!(error as Error).message.includes(MARKER))
+      return true
+    }, what)
+    // The caller that asked for a whole message says so: the service adds no warning of its own.
+    assert.equal(w.warnings.length, warned, what)
+    // Without `complete` (Settings → Memory's preview), the message as far as it goes.
+    const partial = await w.memory.compose({ user: true, family: 'acme' })
+    assert.ok(partial?.includes(`- family/x — ${MARKER} (feedback)`) && partial !== whole, what)
+    // Nothing was kept: with the gap closed, the whole message, at once.
+    w.services.set({ projects, config, configReadError: undefined, projectsError: undefined })
+    assert.equal(await w.memory.compose({ user: true, family: 'acme' }, { complete: true }), whole, what)
+    w.memory.clearCaches()
+  }
+  assert.ok(w.warnings.every(warning => !warning.includes(MARKER)), w.warnings.join('\n'))
+  // A user-only message has no part to miss, and nothing to say is no failure.
+  assert.equal(await w.memory.compose({ user: true }, { complete: true }), undefined)
+  // Two callers at once share one build: the one that asked for a whole message is refused, the other isn't.
+  w.services.set({ config: undefined })
+  const [strict, lenient] = await Promise.allSettled([
+    w.memory.compose({ user: false, family: 'acme' }, { complete: true }),
+    w.memory.compose({ user: false, family: 'acme' }),
+  ])
+  assert.equal(strict.status, 'rejected')
+  assert.equal(lenient.status, 'fulfilled')
 })
 
 test('the budget: more and nearFull reach the write\'s result', async () => {
@@ -631,7 +756,7 @@ test('direction and saveDirection: UNAVAILABLE without dishConfig; saveDirection
 
 test('scopesFor: no family is cached for 60 seconds, a family until a config change', async () => {
   const dirs = await workTree()
-  const w = await memoryWorld({ projects: [{ name: 'acme/widget', family: 'acme' }], clones: {} })
+  const w = await memoryWorld({ projects: [{ name: 'acme/widget', family: 'acme' }], clones: {}, config: true })
   const agent = agentAt(dirs.clone)
   assert.deepEqual(await w.memory.scopesFor(agent), { user: true })
   // Onboarded since: not seen for a minute.
