@@ -1,6 +1,6 @@
 # Spec: browser (`dish-browser`)
 
-Status: Draft 2026-10-04, from the brainstorm (the user's six answers are under Decisions), with the four [Questions for you](#questions-for-you) answered the same day (decisions 8–11) and the spike's results in [Checks](#checks-2026-10-04); waiting for your review. It is the backlog row "A shared browser (step-sized)" in [ROADMAP.md](../../ROADMAP.md#backlog), and it covers the row before it, "Dev-server previews": you see an agent's dev server in the Browser tab. It builds on [crew](crew.md) (role tool lists), the [judge](judge.md) (the result screen) and [prompts](prompts.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources, and every claim about Playwright against the spike on the VM or a local copy of playwright-core 1.62.1's types; see [Checks](#checks-2026-10-04). Revised 2026-10-04 from the plan ([docs/plans/2026-10-04-browser.md](../plans/2026-10-04-browser.md), its Spec corrections, checked against playwright-core 1.63.0's published package); items 4 (service workers) and 15 (how the end-to-end run is driven) there are for your review.
+Status: Draft 2026-10-04, from the brainstorm (the user's six answers are under Decisions), with the four [Questions for you](#questions-for-you) answered the same day (decisions 8–11) and the spike's results in [Checks](#checks-2026-10-04); waiting for your review. It was the backlog row "A shared browser (step-sized)", now step 7a in [ROADMAP.md](../../ROADMAP.md), and it covers the row before it, "Dev-server previews": you see an agent's dev server in the Browser tab. It builds on [crew](crew.md) (role tool lists), the [judge](judge.md) (the result screen) and [prompts](prompts.md). Every claim about dsh below was checked against dsh 0.2.0-rc.2's sources, and every claim about Playwright against the spike on the VM or a local copy of playwright-core 1.62.1's types; see [Checks](#checks-2026-10-04). Revised 2026-10-04 from the plan ([docs/plans/2026-10-04-browser.md](../plans/2026-10-04-browser.md), its Spec corrections, checked against playwright-core 1.63.0's published package); items 4 (service workers) and 15 (how the end-to-end run is driven) there are for your review. Built on branch `browser` (2026-10-04), its real-Chromium tests run in the VM's gate, and checked end to end in a scratch dsh on the VM; awaiting review and the rollout. What the build added is under [Notes from the build](#notes-from-the-build); it reversed item 4: service workers are allowed.
 
 ## Summary
 
@@ -53,7 +53,7 @@ Agents can screenshot a page today only through `chromium --headless --screensho
 
 **One browser per agent session.** A browser is a `BrowserContext` with one page, keyed by the agent's session id (dsh's agent id is its session id).
 - **Its viewport** is fixed at `viewport` (1280×800). The tab scales the picture; it never resizes the page. So you and the agent see the same layout, and screenshots stay comparable.
-- **Context options:** `acceptDownloads: false`, and `serviceWorkers: 'block'`, since a service worker's own requests bypass the context's route. Nothing else differs from Playwright's defaults.
+- **Context options:** `acceptDownloads: false`, and `serviceWorkers: 'allow'`, Playwright's default, set explicitly: with it, the context's route sees a service worker's script and its fetches, and aborts a refused one ([Notes from the build](#notes-from-the-build)). Nothing else differs from Playwright's defaults.
 - **What it remembers:** its session's workspace root, the last snapshot it gave the agent, your input since the agent's last call, the console errors and failed requests since the last read, and when it was last used. It keeps no parent: the switcher reads crew's record.
 - **The workspace root** is `ctx.sandboxPolicy.resolve({ session }).workspaceRoot`: the session's cwd, canonical. It is what the sandbox enforces and what `bash` uses, and dish-judge reads it the same way. A crew child works in its parent's workspace, so a coder's browser can open files anywhere in the project's clone, its worktrees included.
 
@@ -393,7 +393,9 @@ The shipped defaults change, and `previous.json` is regenerated for each (dish-p
 - **Screenshots are kept** in dsh's attachment store with the session, as `read_image`'s are.
 - **The tab's picture is lossy JPEG,** and small text can blur. A screenshot is a PNG.
 - **No HTTP cache, and a hop per request.** With a route on the context, Playwright turns its cache off, and every request goes through Node to be checked. Pages load slower in the agent's browser than in yours.
-- **No service workers** in the agent's browser: a dev server's offline caching or PWA behaviour can't be checked there.
+- **Redirects aren't routed.** Playwright's route sees only the first URL of a redirect chain (playwright-core 1.63.0 `types/types.d.ts`, `route`'s notes). A subresource that redirects to dsh's own address isn't aborted; a main-frame redirect there is caught after it lands (`framenavigated`), and the page is sent to `about:blank`.
+- **Host names that resolve to loopback,** such as `127.0.0.1.nip.io`, reach dsh's port: the rules know loopback by name and address, not by what a name resolves to. dsh still needs its browser-session cookie.
+- **A dedicated Worker's WebSocket isn't routed:** `routeWebSocket` doesn't see a socket a `new Worker(…)` opens, so one to dsh's address isn't closed. The same cookie applies.
 - **`browser_wait`'s text** is looked for in the main frame, not in iframes.
 - **Browsers live in memory.** A restart closes every browser, and crew children's browsers last one run (decision 10).
 
@@ -491,3 +493,58 @@ Against dsh 0.2.0-rc.2's sources, under `node_modules/.pnpm/@deepseek-ai+<packag
 5. **Popups, downloads, the screencast:** `page.on('popup')` fires for a `target=_blank` link, with its URL; with `acceptDownloads: false`, `download` fires with a failure ("Pass { acceptDownloads: true } …") and nothing is saved; `Page.screencastFrame`'s metadata has `deviceWidth`, `deviceHeight`, `pageScaleFactor`, `scrollOffsetX/Y` and `offsetTop`.
 6. **The temporary profile** goes to `TMPDIR` (`playwright_chromiumdev_profile-*`, `playwright-artifacts-*`), removed at `close()`; Chromium leaves one `org.chromium.Chromium.*` directory, which the unit's 10-day aging removes.
 7. **Size:** dsh estimates a text block at `ceil(chars / 4) + 4` tokens (`dsh-token-meter`'s `estimateContent`, `CHARS_PER_TOKEN = 4`, `BLOCK_OVERHEAD = 4`), so 30,000 characters is about 7,500 of the 12,500. A list of 1,500 links gave a 209,697-character snapshot: the cut is needed.
+
+## Notes from the build
+
+What the build decided beyond this spec as revised on 2026-10-04 (the plan's Spec corrections are in the text above), from the controller's ledger and the tasks' reports and reviews. Each was checked against the code. [plugins/browser/README.md](../../plugins/browser/README.md) has the plugin as built.
+
+**The gateway check** (the plan's Task 0). A source-mode stream's uplink works through dsh's real `TypertGatewayService`, in process (`plugins/browser/test/gateway.test.ts`): the method gets `this.ctx.invocation`, uplink items arrive as the JSON values sent, one by one and in order, and aborting the call's signal ends the stream. So the plan's fallback, unary calls for the tab's input, wasn't needed. Two rules came with it:
+- **No remote parameter is named `session` or `agent`.** Source mode matches dsh's lookups by parameter name, so `watch` takes `sessionId`, which stays a JSON value.
+- **The uplink is read as it arrives.** dsh's inbox (262,144 bytes a stream) fails the stream when it overflows, so `watch` reads its uplink into a queue of its own and never waits for what an item does: a navigation can take about 33 s.
+
+The WebSocket leg, the same for every stream, is the end-to-end run's.
+
+**Service workers are allowed: correction 4 reversed** (the controller's decision, in Task 2).
+- **The plan** blocked them (`serviceWorkers: 'block'`), so that the context's route would see every request.
+- **Building the driver showed `'block'` doesn't do that.** In playwright-core 1.63.0 it only replaces the usual `navigator.serviceWorker.register`: a page that calls the container's own method (`ServiceWorkerContainer.prototype.register.call(…)`) still registers a worker. And with `'block'`, Playwright stops watching service workers, so that worker's requests would bypass the route.
+- **With `'allow'`,** Playwright routes a service worker's script and its fetches through the context's route, which aborts a refused one. A real-Chromium test registers a worker both ways, and checks that the route saw its script and its fetches, and that a refused fetch never reached the server.
+- **So the context allows service workers** ([The plugin](#the-plugin)). A dev server's offline caching or PWA works in the agent's browser, and Known limits no longer says it doesn't. The plan's Risks line about blocked workers stays as the plan wrote it.
+
+**Known limits the build found** (now under [Known limits](#known-limits)):
+- **Redirects:** Playwright's route sees only the first URL of a redirect chain. A subresource that redirects to dsh's own address isn't aborted; a main-frame redirect there is caught by `framenavigated` after it lands.
+- **Loopback host names:** a name that resolves to loopback, such as `127.0.0.1.nip.io`, reaches dsh's port.
+- **A dedicated Worker's WebSocket** isn't seen by `routeWebSocket`.
+- **`TMPDIR`'s length:** Chromium's singleton socket goes in an `org.chromium.Chromium.*` directory under `TMPDIR`, and a socket's path holds at most 107 bytes, so a long `TMPDIR` keeps Chromium from starting ("Socket path too long"). The VM's `~/.cache/dish/tmp` is short; `deploy/README.md` (The state) and the plugin's README (Tests) say so.
+
+**Refs.**
+- **Main-frame refs change form after a navigation.** After a page's second new document, Playwright numbers the main frame anew, and its refs carry a frame part: `e7` becomes something like `f1e2`. Chromium's error page's refs do too. `REF` takes both forms, and the tools' texts say "such as e7 or f1e7".
+- **A stale ref is "Not done:" at once,** without the 5 s wait: `hasRef` is asked first, and a ref whose frame is gone, or that matches nothing, is the driver's `DriverTimeout('stale ref')` at once.
+- **Refs from a subtree `browser_read` stay usable outside it** (correction 1): the full snapshot taken after it re-arms them. The agent's last snapshot stays the full tree it last got, so the next action's "Unchanged" check compares against that.
+- **A ref copied with its brackets** (`[ref=e7]`) or as `ref=e7` is taken too.
+
+**The snapshot.**
+- **Password values are blanked on more than a textbox's line:** any textbox, searchbox, combobox or spinbutton that shows a value, inline or in a block (with a placeholder, the value is on a `- text:` line under it). Task 1's review found three shapes that leaked.
+- **A field with no ref to check it by** (covered, or not visible) has its value left out unchecked, as "(its value isn't shown)", and so does any field past the first 200 checked.
+- **Every pattern runs in time linear in the line,** since a page controls the text: a crafted line took 26 s before the review's fix, and 0.7 ms after.
+- **The password check fails with fixed words,** since the page's own script can throw inside it, and the scroll position is read over CDP (`Page.getLayoutMetrics`), with no script of the page.
+
+**The driver.**
+- **Every Playwright call that doesn't time out by itself is bounded,** so a frozen page (a script in an endless loop) ends a call within about 5 s, never a hang. A page's snapshot has 10 s, and typing without a ref 5 s and 25 ms a character.
+- **An error keeps only the first line of Playwright's message:** the call log under it names the page's elements and what was typed.
+- **A failure dish has no words for** is an error that says the action may have happened: "The browser didn't finish this call: the page may be busy or stuck, and what you asked may have happened. `browser_read` shows the page as it is now: check it before you repeat an action."
+
+**The core.**
+- **A call that waited 30 s at the cap** fails with "All 6 browsers dish keeps are in use by other calls; try again in a moment.", not the eviction's words. An address bar's opening at the cap gets it at once, as a notice.
+- **A close for idleness or by the tab's Close** leaves a note for the session's next browser too, as eviction and Chromium's restart do: "dish closed this browser after 15 minutes unused; this page is new, and cookies and sign-ins are gone." and "The user closed this browser; this page is new, and cookies and sign-ins are gone." A close because the agent was disposed, the chat archived or dsh stopped leaves none.
+- **One of the tab's navigations counts as in use,** as a call does: neither eviction nor the sweep takes its browser meanwhile.
+- **A refused main-frame navigation** goes to `about:blank` once the route's abort is through, since Chromium commits its error page after it. A popup's first navigation reaches the route as not the session's own page, so a refused popup is closed and noted with the address it tried: "The page opened a new window at an address dish doesn't allow (<what>); dish closed it."
+- **The workspace** is the sandbox policy's `workspaceRoot`, else the session's own working directory (`header.cwd`), real-pathed.
+- **Log lines hold no address at all,** not even an origin: Chromium's own messages have theirs replaced by `<address>`.
+
+**The stream and the tab.**
+- **A refused watch's reasons** are "That isn't a chat." and "This chat is archived.", in `words.ts` with the other sentences.
+- **The tab acks every frame it gets,** drawn or not (the source it already shows, or one it can't draw), so the host needs no ack timeout.
+- **Each new generation of the stream** is told again whether the tab wants frames; a watch starts with frames off. A stream that fails for good is opened again after 1 s, doubling to 30 s.
+- **The client's own sentences live in the client,** not in `words.ts` as the plan's contracts said: the tab's lines and its empty and closed states in `src/client/TabView.tsx`, the toolview's in `ScreenshotView.tsx`, the header button's in `HeaderButton.tsx`. `words.ts` imports dish-kit's host entry and the URL rules (`node:fs`), which the browser bundle can't load. Everything the host words (a closed browser's reason, a notice, a refusal, every tool result) comes from `words.ts`.
+
+**End to end:** (to come: the end-to-end run on the VM)
