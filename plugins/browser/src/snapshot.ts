@@ -1,6 +1,7 @@
 /**
  * A page's aria snapshot (`ariaSnapshot({ mode: 'ai' })`), made fit for a result: a password field's value blanked, secrets
- * masked, and the text cut at a line end. And the words for one element, from its line.
+ * masked, and the text cut at a line end, with the sections past the cut named. What a browser keeps of it (`keep`). And
+ * the words for one element, from its line.
  *
  * The lines are in the shape playwright-core 1.63.0's renderer gives them (`renderAriaSnapshotAsYaml` and its helpers, in
  * the injected script of `lib/coreBundle.js`):
@@ -21,6 +22,7 @@
  * @module dish-browser/snapshot
  */
 
+import { createHash } from 'node:crypto'
 import { maskSecrets } from 'dish-kit'
 import { PASSWORD_CHECKS } from './types.ts'
 import { ELEMENT_MAX, PASSWORD_HIDDEN, quoted, VALUE_HIDDEN } from './words.ts'
@@ -29,11 +31,36 @@ import { ELEMENT_MAX, PASSWORD_HIDDEN, quoted, VALUE_HIDDEN } from './words.ts'
 export const REF = /^(?:f\d+)?e\d+$/
 
 export interface Processed {
+  /** What a result shows: the text cut at a line end, within `max` with the sections' words. */
   text: string
-  /** The masked text's length, before the cut. */
+  /** All of it, masked and blanked, before the cut. */
+  whole: string
+  /** `whole`'s length. */
   total: number
   cut: boolean
+  /**
+   * When cut, the sections whose line is past the cut, by their words (`region "Bottom" [ref=e3002]`): the shallowest
+   * first, up to `SECTIONS_LISTED` and a sixteenth of `max`, listed in page order; and how many more there are.
+   */
+  sections: { listed: string[], more: number }
 }
+
+/** What a browser keeps of the full snapshot its agent last got: the text for `elementOf`, and a digest of all of it. */
+export interface Kept {
+  /** `whole` up to `KEEP_FACTOR` × max, cut at a line end. */
+  text: string
+  /** SHA-256 of `whole`, all of it: the unchanged line compares these. */
+  digest: string
+}
+
+/** How much of a snapshot a browser keeps, in `snapshotChars`: 4, so 120,000 characters at the default. */
+export const KEEP_FACTOR = 4
+/** The most sections past the cut a result names. */
+const SECTIONS_LISTED = 20
+/** The share of `max` the sections' words may take: a sixteenth (1,875 characters of 30,000). */
+const SECTIONS_SHARE = 16
+/** The roles a section has: what `browser_read` with a ref usefully reads. */
+const SECTION_ROLES = 'main|navigation|region|form|complementary|article|list|table|dialog'
 
 /**
  * A key's name: JSON-quoted; a lone `/`, which ends where the attributes or the key do; or a name that starts and ends with
@@ -67,6 +94,8 @@ const BARE = new RegExp(String.raw`^${keyLine(VALUE_ROLES)}$`)
 const VALUE_LINE = new RegExp(String.raw`^ *- '?(${VALUE_ROLES})\b`)
 /** Any node's line, for `elementOf`, also as `processSnapshot` leaves it. */
 const ANY = new RegExp(String.raw`^${keyLine('[a-z][a-z-]*')}${HIDDEN}(?::(?: [^\n]*)?)?$`)
+/** A section's line, from where the line starts (sticky: `lastIndex` is set to the line's start). */
+const SECTION_AT = new RegExp(String.raw` *- '?(?:${SECTION_ROLES})\b`, 'y')
 /** A block's value line. */
 const TEXT_LINE = /^ *- text: /
 /** A textbox's placeholder line, which comes before its value line. */
@@ -152,12 +181,53 @@ function headOf(text: string, units: number): string {
   return /[\ud800-\udbff]$/.test(head) ? head.slice(0, -1) : head
 }
 
+/** Where `text` is cut to at most `max`: its last line end past half of `max`, else `max` (never inside a surrogate pair). */
+function cutEnd(text: string, max: number): number {
+  const lineEnd = text.lastIndexOf('\n', max)
+  return headOf(text, lineEnd > max / 2 ? lineEnd : max).length
+}
+
+interface Section { at: number, indent: number, words: string }
+
+/** The sections whose line starts after `from`'s line, in page order. */
+function sectionsAfter(text: string, from: number): Section[] {
+  const found: Section[] = []
+  for (let end = text.indexOf('\n', from); end !== -1;) {
+    const start = end + 1
+    end = text.indexOf('\n', start)
+    SECTION_AT.lastIndex = start
+    if (!SECTION_AT.test(text)) continue
+    const line = text.slice(start, end === -1 ? text.length : end)
+    const words = lineWords(line)
+    if (words !== undefined) found.push({ at: start, indent: indentOf(line), words: words.words })
+  }
+  return found
+}
+
+/** Of `found`, the shallowest first, up to `SECTIONS_LISTED` whose words, joined, fit in `room`; in page order. */
+function pick(found: readonly Section[], room: number): Section[] {
+  const order = found.map((section, index) => ({ section, index })).sort((a, b) => a.section.indent - b.section.indent || a.index - b.index)
+  const picked: Section[] = []
+  let used = 0
+  for (const { section } of order) {
+    if (picked.length >= SECTIONS_LISTED) break
+    const cost = section.words.length + (picked.length > 0 ? ', '.length : 0)
+    if (used + cost > room) continue
+    picked.push(section)
+    used += cost
+  }
+  return picked.sort((a, b) => a.at - b.at)
+}
+
 /**
  * Blank password values, mask secrets, cut at `max` at a line end. `isPassword` rejecting counts as a password.
  *
  * The candidates are the lines of a textbox, a searchbox, a combobox or a spinbutton that show a value. The first
  * `PASSWORD_CHECKS` of them with a ref are checked, in parallel. One past them, or with no ref to check it by (covered, or
  * not visible), has its value blanked unchecked.
+ *
+ * A text over `max` is cut, and the sections past the cut are named, so that a read with one's ref reaches it: up to a
+ * sixteenth of `max` is set aside for their words, and the tree takes what they leave, so the two stay within `max`.
  */
 export async function processSnapshot(raw: string, isPassword: (ref: string) => Promise<boolean>, max: number): Promise<Processed> {
   const lines = raw.split('\n')
@@ -178,9 +248,25 @@ export async function processSnapshot(raw: string, isPassword: (ref: string) => 
     if (candidate.valueLine !== undefined) gone.add(candidate.valueLine)
   }
   const text = maskSecrets(lines.filter((_, index) => !gone.has(index)).join('\n'))
-  if (text.length <= max) return { text, total: text.length, cut: false }
-  const lineEnd = text.lastIndexOf('\n', max)
-  return { text: headOf(text, lineEnd > max / 2 ? lineEnd : max), total: text.length, cut: true }
+  if (text.length <= max) return { text, whole: text, total: text.length, cut: false, sections: { listed: [], more: 0 } }
+  const found = sectionsAfter(text, cutEnd(text, max - Math.floor(max / SECTIONS_SHARE)))
+  const picked = pick(found, Math.floor(max / SECTIONS_SHARE))
+  const end = cutEnd(text, max - picked.map(section => section.words).join(', ').length)
+  // The tree took the room the sections left: one now in it is no longer past the cut.
+  const listed = picked.filter(section => section.at >= end).map(section => section.words)
+  const past = found.filter(section => section.at >= end).length
+  return { text: text.slice(0, end), whole: text, total: text.length, cut: true, sections: { listed, more: past - listed.length } }
+}
+
+/** What a browser keeps of `processed`, a full snapshot cut at `max`: see `Kept`. */
+export function keep(processed: Processed, max: number): Kept {
+  return { text: keepText(processed.whole, max), digest: createHash('sha256').update(processed.whole).digest('base64') }
+}
+
+/** `text` up to `KEEP_FACTOR` × `max`, cut at a line end: what a browser keeps to name elements by. */
+export function keepText(text: string, max: number): string {
+  const limit = KEEP_FACTOR * max
+  return text.length <= limit ? text : text.slice(0, cutEnd(text, limit))
 }
 
 /** A key's name as a reader sees it: `''` undone in a quoted key, and the JSON quoting taken off. */
@@ -194,25 +280,46 @@ function nameText(name: string, quotedKey: boolean): string {
   }
 }
 
+/** A node's line as words (`button "Save" [ref=e14]`, cut to 120) and its ref; undefined for a line with no ref. */
+function lineWords(line: string): { words: string, ref: string } | undefined {
+  const match = ANY.exec(line)
+  const ref = match === null ? undefined : refOf(match.groups!.attrs)
+  if (match === null || ref === undefined) return undefined
+  const tail = ` [ref=${ref}]`
+  const role = match.groups!.role!
+  const name = match.groups!.name
+  const room = ELEMENT_MAX - role.length - ' ""'.length - tail.length
+  if (name === undefined || room < 2) return { words: `${role}${tail}`, ref }
+  const words = quoted(nameText(name, match.groups!.q === '\''), room)
+  return { words: words === '' ? `${role}${tail}` : `${role} "${words}"${tail}`, ref }
+}
+
+/** The words for `ref` from its line in `snapshot`, or undefined. */
+function wordsIn(snapshot: string | undefined, ref: string): string | undefined {
+  if (snapshot === undefined || !REF.test(ref)) return undefined
+  const needle = `[ref=${ref}]`
+  for (let at = snapshot.indexOf(needle); at !== -1; at = snapshot.indexOf(needle, at + needle.length)) {
+    const start = snapshot.lastIndexOf('\n', at) + 1
+    const end = snapshot.indexOf('\n', at)
+    const words = lineWords(snapshot.slice(start, end === -1 ? snapshot.length : end))
+    if (words?.ref === ref) return words.words
+  }
+  return undefined
+}
+
 /**
  * The words for `ref` from its snapshot line (`button "Save" [ref=e14]`, cut to 120), else `[ref=e14]`. A line
  * `processSnapshot` blanked is known too.
  */
 export function elementOf(snapshot: string | undefined, ref: string): string {
-  const tail = ` [ref=${ref}]`
-  if (snapshot === undefined || !REF.test(ref)) return tail.trimStart()
-  const needle = `[ref=${ref}]`
-  for (let at = snapshot.indexOf(needle); at !== -1; at = snapshot.indexOf(needle, at + needle.length)) {
-    const start = snapshot.lastIndexOf('\n', at) + 1
-    const end = snapshot.indexOf('\n', at)
-    const match = ANY.exec(snapshot.slice(start, end === -1 ? snapshot.length : end))
-    if (match === null || refOf(match.groups!.attrs) !== ref) continue
-    const role = match.groups!.role!
-    const name = match.groups!.name
-    const room = ELEMENT_MAX - role.length - ' ""'.length - tail.length
-    if (name === undefined || room < 2) return `${role}${tail}`
-    const words = quoted(nameText(name, match.groups!.q === '\''), room)
-    return words === '' ? `${role}${tail}` : `${role} "${words}"${tail}`
+  return wordsIn(snapshot, ref) ?? `[ref=${ref}]`
+}
+
+/** `elementOf` over several texts: the first that knows `ref`, else `[ref=e14]`. */
+export function elementIn(snapshots: ReadonlyArray<string | undefined>, ref: string): string {
+  for (const snapshot of snapshots) {
+    const words = wordsIn(snapshot, ref)
+    if (words !== undefined) return words
   }
-  return tail.trimStart()
+  return `[ref=${ref}]`
 }

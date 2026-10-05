@@ -52,6 +52,8 @@ export type Note =
   | { kind: 'filechooser' }
   | { kind: 'blocked', what: string }
   | { kind: 'crashed' }
+  /** The page stopped answering (a script that never ends), and dish replaced it with a new one in the same context. */
+  | { kind: 'frozen' }
   /** This browser is new: the last one closed for `reason`. */
   | { kind: 'reopened', reason: CloseReason }
 
@@ -69,7 +71,7 @@ export interface UserActivity {
   last: number
 }
 
-export type BrowserErrorCode = 'unavailable' | 'wont-start' | 'busy' | 'closed' | 'crashed'
+export type BrowserErrorCode = 'unavailable' | 'wont-start' | 'busy' | 'closed' | 'crashed' | 'frozen'
 
 export type TabNotice =
   | Note

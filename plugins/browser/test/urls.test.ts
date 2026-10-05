@@ -113,6 +113,19 @@ test('file:// inside the workspace opens: a file, a directory, the root, a link 
   assert.equal(ok(await checkUrl(`file://localhost${join(workspace, 'index.html')}`, places(), 'typed')), fileUrl(join(workspace, 'index.html')))
 })
 
+test('file:// on another host (a share on another machine) is refused in its own words, not the scheme\'s', async () => {
+  for (const sharedTmp of [false, true]) {
+    for (const from of ['typed', 'page'] as const) {
+      const share = refused(await checkUrl(`file://nas${join(workspace, 'index.html')}`, places({ sharedTmp }), from))
+      assert.deepEqual(share, {
+        what: 'file://nas/',
+        reason: `file://nas/ addresses (a file on another machine) aren't opened here: only file:/// paths in this chat's workspace${sharedTmp ? ' or /tmp' : ''}.`,
+      }, `${from}, sharedTmp ${sharedTmp}`)
+    }
+  }
+  assert.equal(refused(await resolveUrl('file://Server.Example/x', places())).what, 'file://server.example/')
+})
+
 test('file:// outside the workspace, through a link out, or missing is refused', async () => {
   const outside = refused(await checkUrl(fileUrl(join(outsideDir, 'secret.txt')), places(), 'page'))
   assert.equal(outside.what, join(outsideDir, 'secret.txt'))
@@ -159,6 +172,13 @@ test('about:blank opens, with a query or a fragment; any other about: is refused
   const config = refused(await resolveUrl('about:config', places()))
   assert.deepEqual(config, { what: 'about:', reason: `about:${SCHEME_TAIL}` })
   refused(await checkUrl('about:srcdoc', places(), 'page'))
+})
+
+test('the scheme refusal says /tmp where it counts', async () => {
+  const tmpTail = ' addresses aren\'t opened here: only http, https, file:// in this chat\'s workspace or /tmp, and about:blank.'
+  assert.deepEqual(refused(await resolveUrl('javascript:alert(1)', places({ sharedTmp: true }))), { what: 'javascript:', reason: `javascript:${tmpTail}` })
+  assert.deepEqual(refused(await checkUrl('chrome://settings', places({ sharedTmp: true }), 'page')), { what: 'chrome:', reason: `chrome:${tmpTail}` })
+  assert.deepEqual(refused(await checkUrl('about:config', places({ workspace: undefined, sharedTmp: true }), 'typed')), { what: 'about:', reason: `about:${tmpTail}` })
 })
 
 test('every other scheme is refused, typed and from the page', async () => {

@@ -42,8 +42,8 @@ function notUrl(text: string): UrlCheck {
   return { ok: false, what: NOT_A_URL, reason: urlRefusal.notUrl(text) }
 }
 
-function schemeRefused(scheme: string): UrlCheck {
-  return { ok: false, what: scheme, reason: urlRefusal.scheme(scheme) }
+function schemeRefused(scheme: string, places: UrlPlaces): UrlCheck {
+  return { ok: false, what: scheme, reason: urlRefusal.scheme(scheme, places.sharedTmp) }
 }
 
 /** What the agent or the address bar typed: made a URL, then checked as typed. */
@@ -79,13 +79,13 @@ export async function checkUrl(url: string, places: UrlPlaces, from: 'typed' | '
       if (isOwnUrl(parsed.href, places.own)) return { ok: false, what: OWN_WHAT, reason: urlRefusal.own(parsed.href) }
       return { ok: true, url: parsed.href }
     case 'about:':
-      return parsed.pathname === 'blank' ? { ok: true, url: parsed.href } : schemeRefused(parsed.protocol)
+      return parsed.pathname === 'blank' ? { ok: true, url: parsed.href } : schemeRefused(parsed.protocol, places)
     case 'file:':
       return checkFile(parsed, places)
     case 'chrome-error:':
-      return from === 'page' ? { ok: true, url: parsed.href } : schemeRefused(parsed.protocol)
+      return from === 'page' ? { ok: true, url: parsed.href } : schemeRefused(parsed.protocol, places)
     default:
-      return schemeRefused(parsed.protocol)
+      return schemeRefused(parsed.protocol, places)
   }
 }
 
@@ -111,7 +111,9 @@ async function realTmp(): Promise<string> {
 /** A `file:` URL: its real path inside the workspace, or under `/tmp` when it counts. */
 async function checkFile(parsed: URL, places: UrlPlaces): Promise<UrlCheck> {
   // `file://localhost/x` parses with an empty host; another host is a remote share, which isn't this chat's workspace.
-  if (parsed.hostname !== '' && parsed.hostname !== 'localhost') return schemeRefused(parsed.protocol)
+  if (parsed.hostname !== '' && parsed.hostname !== 'localhost') {
+    return { ok: false, what: `file://${parsed.hostname}/`, reason: urlRefusal.remoteFile(parsed.hostname, places.sharedTmp) }
+  }
   let path: string
   try {
     path = fileURLToPath(parsed)

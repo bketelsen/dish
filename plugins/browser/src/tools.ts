@@ -14,9 +14,12 @@
  *   A stale ref is found with `hasRef` before the action, or by the driver at once.
  * - **Errors (`isError`) carry dish's words only,** with at most the agent's own masked URL: never page text, nor a driver's
  *   message, because the judge doesn't screen errors.
- * - **A run uses the page it is given,** never `browser.page`, and never calls `browser.call`. Once its call is over (the
- *   browser closed, or the page crashed and the queue moved on), it takes nothing from the browser: no notes, no logs, no
- *   snapshot.
+ * - **A page that stopped answering** (a call's timeout, then no answer to a trivial script within 1 s) is replaced in its
+ *   context, cookies kept, and the call fails with words that say so. `browser_navigate` asks first, and goes on, on the
+ *   new page. A page that answers is only slow, and stays.
+ * - **A run uses the page it is given** (or the one that replaced it), never `browser.page`, and never calls
+ *   `browser.call`. Once its call is over (the browser closed, or the page crashed and the queue moved on), it takes
+ *   nothing from the browser: no notes, no logs, no snapshot.
  * - **Nothing here logs.** A URL, a typed text or a value never reaches a log line.
  *
  * @module dish-browser/tools
@@ -34,15 +37,15 @@ import type { DriverPage } from './driver.ts'
 import type { Viewport } from './protocol.ts'
 import { ownAddress, workspaceOf } from './services.ts'
 import type { ImageRef, Services } from './services.ts'
-import { BrowserError } from './session.ts'
+import { ALWAYS_NOTED, BrowserError } from './session.ts'
 import type { SessionBrowser } from './session.ts'
-import { elementOf, processSnapshot, REF } from './snapshot.ts'
+import { elementIn, keep, keepText, processSnapshot, REF } from './snapshot.ts'
 import type { Processed } from './snapshot.ts'
-import { LOAD_MS, NAV_MS, REF_MS, SETTLE_MS, SHOT_MS, WAIT_MAX_S } from './types.ts'
+import { LISTED, LOAD_MS, NAV_MS, REF_MS, SETTLE_MS, SHOT_MS, WAIT_MAX_S } from './types.ts'
 import type { Limits, OwnAddress, UrlCheck, UrlPlaces, UrlRules } from './types.ts'
 import {
-  done, errorsNote, errorText, navigationFailure, notDone, noteText, quoted, readExtra, refusal, resultText, screenshotText, shown,
-  urlRefusal, userText,
+  done, errorsNote, errorText, eventsLeftOut, navigationFailure, notDone, noteText, quoted, readExtra, refusal, resultText, screenshotText,
+  shown, urlRefusal, userText,
 } from './words.ts'
 import type { ResultParts } from './words.ts'
 
@@ -67,6 +70,8 @@ export const TOOL_NAMES: readonly string[] = [
 
 /** The time for a page's snapshot: a big page takes a while; a stuck one never answers. */
 const SNAPSHOT_MS = SHOT_MS
+/** The time a page has to answer a trivial script before dish takes it for frozen (a script that never ends). */
+const PROBE_MS = 1_000
 /** The time per character for `type` without a ref, which types one character at a time, on top of `REF_MS`. */
 const TYPE_CHAR_MS = 25
 /** The characters kept of an argument in a call's title. */
@@ -187,6 +192,7 @@ function callerOf(exec: ToolRunContext): Caller {
 /** What a call is in its browser's queue: the page it runs on, and whether it may still take from the browser. */
 interface Call {
   browser: SessionBrowser
+  /** The queue's page, or the one that replaced it when it stopped answering (`browser_navigate`). */
   page: DriverPage
   signal: AbortSignal
   /** @throws DriverClosed once this call is over: the browser closed, or the page crashed and the queue moved on. */
@@ -236,14 +242,24 @@ class Tools {
     }
   }
 
-  /** `run` in the browser's queue, its failures in dish's words. */
+  /**
+   * `run` in the browser's queue, its failures in dish's words. A run that timed out on a page that no longer answers
+   * leaves a new page in its place (`frozen`).
+   */
   async inQueue<T>(browser: SessionBrowser, signal: AbortSignal, run: (call: Call) => Promise<T>): Promise<T> {
     let over = false
     try {
-      return await browser.call(signal, page => run({
-        browser, page, signal,
-        live: () => { if (over || browser.closedReason !== undefined || browser.page !== page) throw new DriverClosed('this call is over') },
-      }))
+      return await browser.call(signal, async page => {
+        const call: Call = {
+          browser, page, signal,
+          live: () => { if (over || browser.closedReason !== undefined || browser.page !== call.page) throw new DriverClosed('this call is over') },
+        }
+        try {
+          return await run(call)
+        } catch (error) {
+          throw await frozen(call, error)
+        }
+      })
     } catch (error) {
       throw await failureOf(error, browser, this.limits, signal)
     } finally {
@@ -285,24 +301,33 @@ class Tools {
     // From here on, synchronous: what the result takes from the browser.
     const notes = this.notes(browser, { url, title }, options.read !== true)
     const extra = options.read === true ? readExtra(scroll, browser.takeLogs()) : undefined
-    const whole = subtree === undefined
-    const unchanged = whole && options.read !== true && options.failed !== true && part.text === browser.lastSnapshot
+    // The whole page compared, not the cut part: a change past the cut is a change.
+    const kept = subtree === undefined ? keep(part, max) : undefined
+    const unchanged = kept !== undefined && options.read !== true && options.failed !== true && kept.digest === browser.lastSnapshot?.digest
     const snapshot: ResultParts['snapshot'] = unchanged ? { kind: 'unchanged' } : tree(part, max)
     // A subtree read leaves the last snapshot as it was: it is what the agent's refs came from.
-    if (whole) browser.lastSnapshot = part.text
+    if (kept !== undefined) browser.lastSnapshot = kept
+    else browser.lastSubtree = keepText(part.whole, max)
     const text = resultText({ ...options.done === undefined ? {} : { done: options.done }, notes, page: { url, title }, ...extra === undefined ? {} : { extra }, snapshot })
     return { text: maskSecrets(text), url, title }
   }
 
   /**
-   * The notes, in order: the user's (when they acted), the page's events, and the errors since the last result (left out
-   * of a read, which lists them).
+   * The notes, in order: the user's (when they acted); why the browser or its page is new (a restart, a crash, a frozen
+   * page); the newest 10 of the page's events (dialogs, popups, downloads), after a count of those left out; and the errors
+   * since the last read, when new ones came (left out of a read, which lists them). However much a page does, the notes
+   * stay a few thousand characters.
    */
   notes(browser: SessionBrowser, page: { url: string, title: string }, errors: boolean): string[] {
     const taken = browser.takeNotes()
     const notes: string[] = []
     if (taken.user !== undefined) notes.push(userText(taken.user, page, this.deps.clock.now()))
-    for (const event of taken.events) notes.push(noteText(event, this.limits))
+    for (const event of taken.events.filter(note => ALWAYS_NOTED.has(note.kind))) notes.push(noteText(event, this.limits))
+    const events = taken.events.filter(note => !ALWAYS_NOTED.has(note.kind))
+    const listed = events.slice(-LISTED)
+    const leftOut = taken.leftOut + events.length - listed.length
+    if (leftOut > 0) notes.push(eventsLeftOut(leftOut))
+    for (const event of listed) notes.push(noteText(event, this.limits))
     const counts = browser.newLogCounts()
     const note = errors ? errorsNote(counts) : undefined
     if (note !== undefined) notes.push(note)
@@ -329,6 +354,8 @@ class Tools {
     const target = check.url
     const browser = await this.browser(caller, workspace, exec.signal)
     return this.inQueue(browser, exec.signal, async call => {
+      // A page that doesn't answer would hold the navigation up for its 30 s: a new page takes the agent where it asked.
+      if (!(await call.page.responds(PROBE_MS).catch(() => true))) call.page = await browser.replaceFrozen(call.page, true)
       const { page, signal } = call
       const same = page.url() === target
       try {
@@ -336,6 +363,7 @@ class Tools {
         else await page.goto(target, { timeoutMs: NAV_MS, loadMs: LOAD_MS, signal })
       } catch (error) {
         if (!pageFailure(error, signal)) throw error
+        await unlessFrozen(call, error)
         return { text: (await this.pageResult(call, { done: navigationFailure(target, failureMessage(error)), failed: true })).text }
       }
       const line = same ? done.reloaded(target) : done.opened(target, page.url())
@@ -351,6 +379,7 @@ class Tools {
         moved = await page.back({ timeoutMs: NAV_MS, signal })
       } catch (error) {
         if (!pageFailure(error, signal)) throw error
+        await unlessFrozen(call, error)
         return { text: (await this.pageResult(call, { done: navigationFailure(page.url(), failureMessage(error)), failed: true })).text }
       }
       if (!moved) return { text: (await this.pageResult(call, { done: notDone.noBack(), failed: true })).text }
@@ -365,7 +394,7 @@ class Tools {
       await browser.ensureAllowed()
       if (ref === undefined) return { text: (await this.pageResult(call, { read: true })).text }
       let raw = ''
-      const failed = await onRef(page, ref, signal, async () => { raw = await page.snapshot({ ref, timeoutMs: REF_MS, signal }) })
+      const failed = await onRef(call, ref, async () => { raw = await page.snapshot({ ref, timeoutMs: REF_MS, signal }) })
       if (failed !== undefined) return { text: (await this.pageResult(call, { done: failed, failed: true, read: true })).text }
       const subtree = await processSnapshot(raw, part => page.isPassword(part), this.deps.config.snapshotChars)
       return { text: (await this.pageResult(call, { read: true, subtree })).text }
@@ -385,8 +414,8 @@ class Tools {
       const before = page.url()
       let line: string
       if (ref !== undefined) {
-        const words = elementOf(browser.lastSnapshot, ref)
-        const failed = await onRef(page, ref, signal, () => page.click({ ref }, { timeoutMs: REF_MS, double, signal }))
+        const words = wordsOf(browser, ref)
+        const failed = await onRef(call, ref, () => page.click({ ref }, { timeoutMs: REF_MS, double, signal }))
         if (failed !== undefined) return { text: (await this.pageResult(call, { done: failed, failed: true })).text }
         line = done.clicked(words, double)
       } else {
@@ -408,8 +437,8 @@ class Tools {
       const before = page.url()
       let words: string | undefined
       if (ref !== undefined) {
-        words = elementOf(browser.lastSnapshot, ref)
-        const failed = await onRef(page, ref, signal, () => page.fill(ref, text, { timeoutMs: REF_MS, signal }))
+        words = wordsOf(browser, ref)
+        const failed = await onRef(call, ref, () => page.fill(ref, text, { timeoutMs: REF_MS, signal }))
         if (failed !== undefined) return { text: (await this.pageResult(call, { done: failed, failed: true })).text }
       } else {
         await page.type(text, { timeoutMs: REF_MS + text.length * TYPE_CHAR_MS, signal })
@@ -420,6 +449,7 @@ class Tools {
         try {
           await page.press('Enter', { ref, timeoutMs: REF_MS, signal })
         } catch (error) {
+          await unlessFrozen(call, error)
           failed = refFailure(error, ref, signal)
         }
         if (failed !== undefined) return { text: (await this.pageResult(call, { done: failed, failed: true })).text }
@@ -441,8 +471,8 @@ class Tools {
       const before = page.url()
       let words: string | undefined
       if (ref !== undefined) {
-        words = elementOf(browser.lastSnapshot, ref)
-        const failed = await onRef(page, ref, signal, () => page.press(key, { ref, timeoutMs: REF_MS, signal }), key)
+        words = wordsOf(browser, ref)
+        const failed = await onRef(call, ref, () => page.press(key, { ref, timeoutMs: REF_MS, signal }), key)
         if (failed !== undefined) return { text: (await this.pageResult(call, { done: failed, failed: true })).text }
       } else {
         try {
@@ -465,10 +495,14 @@ class Tools {
     return this.onPage(exec, async call => {
       const { browser, page, signal } = call
       const before = page.url()
-      const words = elementOf(browser.lastSnapshot, ref)
+      const words = wordsOf(browser, ref)
       let chosen: string[] = []
-      const failed = await onRef(page, ref, signal, async () => { chosen = await page.select(ref, values, { timeoutMs: REF_MS, signal }) })
-      if (failed !== undefined) return { text: (await this.pageResult(call, { done: failed, failed: true })).text }
+      const failed = await onRef(call, ref, async () => { chosen = await page.select(ref, values, { timeoutMs: REF_MS, signal }) })
+      if (failed !== undefined) {
+        // Playwright waits for a matching option to appear (a script may fill the list): none, and a stuck element, time out alike.
+        const line = failed === notDone.slow(ref) ? notDone.noOption(ref, values) : failed
+        return { text: (await this.pageResult(call, { done: line, failed: true })).text }
+      }
       await page.settle(SETTLE_MS)
       return { text: (await this.pageResult(call, { done: done.chose(chosen, words) + moved(before, page) })).text }
     })
@@ -481,8 +515,8 @@ class Tools {
     return this.onPage(exec, async call => {
       const { browser, page, signal } = call
       if (ref !== undefined) {
-        const words = elementOf(browser.lastSnapshot, ref)
-        const failed = await onRef(page, ref, signal, () => page.scrollIntoView(ref, { timeoutMs: REF_MS, signal }))
+        const words = wordsOf(browser, ref)
+        const failed = await onRef(call, ref, () => page.scrollIntoView(ref, { timeoutMs: REF_MS, signal }))
         if (failed !== undefined) return { text: (await this.pageResult(call, { done: failed, failed: true })).text }
         return { text: (await this.pageResult(call, { done: done.scrolledTo(words) })).text }
       }
@@ -511,6 +545,7 @@ class Tools {
         await page.waitForText(target, { gone: isGone, timeoutMs: limit * 1000, signal })
       } catch (error) {
         if (!(error instanceof DriverTimeout) || signal.aborted) throw error
+        await unlessFrozen(call, error)
         const line = isGone ? notDone.stillThere(target, limit) : notDone.didNotAppear(target, limit)
         return { text: (await this.pageResult(call, { done: line, failed: true })).text }
       }
@@ -532,8 +567,8 @@ class Tools {
       let words: string | undefined
       let data: Uint8Array | undefined
       if (ref !== undefined) {
-        words = elementOf(browser.lastSnapshot, ref)
-        const failed = await onRef(page, ref, signal, async () => { data = await page.screenshot({ ref, timeoutMs: SHOT_MS, signal }) })
+        words = wordsOf(browser, ref)
+        const failed = await onRef(call, ref, async () => { data = await page.screenshot({ ref, timeoutMs: SHOT_MS, signal }) })
         if (failed !== undefined) {
           const result = await this.pageResult(call, { done: failed, failed: true })
           return { text: result.text, url: shown(result.url), title: quoted(result.title, TITLE_MAX) }
@@ -607,7 +642,12 @@ class Tools {
 // --- inside -------------------------------------------------------------------------------------------------------------------
 
 function tree(processed: Processed, max: number): ResultParts['snapshot'] {
-  return { kind: 'tree', text: processed.text, total: processed.total, cut: processed.cut, max }
+  return { kind: 'tree', text: processed.text, total: processed.total, cut: processed.cut, max, sections: processed.sections }
+}
+
+/** `ref`'s words (`button "Save" [ref=e14]`) from what the agent got: the page's last full snapshot, then its last subtree read. */
+function wordsOf(browser: SessionBrowser, ref: string): string {
+  return elementIn([browser.lastSnapshot?.text, browser.lastSubtree], ref)
 }
 
 /** How far the page is scrolled; undefined when the page won't say. */
@@ -626,6 +666,32 @@ function moved(before: string, page: DriverPage): string {
   return now === before ? '' : done.navigatedTo(now)
 }
 
+/**
+ * A call's error, or, when it is a timeout on a page that no longer answers a trivial script within `PROBE_MS`, the page
+ * replaced (in the same context) and `BrowserError('frozen')`. A page that answers is only slow: its error stands.
+ */
+async function frozen(call: Call, error: unknown): Promise<unknown> {
+  if (!(error instanceof DriverTimeout) || error.message === STALE_REF || call.signal.aborted) return error
+  try {
+    call.live()
+    if (await call.page.responds(PROBE_MS)) return error
+    call.live()
+    await call.browser.replaceFrozen(call.page, false)
+  } catch {
+    return error
+  }
+  return new BrowserError('frozen')
+}
+
+/**
+ * Before a timeout becomes a "Not done:" result: a page that no longer answers is replaced (`frozen`), and the call fails
+ * with its words, rather than wait out a snapshot of it first.
+ */
+async function unlessFrozen(call: Call, error: unknown): Promise<void> {
+  const outcome = await frozen(call, error)
+  if (outcome !== error) throw outcome
+}
+
 /** Whether a navigation's error is the page's (a result led by "Not done:") rather than the browser's or the caller's. */
 function pageFailure(error: unknown, signal: AbortSignal): boolean {
   return !signal.aborted && !(error instanceof DriverClosed) && !(error instanceof BrowserError) && !(error instanceof Refusal)
@@ -639,16 +705,18 @@ function failureMessage(error: unknown): string {
 
 /**
  * `act` on `ref`, after `hasRef` says it is on the page. Undefined when it was done, else the "Not done:" line: stale (not
- * there, or the driver found it stale at once: `DriverTimeout('stale ref')`), slow (any other timeout), not a select, not
- * fillable. An unknown key is an argument error; any other refusal of the driver's is taken as stale.
+ * there, or the driver found it stale at once: `DriverTimeout('stale ref')`), slow (any other timeout, on a page that
+ * still answers), not a select, not fillable. An unknown key is an argument error; any other refusal of the driver's is
+ * taken as stale.
  */
-async function onRef(page: DriverPage, ref: string, signal: AbortSignal, act: () => Promise<unknown>, key?: string): Promise<string | undefined> {
-  if (!(await page.hasRef(ref))) return notDone.stale(ref)
+async function onRef(call: Call, ref: string, act: () => Promise<unknown>, key?: string): Promise<string | undefined> {
+  if (!(await call.page.hasRef(ref))) return notDone.stale(ref)
   try {
     await act()
     return undefined
   } catch (error) {
-    return refFailure(error, ref, signal, key)
+    await unlessFrozen(call, error)
+    return refFailure(error, ref, call.signal, key)
   }
 }
 

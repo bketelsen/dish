@@ -29,6 +29,8 @@ const TOKEN = `ghp_${'A1b2C3d4E5'.repeat(4)}`
 const MASK = '‹secret: a GitHub token›'
 const never = new AbortController().signal
 const ITEMS = 'http://localhost:5173/items'
+/** The characters a dialog's message keeps before its '…'. */
+const DIALOG_ROOM = 499
 
 /** A page as Playwright's `ai` snapshot gives it, with refs of the main frame as they are after a navigation (`f1e6`). */
 const TREE = [
@@ -550,6 +552,50 @@ test('snapshots: cut at snapshotChars with its note; a password\'s value never s
   assert.ok(!result.includes('hunter2'))
 })
 
+/** A long list, then a region past the cut with a button and a list in it, as on a page of 1,500 links (`rows` of them). */
+function longTree(rows: number, added: string[] = []): string {
+  return [
+    '- list [ref=e2]:',
+    ...Array.from({ length: rows }, (_, i) => `  - listitem [ref=e${i + 3}]:\n    - link "Link number ${i}" [ref=e${i + 1000}]`),
+    '- region "Bottom" [ref=e3002]:',
+    '  - button "Add at bottom" [ref=e3004] [cursor=pointer]',
+    '  - list [ref=e3005]:',
+    ...added.map((text, i) => `    - listitem [ref=e${3006 + i}]: ${text}`),
+  ].join('\n')
+}
+
+test('snapshots: a change past the cut is no "Unchanged"; the cut names the sections past it; an element past it has its words', async () => {
+  const w = world({ snapshotChars: 2000 })
+  const page = await opened(w, { tree: longTree(100) })
+  page.refs.add('e3004')
+  const read = await call(w, 'browser_read')
+  assert.ok(read.endsWith(' Sections past the cut: region "Bottom" [ref=e3002], list [ref=e3005].'), read.slice(-300))
+  assert.match(read, /\nCut at 2,000 of [\d,]+ characters: `browser_read` with a section's ref reads that part\. Sections past the cut: /)
+  const click = page.click.bind(page)
+  page.click = async (t, o) => { await click(t, o); page.tree = longTree(100, ['ADDED-0']) }
+  const clicked = await call(w, 'browser_click', { ref: 'e3004' })
+  assert.ok(clicked.startsWith('Clicked button "Add at bottom" [ref=e3004].\n'), clicked.slice(0, 200))
+  assert.ok(!clicked.includes(UNCHANGED), 'the page changed past the cut')
+  assert.ok(clicked.includes(`${LEAD}\n- list [ref=e2]:`))
+  page.click = click
+  assert.equal(await call(w, 'browser_click', { ref: 'e3004' }), lines('Clicked button "Add at bottom" [ref=e3004].', `Page: ${ITEMS} — "Items"`, UNCHANGED))
+  const kept = w.core.browserOf(SESSION)!.lastSnapshot!
+  assert.ok(kept.text.length <= 4 * 2000, `${kept.text.length} characters kept`)
+})
+
+test('snapshots: an element of a subtree read past what is kept of the page has its words', async () => {
+  const w = world({ snapshotChars: 2000 })
+  const page = await opened(w, { tree: longTree(400) })
+  page.refs.add('e3002')
+  page.refs.add('e3004')
+  page.subtrees.set('e3002', ['- region "Bottom" [ref=e3002]:', '  - button "Add at bottom" [ref=e3004] [cursor=pointer]', '  - list [ref=e3005]'].join('\n'))
+  await call(w, 'browser_read')
+  assert.ok(w.core.browserOf(SESSION)!.lastSnapshot!.text.length <= 8000)
+  assert.ok(!w.core.browserOf(SESSION)!.lastSnapshot!.text.includes('e3004'), 'past what the browser keeps of the page')
+  await call(w, 'browser_read', { ref: 'e3002' })
+  assert.ok((await call(w, 'browser_click', { ref: 'e3004' })).startsWith('Clicked button "Add at bottom" [ref=e3004].\n'))
+})
+
 test('masking: a token in a title, a URL, a console line and a dialog message comes out masked', async () => {
   const w = world()
   const page = await opened(w, { title: `Token ${TOKEN}` })
@@ -672,6 +718,17 @@ test('not done: slow, not a select, not fillable, each with the fresh tree', asy
   assert.equal(page.callsOf('press').length, 0, 'no Enter after a fill that failed')
 })
 
+test('not done: a choice that times out names the values: no such option, or a stuck element', async () => {
+  const w = world()
+  const page = await readOnce(w)
+  page.failNext('select', new DriverTimeout('Timeout 5000ms exceeded.'))
+  assert.equal(await call(w, 'browser_select', { ref: 'e5', values: ['Purple', 'Mauve'] }), lines(
+    'Not done: [ref=e5] has no option "Purple" or "Mauve" by label or value, or didn\'t respond within 5 s. Its options are in the tree below.',
+    `Page: ${ITEMS} — "Items"`, LEAD, SHOWN))
+  page.failNext('select', new DriverTimeout('stale ref'))
+  assert.ok((await call(w, 'browser_select', { ref: 'e5', values: ['Purple'] })).startsWith(`${STALE('e5')}\n`), 'a stale ref is still stale')
+})
+
 test('not done: a navigation that fails is a result, not an error, with the page as it is', async () => {
   const w = world()
   const page = await opened(w, { url: 'about:blank' })
@@ -718,7 +775,7 @@ test('a subtree read: its part, password values blanked, then a full snapshot th
   const order = page.calls.filter(c => c.method === 'snapshot' || c.method === 'isPassword')
     .map(c => c.method === 'snapshot' ? `snapshot ${(c.args[0] as { ref?: string }).ref ?? 'page'}` : `isPassword ${String(c.args[0])}`)
   assert.deepEqual(order, ['snapshot f1e7', 'isPassword f1e9', 'snapshot page'])
-  assert.equal(w.core.browserOf(SESSION)?.lastSnapshot, SHOWN)
+  assert.equal(w.core.browserOf(SESSION)?.lastSnapshot?.text, SHOWN)
   assert.equal(await call(w, 'browser_click', { ref: 'e2' }), lines('Clicked button "Save" [ref=e2].', `Page: ${ITEMS} — "Items"`, UNCHANGED))
 })
 
@@ -755,6 +812,32 @@ test('notes: the user\'s note comes before the page\'s events', async () => {
   assert.ok(!(await call(w, 'browser_read')).startsWith('Notes:'), 'taken once')
 })
 
+test('notes: the newest 10 page events, after a count of the rest; a crash\'s and a new browser\'s notes always come', async () => {
+  const w = world()
+  const page = await readOnce(w)
+  const click = page.click.bind(page)
+  page.click = async (t, o) => {
+    for (let i = 0; i < 150; i++) page.emit('dialog', new FakeDialog('alert', `message ${i} ${'x'.repeat(600)}`))
+    page.emit('crash')
+    await click(t, o)
+  }
+  assert.equal(await refused(w, 'browser_click', { ref: 'e2' }), 'The page crashed during this call. Your next browser call gets a new page.')
+  await flush()
+  const fresh = w.core.browserOf(SESSION)!.page as FakePage
+  fresh.tree = TREE
+  for (const ref of REFS) fresh.refs.add(ref)
+  fresh.passwords.add('e4')
+  const result = await call(w, 'browser_read')
+  const notes = result.split('\n')[0]!
+  const dialog = (i: number) => `The page showed an alert: «message ${i} ${'x'.repeat(DIALOG_ROOM - `message ${i} `.length)}…» (dismissed).`
+  assert.equal(notes, [
+    'Notes: The page crashed; this is a new page.',
+    '140 earlier page events (dialogs, popups, downloads) aren\'t listed; the newest 10 follow.',
+    ...Array.from({ length: 10 }, (_, i) => dialog(140 + i)),
+  ].join(' '))
+  assert.ok(result.length < 7_000, `${result.length} characters`)
+})
+
 test('notes: console errors and failed requests are noted only when new; read lists them', async () => {
   const w = world()
   const page = await readOnce(w)
@@ -777,6 +860,23 @@ test('notes: console errors and failed requests are noted only when new; read li
     SHOWN,
   ))
   assert.ok(!(await call(w, 'browser_read')).includes('Console errors'))
+})
+
+test('notes: the errors note counts every error since the last read, not only those since the last result', async () => {
+  const w = world()
+  const page = await opened(w, { url: 'about:blank' })
+  const goto = page.goto.bind(page)
+  page.goto = async (url, options) => { await goto(url, options); page.emit('consoleError', 'first'); page.emit('consoleError', 'second') }
+  const note = (text: string) => text.split('\n').find(line => line.startsWith('Notes:'))
+  assert.equal(note(await call(w, 'browser_navigate', { url: ITEMS })), 'Notes: 2 console errors since your last read: `browser_read` lists them.')
+  const click = page.click.bind(page)
+  page.click = async (t, o) => { page.emit('consoleError', 'one more'); await click(t, o) }
+  assert.equal(note(await call(w, 'browser_click', { ref: 'e2' })), 'Notes: 3 console errors since your last read: `browser_read` lists them.')
+  page.click = click
+  assert.equal(note(await call(w, 'browser_click', { ref: 'e2' })), undefined, 'none new')
+  assert.ok((await call(w, 'browser_read')).includes('Console errors (3):\n- first\n- second\n- one more\n'))
+  page.emit('consoleError', 'later')
+  assert.equal(note(await call(w, 'browser_click', { ref: 'e2' })), 'Notes: 1 console error since your last read: `browser_read` lists them.')
 })
 
 test('read lists the newest 10 console errors, and counts the rest', async () => {
@@ -878,6 +978,129 @@ test('the core\'s errors: a DriverClosed with the browser still open is the page
   const page = await readOnce(w)
   page.failNext('click', new DriverClosed(`Target page, context or browser has been closed ${ITEMS}`))
   assert.equal(await refused(w, 'browser_click', { ref: 'e2' }), 'The page crashed during this call. Your next browser call gets a new page.')
+})
+
+// --- a page that stops answering -------------------------------------------------------------------------------------------
+
+const FROZEN_ERROR = 'The page stopped responding (a script that never ends?), so dish replaced it with a new, blank page in the same browser; '
+  + 'cookies and sign-ins stay. Open it again with `browser_navigate`.'
+const FROZEN_NOTE = 'The page stopped responding (a script that never ends?), so dish replaced it with a new, blank page in the same browser; '
+  + 'cookies and sign-ins stay.'
+
+/** The core's notices for the tab, as they come. */
+function notices(w: World): unknown[] {
+  const seen: unknown[] = []
+  w.core.subscribe(event => { if (event.kind === 'notice') seen.push(event.notice) })
+  return seen
+}
+
+test('a frozen page: a snapshot that times out on a page that doesn\'t answer replaces the page, in the same context, with the words', async () => {
+  const w = world()
+  const page = await readOnce(w)
+  const told = notices(w)
+  const browser = w.core.browserOf(SESSION)!
+  page.failNext('snapshot', new DriverTimeout('Timeout 10000ms exceeded.'))
+  page.responsive = false
+  assert.equal(await refused(w, 'browser_scroll', {}), FROZEN_ERROR)
+  assert.deepEqual(page.callsOf('responds'), [[1_000]], 'one probe of 1 s')
+  assert.equal(page.closed, true)
+  const fresh = browser.page as FakePage
+  assert.notEqual(fresh, page)
+  assert.equal(w.driver.browser.contexts.length, 1, 'the same context: cookies stay')
+  assert.equal(w.core.browserOf(SESSION), browser, 'the same browser')
+  assert.equal(browser.lastSnapshot, undefined)
+  assert.deepEqual(told, [{ kind: 'frozen' }])
+  fresh.tree = TREE
+  fresh.passwords.add('e4')
+  const next = await call(w, 'browser_read')
+  assert.ok(next.startsWith('Page: about:blank\n'), 'the call said it; the next result needn\'t')
+  assert.ok(next.endsWith(SHOWN))
+})
+
+test('a frozen page: a hasRef that times out is checked the same way; a page that answers is only slow, and stays', async () => {
+  const w = world()
+  const page = await readOnce(w)
+  page.failNext('hasRef', new DriverTimeout('not done within 5000 ms'))
+  assert.equal(await refused(w, 'browser_click', { ref: 'e2' }), refusal.unfinished, 'it answered: slow, not frozen')
+  assert.equal(w.core.browserOf(SESSION)!.page, page)
+  assert.equal(page.closed, false)
+  page.failNext('hasRef', new DriverTimeout('not done within 5000 ms'))
+  page.responsive = false
+  assert.equal(await refused(w, 'browser_click', { ref: 'e2' }), FROZEN_ERROR)
+  assert.notEqual(w.core.browserOf(SESSION)!.page, page)
+  assert.equal(page.callsOf('click').length, 0)
+})
+
+test('a frozen page: a timeout that would be a "Not done:" result is checked at once, before any snapshot', async () => {
+  const w = world()
+  const page = await readOnce(w)
+  const snapshots = () => page.callsOf('snapshot').length
+  let before = snapshots()
+  page.failNext('click', new DriverTimeout('Timeout 5000ms exceeded.'))
+  page.responsive = false
+  assert.equal(await refused(w, 'browser_click', { ref: 'e2' }), FROZEN_ERROR)
+  assert.equal(snapshots(), before, 'no 10 s snapshot of the frozen page first')
+
+  const w2 = world()
+  const page2 = await readOnce(w2)
+  before = page2.callsOf('snapshot').length
+  page2.goto = async () => { page2.responsive = false; throw new DriverTimeout('Timeout 30000ms exceeded.') }
+  assert.equal(await refused(w2, 'browser_navigate', { url: 'https://slow.test/' }), FROZEN_ERROR, 'it froze while it loaded')
+  assert.equal(page2.callsOf('snapshot').length, before)
+
+  const w3 = world()
+  const page3 = await readOnce(w3)
+  before = page3.callsOf('snapshot').length
+  page3.failNext('waitForText', new DriverTimeout('Timeout 30000ms exceeded.'))
+  page3.responsive = false
+  assert.equal(await refused(w3, 'browser_wait', { text: 'Saved' }), FROZEN_ERROR)
+  assert.equal(page3.callsOf('snapshot').length, before)
+
+  // A page that answers: the "Not done:" results as before.
+  const w4 = world()
+  const page4 = await readOnce(w4)
+  page4.failNext('click', new DriverTimeout('Timeout 5000ms exceeded.'))
+  assert.ok((await call(w4, 'browser_click', { ref: 'e2' })).startsWith('Not done: [ref=e2] didn\'t respond within 5 s'))
+  page4.failNext('back', new DriverTimeout('Timeout 30000ms exceeded.'))
+  assert.ok((await call(w4, 'browser_back')).startsWith(`Not done: ${ITEMS} didn't load within 30 s.`))
+})
+
+test('a frozen page: no probe for what isn\'t a timeout, or for a call cancelled', async () => {
+  const w = world()
+  const page = await readOnce(w)
+  page.responsive = false
+  page.failNext('snapshot', new Error('something odd'))
+  assert.equal(await refused(w, 'browser_read'), refusal.unfinished)
+  const controller = new AbortController()
+  page.failNext('snapshot', new DriverTimeout('Timeout 10000ms exceeded.'))
+  const hold = page.hold('snapshot')
+  const reading = value(w, 'browser_read', {}, exec({ signal: controller.signal }))
+  await hold.reached
+  const reason = new Error('cancelled')
+  controller.abort(reason)
+  hold.release()
+  await assert.rejects(reading, (error: unknown) => error === reason)
+  assert.deepEqual(page.callsOf('responds'), [])
+  assert.equal(w.core.browserOf(SESSION)!.page, page)
+})
+
+test('a frozen page: navigate replaces it first, then opens the URL on the new page, with the note', async () => {
+  const w = world()
+  const page = await readOnce(w)
+  const told = notices(w)
+  page.responsive = false
+  w.driver.onPage = fresh => { fresh.tree = TREE; fresh.currentTitle = 'Items'; fresh.passwords.add('e4') }
+  const result = await call(w, 'browser_navigate', { url: ITEMS })
+  assert.equal(result, lines(`Opened ${ITEMS}.`, `Notes: ${FROZEN_NOTE}`, `Page: ${ITEMS} — "Items"`, LEAD, SHOWN))
+  assert.deepEqual(page.callsOf('goto'), [], 'nothing more on the frozen page')
+  assert.equal(page.closed, true)
+  const fresh = w.core.browserOf(SESSION)!.page as FakePage
+  assert.deepEqual(fresh.callsOf('goto').map(args => args[0]), [ITEMS])
+  assert.deepEqual(told, [{ kind: 'frozen' }])
+  // The same URL again on a page that answers: a reload, no replacement.
+  assert.ok((await call(w, 'browser_navigate', { url: ITEMS })).startsWith(`Reloaded ${ITEMS}.`))
+  assert.equal(w.core.browserOf(SESSION)!.page, fresh)
+  assert.deepEqual(fresh.callsOf('responds'), [[1_000]])
 })
 
 test('the core\'s errors: busy at the cap, won\'t start, no Chromium', async () => {

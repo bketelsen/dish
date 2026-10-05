@@ -8,7 +8,8 @@
  *   queue.
  * - **The page's events** become notes for the agent's next result, and notices for the tab: dialogs are answered at once,
  *   popups followed in this page or closed, downloads and file choosers refused, navigations checked against the URL
- *   rules. A crashed page is replaced at once in the same context.
+ *   rules. A crashed page is replaced at once in the same context, and so is one that stopped answering, when the tools
+ *   find it so (`replaceFrozen`).
  * - **What it remembers:** the workspace, the last snapshot the agent got, the user's activity since the agent's last
  *   call, the console errors and failed requests, when it was last used, and the page's URL, title and history for the
  *   tab.
@@ -23,7 +24,8 @@ import type { Clock } from './clock.ts'
 import type { DriverContext, DriverDialog, DriverPage, DriverPopup, FailedRequest, RouteRequest, ScreencastFrame } from './driver.ts'
 import { ALT, CONTROL, META, SHIFT } from './protocol.ts'
 import type { Up, Viewport } from './protocol.ts'
-import { JPEG_QUALITY, LOAD_MS, LOG_RING, NAV_MS, POPUP_URL_MS } from './types.ts'
+import type { Kept } from './snapshot.ts'
+import { JPEG_QUALITY, LISTED, LOAD_MS, LOG_RING, NAV_MS, POPUP_URL_MS } from './types.ts'
 import type { BrowserErrorCode, CloseReason, Note, OwnAddress, TabNotice, UrlCheck, UrlPlaces, UrlRules, UserActivity } from './types.ts'
 
 /** The core's own failure of a browser call; `detail` is a path, a close reason, or Chromium's first line, never page text. */
@@ -83,8 +85,12 @@ export interface SessionBrowserOptions {
 
 /** The lines kept of one dialog message, console line or failed request. */
 const KEPT = 1000
-/** The most notes kept between two of the agent's calls; past it, the oldest page-caused note goes. */
-const NOTES_KEPT = LOG_RING
+/**
+ * The notes that always reach the agent's next result: why its browser or its page is new. The others are the page's
+ * events (dialogs, popups, downloads, file choosers, refused addresses), of which the newest `LISTED` are kept, and the
+ * rest counted.
+ */
+export const ALWAYS_NOTED: ReadonlySet<Note['kind']> = new Set<Note['kind']>(['reopened', 'crashed', 'frozen'])
 /** The wait, after a navigation commits, before the title is read again. */
 const TITLE_DELAY_MS = 200
 
@@ -105,8 +111,13 @@ export class SessionBrowser {
   readonly sessionId: string
   readonly context: DriverContext
   workspace: string | undefined
-  /** The processed full-page snapshot this agent last got; undefined after a new page. */
-  lastSnapshot: string | undefined
+  /**
+   * What this agent last got of the page's full snapshot (`snapshot.ts`'s `keep`): its text, up to 4× `snapshotChars`, to
+   * name elements by, and a digest of all of it, for the unchanged line. Undefined after a new page.
+   */
+  lastSnapshot: Kept | undefined
+  /** The text of this agent's last subtree read, kept the same way, to name its elements by. Undefined after a new page. */
+  lastSubtree: string | undefined
   /** How a dialog in the current agent call is answered; reset to 'dismiss' after each call. */
   dialogAnswer: 'accept' | 'dismiss' = 'dismiss'
 
@@ -124,6 +135,8 @@ export class SessionBrowser {
   private pageView: PageView
   // What the agent's next result says.
   private events: Note[]
+  /** The page's events left out of `events` since the agent's last take. */
+  private eventsLeftOut = 0
   private activity: UserActivity | undefined
   private consoleRing: string[] = []
   private requestRing: string[] = []
@@ -288,13 +301,18 @@ export class SessionBrowser {
 
   // --- the notes ------------------------------------------------------------------------------------------------------
 
-  /** The user's activity (when there was any) and the events, since the agent's last take; clears both. */
-  takeNotes(): { user?: UserActivity, events: Note[] } {
+  /**
+   * The user's activity (when there was any) and the events, since the agent's last take: every note of `ALWAYS_NOTED`,
+   * and the newest `LISTED` of the page's events, in order, with how many earlier ones were left out. Clears them.
+   */
+  takeNotes(): { user?: UserActivity, events: Note[], leftOut: number } {
     const activity = this.activity
     const events = this.events
+    const leftOut = this.eventsLeftOut
     this.activity = undefined
     this.events = []
-    return { user: activity !== undefined && substantial(activity) ? activity : undefined, events }
+    this.eventsLeftOut = 0
+    return { user: activity !== undefined && substantial(activity) ? activity : undefined, events, leftOut }
   }
 
   /** Console errors and failed requests since the last take, newest last; clears them. */
@@ -307,12 +325,16 @@ export class SessionBrowser {
     return logs
   }
 
-  /** How many console errors and failed requests came since the last call of this; resets. */
+  /**
+   * When console errors or failed requests came since the last call of this: how many there are since the last
+   * `takeLogs` (a read), the ones the ring no longer holds counted. Zeros when none came. Resets what counts as new.
+   */
   newLogCounts(): { console: number, requests: number } {
-    const counts = { console: this.consoleNew, requests: this.requestNew }
+    const fresh = this.consoleNew > 0 || this.requestNew > 0
     this.consoleNew = 0
     this.requestNew = 0
-    return counts
+    if (!fresh) return { console: 0, requests: 0 }
+    return { console: this.consoleRing.length + this.consoleDropped, requests: this.requestRing.length + this.requestDropped }
   }
 
   /** When the page's URL breaks the rules: send it to about:blank and note it. */
@@ -639,11 +661,33 @@ export class SessionBrowser {
     this.noteAndNotice({ kind: 'crashed' })
     this.host.log.warn(`the page of ${this.sessionId} crashed`)
     this.lastSnapshot = undefined
+    this.lastSubtree = undefined
     this.replacing = this.replace(page)
     this.current?.fail(new BrowserError('crashed'))
   }
 
-  /** A new page in the same context, in place of the crashed one: wired again, and screencasting when watched. */
+  /**
+   * The agent's call in flight found `page` not answering (a script that never ends): it is replaced as a crashed page is,
+   * by a new page in the same context, so cookies and sign-ins stay. The call goes on, on the new page, which this gives.
+   * The tab gets a notice; the agent's next result a note only when `note` (a call that fails says it itself).
+   *
+   * @throws BrowserError('closed') when the browser closed meanwhile.
+   */
+  async replaceFrozen(page: DriverPage, note: boolean): Promise<DriverPage> {
+    if (this.isCurrent(page) && this.replacing === undefined) {
+      this.host.notice({ kind: 'frozen' })
+      if (note) this.addNote({ kind: 'frozen' })
+      this.host.log.warn(`the page of ${this.sessionId} stopped responding; it was replaced`)
+      this.lastSnapshot = undefined
+      this.lastSubtree = undefined
+      this.replacing = this.replace(page)
+    }
+    await this.ready()
+    if (this.closed !== undefined) throw new BrowserError('closed', this.closed)
+    return this.currentPage
+  }
+
+  /** A new page in the same context, in place of a crashed or frozen one: wired again, and screencasting when watched. */
   private async replace(old: DriverPage): Promise<void> {
     void old.close().catch(() => {})
     try {
@@ -689,11 +733,12 @@ export class SessionBrowser {
     this.host.notice(note)
   }
 
+  /** A note for the agent's next result. Past `LISTED` of the page's events, the oldest goes, counted. */
   private addNote(note: Note): void {
     this.events.push(note)
-    if (this.events.length <= NOTES_KEPT) return
-    const oldest = this.events.findIndex(event => event.kind !== 'reopened' && event.kind !== 'crashed')
-    this.events.splice(oldest >= 0 ? oldest : 0, 1)
+    if (ALWAYS_NOTED.has(note.kind) || this.events.filter(event => !ALWAYS_NOTED.has(event.kind)).length <= LISTED) return
+    this.events.splice(this.events.findIndex(event => !ALWAYS_NOTED.has(event.kind)), 1)
+    this.eventsLeftOut++
   }
 
   /** A timer of this browser's, cancelled when it closes. */

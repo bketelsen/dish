@@ -7,8 +7,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Limits, UserActivity } from '../src/types.ts'
 import {
-  ARCHIVED, closedText, cutNote, done, EMPTY_TREE, errorsNote, errorText, LEAD, navigationFailure, NOT_A_CHAT, notDone, noteText, notesLine,
-  pageLine, quoted, readExtra, refusal, resultText, screenshotText, shown, tabNoticeText, UNCHANGED, urlRefusal, userText,
+  ARCHIVED, closedText, cutNote, done, EMPTY_TREE, errorsNote, errorText, eventsLeftOut, LEAD, navigationFailure, NOT_A_CHAT, notDone, noteText,
+  notesLine, pageLine, quoted, readExtra, refusal, resultText, screenshotText, shown, tabNoticeText, UNCHANGED, urlRefusal, userText,
 } from '../src/words.ts'
 
 const TOKEN = `ghp_${'A1b2C3d4E5'.repeat(4)}`
@@ -47,6 +47,15 @@ test('LEAD and UNCHANGED', () => {
 
 test('cutNote', () => {
   assert.equal(cutNote(93_512, 30_000), 'Cut at 30,000 of 93,512 characters: `browser_read` with the ref of a section (a `main`, `list` or `region`) reads that part.')
+  assert.equal(cutNote(93_512, 30_000, { listed: [], more: 0 }), cutNote(93_512, 30_000), 'no section past the cut')
+})
+
+test('cutNote: the sections past the cut, which a read with their ref reaches', () => {
+  assert.equal(cutNote(166_311, 30_000, { listed: ['region "Bottom" [ref=e3002]', 'list [ref=e3005]'], more: 0 }),
+    'Cut at 30,000 of 166,311 characters: `browser_read` with a section\'s ref reads that part. Sections past the cut: region "Bottom" [ref=e3002], list [ref=e3005].')
+  assert.equal(cutNote(166_311, 30_000, { listed: ['main [ref=e2]'], more: 1 }),
+    'Cut at 30,000 of 166,311 characters: `browser_read` with a section\'s ref reads that part. Sections past the cut: main [ref=e2], and 1 more.')
+  assert.equal(cutNote(166_311, 30_000, { listed: ['main [ref=e2]'], more: 1_204 }).endsWith('Sections past the cut: main [ref=e2], and 1,204 more.'), true)
 })
 
 test('pageLine: the URL, and the title when there is one', () => {
@@ -92,6 +101,14 @@ test('noteText: popups, downloads, the file chooser, a blocked address, a crash'
   assert.equal(noteText({ kind: 'filechooser' }, LIMITS), 'The page asked for a file to upload; dish can\'t upload files yet.')
   assert.equal(noteText({ kind: 'blocked', what: 'file:' }, LIMITS), 'The page went to an address dish doesn\'t allow (file:); it was sent to about:blank.')
   assert.equal(noteText({ kind: 'crashed' }, LIMITS), 'The page crashed; this is a new page.')
+  assert.equal(noteText({ kind: 'frozen' }, LIMITS),
+    'The page stopped responding (a script that never ends?), so dish replaced it with a new, blank page in the same browser; cookies and sign-ins stay.')
+})
+
+test('eventsLeftOut: the page events a result doesn\'t list, before the newest 10', () => {
+  assert.equal(eventsLeftOut(140), '140 earlier page events (dialogs, popups, downloads) aren\'t listed; the newest 10 follow.')
+  assert.equal(eventsLeftOut(1), '1 earlier page event (dialogs, popups, downloads) isn\'t listed; the newest 10 follow.')
+  assert.equal(eventsLeftOut(12_000), '12,000 earlier page events (dialogs, popups, downloads) aren\'t listed; the newest 10 follow.')
 })
 
 test('noteText: a browser that is new', () => {
@@ -155,6 +172,9 @@ test('errorText', () => {
   assert.equal(errorText('closed', 'tab', LIMITS), 'The browser closed during this call (closed in the Browser tab). Your next browser call starts a new one.')
   assert.equal(errorText('closed', 'evicted', LIMITS), 'The browser closed during this call (dish closed it to make room, 6 at most). Your next browser call starts a new one.')
   assert.equal(errorText('crashed', '', LIMITS), 'The page crashed during this call. Your next browser call gets a new page.')
+  assert.equal(errorText('frozen', '', LIMITS),
+    'The page stopped responding (a script that never ends?), so dish replaced it with a new, blank page in the same browser; cookies and sign-ins stay. '
+    + 'Open it again with `browser_navigate`.')
 })
 
 test('navigationFailure: nothing listening on loopback, a timeout, a net error, anything else', () => {
@@ -177,6 +197,7 @@ test('navigationFailure: nothing listening on loopback, a timeout, a net error, 
 
 test('tabNoticeText: a note, a refusal, a failure, an error, and a browser that can\'t start', () => {
   assert.equal(tabNoticeText({ kind: 'crashed' }, LIMITS), 'The page crashed; this is a new page.')
+  assert.equal(tabNoticeText({ kind: 'frozen' }, LIMITS), noteText({ kind: 'frozen' }, LIMITS))
   assert.equal(tabNoticeText({ kind: 'reopened', reason: 'evicted' }, LIMITS), 'dish closed this browser to make room (6 at most); its cookies and sign-ins are gone.')
   assert.equal(tabNoticeText({ kind: 'refused', reason: 'javascript: addresses aren\'t opened here.' }, LIMITS), 'javascript: addresses aren\'t opened here.')
   assert.equal(tabNoticeText({ kind: 'failed', url: 'http://127.0.0.1:5173/', error: 'net::ERR_CONNECTION_REFUSED' }, LIMITS),
@@ -238,6 +259,10 @@ test('notDone', () => {
   assert.equal(notDone.noForward(), 'Not done: there\'s no later page in this browser.')
   assert.equal(notDone.didNotAppear('Saved', 30), 'Not done: "Saved" didn\'t appear within 30 s.')
   assert.equal(notDone.stillThere('Loading', 5), 'Not done: "Loading" was still there after 5 s.')
+  assert.equal(notDone.noOption('e7', ['Purple']),
+    'Not done: [ref=e7] has no option "Purple" by label or value, or didn\'t respond within 5 s. Its options are in the tree below.')
+  assert.equal(notDone.noOption('e7', ['Purple', `x\n${TOKEN}`]),
+    `Not done: [ref=e7] has no option "Purple" or "x ${MASK}" by label or value, or didn't respond within 5 s. Its options are in the tree below.`)
 })
 
 test('refusal', () => {
@@ -278,7 +303,13 @@ test('urlRefusal: the words urls.ts gives', () => {
   assert.equal(urlRefusal.outside('file:///etc/hosts', '/w', true), 'file:///etc/hosts is outside this chat\'s workspace (/w) and /tmp.')
   assert.equal(urlRefusal.noWorkspace('file:///w/x'),
     'dish doesn\'t know this chat\'s workspace yet, so file:///w/x can\'t open: a file:// page opens once the chat\'s agent has used the browser, or while it is running.')
-  assert.equal(urlRefusal.scheme('javascript:'), 'javascript: addresses aren\'t opened here: only http, https, file:// in this chat\'s workspace, and about:blank.')
+  assert.equal(urlRefusal.scheme('javascript:', false), 'javascript: addresses aren\'t opened here: only http, https, file:// in this chat\'s workspace, and about:blank.')
+  assert.equal(urlRefusal.scheme('javascript:', true), 'javascript: addresses aren\'t opened here: only http, https, file:// in this chat\'s workspace or /tmp, and about:blank.')
+  assert.equal(urlRefusal.remoteFile('nas', false),
+    'file://nas/ addresses (a file on another machine) aren\'t opened here: only file:/// paths in this chat\'s workspace.')
+  assert.equal(urlRefusal.remoteFile('nas', true),
+    'file://nas/ addresses (a file on another machine) aren\'t opened here: only file:/// paths in this chat\'s workspace or /tmp.')
+  assert.equal(urlRefusal.remoteFile(`${TOKEN}.example`, false).startsWith(`file://${MASK}.example/ addresses`), true)
 })
 
 // --- whole results -------------------------------------------------------------------------------------------------------------

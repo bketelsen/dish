@@ -262,6 +262,8 @@ export class FakePage implements DriverPage {
   readonly viewport: Viewport
   /** What `select` gives; by default the values asked for. */
   chosen: string[] | undefined
+  /** What `responds` gives: false for a page whose script never ends. */
+  responsive = true
   private listeners: Listeners = {
     crash: [], dialog: [], download: [], filechooser: [], navigated: [], load: [], popup: [], consoleError: [], requestFailed: [],
   }
@@ -381,6 +383,10 @@ export class FakePage implements DriverPage {
 
   isPassword(ref: string): Promise<boolean> {
     return this.act('isPassword', [ref], () => this.passwords.has(ref))
+  }
+
+  responds(timeoutMs: number): Promise<boolean> {
+    return this.act('responds', [timeoutMs], () => this.responsive)
   }
 
   click(target: ClickTarget, options: Act & { double: boolean }): Promise<void> {

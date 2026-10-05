@@ -89,6 +89,11 @@ export interface DriverPage {
   hasRef(ref: string): Promise<boolean>
   /** Whether `ref` is an <input type=password>. Rejects when it can't tell. */
   isPassword(ref: string): Promise<boolean>
+  /**
+   * Whether the page's main thread answers a trivial script within `timeoutMs`: false for a page whose script never ends.
+   * Any answer, an error too, is true. Rejects with `DriverClosed` when the page is gone.
+   */
+  responds(timeoutMs: number): Promise<boolean>
   click(target: ClickTarget, options: Act & { double: boolean }): Promise<void>
   fill(ref: string, text: string, options: Act): Promise<void>
   /** Types `text` into the focused element. */
