@@ -437,6 +437,7 @@ test('check says what the registry says of a field, as a result: the sentence th
       [{ gateTimeout: '9s' }, /^projects\.yaml: acme\/widget: gateTimeout must be <n>s, <n>m or <n>h between 10s and 10m$/],
       [{ gateTimeout: '' }, /gateTimeout must be/],
       [{ family: '' }, /^projects\.yaml: acme\/widget: family is blank$/],
+      [{ family: 'Frostyard' }, /family must be a lowercase name/],
       [{ role: '  ' }, /role is blank$/],
       [{ gate: 'a\nb' }, /gate must be one line$/],
       [{ setupTimeout: '61m' }, /setupTimeout must be/],

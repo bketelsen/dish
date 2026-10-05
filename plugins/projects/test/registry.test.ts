@@ -7,6 +7,7 @@ import { Context } from '@deepseek-ai/cordis'
 import * as configPlugin from 'dish-config'
 import type { ConfigStoreError } from 'dish-config'
 import {
+  FAMILY,
   GATE_TIMEOUT,
   OWNER,
   PROJECTS_PATH,
@@ -114,6 +115,8 @@ test('the constants are the ones the spec names', () => {
   // dsh's own scrub pattern (the pin against dsh's constant is dish-workspaces' env test).
   assert.equal(SECRET_NAME.source, 'KEY|PASSWORD|SECRET|TOKEN')
   assert.equal(SECRET_NAME.flags, 'i')
+  // dish-memory names its paths with the same grammar.
+  assert.equal(FAMILY.source, '^[a-z0-9][a-z0-9-]{0,63}$')
 })
 
 test('the seed is a valid, empty registry', () => {
@@ -364,6 +367,16 @@ test('family, role and gate must be non-blank, single-line strings', () => {
   }
 })
 
+test('family must be a lowercase name', () => {
+  const refusal = 'projects.yaml: acme/widget: family must be a lowercase name: letters, digits and hyphens, starting with a letter or digit, at most 64 characters'
+  for (const family of ['Frostyard', 'frost yard', 'frost/yard', '-x', 'x_y', 'a'.repeat(65)]) {
+    assert.equal(problemOf(one({ family })), refusal, family)
+  }
+  for (const family of ['frostyard', 'b2-x', '0', 'a'.repeat(64)]) {
+    assert.equal(only(one({ family })).family, family)
+  }
+})
+
 test('a value is trimmed, so a block scalar\'s trailing newline is not part of the gate', () => {
   const text = 'projects:\n  acme/widget:\n    family: " acme "\n    role: widgets\n    gate: |\n      make test\n    gateTimeout: 5m\n'
   const project = only(text)
@@ -544,6 +557,7 @@ test('a problem never quotes a value', () => {
   const lines = `${TOKEN}\nmore`
   const cases: Array<Record<string, unknown>> = [
     { family: lines },
+    { family: TOKEN },
     { role: lines },
     { gate: lines },
     { gate: `${TOKEN}\u0000` },
@@ -651,7 +665,7 @@ test('what serializeProjects writes parses back to the same fields', () => {
     },
     'frostyard/snosi': { family: 'true', role: '123', gate: 'null', gateTimeout: '10s', setup: 'line one\nline two\n  indented\nline three', gateEnv: { Z: 'true', A: '10', M: '- dash', Q: "it's", E: '', S: '  spaced  ' } },
     'a/1': { family: '2024-01-01', role: '~', gate: '[x]', gateTimeout: '600s', setup: '#!/bin/sh\necho "hi"', setupTimeout: '3600s' },
-    'A/B.c': { family: 'é ü', role: 'tab\tinside', gate: '*star', gateTimeout: '1m', gateEnv: { _: '&anchor', X1: '!tag', Y: '%dir', U: '@at', T: '`tick`', P: 'a: b', H: 'a #b' } },
+    'A/B.c': { family: 'e-u', role: 'é ü tab\tinside', gate: '*star', gateTimeout: '1m', gateEnv: { _: '&anchor', X1: '!tag', Y: '%dir', U: '@at', T: '`tick`', P: 'a: b', H: 'a #b' } },
   }
   const text = serializeProjects(awkward)
   const result = parseProjects(text)
