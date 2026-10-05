@@ -1002,7 +1002,7 @@ test('a frozen page: a snapshot that times out on a page that doesn\'t answer re
   page.failNext('snapshot', new DriverTimeout('Timeout 10000ms exceeded.'))
   page.responsive = false
   assert.equal(await refused(w, 'browser_scroll', {}), FROZEN_ERROR)
-  assert.deepEqual(page.callsOf('responds'), [[1_000]], 'one probe of 1 s')
+  assert.deepEqual(page.callsOf('responds'), [[5_000]], 'one probe of 5 s, as long as an action gets')
   assert.equal(page.closed, true)
   const fresh = browser.page as FakePage
   assert.notEqual(fresh, page)

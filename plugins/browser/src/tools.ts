@@ -70,8 +70,13 @@ export const TOOL_NAMES: readonly string[] = [
 
 /** The time for a page's snapshot: a big page takes a while; a stuck one never answers. */
 const SNAPSHOT_MS = SHOT_MS
-/** The time a page has to answer a trivial script before dish takes it for frozen (a script that never ends). */
-const PROBE_MS = 1_000
+/**
+ * The time a page has to answer a trivial script, after a call's timeout, before dish takes it for frozen (a script that
+ * never ends): as long as an action gets, so that a long task on a live page (a big bundle booting) ends first.
+ */
+const PROBE_MS = REF_MS
+/** The same before `browser_navigate`, which leaves the page anyway: a page busy that long is as good as hung. */
+const NAVIGATE_PROBE_MS = 1_000
 /** The time per character for `type` without a ref, which types one character at a time, on top of `REF_MS`. */
 const TYPE_CHAR_MS = 25
 /** The characters kept of an argument in a call's title. */
@@ -355,7 +360,7 @@ class Tools {
     const browser = await this.browser(caller, workspace, exec.signal)
     return this.inQueue(browser, exec.signal, async call => {
       // A page that doesn't answer would hold the navigation up for its 30 s: a new page takes the agent where it asked.
-      if (!(await call.page.responds(PROBE_MS).catch(() => true))) call.page = await browser.replaceFrozen(call.page, true)
+      if (!(await call.page.responds(NAVIGATE_PROBE_MS).catch(() => true))) call.page = await browser.replaceFrozen(call.page, true)
       const { page, signal } = call
       const same = page.url() === target
       try {
