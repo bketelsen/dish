@@ -255,6 +255,11 @@ export function tabNoticeText(notice: TabNotice, limits: Limits): string {
   }
 }
 
+/** The Browser tab's refusal of an id that isn't a chat's: its state's reason. */
+export const NOT_A_CHAT = 'That isn\'t a chat.'
+/** The Browser tab's refusal of an archived chat: its state's reason. */
+export const ARCHIVED = 'This chat is archived.'
+
 /** Whether a navigation's error is a timeout: a `DriverTimeout`, which the tools pass as `'timeout'`, or Playwright's own words. */
 function isTimeout(message: string): boolean {
   return message.trim().toLowerCase() === 'timeout' || /\bTimeout \d+ms exceeded\b/.test(message)
