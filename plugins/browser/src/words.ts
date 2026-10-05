@@ -97,7 +97,7 @@ function sameAddress(a: string, b: string): boolean {
 
 /** What stands for a password field's value in a snapshot. */
 export const PASSWORD_HIDDEN = '(a password field; its value isn\'t shown)'
-/** What stands for a textbox's value that dish didn't check: past the first 200, or with no ref to check it by. */
+/** What stands for a field's value that dish didn't check: past the first 200, or with no ref to check it by. */
 export const VALUE_HIDDEN = '(its value isn\'t shown)'
 
 // --- a result's lines -----------------------------------------------------------------------------------------------------

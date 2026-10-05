@@ -8,8 +8,13 @@
  * - its key is `role "name" [attr] [ref=e5]`, in single quotes (a `'` in it doubled) when YAML needs them, as for a name
  *   holding ": ". The name is JSON-quoted, or written as it is when it starts and ends with `/`;
  * - an `<input>`'s value is its text: `- textbox "Password" [ref=e5]: hunter2`. With a placeholder that isn't its name,
- *   the textbox is a block, the placeholder on a `- /placeholder:` line and the value on a `- text:` line under it;
+ *   the textbox is a block, the placeholder on a `- /placeholder:` line and the value on a `- text:` line under it. A
+ *   password input given another role (`role="searchbox"`) shows its value under that role the same way;
  * - a node gets a ref only when it is visible and takes the pointer, so a covered textbox shows its value with no ref.
+ *
+ * Every pattern here runs in time linear in the line: a name written as it is has at most 900 characters (Playwright
+ * leaves out a longer one), and an attribute is a word, maybe with `=` and a value with no blank. A page controls the
+ * text, so a pattern that could backtrack across a long line would block dsh.
  *
  * Pure: the password check comes in as an argument.
  *
@@ -30,30 +35,44 @@ export interface Processed {
   cut: boolean
 }
 
-/** A key's name: JSON-quoted, or a name that starts and ends with `/`, written as it is. */
-const NAME = String.raw`"(?:[^"\\\n]|\\.)*"|\/[^\n]*?\/`
-/** A key's attributes: `[level=1]`, `[active]`, `[ref=e5]`, `[cursor=pointer]`. */
-const ATTRS = String.raw`(?: \[[^\]\n]*\])*`
+/**
+ * A key's name: JSON-quoted; a lone `/`, which ends where the attributes or the key do; or a name that starts and ends with
+ * `/`, written as it is, of at most 900 characters.
+ */
+const NAME = String.raw`"(?:[^"\\\n]|\\.)*"|\/(?= \[|'?:|'?$)|\/[^\n]{0,898}?\/`
+/** A key's attributes, each a word maybe with a value: `[level=1]`, `[active]`, `[ref=e5]`, `[cursor=pointer]`, `[box=1,2,3,4]`. */
+const ATTRS = String.raw`(?: \[[a-z-]+(?:=[^\]\s]*)?\])*`
+/** The roles an `<input>` that may be a password field can have: its own, `textbox`, or one a page gave it. */
+const VALUE_ROLES = 'textbox|searchbox|combobox|spinbutton'
+/** What `processSnapshot` writes after a key whose value it left out. */
+const HIDDEN = String.raw`(?: (?:${escaped(PASSWORD_HIDDEN)}|${escaped(VALUE_HIDDEN)}))?`
+
+/** `text` as a pattern that matches it literally. */
+function escaped(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
 
 /** A node's key line up to its colon: the indent, `- `, and the key, in single quotes or not. */
 function keyLine(role: string): string {
-  return String.raw`(?<head>(?<indent> *)- (?<q>'?)${role}(?: (?<name>${NAME}))?(?<attrs>${ATTRS})\k<q>)`
+  return String.raw`(?<head>(?<indent> *)- (?<q>'?)(?<role>${role})(?: (?<name>${NAME}))?(?<attrs>${ATTRS})\k<q>)`
 }
 
-/** A textbox with its value on its line. */
-const INLINE = new RegExp(String.raw`^${keyLine('textbox')}: (?<value>.+)$`)
-/** A textbox whose children (a placeholder, its value) are under it. */
-const BLOCK = new RegExp(String.raw`^${keyLine('textbox')}:$`)
-/** A textbox with no value. */
-const BARE = new RegExp(String.raw`^${keyLine('textbox')}$`)
-/** Any textbox line, whatever follows the role. */
-const TEXTBOX = /^ *- '?textbox\b/
-/** Any node's line, for `elementOf`. */
-const ANY = new RegExp(String.raw`^${keyLine('(?<role>[a-z][a-z-]*)')}(?::(?: .*)?)?$`)
+/** A value role with its value on its line. */
+const INLINE = new RegExp(String.raw`^${keyLine(VALUE_ROLES)}: (?<value>[^\n]+)$`)
+/** A value role whose children (a placeholder, its value) are under it. */
+const BLOCK = new RegExp(String.raw`^${keyLine(VALUE_ROLES)}:$`)
+/** A value role with no value. */
+const BARE = new RegExp(String.raw`^${keyLine(VALUE_ROLES)}$`)
+/** Any value role's line, whatever follows the role. */
+const VALUE_LINE = new RegExp(String.raw`^ *- '?(${VALUE_ROLES})\b`)
+/** Any node's line, for `elementOf`, also as `processSnapshot` leaves it. */
+const ANY = new RegExp(String.raw`^${keyLine('[a-z][a-z-]*')}${HIDDEN}(?::(?: [^\n]*)?)?$`)
 /** A block's value line. */
 const TEXT_LINE = /^ *- text: /
+/** A textbox's placeholder line, which comes before its value line. */
+const PLACEHOLDER_LINE = /^ *- \/placeholder: /
 
-/** A textbox line that shows a value. */
+/** A line of a value role that shows a value. */
 interface Candidate {
   /** The line of the key. */
   line: number
@@ -76,23 +95,28 @@ function refOf(attrs: string | undefined): string | undefined {
   return ref !== undefined && REF.test(ref) ? ref : undefined
 }
 
-/** A block's value: the `- text:` line among its own children. */
+/**
+ * A block's value: an `<input>`'s `- text:` line is its first child, or its second, after its `- /placeholder:` line.
+ * Nothing further is looked at, so nested blocks cost no more than their lines.
+ */
 function valueLineOf(lines: readonly string[], at: number): number | undefined {
-  const indent = indentOf(lines[at]!)
-  for (let index = at + 1; index < lines.length; index++) {
-    const depth = indentOf(lines[index]!)
-    if (depth <= indent) break
-    if (depth === indent + 2 && TEXT_LINE.test(lines[index]!)) return index
+  const depth = indentOf(lines[at]!) + 2
+  for (let index = at + 1; index <= at + 2 && index < lines.length; index++) {
+    const line = lines[index]!
+    if (indentOf(line) !== depth) return undefined
+    if (TEXT_LINE.test(line)) return index
+    if (!PLACEHOLDER_LINE.test(line)) return undefined
   }
   return undefined
 }
 
-/** Every textbox line that shows a value. One in a shape the patterns don't know comes with no ref, and no head of its own. */
+/** Every value role's line that shows a value. One in a shape the patterns don't know comes with no ref, and no head of its own. */
 function candidates(lines: readonly string[]): Candidate[] {
   const found: Candidate[] = []
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index]!
-    if (!TEXTBOX.test(line)) continue
+    const role = VALUE_LINE.exec(line)?.[1]
+    if (role === undefined) continue
     const inline = INLINE.exec(line)
     if (inline !== null) {
       found.push({ line: index, head: inline.groups!.head!, form: 'inline', ref: refOf(inline.groups!.attrs) })
@@ -106,7 +130,7 @@ function candidates(lines: readonly string[]): Candidate[] {
     }
     if (BARE.test(line)) continue
     // A shape the patterns don't know, which may hold a value: everything after the role goes.
-    const head = `${' '.repeat(indentOf(line))}- textbox`
+    const head = `${' '.repeat(indentOf(line))}- ${role}`
     if (line.endsWith(':')) found.push({ line: index, head, form: 'block', valueLine: valueLineOf(lines, index), ref: undefined })
     else if (line.includes(': ')) found.push({ line: index, head, form: 'inline', ref: undefined })
   }
@@ -131,8 +155,9 @@ function headOf(text: string, units: number): string {
 /**
  * Blank password values, mask secrets, cut at `max` at a line end. `isPassword` rejecting counts as a password.
  *
- * The first `PASSWORD_CHECKS` textboxes with a value and a ref are checked, in parallel. A textbox past them, or with no
- * ref to check it by (covered, or not visible), has its value blanked unchecked.
+ * The candidates are the lines of a textbox, a searchbox, a combobox or a spinbutton that show a value. The first
+ * `PASSWORD_CHECKS` of them with a ref are checked, in parallel. One past them, or with no ref to check it by (covered, or
+ * not visible), has its value blanked unchecked.
  */
 export async function processSnapshot(raw: string, isPassword: (ref: string) => Promise<boolean>, max: number): Promise<Processed> {
   const lines = raw.split('\n')
@@ -169,7 +194,10 @@ function nameText(name: string, quotedKey: boolean): string {
   }
 }
 
-/** The words for `ref` from its snapshot line (`button "Save" [ref=e14]`, cut to 120), else `[ref=e14]`. */
+/**
+ * The words for `ref` from its snapshot line (`button "Save" [ref=e14]`, cut to 120), else `[ref=e14]`. A line
+ * `processSnapshot` blanked is known too.
+ */
 export function elementOf(snapshot: string | undefined, ref: string): string {
   const tail = ` [ref=${ref}]`
   if (snapshot === undefined || !REF.test(ref)) return tail.trimStart()

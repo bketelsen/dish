@@ -193,7 +193,7 @@ test('a textbox with no value, other roles, and text lines are left alone', asyn
   const raw = [
     '- textbox "Search" [ref=e2]',
     `- 'textbox "Password: at least 8" [ref=e4]'`,
-    '- searchbox "Find" [ref=e3]: cats',
+    '- slider "Volume" [ref=e3]: "50"',
     '- text: "textbox \\"x\\" [ref=e9]: not a field"',
     '- paragraph: "- textbox: inside a paragraph"',
   ].join('\n')
@@ -201,6 +201,157 @@ test('a textbox with no value, other roles, and text lines are left alone', asyn
   const result = await processSnapshot(raw, isPassword, 30_000)
   assert.deepEqual(asked, [])
   assert.equal(result.text, raw)
+})
+
+test('a password input under another role (searchbox, combobox, spinbutton) is checked and blanked the same way', async () => {
+  const raw = [
+    '- searchbox "Password" [ref=e6]: hunter2',
+    '- combobox "PIN" [ref=e7]: "1234"',
+    `- 'spinbutton "Code: 6 digits" [ref=e8]': "987654"`,
+    '- searchbox "Find" [ref=e9]: cats',
+    '- searchbox "Hidden": hunter3',
+    '- combobox "Country" [ref=e10]:',
+    '  - option "France" [selected]',
+    '  - option "Germany"',
+  ].join('\n')
+  const { asked, isPassword } = checker(['e6', 'e7', 'e8'])
+  const result = await processSnapshot(raw, isPassword, 30_000)
+  assert.deepEqual(asked.sort(), ['e6', 'e7', 'e8', 'e9'], 'one check per line with a value; a <select>\'s options are no value')
+  assert.equal(result.text, [
+    `- searchbox "Password" [ref=e6] ${PASSWORD}`,
+    `- combobox "PIN" [ref=e7] ${PASSWORD}`,
+    `- 'spinbutton "Code: 6 digits" [ref=e8]' ${PASSWORD}`,
+    '- searchbox "Find" [ref=e9]: cats',
+    `- searchbox "Hidden" ${UNCHECKED}`,
+    '- combobox "Country" [ref=e10]:',
+    '  - option "France" [selected]',
+    '  - option "Germany"',
+  ].join('\n'))
+  for (const secret of ['hunter2', 'hunter3', '1234', '987654']) assert.ok(!result.text.includes(secret), secret)
+})
+
+test('a name written /like this/ is a name: the value after it is checked, and kept when it isn\'t a password', async () => {
+  const raw = [
+    '- textbox /re/ [ref=e5]: hunter2',
+    '- textbox /path/ [ref=e6]: /usr/bin/x',
+    `- 'textbox /a: b/ [active] [ref=e7]': pw-three`,
+  ].join('\n')
+  const { asked, isPassword } = checker(['e5', 'e7'])
+  const result = await processSnapshot(raw, isPassword, 30_000)
+  assert.deepEqual(asked.sort(), ['e5', 'e6', 'e7'])
+  assert.equal(result.text, [
+    `- textbox /re/ [ref=e5] ${PASSWORD}`,
+    '- textbox /path/ [ref=e6]: /usr/bin/x',
+    `- 'textbox /a: b/ [active] [ref=e7]' ${PASSWORD}`,
+  ].join('\n'))
+  assert.equal(elementOf(raw, 'e6'), 'textbox "/path/" [ref=e6]')
+})
+
+test('a name that is a lone "/" ends at the slash: no part of the value is kept', async () => {
+  const raw = [
+    '- textbox / [ref=e5]: "hunter2/: rest"',
+    '- textbox /: "pw-two/ [ref=e9]: x"',
+    '- textbox / [ref=e6]:',
+    '  - /placeholder: pin',
+    '  - text: pw-three/',
+  ].join('\n')
+  const { asked, isPassword } = checker(['e5', 'e6'])
+  const result = await processSnapshot(raw, isPassword, 30_000)
+  assert.deepEqual(asked.sort(), ['e5', 'e6'])
+  assert.equal(result.text, [
+    `- textbox / [ref=e5] ${PASSWORD}`,
+    `- textbox / ${UNCHECKED}`,
+    `- textbox / [ref=e6] ${PASSWORD}:`,
+    '  - /placeholder: pin',
+  ].join('\n'))
+  for (const secret of ['hunter2', 'pw-two', 'pw-three']) assert.ok(!result.text.includes(secret), secret)
+})
+
+test('a hostile line of ~300,000 characters (or ~1,000,000) is processed in well under 200 ms', async () => {
+  const shapes = [
+    `- textbox / [ref=e5]: ${'/ ['.repeat(100_000)}]x`,
+    `- textbox / [ref=e5]: ${`/${' [a]'.repeat(50)}`.repeat(1_500)}x`,
+    `- textbox / [ref=e5]: ${`/ [a=${'b'.repeat(20)}`.repeat(12_000)}`,
+    `- textbox /${'/'.repeat(900)}${' [a]'.repeat(75_000)}`,
+    `- textbox "${'\\"'.repeat(150_000)}`,
+    // A million characters for these two, whose cost would grow with the line only a few hundred times over: every name
+    // that ends at a `/` in the first 900 characters scanning on to a line separator, which `.` doesn't match, or to the
+    // end of an attribute with no `]`.
+    `- textbox /${'/: '.repeat(333_000)} x`,
+    `- textbox /${'/ ['.repeat(333_000)}x`,
+  ]
+  for (const line of shapes) {
+    assert.ok(line.length > 250_000 && line.length < 1_100_000, `${line.length}`)
+    let started = performance.now()
+    const result = await processSnapshot(line, async () => true, 30_000)
+    const processMs = performance.now() - started
+    assert.ok(processMs < 200, `processSnapshot took ${processMs.toFixed(0)} ms on ${line.slice(0, 30)}…`)
+    assert.ok(!result.text.includes('x\n') && result.text.length <= 30_000)
+    started = performance.now()
+    // The ref at the end, so the line is one elementOf parses.
+    elementOf(`${line.replace('textbox', 'button')} [ref=e5]`, 'e5')
+    const elementMs = performance.now() - started
+    assert.ok(elementMs < 200, `elementOf took ${elementMs.toFixed(0)} ms on ${line.slice(0, 30)}…`)
+  }
+})
+
+test('a block\'s value is its first child line, or the second after a placeholder: nothing deeper is looked at', async () => {
+  const raw = [
+    '- textbox "Editor" [ref=e3]:',
+    '  - paragraph: one',
+    '  - text: two',
+    '- textbox "Notes" [ref=e4]:',
+    '  - text: first',
+    '- textbox "Pin" [ref=e5]:',
+    '  - /placeholder: pin',
+    '  - paragraph: not a value',
+    '  - text: three',
+  ].join('\n')
+  const { asked, isPassword } = checker(['e3', 'e4', 'e5'])
+  const result = await processSnapshot(raw, isPassword, 30_000)
+  assert.deepEqual(asked, ['e4'])
+  assert.equal(result.text, [
+    '- textbox "Editor" [ref=e3]:',
+    '  - paragraph: one',
+    '  - text: two',
+    `- textbox "Notes" [ref=e4] ${PASSWORD}:`,
+    '- textbox "Pin" [ref=e5]:',
+    '  - /placeholder: pin',
+    '  - paragraph: not a value',
+    '  - text: three',
+  ].join('\n'))
+})
+
+test('nested textbox blocks cost time in proportion to the snapshot, not more', async () => {
+  const depth = 2_000
+  const lines: string[] = []
+  for (let i = 0; i < depth; i++) lines.push(`${'  '.repeat(i)}- textbox:`)
+  for (let i = depth - 1; i >= 0; i--) lines.push(`${'  '.repeat(i + 1)}- text: tail`)
+  const raw = lines.join('\n')
+  assert.ok(raw.length > 8_000_000)
+  const started = performance.now()
+  const result = await processSnapshot(raw, async () => false, 30_000)
+  const ms = performance.now() - started
+  assert.ok(ms < 1_000, `${ms.toFixed(0)} ms`)
+  assert.equal(result.cut, true)
+})
+
+test('elementOf knows a line processSnapshot blanked', async () => {
+  const raw = [
+    '- textbox "Password" [ref=e5]: hunter2',
+    '- textbox "Pin" [ref=e6]:',
+    '  - /placeholder: pin',
+    '  - text: "1234"',
+    `- 'searchbox "Key: here" [ref=e7]': secret`,
+    ...Array.from({ length: PASSWORD_CHECKS }, (_, i) => `- textbox "F${i}" [ref=e${100 + i}]: v`),
+    '- textbox "Last" [ref=e9]: past the checks',
+  ].join('\n')
+  const processed = (await processSnapshot(raw, async ref => ['e5', 'e6', 'e7'].includes(ref), 1_000_000)).text
+  assert.ok(processed.includes(`- textbox "Last" [ref=e9] ${UNCHECKED}`))
+  assert.equal(elementOf(processed, 'e5'), 'textbox "Password" [ref=e5]')
+  assert.equal(elementOf(processed, 'e6'), 'textbox "Pin" [ref=e6]')
+  assert.equal(elementOf(processed, 'e7'), 'searchbox "Key: here" [ref=e7]')
+  assert.equal(elementOf(processed, 'e9'), 'textbox "Last" [ref=e9]')
 })
 
 test('secrets are masked, after the password fields', async () => {
