@@ -25,6 +25,7 @@ import { AGENT_IDENTITY, personIdentity } from 'dish-kit/store'
 import type { RemoteStatus, VersionedStore } from 'dish-kit/store'
 import { validateDirection } from './format.ts'
 import { INDEX_BYTES, INDEX_LINES } from './protocol.ts'
+import { MemoryRemote } from './remote.ts'
 import { createMemory } from './service.ts'
 import type { DishMemory } from './service.ts'
 import { contextServices } from './services.ts'
@@ -212,6 +213,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (unloaded(error)) return
     throw error
   }
+  // Settings → Memory's remote: a child plugin that needs `dishMemory`, so it goes when the service does.
+  ctx.plugin(MemoryRemote)
   logger.info('vault ready at %s', repository)
   announced = true
   if (latest !== undefined) report(latest)
