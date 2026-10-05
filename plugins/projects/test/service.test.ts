@@ -77,3 +77,44 @@ test('a retry that read the registry before a pass removed the project is refuse
     await status.forget('acme/none').catch(() => {})
   }
 })
+
+test('a project that reads failed can be retried at once, while its onboarding is still saving that it failed', async () => {
+  const fake = fakeStore({ c1: serializeProjects({ 'acme/widget': FIELDS }) }, 'c1')
+  const driver = fakeDriver()
+  const status = new StatusStore(join(await tempDir(), 'projects', 'status.json'))
+  // The job's save of `failed` is held: it is in memory (and emitted) at once, and the job waits on the file. Under
+  // load that write is slow, and a retry in the meantime was refused as being onboarded (the flake of remote.test.ts's
+  // "retry onboards a failed project again").
+  let release = (): void => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const set = status.set.bind(status)
+  status.set = (name, value) => {
+    const saving = set(name, value)
+    return value.state === 'failed' ? held.then(() => saving) : saving
+  }
+  const service = createDishProjects({
+    store: () => fake.store,
+    status,
+    workspaces: () => driver.driver,
+    changed: () => {},
+    emitStatus: () => {},
+    logger: { info: () => {}, warn: () => {} },
+  })
+  try {
+    await service.drive()
+    ;(await driver.next('onboard', 'acme/widget')).reject(new Error('could not clone it'))
+    await waitFor('the project to fail', () => service.status('acme/widget').state === 'failed')
+    await service.retry('acme/widget')
+    assert.equal(service.status('acme/widget').state, 'pending')
+    // The second onboarding runs once the first has settled.
+    release()
+    ;(await driver.next('onboard', 'acme/widget')).resolve()
+    await service.idle()
+    assert.equal(service.status('acme/widget').state, 'ready')
+    assert.deepEqual(driver.calls.map(call => `${call.kind} ${call.project.name}`), ['onboard acme/widget', 'onboard acme/widget'])
+  } finally {
+    release()
+    service.close()
+    await status.forget('acme/none').catch(() => {})
+  }
+})

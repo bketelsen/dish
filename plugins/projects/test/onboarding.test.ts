@@ -493,6 +493,23 @@ test('onboarding(name) says whether an onboarding is queued or running; a prepar
   await onboarding.idle()
 })
 
+test('a job recording its end is an onboarding no more: from the moment a project reads failed or ready, onboarding(name) says so', async () => {
+  const { fake, onboarding, state } = await harness()
+  // The end is set and emitted at once, and saved after: the job stays the running one until the file is written. A
+  // retry, refused by `onboarding(name)`, of a project that already read failed was refused as being onboarded (the
+  // flake of remote.test.ts's "retry onboards a failed project again" under load).
+  const seen: string[] = []
+  state.onEmit = (name, value) => {
+    if (value.state === 'failed' || value.state === 'ready') seen.push(`${name} ${value.state} ${onboarding.onboarding(name) ?? '-'}`)
+  }
+  onboarding.enqueue(project('acme/a'), 'onboard')
+  onboarding.enqueue(project('acme/b'), 'onboard')
+  ;(await fake.next('onboard', 'acme/a')).reject(new Error('could not clone it'))
+  ;(await fake.next('onboard', 'acme/b')).resolve()
+  await onboarding.idle()
+  assert.deepEqual(seen, ['acme/a failed -', 'acme/b ready -'])
+})
+
 test('close starts no grace timer and clears one already running: nothing is logged after the plugin is gone', async () => {
   // A job that never settles, closed.
   const first = await harness({ abortGraceMs: 40 })

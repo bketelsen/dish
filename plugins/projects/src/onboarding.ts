@@ -9,7 +9,7 @@
  *   onboarding asked for while a prepare is queued turns that job into an onboarding. A project whose onboarding is
  *   running isn't queued again; one whose prepare is running gets its onboarding queued behind it. A job whose end is
  *   decided (its driver call has settled, or it found no driver) and is only recording it counts no more: what is
- *   asked for then (dish-workspaces back, the fields changed) is queued behind it, not dropped.
+ *   asked for then (dish-workspaces back, the fields changed, a retry) is queued behind it, not dropped or refused.
  * - **Status.** Each step `dish-workspaces` reports moves the project's status (`installation`, `clone` and
  *   `configure` are cloning; `setup` and `workspace` are setup; any other is ignored), and the end is `ready` or
  *   `failed`. Each change is set in the status store and emitted. A job that dish-projects aborted (a removal, a stop)
@@ -162,12 +162,15 @@ export class Onboarding {
     this.#drain()
   }
 
-  /** Whether an onboarding of `name` is queued (`queued`) or running (`running`). A prepare, or an aborted job, doesn't count. */
+  /**
+   * Whether an onboarding of `name` is queued (`queued`) or running (`running`). A prepare, an aborted job, or one only
+   * recording its end (which the project's status shows already) doesn't count.
+   */
   onboarding(name: string): 'queued' | 'running' | undefined {
     const key = keyOf(name)
     if (this.#queue.some(job => job.key === key && job.kind === 'onboard')) return 'queued'
     const running = this.#running
-    if (running?.key === key && running.kind === 'onboard' && !running.controller.signal.aborted) return 'running'
+    if (running?.key === key && running.kind === 'onboard' && !running.controller.signal.aborted && !running.finishing) return 'running'
     return undefined
   }
 
