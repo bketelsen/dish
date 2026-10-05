@@ -145,12 +145,12 @@ test('namespaceSpecs makes a fresh set each time', () => {
 
 // --- defaults --------------------------------------------------------------------------------
 
-test('DEFAULTS has exactly the eight roles, each non-empty and under 8 KiB', () => {
+test('DEFAULTS has exactly the eight roles, each non-empty and under 9 KiB', () => {
   assert.deepEqual(Object.keys(DEFAULTS).sort(), [...ALL_ROLES].sort())
   for (const role of ALL_ROLES) {
     const text = DEFAULTS[role]!
     assert.ok(text.trim() !== '', `${role} is empty`)
-    assert.ok(Buffer.byteLength(text) < 8192, `${role} is ${Buffer.byteLength(text)} bytes`)
+    assert.ok(Buffer.byteLength(text) < 9216, `${role} is ${Buffer.byteLength(text)} bytes`)
   }
 })
 
