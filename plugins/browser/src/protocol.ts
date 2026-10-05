@@ -14,7 +14,8 @@ export const FRAME_RATE = 15
 export const TEXT_MAX = 10_000
 /** The most characters in an address. */
 export const URL_MAX = 4096
-// The bits of a `key` item's `modifiers`. They are CDP's, so they go to Chromium as they are.
+// The bits of a `key` item's `modifiers`. They are CDP's values. The core reads them to release any modifier key the tab
+// no longer holds; the page's own key presses carry no modifiers.
 /** The `modifiers` bit for Alt. */
 export const ALT = 1
 /** The `modifiers` bit for Control. */
