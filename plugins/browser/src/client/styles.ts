@@ -6,7 +6,8 @@
  * Nothing is wider than its container: text from a page (a URL, a title, a notice) wraps anywhere.
  *
  * The tab is a size container: the toolbar wraps below 360px, the address taking a line of its own. The picture's box fills
- * what the stage has left, whatever the image's size, so `Picture` can measure the room and draw the frame to fit it.
+ * what the stage has left, whatever the image's size, so `Picture` can measure the room and draw the frame to fit it: at the
+ * box's top, as a browser shows a page under its address bar, and centred across.
  */
 
 const css = `
@@ -138,7 +139,7 @@ const css = `
 .dish-browser-picture {
   display: flex;
   flex: 1 1 0;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   min-width: 0;
   min-height: 0;

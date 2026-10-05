@@ -14,7 +14,10 @@
  *   and `'block'` would stop that while blocking nothing but the usual `navigator.serviceWorker.register` (a page can
  *   call the container's own method). WebSockets, which the route doesn't see, go through `routeWebSocket` (:10482).
  * - **A page** reports its events in dish's terms (`PageEvents`), and keeps one CDP session (`newCDPSession`, :10325)
- *   for its history and the screencast.
+ *   for its history, the screencast and the tab's capture.
+ * - **No capture is lost to a navigation.** Chromium never answers a capture asked for just before the main frame commits
+ *   a new document, so a screenshot or a capture pending at a commit is asked for again (`acrossCommits`). The tab's
+ *   capture goes over CDP, outside the queue Playwright keeps a page's screenshots in, so it never holds up the agent's.
  * - **Errors.** An action maps Playwright's errors to the driver's: a timeout (`errors.TimeoutError`, :18779) is a
  *   `DriverTimeout`, and so is a ref that resolves to nothing at once (its frame is gone), as `stale ref`; a closed or
  *   crashed target is `DriverClosed`; an unknown key, a `selectOption` on what isn't a `<select>` and a `fill` that the
@@ -142,6 +145,49 @@ function bounded<T>(work: Promise<T>, timeoutMs: number, signal?: AbortSignal): 
     signal?.addEventListener('abort', onAbort, { once: true })
     work.then(value => { finish(); resolve(value) }, (error: unknown) => { finish(); reject(error) })
   })
+}
+
+/** How many times a capture is asked for in all when the main frame commits while it's pending (`acrossCommits`). */
+const CAPTURE_TRIES = 3
+
+/**
+ * A screenshot or a capture that a commit can't stall. Chromium loses a capture asked for just before the main frame
+ * commits a new document: `Page.captureScreenshot` never answers, with or without Playwright around it (the end-to-end
+ * dry run's 9.9 s screenshot; a repro lost 25 of 64 asked for 2–17 ms before a reload or a back started, most of those
+ * at 4–10 ms). So `attempt` gets a signal that aborts when the main frame commits while it's pending, and is asked
+ * again, up to `tries` times in all, within the one `timeoutMs`; the last try runs to its time. The caller's `signal`
+ * aborts the try with its own reason, and nothing more is tried. A commit with no time left is a `DriverTimeout`.
+ *
+ * @param onCommit - subscribes to the page's main-frame commits; gives the unsubscribe.
+ */
+export async function acrossCommits<T>(
+  attempt: (signal: AbortSignal, timeoutMs: number) => Promise<T>,
+  onCommit: (listener: () => void) => () => void,
+  options: { timeoutMs: number, signal?: AbortSignal, tries?: number },
+): Promise<T> {
+  const { signal } = options
+  const tries = options.tries ?? CAPTURE_TRIES
+  const deadline = Date.now() + options.timeoutMs
+  for (let tried = 1; ; tried++) {
+    signal?.throwIfAborted()
+    const controller = new AbortController()
+    let committed = false
+    const onAbort = () => controller.abort(signal?.reason)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    const unsubscribe = tried >= tries ? undefined : onCommit(() => {
+      committed = true
+      controller.abort(new DriverTimeout('the page committed a navigation'))
+    })
+    try {
+      return await attempt(controller.signal, Math.max(1, deadline - Date.now()))
+    } catch (error) {
+      if (!committed || signal?.aborted) throw error
+      if (Date.now() >= deadline) throw new DriverTimeout(`not done within ${options.timeoutMs} ms`)
+    } finally {
+      unsubscribe?.()
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
 }
 
 /** A Playwright timeout: never 0, which Playwright reads as "no timeout". */
@@ -383,6 +429,8 @@ class PlaywrightPage implements DriverPage {
   private readonly navigations = new Set<PlaywrightRequest>()
   /** For `settle`: called when one of `navigations` ends, or the page goes. */
   private readonly waiters = new Set<() => void>()
+  /** For `acrossCommits`: called when the main frame commits a navigation. */
+  private readonly commits = new Set<() => void>()
 
   constructor(page: Page, viewport: Viewport) {
     this.page = page
@@ -402,7 +450,9 @@ class PlaywrightPage implements DriverPage {
     // A listener makes Playwright take the chooser over, so no native one opens.
     page.on('filechooser', () => this.emit('filechooser'))
     page.on('framenavigated', frame => {
-      if (frame === page.mainFrame()) this.emit('navigated', frame.url())
+      if (frame !== page.mainFrame()) return
+      for (const listener of [...this.commits]) safely(listener)
+      this.emit('navigated', frame.url())
     })
     page.on('load', () => this.emit('load'))
     page.on('domcontentloaded', () => this.ended(true))
@@ -677,12 +727,22 @@ class PlaywrightPage implements DriverPage {
     return act(signal, () => this.page.getByText(text).first().waitFor({ state: gone ? 'hidden' : 'visible', timeout: ms(timeoutMs), signal }))
   }
 
-  /** A PNG of the viewport (:4563) or of one ref's element (:16617). */
+  /** Subscribes to the main frame's commits (`acrossCommits`); gives the unsubscribe. */
+  private onCommit(listener: () => void): () => void {
+    this.commits.add(listener)
+    return () => { this.commits.delete(listener) }
+  }
+
+  /**
+   * A PNG of the viewport (:4563) or of one ref's element (:16617), asked again when the main frame commits meanwhile
+   * (`acrossCommits`). Playwright takes a page's screenshots one at a time, so a lost one would hold every later one up
+   * for its time; aborting it through its `signal` lets them go.
+   */
   screenshot({ ref, timeoutMs, signal }: Act & { ref?: string }): Promise<Uint8Array> {
-    return act(signal, () => {
-      const options = { type: 'png' as const, timeout: ms(timeoutMs), signal }
+    return act(signal, () => acrossCommits((attempt, left) => {
+      const options = { type: 'png' as const, timeout: ms(left), signal: attempt }
       return ref ? this.locate(ref).screenshot(options) : this.page.screenshot(options)
-    })
+    }, listener => this.onCommit(listener), { timeoutMs, signal }))
   }
 
   /**
@@ -743,11 +803,22 @@ class PlaywrightPage implements DriverPage {
     })
   }
 
+  /**
+   * The tab's picture, now: CDP's `Page.captureScreenshot` (protocol.d.ts:15434) on the page's own session, not
+   * Playwright's `screenshot`, whose queue the agent's screenshots wait in. So no capture can hold the agent's
+   * `browser_screenshot` up. Asked again when the main frame commits meanwhile (`acrossCommits`); a capture left
+   * unanswered is only let go, since CDP can't take it back.
+   */
   capture(quality: number): Promise<ScreencastFrame> {
     return act(undefined, async () => {
-      const image = await this.page.screenshot({ type: 'jpeg', quality, timeout: SHOT_MS })
+      const session = await bounded(this.session(), REF_MS)
+      const { data } = await acrossCommits(
+        (attempt, left) => bounded(session.send('Page.captureScreenshot', { format: 'jpeg', quality }), left, attempt),
+        listener => this.onCommit(listener),
+        { timeoutMs: SHOT_MS },
+      )
       const size = this.page.viewportSize() ?? this.viewport
-      return { data: image.toString('base64'), width: size.width, height: size.height }
+      return { data, width: size.width, height: size.height }
     })
   }
 
