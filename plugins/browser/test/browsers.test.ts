@@ -855,6 +855,86 @@ test('user navigate that fails records the URL asked for, not the error page; a 
   assert.equal(w.notices('s1').length, 2)
 })
 
+/** Hold the first `goto` of every new page from now on: the tab's navigations stay in flight. */
+function holdGotos(w: World): Hold[] {
+  const holds: Hold[] = []
+  w.driver.onPage = page => { holds.push(page.hold('goto')) }
+  return holds
+}
+
+test('the tab\'s first navigation keeps its browser (max 1): an agent waiting at the cap doesn\'t evict it mid-navigation', async () => {
+  const w = world({ limits: { maxBrowsers: 1, idleMinutes: 15 } })
+  const holds = holdGotos(w)
+  const launch = w.driver.holdLaunch()
+  const tab = w.core.user('s1', { kind: 'navigate', url: 'example.test/' }, { workspace: undefined })
+  await flush()
+  const agent = w.core.forAgent('s2', undefined, never)
+  agent.catch(() => {})
+  await flush()
+  launch.release()
+  await flush()
+  assert.equal(w.core.isOpen('s1'), true)
+  await w.clock.tick(300, 50)
+  assert.equal(w.core.isOpen('s1'), true)
+  assert.equal(w.core.isOpen('s2'), false)
+  assert.deepEqual(w.notices('s1'), [])
+  const page = w.driver.pages[0]!
+  holds[0]?.release()
+  await tab
+  // The navigation finished, with no error for the tab; then the waiting agent took its place, as the cap says.
+  assert.equal(page.currentUrl, 'https://example.test/')
+  assert.deepEqual(w.notices('s1'), [])
+  await agent
+  assert.equal(w.core.view('s1').reason, 'evicted')
+  assert.equal(w.core.isOpen('s2'), true)
+})
+
+test('the tab\'s first navigation keeps its browser (max 2): with the other browser in a call, an agent waits rather than evict it', async () => {
+  const w = world({ limits: { maxBrowsers: 2, idleMinutes: 15 } })
+  const s0 = await busyCall(w, 's0')
+  const holds = holdGotos(w)
+  const tab = w.core.user('s1', { kind: 'navigate', url: 'example.test/' }, { workspace: undefined })
+  await flush()
+  assert.equal(w.core.isOpen('s1'), true)
+  let agent = 'pending'
+  const opening = w.core.forAgent('s2', undefined, never).then(() => { agent = 'opened' }, (error: unknown) => { agent = `rejected ${String((error as BrowserError).code)}` })
+  await w.clock.tick(300, 50)
+  assert.equal(agent, 'pending')
+  assert.equal(w.core.isOpen('s1'), true)
+  assert.deepEqual(w.notices('s1'), [])
+  holds[0]?.release()
+  await tab
+  // The navigation's end wakes the waiting call at once: no wait for the next 250 ms look.
+  await flush()
+  assert.equal(agent, 'opened')
+  await opening
+  assert.equal(w.core.view('s1').reason, 'evicted')
+  assert.equal(w.core.isOpen('s0'), true)
+  s0.hold.release()
+  await s0.done
+})
+
+test('the tab\'s navigation on an open browser keeps it from the sweep and from eviction while it runs', async () => {
+  const w = world({ limits: { maxBrowsers: 1, idleMinutes: 15 } })
+  await w.core.forAgent('s1', undefined, never)
+  const page = pageOf(w, 's1')
+  const hold = page.hold('reload')
+  const reload = w.core.user('s1', { kind: 'reload' }, undefined)
+  await hold.reached
+  w.clock.advance(15 * 60_000)
+  await w.core.sweep(new Set())
+  assert.equal(w.core.isOpen('s1'), true)
+  const agent = w.core.forAgent('s2', undefined, never)
+  agent.catch(() => {})
+  await w.clock.tick(300, 50)
+  assert.equal(w.core.isOpen('s1'), true)
+  hold.release()
+  await reload
+  await w.clock.tick(300, 50)
+  await agent
+  assert.equal(w.core.view('s1').reason, 'evicted')
+})
+
 test('user navigate doesn\'t wait for the agent\'s call', async () => {
   const w = world()
   const call = await busyCall(w, 's1')
