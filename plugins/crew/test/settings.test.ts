@@ -106,7 +106,7 @@ test('the default has the models, limits and roles of the spec', () => {
   assert.equal(coder.family, 'anthropic')
   assert.equal(coder.writes, true)
   assert.equal(coder.reviews, false)
-  assert.deepEqual([...coder.tools], ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message', 'ask_judge'])
+  assert.deepEqual([...coder.tools], ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot', 'skill', 'todo_write', 'send_message', 'ask_judge'])
   assert.equal(settings.roles.architect!.tier, 'strong')
   // writes and reviews are false unless the file says so.
   const researcher = settings.roles.researcher!
@@ -565,13 +565,28 @@ test('every shipped role lists ask_judge, last, and the tools it had before are 
     assert.equal(settings.tools.at(-1), JUDGE_TOOL, role)
     assert.equal(settings.tools.filter(tool => tool === JUDGE_TOOL).length, 1, role)
   }
-  // The tools before it are the spec's roles from before dish-judge: the lists only gained one name, and (2026-10-03)
-  // read_image for the roles that check what they or others made.
+  // The tools before it are the spec's roles from before dish-judge: the lists only gained one name, (2026-10-03)
+  // read_image for the roles that check what they or others made, and (2026-10-04) the browser tools for the same roles.
   const before = (role: string) => DEFAULT_SETTINGS.roles[role]!.tools.slice(0, -1)
   assert.deepEqual(before('architect'), ['read', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
-  assert.deepEqual(before('reviewer'), ['read', 'read_image', 'glob', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('reviewer'), ['read', 'read_image', 'glob', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot', 'skill', 'todo_write', 'send_message'])
   assert.deepEqual(before('researcher'), ['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
-  assert.deepEqual(before('writer'), ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('writer'), ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot', 'skill', 'todo_write', 'send_message'])
+})
+
+test('the coder, the reviewer and the writer have the ten browser tools; the researcher, the architect and ops have none', () => {
+  // dish-browser's tools, in its tools table's order (docs/specs/browser.md), right after web_fetch.
+  const browser = ['browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot']
+  for (const role of ['coder', 'reviewer', 'writer']) {
+    const tools = DEFAULT_SETTINGS.roles[role]!.tools
+    const at = tools.indexOf('web_fetch')
+    assert.ok(at >= 0, role)
+    assert.deepEqual(tools.slice(at + 1, at + 1 + browser.length), browser, role)
+    assert.equal(tools.filter(tool => tool.startsWith('browser_')).length, browser.length, role)
+  }
+  for (const role of ['researcher', 'architect', 'ops']) {
+    assert.deepEqual(DEFAULT_SETTINGS.roles[role]!.tools.filter(tool => tool.startsWith('browser_')), [], role)
+  }
 })
 
 test('a tool name is only a name: a file that lists ask_judge is valid whether or not dish-judge is installed', () => {

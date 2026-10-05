@@ -310,7 +310,15 @@ test('tools.screened entries are exact names, or a prefix ending in *', () => {
 
 test('the shipped default screens pr_feedback, whose answer is what people and checks wrote on GitHub', () => {
   assert.equal(isScreened('pr_feedback', DEFAULT_SETTINGS.tools.screened), true)
-  assert.equal(DEFAULT_SETTINGS.tools.screened.at(-1), 'pr_feedback')
+  assert.equal(DEFAULT_SETTINGS.tools.screened.at(-2), 'pr_feedback')
+})
+
+test('the shipped default screens every browser_* tool, whose results carry a page\'s own text', () => {
+  assert.equal(DEFAULT_SETTINGS.tools.screened.at(-1), 'browser_*')
+  for (const name of ['browser_navigate', 'browser_read', 'browser_click', 'browser_screenshot']) {
+    assert.equal(isScreened(name, DEFAULT_SETTINGS.tools.screened), true, name)
+  }
+  for (const name of ['browser', 'browse', 'my_browser_read']) assert.equal(isScreened(name, DEFAULT_SETTINGS.tools.screened), false, name)
 })
 
 // --- the text the judge reads --------------------------------------------------------------------------

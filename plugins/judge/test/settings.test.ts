@@ -50,7 +50,7 @@ test('the default has the model, time limit, thresholds and tool lists of the sp
     timeoutMs: 2000,
     commands: { readOnly: 0.9, reversible: 0.9, servesTask: 0.5 },
     screening: { withhold: 0.9, warn: 0.5, chunkChars: 24000 },
-    tools: { gated: ['bash', 'pwsh'], screened: ['web_search', 'web_fetch', 'read_mcp_resource', 'mcp__*', 'pr_feedback'] },
+    tools: { gated: ['bash', 'pwsh'], screened: ['web_search', 'web_fetch', 'read_mcp_resource', 'mcp__*', 'pr_feedback', 'browser_*'] },
   })
 })
 
