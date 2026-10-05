@@ -134,6 +134,17 @@ incus exec minideb:dish --project dish -- su - dish -c 'cd ~/dish && env -i HOME
 
 Without the bundle, the dish preset's `dish-memory/context` row, which loads through dish-crew's dependency on `dish-memory`, adds no message, and its tools say memory is unavailable, until the rollback takes the row out of the preset. What memory kept stays where it is, for a later update to find: the vault (`~/.local/share/dish/vault.git`, and its remote) and the directions (`families/<family>/direction.md` in the config store, which nothing owns until then). The profile's `dish-memory` row stays too: with no bundle to patch, dsh warns `patch: entry dish-memory not found` when it composes the profile, and starts all the same. Delete the row from `~/.dsh/profiles/web/cordis.patch.yml` to quiet it. The store's prompts (`common.md`, `main.md` and the six crew roles') and `crew.yaml` stay at this step's texts, which name `remember`, `recall` and the `<dish-memory>` message, because an older `previous.json` doesn't know them: reset the eight prompts on Settings → Prompts, and revert `crew.yaml`'s "updated to the new defaults" commit on Settings → History. Nothing breaks before you do: crew's allow lists drop `recall` when dsh doesn't have it.
 
+Coming back is one step more. A checkout from before the memory step has an `update.sh` that refuses `install.env`'s `DISH_VAULT_REMOTE` line, and it reads `install.env` before it fetches, so `dish-update` can't update past it: it stops at `reading the inputs` and changes nothing. Move the checkout yourself, as `dish`, then update as usual (the new `update.sh` finds itself at the target, installs and restarts):
+
+```sh
+incus exec minideb:dish --project dish -- su - dish -c 'cd ~/dish && git status --short'    # must print nothing
+incus exec minideb:dish --project dish -- su - dish -c 'cd ~/dish && git fetch origin && git switch main && git merge --ff-only origin/main'
+incus exec minideb:dish --project dish -- dish-update
+incus exec minideb:dish --project dish -- dish-update --apply
+```
+
+This is how the VM first got the memory step, on 2026-10-05: fleet's `DISH_VAULT_REMOTE` arrived before an `update.sh` that knew it.
+
 `minideb` is your desktop's Incus remote for Minideb. Without it, go through Minideb: `ssh <you>@<minideb-host> incus exec dish --project dish -- dish-update`, and so on. On Minideb itself it's `incus exec dish --project dish -- dish-update`. The scripts' own hints, such as `run dish-url for a fresh sign-in link (incus exec dish --project dish -- dish-url)`, give that form for Minideb itself; from the desktop, add the `minideb:` remote.
 
 ### Who runs it
