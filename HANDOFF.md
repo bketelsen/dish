@@ -1,6 +1,6 @@
 # Handoff
 
-Where dish stands, how to run it, and what's next. Updated 2026-10-04. The plan of record is [ROADMAP.md](ROADMAP.md). The design is [docs/design.md](docs/design.md), and each step has its spec under [docs/specs/](docs/specs/).
+Where dish stands, how to run it, and what's next. Updated 2026-10-05. The plan of record is [ROADMAP.md](ROADMAP.md). The design is [docs/design.md](docs/design.md), and each step has its spec under [docs/specs/](docs/specs/).
 
 ## What dish is
 
@@ -19,7 +19,7 @@ It runs as `dsh web` on a Debian VM.
   - The prod profile is `~dish/.dsh/profiles/web`. Work lives in `~dish/work` (clones, worktrees, and the `scratch` workspace).
 - **The config store:** `~/.config/dish/config.git`. The VM pushes it to `bketelsen/dish-config`, and the desktop's store has no remote. Never give the desktop one while the VM runs, and never put a secret in it.
 
-## State on 2026-10-04
+## State on 2026-10-05
 
 Everything below is merged and running on the VM, except the browser step (7a), which is built and awaiting review.
 
@@ -39,7 +39,7 @@ Everything below is merged and running on the VM, except the browser step (7a), 
 | Chromium, `fonts-liberation` and `xmllint` on the VM | fleet #43 | Guest play applied 2026-10-04 (`changed=1`, rerun `changed=0`). Checked through `dish-sandbox` as `dish`: headless screenshots of a `file://` page and of a `127.0.0.1` dev server started in the same call, fonts rendering, no process left; `xmllint` in both modes. Chromium needs a writable sandbox: in read-only mode it can't make its profile directory. `common.md` tells agents. |
 | `bketelsen/dish` as a dish project | registered 2026-10-04 | `projects.yaml`: family `bketelsen`, gate `pnpm typecheck && pnpm test` (10m), setup `pnpm install --frozen-lockfile`, and a role line telling agents the user deploys it (never run `deploy/` scripts or restart `dish-web`). Its gate passes inside the VM's sandbox: 4,505 tests, 4,499 pass, 0 fail, 6 skipped, in about 146 s. Two of the skips are the shellcheck tests, until [bketelsen/fleet#44](https://github.com/bketelsen/fleet/pull/44) installs `shellcheck` on the guest. Each task worktree needs its own `pnpm install --frozen-lockfile` (the `worktree` tool's answer says so). |
 | 7 `orchestrator` | #21 | Deployed 2026-10-03 at 23:23 UTC. The first live run, on `bketelsen/clippy` (`20261003-readme-output-example`), went clean from start to finish: a coder's `report`, the gate passed at its head, a `final: true` review approved that head, and `open_pr` opened [bketelsen/clippy#13](https://github.com/bketelsen/clippy/pull/13), which the user merged. Every ledger line was the harness's, and no token was on disk. |
-| 7a `browser` | branch `browser` | Built, awaiting review and the rollout ([spec](docs/specs/browser.md), [plan](docs/plans/2026-10-04-browser.md)): `dish-browser`, one headless Chromium with a browser per agent session, the ten `browser_*` tools, the Browser tab and screenshots in the chat. Its real-Chromium tests run in the VM's gate, and it was checked end to end in a scratch dsh on the VM. The rollout adds `browser_*` to the VM's `judge.yaml` by hand. |
+| 7a `browser` | branch `browser` | Built, awaiting review and the rollout ([spec](docs/specs/browser.md), [plan](docs/plans/2026-10-04-browser.md)): `dish-browser`, one headless Chromium with a browser per agent session, the ten `browser_*` tools, the Browser tab and screenshots in the chat. Its real-Chromium tests run in the VM's gate, and it was checked end to end in a scratch dsh on the VM on 2026-10-05. The rollout adds `browser_*` to the VM's `judge.yaml` by hand. |
 
 **The VM's `judge.yaml`** has `reversible: 0.80` and `servesTask: 0.40` (set in the web UI on 2026-10-03; the shipped default is 0.90/0.50). The [judge spec](docs/specs/judge.md) has the replay behind them. Its `tools.screened` gained `pr_feedback` by hand on 2026-10-03, as step 7's rollout says.
 

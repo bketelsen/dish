@@ -125,6 +125,22 @@ test('the picture sits at the top of its area, as a browser shows a page under i
   assert.equal(toViewport(wide.left - 1, 130, wide, VIEWPORT), undefined)
 })
 
+test('the focus ring is drawn on the image, not on the box, which fills the stage below it', () => {
+  // The box keeps filling the stage (`Picture` measures it for the room), so a ring on the box ran far below a wide
+  // pane's image. The ring is the image's outline, drawn over its border.
+  const styles = readFileSync(new URL('../src/client/styles.ts', import.meta.url), 'utf8')
+  const box = /\n\.dish-browser-picture \{\n([^}]*)\}/.exec(styles)
+  assert.ok(box, 'the .dish-browser-picture rule')
+  assert.match(box[1]!, /^ {2}flex: 1 1 0;$/m, 'the box fills the stage')
+  assert.match(box[1]!, /^ {2}outline: none;$/m)
+  assert.doesNotMatch(styles, /\.dish-browser-picture:focus(?:-visible|-within)? \{/, 'no ring on the box itself')
+  assert.doesNotMatch(styles, /box-shadow/)
+  const ring = /\n\.dish-browser-picture:focus \.dish-browser-frame \{\n([^}]*)\}/.exec(styles)
+  assert.ok(ring, 'the .dish-browser-picture:focus .dish-browser-frame rule')
+  assert.match(ring[1]!, /^ {2}outline: 2px solid var\(--dsw-alias-state-business-primary\);$/m)
+  assert.match(ring[1]!, /^ {2}outline-offset: -2px;$/m)
+})
+
 test('buttonOf: the three buttons a page knows, and nothing else', () => {
   assert.equal(buttonOf(0), 'left')
   assert.equal(buttonOf(1), 'middle')
@@ -335,6 +351,73 @@ test('keys are sent and remembered; an up for a key not pressed here sends nothi
   assert.equal(pacer.keyUp('KeyB', undefined), true)
   assert.deepEqual(sent.at(-1), keyItem('up', 'b', 'KeyB'))
   pacer.dispose()
+})
+
+test('what waits goes first: a wheel turn and a drag\'s move go before a later press, key or text, in the order they came', () => {
+  const { sent, clock, pacer } = pacing()
+  const wheel = (x: number, y: number, dy: number): Up => ({ kind: 'wheel', x, y, dx: 0, dy })
+  // Inertial scroll, then a click within 33 ms: the page gets the last turn, then the click.
+  pacer.wheel({ x: 1, y: 1 }, 0, 100)
+  clock.advance(5)
+  pacer.wheel({ x: 2, y: 2 }, 0, 40)
+  pacer.press({ x: 3, y: 3 }, 'left', 1)
+  assert.deepEqual(sent, [wheel(1, 1, 100), wheel(2, 2, 40), mouse('move', 3, 3), mouse('down', 3, 3)])
+  clock.advance(100)
+  assert.equal(sent.length, 4, 'the waiting turn went once, with the press')
+  assert.equal(clock.pending(), 0)
+  // A drag's move waiting, then a key: the move, then the key.
+  sent.length = 0
+  pacer.move({ x: 4, y: 4 })
+  clock.advance(5)
+  pacer.move({ x: 5, y: 5 })
+  pacer.keyDown('ShiftLeft', keyItem('down', 'Shift', 'ShiftLeft', SHIFT))
+  assert.deepEqual(sent, [mouse('move', 4, 4), mouse('move', 5, 5), keyItem('down', 'Shift', 'ShiftLeft', SHIFT)])
+  clock.advance(100)
+  assert.equal(sent.length, 3, 'the waiting move went once, with the key')
+  // Both waiting, then a paste or a composition's text: the turn, the move, then the text.
+  sent.length = 0
+  pacer.wheel({ x: 6, y: 6 }, 0, 10)
+  pacer.move({ x: 7, y: 7 })
+  clock.advance(5)
+  pacer.wheel({ x: 8, y: 8 }, 0, 20)
+  pacer.move({ x: 9, y: 9 })
+  pacer.text('naïve 東京')
+  assert.deepEqual(sent, [wheel(6, 6, 10), mouse('move', 7, 7), wheel(8, 8, 20), mouse('move', 9, 9), { kind: 'text', text: 'naïve 東京' }])
+  clock.advance(100)
+  assert.equal(sent.length, 5)
+  // A key going up after a turn (Ctrl with the wheel): the turn first, so the page sees it with the key still down.
+  sent.length = 0
+  pacer.wheel({ x: 10, y: 10 }, 0, 30)
+  clock.advance(5)
+  pacer.wheel({ x: 10, y: 10 }, 0, 30)
+  assert.equal(pacer.keyUp('ShiftLeft', keyItem('up', 'Shift', 'ShiftLeft')), true)
+  assert.deepEqual(sent, [wheel(10, 10, 30), wheel(10, 10, 30), keyItem('up', 'Shift', 'ShiftLeft')])
+  // A release after a turn: the turn, then the release's own move and up.
+  sent.length = 0
+  clock.advance(100)
+  pacer.wheel({ x: 11, y: 11 }, 0, 50)
+  clock.advance(5)
+  pacer.wheel({ x: 12, y: 12 }, 0, 50)
+  pacer.move({ x: 12, y: 12 })
+  pacer.release('left', { x: 13, y: 13 })
+  assert.deepEqual(sent, [wheel(11, 11, 50), mouse('move', 12, 12), wheel(12, 12, 50), mouse('move', 13, 13), mouse('up', 13, 13)])
+  // Leaving the picture after a turn: the turn, then the releases.
+  sent.length = 0
+  clock.advance(100)
+  pacer.press({ x: 14, y: 14 }, 'left', 1)
+  pacer.wheel({ x: 14, y: 14 }, 0, 60)
+  clock.advance(5)
+  pacer.wheel({ x: 14, y: 14 }, 0, 60)
+  pacer.releaseAll()
+  assert.deepEqual(sent, [mouse('move', 14, 14), mouse('down', 14, 14), wheel(14, 14, 60), wheel(14, 14, 60), mouse('up', 14, 14)])
+  clock.advance(100)
+  assert.equal(sent.length, 5)
+  // Empty text sends nothing, and nothing goes after dispose.
+  sent.length = 0
+  pacer.text('')
+  pacer.dispose()
+  pacer.text('late')
+  assert.equal(sent.length, 0)
 })
 
 test('dispose cancels what is waiting, and nothing goes after it', () => {

@@ -347,6 +347,22 @@ test('each control calls what it says, and the picture\'s handlers are the only 
   ].sort())
 })
 
+test('Enter in an address bar you haven\'t edited reloads the page: the URL it shows is masked and cut, so it never goes back', async () => {
+  const { TabView } = await components()
+  const submit = (tree: Element): void => {
+    const form = elements(tree).find(element => element.type === 'form')!
+    ;(form.props.onSubmit as (event: { preventDefault(): void }) => void)({ preventDefault: () => {} })
+  }
+  const masked = 'http://127.0.0.1:5173/callback?token=‹secret: github token›'
+  const unedited: string[] = []
+  submit(TabView({ state: state({ url: masked }), editing: undefined, actions: noActions(unedited), picture: null }))
+  assert.deepEqual(unedited, ['reload'])
+  // Edited: what is typed goes.
+  const edited: string[] = []
+  submit(TabView({ state: state({ url: masked }), editing: 'localhost:5173/next', actions: noActions(edited), picture: null }))
+  assert.deepEqual(edited, ['navigate localhost:5173/next'])
+})
+
 // --- the screenshot's row ------------------------------------------------------------------------------
 
 test('the screenshot while it runs, as an image with its page\'s URL and title, and as text', async () => {

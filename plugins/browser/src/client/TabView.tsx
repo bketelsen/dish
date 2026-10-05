@@ -50,7 +50,9 @@ export function TabView({ state, editing, actions, picture, away }: TabViewProps
           className="dish-browser-address-form"
           onSubmit={(event) => {
             event.preventDefault()
-            actions.navigate(editing ?? state.url)
+            // Unedited, the bar shows the page's URL masked and cut, which isn't an address to go to: Enter reloads.
+            if (editing === undefined) actions.reload()
+            else actions.navigate(editing)
           }}
         >
           <input

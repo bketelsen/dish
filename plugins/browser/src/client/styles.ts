@@ -7,7 +7,8 @@
  *
  * The tab is a size container: the toolbar wraps below 360px, the address taking a line of its own. The picture's box fills
  * what the stage has left, whatever the image's size, so `Picture` can measure the room and draw the frame to fit it: at the
- * box's top, as a browser shows a page under its address bar, and centred across.
+ * box's top, as a browser shows a page under its address bar, and centred across. So the focus ring is the image's outline,
+ * not the box's: on the box, it ran down the stage's empty room below the image.
  */
 
 const css = `
@@ -150,8 +151,9 @@ const css = `
   touch-action: none;
   user-select: none;
 }
-.dish-browser-picture:focus {
-  box-shadow: inset 0 0 0 2px var(--dsw-alias-state-business-primary);
+.dish-browser-picture:focus .dish-browser-frame {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: -2px;
 }
 .dish-browser-frame {
   display: block;

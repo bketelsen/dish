@@ -9,7 +9,7 @@
  * - **The wheel** is taken from the pane (a listener that may `preventDefault`; React's own is passive).
  * - **The keys** call `preventDefault()` and `stopPropagation()`, so dsh's shortcuts don't see them. A paste (Ctrl or Cmd
  *   with V) is left to the `paste` event, which sends the clipboard's text; keys that aren't keys yet (an input method's, a
- *   dead key) are skipped, and a composition's end sends its text. Leaving the picture (blur), or the picture going, releases
+ *   dead key) are skipped, and a composition's end sends its text. Text goes through the pacer too, after what waits there. Leaving the picture (blur), or the picture going, releases
  *   what it holds down.
  * - **Acks.** A frame is acked when its image has loaded, or failed to. A frame that draws nothing new (the source already
  *   shown) is the controller's to ack: no load event comes for it.
@@ -168,12 +168,12 @@ export function Picture({ frame, viewport, dimmed, send, ack }: PictureProps) {
           event.stopPropagation()
           if (latest.current.dimmed) return
           const text = pasteText(event.clipboardData.getData('text/plain'))
-          if (text !== undefined) send({ kind: 'text', text })
+          if (text !== undefined) pacer.current?.text(text)
         },
         onCompositionEnd: (event: CompositionEvent<HTMLDivElement>) => {
           if (latest.current.dimmed) return
           const text = pasteText(event.data)
-          if (text !== undefined) send({ kind: 'text', text })
+          if (text !== undefined) pacer.current?.text(text)
         },
         onLoad: () => { ack(frame.seq) },
         onError: () => { ack(frame.seq) },
