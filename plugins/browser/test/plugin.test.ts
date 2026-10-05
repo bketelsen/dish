@@ -35,7 +35,7 @@ import type { AgentHandle } from '../src/services.ts'
 import { TOOL_NAMES } from '../src/tools.ts'
 import { SWEEP_MS } from '../src/types.ts'
 import { errorText, urlRefusal } from '../src/words.ts'
-import { FakeDriver, ManualClock, flush } from './fake-driver.ts'
+import { FakeDriver, FakePage, ManualClock, flush } from './fake-driver.ts'
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), '..', 'src')
 const never = new AbortController().signal
@@ -513,6 +513,34 @@ test('agent/created makes canStart true for a watch; agent/disposed makes it fal
   await waitFor(() => r.done, 'the watch to end')
 })
 
+test('agent/created keeps a re-created agent\'s browser: an open one stays open, and a held one is the agent\'s again', async () => {
+  const w = await world({ gateway: true })
+  // Open and unwatched: the agent created again (a resume, a clear) finds its browser as it was.
+  w.agents.set('s1', agent('s1'))
+  await w.core.forAgent('s1', undefined, never)
+  await w.ctx.serial('agent/created', { agent: { id: 's1' }, source: 'resume' } as never)
+  assert.equal(w.core.isOpen('s1'), true, 'an open browser stays open')
+
+  // Held: disposed while a frames-on watch watches it, then created again before the watch ends. The live agent owns it
+  // again, so the watch leaving doesn't close it.
+  w.agents.set('s2', agent('s2'))
+  await w.core.forAgent('s2', undefined, never)
+  const page = w.core.browserOf('s2')!.page as FakePage
+  const watch = await gatewayWatch(w, 's2')
+  watch.uplink.push({ kind: 'frames', on: true })
+  await eventually(w, () => watch.items.some(item => item.kind === 'frame'), 'a frame')
+  w.agents.delete('s2')
+  w.ctx.emit('agent/disposed', { agent: { id: 's2' } } as never)
+  assert.equal(w.core.isOpen('s2'), true, 'held while watched')
+  w.agents.set('s2', agent('s2'))
+  await w.ctx.serial('agent/created', { agent: { id: 's2' }, source: 'resume' } as never)
+  watch.controller.abort()
+  await waitFor(watch.ended, 'the watch to end')
+  await eventually(w, () => !page.screencasting, 'the watch to let go of the browser')
+  await flush()
+  assert.equal(w.core.isOpen('s2'), true, 'the re-created agent\'s browser stays open')
+})
+
 test('a listener catches its own errors: a payload without an agent throws nothing into dsh', async () => {
   const w = await world()
   await w.ctx.serial('agent/created', {} as never)
@@ -582,6 +610,26 @@ test('disposing the plugin closes every browser and Chromium once, ends open wat
   await w.core.forAgent('s2', undefined, never)
   const r = new Reader(w.ctx, 's1')
   await r.opened()
+  // What the listeners and the sweep call on the core, seen from here on: first while the plugin runs, then after.
+  const reached: string[] = []
+  const spied = w.core as unknown as Record<string, (...args: unknown[]) => unknown>
+  for (const method of ['touch', 'agentDisposed', 'close', 'sweep']) {
+    const original = spied[method]!.bind(w.core)
+    spied[method] = (...args: unknown[]) => {
+      reached.push(method)
+      return original(...args)
+    }
+  }
+  const nobody = async (): Promise<void> => {
+    await w.ctx.serial('agent/created', { agent: { id: 'nobody' }, source: 'creation' } as never)
+    w.ctx.emit('agent/disposed', { agent: { id: 'nobody' } } as never)
+    await w.ctx.parallel('workspace/session-stop', { sessionId: 'nobody' } as never)
+    w.clock.advance(SWEEP_MS)
+    await flush()
+  }
+  await nobody()
+  assert.deepEqual(reached, ['touch', 'agentDisposed', 'close', 'sweep'], 'each event, and the minute, reach the core while the plugin runs')
+  reached.length = 0
   await w.plugin.dispose()
   await waitFor(() => r.done, 'the open watch to end')
   assert.equal(r.error, undefined)
@@ -593,10 +641,11 @@ test('disposing the plugin closes every browser and Chromium once, ends open wat
   assert.equal(w.clock.pending, 0, 'no timer left: the sweep, the core\'s and the stream\'s')
   assert.deepEqual(registered(w.tools!), [])
   assert.equal(w.ctx.get(SERVICE), undefined, 'the remote went with it')
-  // The listeners went with it: an event after the stop reaches nothing.
-  w.ctx.emit('agent/disposed', { agent: { id: 's2' } } as never)
-  await w.ctx.parallel('workspace/session-stop', { sessionId: 's2' } as never)
-  await w.clock.tick(SWEEP_MS * 2, SWEEP_MS)
+  // The listeners and the sweep went with it: the same events, and two minutes, reach nothing of the core's.
+  reached.length = 0
+  await nobody()
+  await nobody()
+  assert.deepEqual(reached, [], 'no listener, and no sweep, after the plugin went')
   assert.equal(w.driver.launches.length, 1)
 })
 
