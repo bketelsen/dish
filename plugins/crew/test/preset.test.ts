@@ -19,6 +19,10 @@ const SYNC = 'pnpm --filter dish-crew sync-preset'
 /** dsh's row for `send_message` and `interrupt_agent`, which dish-crew/control replaces. */
 const CONTROL_NAME = "'@deepseek-ai/dsh-tool-subagent-control'"
 const PERSONA_NAME = "'@deepseek-ai/dsh-persona'"
+/** dsh's row that delivers `AGENTS.md`. The dish preset puts dish-memory/context right after it. */
+const INSTRUCTIONS_NAME = "'@deepseek-ai/dsh-agent-instructions'"
+/** What the generator says when the standard preset has no `agent-instructions` row. */
+const NO_INSTRUCTIONS = 'the standard preset has no agent-instructions row: where does dish-memory/context go?'
 const DESCRIPTION = "The dish main agent: your prompts from Settings → Prompts, and a crew to delegate to, on the standard tool set without dsh's own delegation tools."
 
 /** The standard rows that dsh's own delegation machinery lives in: the dish preset disables them, so the main agent delegates through crew. */
@@ -72,12 +76,14 @@ function listNames(text: string): string[] {
   return lines.slice(start + 1).flatMap(line => /^\s*name:\s*(.+?)\s*$/.exec(line)?.[1] ?? [])
 }
 
-test('the dish preset swaps the persona row, adds the delegate row after it, and keeps every other row of the standard list, in order', () => {
+test('the dish preset swaps the persona row, adds the delegate row after it and the memory row after agent-instructions, and keeps every other row of the standard list, in order', () => {
   const output = generate(standard.text, standard.version)
   const names = listNames(standard.text)
   assert.equal(names.filter(name => name === PERSONA_NAME).length, 1, 'the standard preset has one persona row')
+  assert.equal(names.filter(name => name === INSTRUCTIONS_NAME).length, 1, 'the standard preset has one agent-instructions row')
   assert.deepEqual(listNames(output), names.flatMap(name => name === PERSONA_NAME
     ? ['dish-prompts/persona', 'dish-crew/delegate']
+    : name === INSTRUCTIONS_NAME ? [name, 'dish-memory/context']
     : name === CONTROL_NAME ? ['dish-crew/control'] : [name]))
   assert.ok(!output.includes('@deepseek-ai/dsh-persona'), 'no stock persona row')
   assert.ok(!output.includes('You are a coding agent'), 'the stock persona config is gone')
@@ -90,6 +96,17 @@ test('the delegate row follows the persona row, at its indentation', () => {
   const output = generate(standard.text, standard.version)
   assert.ok(output.includes([...DISH_PERSONA, ...DELEGATE].join('\n') + '\n'), 'the persona row, then the delegate row')
   assert.equal(output.split('\n').filter(line => line.trim() === 'name: dish-crew/delegate').length, 1)
+})
+
+test('dish-memory/context follows the agent-instructions row, at its indentation, and that row is as standard has it', () => {
+  const output = generate(standard.text, standard.version)
+  const stock = rowLines(standard.text, 'agent-instructions')
+  const pad = ' '.repeat(stock[0]!.length - stock[0]!.trimStart().length)
+  const memory = [`${pad}- id: dish-memory-context`, `${pad}  name: dish-memory/context`]
+  assert.deepEqual(rowLines(output, 'agent-instructions'), stock)
+  assert.deepEqual(rowLines(output, 'dish-memory-context'), memory)
+  assert.ok(output.includes(`\n${[...stock, ...memory].join('\n')}\n`), 'the agent-instructions row, then the memory row')
+  assert.equal(output.split('\n').filter(line => line.trim() === 'name: dish-memory/context').length, 1)
 })
 
 /** The standard file's rows (nested groups too) by id, as text: the row's lines, from its `- id:` line to the next row at or above its indentation. */
@@ -189,9 +206,11 @@ test('the dish preset parses as YAML with its !!js tags, and its list is the sta
   const persona = { id: 'dish-persona', name: 'dish-prompts/persona', config: { role: 'main' } }
   const delegate = { id: 'dish-crew-delegate', name: 'dish-crew/delegate' }
   const control = { id: 'dish-crew-control', name: 'dish-crew/control' }
-  /** The standard list as the dish preset should have it: persona swapped, delegate after it, control swapped, the four rows disabled. */
+  const memory = { id: 'dish-memory-context', name: 'dish-memory/context' }
+  /** The standard list as the dish preset should have it: persona swapped, delegate after it, memory after agent-instructions, control swapped, the four rows disabled. */
   const expect = (entries: any[]): any[] => entries.flatMap(entry => {
     if (entry.id === 'persona') return [persona, delegate]
+    if (entry.id === 'agent-instructions') return [entry, memory]
     if (entry.id === 'tool-subagent-control') return [control]
     const copy = DISABLED_IDS.includes(entry.id) ? { ...entry, disabled: true } : entry
     return [Array.isArray(copy.config) ? { ...copy, config: expect(copy.config) } : copy]
@@ -217,6 +236,7 @@ test('the dish preset parses as YAML with its !!js tags, and its list is the sta
   assert.deepEqual(delegation.filter(([, disabled]) => disabled !== true).map(([id]) => id), [], 'every row of a delegation package is disabled: true')
   const ids = (entries: any[]): string[] => entries.flatMap(entry => [entry.id, ...(Array.isArray(entry.config) ? ids(entry.config) : [])])
   assert.ok(ids(row.config.plugins).includes('dish-crew-control'))
+  assert.equal(ids(row.config.plugins).filter(id => id === 'dish-memory-context').length, 1)
   assert.ok(!ids(row.config.plugins).includes('tool-subagent-control'))
   assert.ok(ids(row.config.plugins).includes('tool-subagent-list-agents'))
   assert.ok(!disabledIds(row.config.plugins).some(id => id === 'dish-crew-control' || id === 'tool-subagent-list-agents'))
@@ -289,6 +309,18 @@ const GROUP = [
   '              # a comment inside a group',
   '              - id: plan-mode',
   "                name: '@deepseek-ai/dsh-plan-mode'",
+]
+/** dsh's row that delivers `AGENTS.md`, in the standard preset's shape. Every synthetic list has one: dish-memory/context goes after it. */
+const INSTRUCTIONS = [
+  '          - id: agent-instructions',
+  `            name: ${INSTRUCTIONS_NAME}`,
+  '            config:',
+  '              maxBytes: 65536',
+]
+/** The row the generator adds right after INSTRUCTIONS. */
+const MEMORY = [
+  '          - id: dish-memory-context',
+  '            name: dish-memory/context',
 ]
 const DISH_PERSONA = [
   '          - id: dish-persona',
@@ -380,20 +412,23 @@ function bodyOf(list: string[], listIndent = 10): string {
 }
 
 test('the header says the file is generated, from which dsh-web-app version, and how to regenerate it', () => {
-  const [header] = split(generate(standardOf([...BASH, ...PERSONA, ...DELEGATION]), '9.8.7-test'))
+  const [header] = split(generate(standardOf([...BASH, ...PERSONA, ...INSTRUCTIONS, ...DELEGATION]), '9.8.7-test'))
   assert.ok(header.split('\n').filter(line => line !== '').every(line => line.startsWith('#')), header)
   assert.match(header, /generated/i)
   assert.match(header, /@deepseek-ai\/dsh-web-app 9\.8\.7-test/)
   assert.ok(header.includes(SYNC), header)
+  assert.match(header, /with five changes:/)
+  assert.ok(header.includes('dish-memory/context is added after `agent-instructions`'), header)
 })
 
 test('a persona row first, in the middle, or last is replaced, the delegate row goes after it, and nothing else changes', () => {
   const swapped = [...DISH_PERSONA, ...DELEGATE]
+  const remembered = [...INSTRUCTIONS, ...MEMORY]
   const cases: [string, string[], string[]][] = [
-    ['first', [...PERSONA, ...BASH, ...GROUP, ...DELEGATION], [...swapped, ...BASH, ...GROUP, ...DELEGATION_OFF]],
-    ['middle', [...BASH, ...PERSONA, ...GROUP, ...DELEGATION], [...BASH, ...swapped, ...GROUP, ...DELEGATION_OFF]],
-    ['last', [...BASH, ...GROUP, ...DELEGATION, ...PERSONA], [...BASH, ...GROUP, ...DELEGATION_OFF, ...swapped]],
-    ['alone', [...PERSONA, ...DELEGATION], [...swapped, ...DELEGATION_OFF]],
+    ['first', [...PERSONA, ...INSTRUCTIONS, ...BASH, ...GROUP, ...DELEGATION], [...swapped, ...remembered, ...BASH, ...GROUP, ...DELEGATION_OFF]],
+    ['middle', [...BASH, ...PERSONA, ...INSTRUCTIONS, ...GROUP, ...DELEGATION], [...BASH, ...swapped, ...remembered, ...GROUP, ...DELEGATION_OFF]],
+    ['last', [...INSTRUCTIONS, ...BASH, ...GROUP, ...DELEGATION, ...PERSONA], [...remembered, ...BASH, ...GROUP, ...DELEGATION_OFF, ...swapped]],
+    ['alone', [...PERSONA, ...INSTRUCTIONS, ...DELEGATION], [...swapped, ...remembered, ...DELEGATION_OFF]],
   ]
   for (const [where, list, expected] of cases) {
     assert.equal(bodyOf(list), [...WRAPPER, ...expected, ''].join('\n'), where)
@@ -404,6 +439,7 @@ test('comments and blank lines inside the list stay; a comment above the next ro
   const list = [
     '          # the persona',
     ...PERSONA,
+    ...INSTRUCTIONS,
     '          # the shell',
     '',
     ...BASH,
@@ -416,6 +452,8 @@ test('comments and blank lines inside the list stay; a comment above the next ro
     '          # the persona',
     ...DISH_PERSONA,
     ...DELEGATE,
+    ...INSTRUCTIONS,
+    ...MEMORY,
     '          # the shell',
     '',
     ...BASH,
@@ -428,20 +466,20 @@ test('comments and blank lines inside the list stay; a comment above the next ro
 
 test('a persona row with a comment of its own inside it goes entirely', () => {
   const persona = [...PERSONA.slice(0, 3), '              # why', ...PERSONA.slice(3)]
-  assert.equal(bodyOf([...BASH, ...persona, ...GROUP, ...DELEGATION]), [...WRAPPER, ...BASH, ...DISH_PERSONA, ...DELEGATE, ...GROUP, ...DELEGATION_OFF, ''].join('\n'))
+  assert.equal(bodyOf([...BASH, ...persona, ...INSTRUCTIONS, ...GROUP, ...DELEGATION]), [...WRAPPER, ...BASH, ...DISH_PERSONA, ...DELEGATE, ...INSTRUCTIONS, ...MEMORY, ...GROUP, ...DELEGATION_OFF, ''].join('\n'))
 })
 
 test('a persona-looking row inside a nested group is not the persona row', () => {
   const nested = [...GROUP, '              - id: persona', "                name: '@deepseek-ai/dsh-persona'"]
-  assert.equal(bodyOf([...nested, ...PERSONA, ...DELEGATION]), [...WRAPPER, ...nested, ...DISH_PERSONA, ...DELEGATE, ...DELEGATION_OFF, ''].join('\n'))
+  assert.equal(bodyOf([...nested, ...PERSONA, ...INSTRUCTIONS, ...DELEGATION]), [...WRAPPER, ...nested, ...DISH_PERSONA, ...DELEGATE, ...INSTRUCTIONS, ...MEMORY, ...DELEGATION_OFF, ''].join('\n'))
 })
 
 test('a list at another indentation lands where the wrapper expects it, keeping its shape', () => {
-  assert.equal(bodyOf([...BASH, ...PERSONA, ...GROUP, ...DELEGATION], 14), [...WRAPPER, ...BASH, ...DISH_PERSONA, ...DELEGATE, ...GROUP, ...DELEGATION_OFF, ''].join('\n'))
+  assert.equal(bodyOf([...BASH, ...PERSONA, ...INSTRUCTIONS, ...GROUP, ...DELEGATION], 14), [...WRAPPER, ...BASH, ...DISH_PERSONA, ...DELEGATE, ...INSTRUCTIONS, ...MEMORY, ...GROUP, ...DELEGATION_OFF, ''].join('\n'))
 })
 
 test('CRLF line endings in the standard file make the same output', () => {
-  const text = standardOf([...BASH, ...PERSONA, ...GROUP, ...DELEGATION])
+  const text = standardOf([...BASH, ...PERSONA, ...INSTRUCTIONS, ...GROUP, ...DELEGATION])
   assert.equal(generate(text.replaceAll('\n', '\r\n'), '1.0.0'), generate(text, '1.0.0'))
 })
 
@@ -451,7 +489,7 @@ test('a row that is already disabled has its value replaced, not a second disabl
     : line === "                name: '@deepseek-ai/dsh-tool-workflow'" ? [line, '                disabled: false # was on']
     : line === '                  provider: fork' ? [line, '                  disabled: false'] // a config key, not the row's
     : [line])
-  const body = bodyOf([...PERSONA, ...list])
+  const body = bodyOf([...PERSONA, ...INSTRUCTIONS, ...list])
   const lines = body.split('\n')
   assert.equal(lines.filter(line => line.trim().startsWith('disabled:')).length, 8, '7 rows and one config key')
   assert.deepEqual(
@@ -462,13 +500,53 @@ test('a row that is already disabled has its value replaced, not a second disabl
   assert.ok(!body.includes('process.platform'))
   assert.ok(!body.includes('was on'))
   // Once the config key is set aside, the rows are as when none was disabled.
-  assert.equal(body, bodyOf([...PERSONA, ...DELEGATION].flatMap(line => line === '                  provider: fork' ? [line, '                  disabled: false'] : [line])))
+  assert.equal(body, bodyOf([...PERSONA, ...INSTRUCTIONS, ...DELEGATION].flatMap(line => line === '                  provider: fork' ? [line, '                  disabled: false'] : [line])))
 })
 
 test('a standard file with no persona row, two persona rows, or no plugin list is refused', () => {
-  assert.throws(() => generate(standardOf([...BASH, ...GROUP, ...DELEGATION]), '1.0.0'), /persona/)
-  assert.throws(() => generate(standardOf([...PERSONA, ...BASH, ...PERSONA, ...DELEGATION]), '1.0.0'), /persona/)
+  assert.throws(() => generate(standardOf([...BASH, ...INSTRUCTIONS, ...GROUP, ...DELEGATION]), '1.0.0'), /persona/)
+  assert.throws(() => generate(standardOf([...PERSONA, ...INSTRUCTIONS, ...BASH, ...PERSONA, ...DELEGATION]), '1.0.0'), /persona/)
   assert.throws(() => generate('- insert:\n    - id: preset-standard\n', '1.0.0'), /plugins/)
+})
+
+test('generate throws on a standard preset with no agent-instructions row', () => {
+  assert.throws(() => generate(standardOf([...PERSONA, ...BASH, ...GROUP, ...DELEGATION]), '1.0.0'), { message: NO_INSTRUCTIONS })
+  // A row of another id that loads dsh-agent-instructions isn't the row: the generator goes by id, as for the others.
+  const renamed = INSTRUCTIONS.map(line => line.replace('- id: agent-instructions', '- id: instructions'))
+  assert.throws(() => generate(standardOf([...PERSONA, ...renamed, ...DELEGATION]), '1.0.0'), { message: NO_INSTRUCTIONS })
+})
+
+test('a standard preset with two agent-instructions rows is refused too: the generator can\'t tell which one to follow', () => {
+  const twice = [...PERSONA, ...INSTRUCTIONS, ...BASH, ...INSTRUCTIONS, ...DELEGATION]
+  assert.throws(() => generate(standardOf(twice), '1.0.0'), error => error instanceof Error
+    && error.message.includes('agent-instructions') && error.message.includes('dish-memory/context') && error.message !== NO_INSTRUCTIONS)
+})
+
+test('dish-memory/context goes right after the agent-instructions row wherever it is, at its indentation, before the comments above the next row', () => {
+  // Its own comment and config stay with it; a comment and a blank line above the next row stay with that row.
+  const commented = [...INSTRUCTIONS.slice(0, 3), '              # how much of AGENTS.md', ...INSTRUCTIONS.slice(3)]
+  assert.equal(
+    bodyOf([...PERSONA, ...commented, '', '          # the shell', ...BASH, ...DELEGATION]),
+    [...WRAPPER, ...DISH_PERSONA, ...DELEGATE, ...commented, ...MEMORY, '', '          # the shell', ...BASH, ...DELEGATION_OFF, ''].join('\n'),
+  )
+  // The last row of the list.
+  assert.equal(
+    bodyOf([...PERSONA, ...DELEGATION, ...INSTRUCTIONS]),
+    [...WRAPPER, ...DISH_PERSONA, ...DELEGATE, ...DELEGATION_OFF, ...INSTRUCTIONS, ...MEMORY, ''].join('\n'),
+  )
+  // Inside a group: after the row, at the group's indentation, before the comment that ends the group.
+  const deeper = (lines: string[]) => lines.map(line => `    ${line}`)
+  const group = ['          - id: context', '            name: cordis:group', '            group: true', '            config:']
+  assert.equal(
+    bodyOf([...PERSONA, ...group, ...deeper(INSTRUCTIONS), '              # end of the group', ...BASH, ...DELEGATION]),
+    [...WRAPPER, ...DISH_PERSONA, ...DELEGATE, ...group, ...deeper(INSTRUCTIONS), ...deeper(MEMORY), '              # end of the group', ...BASH, ...DELEGATION_OFF, ''].join('\n'),
+  )
+  // A quoted id, and a comment on the id's line, are the same row.
+  const quoted = [`          - id: 'agent-instructions' # AGENTS.md`, ...INSTRUCTIONS.slice(1)]
+  assert.equal(
+    bodyOf([...PERSONA, ...quoted, ...DELEGATION]),
+    [...WRAPPER, ...DISH_PERSONA, ...DELEGATE, ...quoted, ...MEMORY, ...DELEGATION_OFF, ''].join('\n'),
+  )
 })
 
 test('a standard file missing any of the delegation rows is refused, naming it', () => {
@@ -478,15 +556,15 @@ test('a standard file missing any of the delegation rows is refused, naming it',
     // The row runs to the next row of the group, or the end.
     const next = DELEGATION.findIndex((line, i) => i > at && /^ {14}- id:/.test(line))
     const without = [...DELEGATION.slice(0, at), ...(next === -1 ? [] : DELEGATION.slice(next))]
-    assert.throws(() => generate(standardOf([...PERSONA, ...without]), '1.0.0'), error => error instanceof Error && error.message.includes(id), id)
+    assert.throws(() => generate(standardOf([...PERSONA, ...INSTRUCTIONS, ...without]), '1.0.0'), error => error instanceof Error && error.message.includes(id), id)
   }
 })
 
 test('a delegation row listed twice, or with no name, is refused too', () => {
   const twice = [...DELEGATION, ...DELEGATION.slice(6, 8)]
-  assert.throws(() => generate(standardOf([...PERSONA, ...twice]), '1.0.0'), /`tool-subagent`/)
+  assert.throws(() => generate(standardOf([...PERSONA, ...INSTRUCTIONS, ...twice]), '1.0.0'), /`tool-subagent`/)
   const nameless = DELEGATION.filter(line => line !== "                name: '@deepseek-ai/dsh-tool-workflow'")
-  assert.throws(() => generate(standardOf([...PERSONA, ...nameless]), '1.0.0'), /`tool-workflow`/)
+  assert.throws(() => generate(standardOf([...PERSONA, ...INSTRUCTIONS, ...nameless]), '1.0.0'), /`tool-workflow`/)
 })
 
 test('a new row of a delegation package that is not disabled is refused, naming it', () => {
@@ -497,34 +575,34 @@ test('a new row of a delegation package that is not disabled is refused, naming 
       ['explicitly on', ['                disabled: false']],
       ['by an expression', ["                disabled: !!js process.platform === 'win32'"]],
     ] as [string, string[]][]) {
-      const list = [...PERSONA, ...DELEGATION, ...extra(`'${pkg}'`, ...tail)]
+      const list = [...PERSONA, ...INSTRUCTIONS, ...DELEGATION, ...extra(`'${pkg}'`, ...tail)]
       assert.throws(() => generate(standardOf(list), '1.0.0'), error => error instanceof Error && error.message.includes('`tool-extra`') && error.message.includes(pkg), `${pkg} ${what}`)
     }
     // Quoted the other way and at the top of the list rather than in the group: still found.
     const top = extra(`"${pkg}"`).map(line => line.slice(4))
-    assert.throws(() => generate(standardOf([...top, ...PERSONA, ...DELEGATION]), '1.0.0'), /`tool-extra`/, `${pkg} at the top, double-quoted`)
+    assert.throws(() => generate(standardOf([...top, ...PERSONA, ...INSTRUCTIONS, ...DELEGATION]), '1.0.0'), /`tool-extra`/, `${pkg} at the top, double-quoted`)
   }
   const sibling = ['              - id: tool-extra', "                name: '@deepseek-ai/dsh-tool-subagent'", '                config:', '                  provider: spawn']
-  assert.throws(() => generate(standardOf([...PERSONA, ...DELEGATION, ...sibling]), '1.0.0'), /`tool-extra`/, 'the standard shape: a row with config')
+  assert.throws(() => generate(standardOf([...PERSONA, ...INSTRUCTIONS, ...DELEGATION, ...sibling]), '1.0.0'), /`tool-extra`/, 'the standard shape: a row with config')
 })
 
 test('a standard file without dsh\'s control row, or with dsh\'s send_message loaded a second time, is refused', () => {
   const at = DELEGATION.findIndex(line => line.endsWith('- id: tool-subagent-control'))
   const without = [...DELEGATION.slice(0, at), ...DELEGATION.slice(at + 2)]
-  assert.throws(() => generate(standardOf([...PERSONA, ...without]), '1.0.0'), /`tool-subagent-control`/)
+  assert.throws(() => generate(standardOf([...PERSONA, ...INSTRUCTIONS, ...without]), '1.0.0'), /`tool-subagent-control`/)
   // Another row of dsh's package, under any id, would register a second send_message beside dish-crew/control's.
   const again = ['              - id: tool-other-control', `                name: ${CONTROL_NAME}`]
-  assert.throws(() => generate(standardOf([...PERSONA, ...DELEGATION, ...again]), '1.0.0'), /dsh-tool-subagent-control/)
+  assert.throws(() => generate(standardOf([...PERSONA, ...INSTRUCTIONS, ...DELEGATION, ...again]), '1.0.0'), /dsh-tool-subagent-control/)
   // Its list-agents subpath is another package: that row stays.
-  assert.doesNotThrow(() => generate(standardOf([...PERSONA, ...DELEGATION, '              - id: tool-subagent-list-agents', "                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'"]), '1.0.0'))
+  assert.doesNotThrow(() => generate(standardOf([...PERSONA, ...INSTRUCTIONS, ...DELEGATION, '              - id: tool-subagent-list-agents', "                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'"]), '1.0.0'))
 })
 
 test('a new row of a delegation package that is already disabled: true is accepted, and the control rows are not delegation rows', () => {
   const quiet = ['              - id: tool-extra', "                name: '@deepseek-ai/dsh-tool-subagent'", '                disabled: true']
-  const output = bodyOf([...PERSONA, ...DELEGATION, ...quiet])
+  const output = bodyOf([...PERSONA, ...INSTRUCTIONS, ...DELEGATION, ...quiet])
   assert.ok(output.includes([...quiet, ''].join('\n')), 'the row is left as dsh has it')
   // `dsh-tool-subagent-control` is another package, not the exact name of a delegation one.
-  assert.doesNotThrow(() => generate(standardOf([...PERSONA, ...DELEGATION]), '1.0.0'))
+  assert.doesNotThrow(() => generate(standardOf([...PERSONA, ...INSTRUCTIONS, ...DELEGATION]), '1.0.0'))
 })
 
 // --- running the script ------------------------------------------------------------------------

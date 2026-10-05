@@ -7,7 +7,7 @@
 //   --out <file>                          write or check <file> instead
 //
 // The standard file's plugin list is copied line for line, so its indentation,
-// comments, `!!js` tags and nested groups survive untouched. Four things change:
+// comments, `!!js` tags and nested groups survive untouched. Five things change:
 //   - the `persona` row becomes dish-prompts/persona;
 //   - the row dish-crew/delegate follows it, so the main agent has `delegate`;
 //   - the rows of dsh's own delegation (`subagent`, `subagent_fork` and the
@@ -17,7 +17,11 @@
 //     `send_message` and `interrupt_agent` without dsh's mark, so dsh adds no
 //     "send your result with send_message" note to a crew child's task. A row of
 //     dsh's package left in stops the generator: two `send_message` tools in one
-//     scope is a registration error.
+//     scope is a registration error;
+//   - the row dish-memory/context is added after `agent-instructions`, at its
+//     indentation: dish's memory and direction, delivered as dsh delivers
+//     `AGENTS.md`. Unless there is exactly one `agent-instructions` row, the
+//     generator stops: it can't tell where the row goes.
 // A row of any other id whose package is one of dsh's delegation packages, and
 // that the preset leaves enabled, stops the generator, so a dsh upgrade can't
 // slip `subagent` back in.
@@ -69,6 +73,13 @@ const DELEGATION_PACKAGES = [
 /** dsh's row for `send_message` and `interrupt_agent`, and the package it loads, which dish-crew/control stands in for. */
 const CONTROL_ID = 'tool-subagent-control'
 const CONTROL_PACKAGE = '@deepseek-ai/dsh-tool-subagent-control'
+
+/**
+ * dsh's row that delivers `AGENTS.md`, and the row that follows it in the dish preset: dish-memory/context, which delivers
+ * dish's memory and direction the same way. It resolves through dish-crew's dependency on `dish-memory`.
+ */
+const INSTRUCTIONS_ID = 'agent-instructions'
+const MEMORY_ROW = ['- id: dish-memory-context', '  name: dish-memory/context']
 
 /** The `insert` row around the list, in the standard file's own shape. The list goes under `plugins:`. */
 const WRAPPER = [
@@ -123,6 +134,35 @@ function disable(rows, id) {
 }
 
 /**
+ * Where the rows with `id` start: the index of each `- id:` line, at any indentation, so inside a group too.
+ *
+ * @param {string[]} rows the list's lines
+ * @param {string} id the row's `id`
+ * @returns {number[]}
+ */
+function rowsWithId(rows, id) {
+  const pattern = new RegExp(`^\\s*- id:\\s*['"]?${id}['"]?\\s*(#.*)?$`)
+  return rows.flatMap((line, i) => pattern.test(line) ? [i] : [])
+}
+
+/**
+ * Where the row starting at `start` ends: the index just past its last line. The row runs to the next line at or above
+ * its dash that isn't a comment or blank, and the comments and blank lines at its end belong to what follows.
+ *
+ * @param {string[]} rows the list's lines
+ * @param {number} start the index of the row's `- id:` line
+ * @returns {number}
+ */
+function rowEnd(rows, start) {
+  const dash = indentOf(rows[start])
+  let end = start + 1
+  while (end < rows.length && (isBlank(rows[end]) || isComment(rows[end]) || indentOf(rows[end]) > dash)) end++
+  // Trailing comments and blank lines belong to what follows.
+  while (end > start + 1 && (isBlank(rows[end - 1]) || isComment(rows[end - 1]))) end--
+  return end
+}
+
+/**
  * Put `replacement` (rows' lines, indented from the dash) where the row `id` was, at its dash's indentation. The row may
  * sit anywhere in the list, inside a group too, but there must be exactly one. Comments and blank lines after it, before
  * the next row, stay.
@@ -132,17 +172,27 @@ function disable(rows, id) {
  * @param {string[]} replacement the new row's lines, the first starting `- `, with no indentation of their own
  */
 function replace(rows, id, replacement) {
-  const pattern = new RegExp(`^\\s*- id:\\s*['"]?${id}['"]?\\s*(#.*)?$`)
-  const found = rows.flatMap((line, i) => pattern.test(line) ? [i] : [])
+  const found = rowsWithId(rows, id)
   if (found.length !== 1) throw new Error(`expected one \`${id}\` row in the standard preset, found ${found.length}`)
   const start = found[0]
-  const dash = indentOf(rows[start])
-  let end = start + 1
-  while (end < rows.length && (isBlank(rows[end]) || isComment(rows[end]) || indentOf(rows[end]) > dash)) end++
-  // Trailing comments and blank lines belong to what follows.
-  while (end > start + 1 && (isBlank(rows[end - 1]) || isComment(rows[end - 1]))) end--
-  const pad = ' '.repeat(dash)
-  rows.splice(start, end - start, ...replacement.map(line => pad + line))
+  const pad = ' '.repeat(indentOf(rows[start]))
+  rows.splice(start, rowEnd(rows, start) - start, ...replacement.map(line => pad + line))
+}
+
+/**
+ * Add dish-memory/context right after the `agent-instructions` row, at its dash's indentation, wherever that row sits.
+ * Comments and blank lines after it, before the next row, stay with the next row, as `replace` leaves them.
+ *
+ * @param {string[]} rows the list's lines, changed in place
+ * @throws {Error} unless there is exactly one `agent-instructions` row
+ */
+function addMemory(rows) {
+  const found = rowsWithId(rows, INSTRUCTIONS_ID)
+  if (found.length === 0) throw new Error('the standard preset has no agent-instructions row: where does dish-memory/context go?')
+  if (found.length > 1) throw new Error(`the standard preset has ${found.length} agent-instructions rows: where does dish-memory/context go?`)
+  const start = found[0]
+  const pad = ' '.repeat(indentOf(rows[start]))
+  rows.splice(rowEnd(rows, start), 0, ...MEMORY_ROW.map(line => pad + line))
 }
 
 /**
@@ -251,6 +301,7 @@ export function generate(standardText, version) {
     `${pad}  name: dish-crew/delegate`,
   ]
   const rows = [...list.slice(0, start), ...persona, ...delegate, ...list.slice(last + 1)]
+  addMemory(rows)
   for (const id of DISABLED) disable(rows, id)
   refuseEnabledDelegation(rows)
   replace(rows, CONTROL_ID, ['- id: dish-crew-control', '  name: dish-crew/control'])
@@ -269,7 +320,7 @@ export function generate(standardText, version) {
     '# (presets/standard.patch.yml). Do not edit it by hand: the next run replaces',
     '# it, and the drift test fails until the committed file matches.',
     '#',
-    "# The dish preset: the standard preset's plugin list, with four changes:",
+    "# The dish preset: the standard preset's plugin list, with five changes:",
     '#   - its `persona` row is replaced by dish-prompts/persona, so the main',
     "#     agent's prompts come from Settings → Prompts;",
     '#   - dish-crew/delegate follows it, which gives the main agent `delegate`;',
@@ -279,7 +330,9 @@ export function generate(standardText, version) {
     "#   - dsh's `tool-subagent-control` row is replaced by dish-crew/control:",
     "#     the same `send_message` and `interrupt_agent`, without dsh's mark, so",
     '#     dsh adds no "send your result with send_message" note to a crew',
-    "#     child's task.",
+    "#     child's task;",
+    "#   - dish-memory/context is added after `agent-instructions`: dish's",
+    '#     memory and direction, delivered as dsh delivers `AGENTS.md`.',
     '# Edits saved from Settings → Agent presets live in your profile and override',
     "# this row's `config.plugins` there.",
     '#',

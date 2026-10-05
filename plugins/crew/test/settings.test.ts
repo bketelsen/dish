@@ -28,9 +28,11 @@ function settingsOf(text: string): CrewSettings {
 }
 
 const ROLES = ['architect', 'coder', 'reviewer', 'researcher', 'ops', 'writer']
-const STANDARD_TOOLS = ['read', 'glob', 'grep', 'skill', 'todo_write', 'send_message']
+const STANDARD_TOOLS = ['read', 'glob', 'grep', 'skill', 'todo_write', 'send_message', 'recall']
 /** The tool dish-judge registers. It's in every shipped role so that crew children can ask the judge. */
 const JUDGE_TOOL = 'ask_judge'
+/** dish-memory's tool for reading memory, from the dish preset's dish-memory/context row. Every shipped role lists it, right before ask_judge. */
+const RECALL_TOOL = 'recall'
 
 // --- the shipped default --------------------------------------------------------------------------
 
@@ -106,7 +108,7 @@ test('the default has the models, limits and roles of the spec', () => {
   assert.equal(coder.family, 'anthropic')
   assert.equal(coder.writes, true)
   assert.equal(coder.reviews, false)
-  assert.deepEqual([...coder.tools], ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot', 'skill', 'todo_write', 'send_message', 'ask_judge'])
+  assert.deepEqual([...coder.tools], ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot', 'skill', 'todo_write', 'send_message', 'recall', 'ask_judge'])
   assert.equal(settings.roles.architect!.tier, 'strong')
   // writes and reviews are false unless the file says so.
   const researcher = settings.roles.researcher!
@@ -566,12 +568,24 @@ test('every shipped role lists ask_judge, last, and the tools it had before are 
     assert.equal(settings.tools.filter(tool => tool === JUDGE_TOOL).length, 1, role)
   }
   // The tools before it are the spec's roles from before dish-judge: the lists only gained one name, (2026-10-03)
-  // read_image for the roles that check what they or others made, and (2026-10-04) the browser tools for the same roles.
+  // read_image for the roles that check what they or others made, (2026-10-04) the browser tools for the same roles, and
+  // (2026-10-05) recall, dish-memory's, for every role, just before ask_judge.
   const before = (role: string) => DEFAULT_SETTINGS.roles[role]!.tools.slice(0, -1)
-  assert.deepEqual(before('architect'), ['read', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
-  assert.deepEqual(before('reviewer'), ['read', 'read_image', 'glob', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot', 'skill', 'todo_write', 'send_message'])
-  assert.deepEqual(before('researcher'), ['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message'])
-  assert.deepEqual(before('writer'), ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot', 'skill', 'todo_write', 'send_message'])
+  assert.deepEqual(before('architect'), ['read', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message', 'recall'])
+  assert.deepEqual(before('reviewer'), ['read', 'read_image', 'glob', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_fetch', 'browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot', 'skill', 'todo_write', 'send_message', 'recall'])
+  assert.deepEqual(before('researcher'), ['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'todo_write', 'send_message', 'recall'])
+  assert.deepEqual(before('writer'), ['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'web_search', 'web_fetch', 'browser_navigate', 'browser_back', 'browser_read', 'browser_click', 'browser_type', 'browser_press', 'browser_select', 'browser_scroll', 'browser_wait', 'browser_screenshot', 'skill', 'todo_write', 'send_message', 'recall'])
+})
+
+test('every role lists recall, right before ask_judge', () => {
+  // dish-memory/context, a row of the dish preset, registers recall in the preset's layer, so children can inherit it.
+  // remember and forget, which write memory, are the main agent's: crew's NEVER keeps them off every allow list.
+  assert.deepEqual(Object.keys(DEFAULT_SETTINGS.roles), ROLES)
+  for (const [role, settings] of Object.entries(DEFAULT_SETTINGS.roles)) {
+    assert.deepEqual(settings.tools.slice(-2), [RECALL_TOOL, JUDGE_TOOL], role)
+    assert.equal(settings.tools.filter(tool => tool === RECALL_TOOL).length, 1, role)
+    assert.ok(!settings.tools.includes('remember') && !settings.tools.includes('forget'), role)
+  }
 })
 
 test('the coder, the reviewer and the writer have the ten browser tools; the researcher, the architect and ops have none', () => {
