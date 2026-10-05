@@ -35,6 +35,11 @@ export interface TabState {
   viewport: Viewport
   /** The newest picture. An open browser's, or a closed one's last, shown dimmed. */
   frame?: TabFrame
+  /**
+   * Whether the picture is a closed browser's last: set by a `closed` state, cleared by a frame. A new browser's first frame
+   * can come before the host's coalesced `open` state does; only a picture still the closed one's goes when it does.
+   */
+  closedFrame: boolean
   children: ChildBrowser[]
   /** The newest notice, until it is dismissed. */
   notice?: string
@@ -53,6 +58,7 @@ export const INITIAL: TabState = {
   canStart: false,
   sandboxOff: false,
   viewport: { width: 1280, height: 800 },
+  closedFrame: false,
   children: [],
 }
 
@@ -94,10 +100,12 @@ function applyState(state: TabState, down: StateDown): TabState {
     canStart: down.canStart,
     sandboxOff: down.sandboxOff,
     viewport: down.viewport,
+    // A closed state said again keeps what the first one set: a frame between them is the new browser's.
+    closedFrame: down.status === 'closed' && (state.status === 'closed' ? state.closedFrame : true),
   }
   // The picture is the open browser's, and a closed one keeps its last. A browser that is gone (`none`), a host without one,
-  // a refusal, and a new browser after a closed one start without it.
-  const keep = down.status === 'open' ? state.status !== 'closed' : down.status === 'closed'
+  // and a refusal start without it; so does a new browser after a closed one, unless its first frame came already.
+  const keep = down.status === 'open' ? !(state.status === 'closed' && state.closedFrame) : down.status === 'closed'
   if (!keep) delete next.frame
   return next
 }
@@ -105,7 +113,11 @@ function applyState(state: TabState, down: StateDown): TabState {
 function applyFrame(state: TabState, down: FrameDown): TabState {
   if (typeof down.data !== 'string' || !BASE64.test(down.data)) return state
   if (!positive(down.width) || !positive(down.height) || !Number.isFinite(down.seq)) return state
-  return { ...state, frame: { seq: down.seq, src: 'data:image/jpeg;base64,' + down.data, width: down.width, height: down.height } }
+  return {
+    ...state,
+    frame: { seq: down.seq, src: 'data:image/jpeg;base64,' + down.data, width: down.width, height: down.height },
+    closedFrame: false,
+  }
 }
 
 function positive(value: number): boolean {

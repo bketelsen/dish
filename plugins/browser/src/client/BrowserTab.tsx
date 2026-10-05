@@ -34,7 +34,7 @@ export function BrowserTab(props: Props) {
 
   useEffect(() => {
     attach(target)
-    return () => { detach() }
+    return () => { detach(target) }
   }, [attach, detach, target])
 
   const documentVisible = useDocumentVisible()

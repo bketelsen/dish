@@ -151,6 +151,14 @@ function state(overrides: Partial<StateDown> = {}): StateDown {
   }
 }
 
+function frame(seq: number, data = 'QUFBQQ=='): Down {
+  return { kind: 'frame', seq, data, width: 1280, height: 800 }
+}
+
+function acks(handle: FakeHandle): number[] {
+  return handle.sent.flatMap(item => (item.kind === 'ack' ? [item.seq] : []))
+}
+
 /** Let what is queued run on. */
 async function settle(): Promise<void> {
   for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve))
@@ -287,6 +295,73 @@ test('the picture\'s input and its acks go up as they are', async () => {
   await settle()
 })
 
+test('a frame the tab already has is acked at once, after frames go off and on and on a new generation', async () => {
+  // The host's frame numbers are its own, and the latest frame it hands a watcher that turns frames on is the one it has,
+  // unchanged. The picture draws nothing for a source it already shows, so it can't ack it: the controller must, or the host
+  // would wait for that ack for the rest of the generation.
+  const { api, tab } = make()
+  tab.face.attach('s1')
+  tab.face.setVisible(true)
+  await settle()
+  const first = api.last()
+  first.push({ kind: 'hello', watchId: '1' }, state(), frame(5))
+  await settle()
+  assert.deepEqual(acks(first), [], 'a new picture is the picture\'s to ack, once drawn')
+  tab.face.setVisible(false)
+  tab.face.setVisible(true)
+  first.push(frame(5))
+  await settle()
+  assert.deepEqual(acks(first), [5])
+  // The same picture under a new number is nothing new to draw either.
+  first.push(frame(6))
+  await settle()
+  assert.deepEqual(acks(first), [5, 6])
+  // The carrier drops; the next generation starts with the latest frame again.
+  first.finish()
+  await settle()
+  const second = api.last()
+  assert.notEqual(second, first)
+  second.push({ kind: 'hello', watchId: '2' }, state(), frame(6))
+  await settle()
+  assert.deepEqual(acks(second), [6])
+  // A new picture: drawn first, acked by the picture.
+  second.push(frame(7, 'QkJCQg=='))
+  await settle()
+  assert.deepEqual(acks(second), [6])
+  assert.equal(tab.face.hooks.tab.getSnapshot().frame?.seq, 7)
+  // A frame the tab can't draw is acked at once too.
+  second.push(frame(8, '"><img>'))
+  await settle()
+  assert.deepEqual(acks(second), [6, 8])
+  assert.equal(tab.face.hooks.tab.getSnapshot().frame?.seq, 7)
+  tab.dispose()
+  await settle()
+})
+
+test('a body\'s detach stops only the stream of the target it attached', async () => {
+  // Two Browser tabs in two panes of one chat: body A on the chat's own browser, body B on a crew child's.
+  const { api, tab } = make()
+  tab.face.attach('s1')
+  await settle()
+  const own = api.last()
+  tab.face.attach('c1')
+  await settle()
+  const child = api.last()
+  assert.equal(child.sessionId, 'c1')
+  assert.equal(own.signal.aborted, true, 'one stream at a time: B\'s target is followed')
+  // A unmounts: its detach is for a target no longer followed, and changes nothing.
+  tab.face.detach('s1')
+  await settle()
+  assert.equal(child.signal.aborted, false, 'B is still mounted')
+  tab.face.send({ kind: 'reload' })
+  assert.deepEqual(child.sent.at(-1), { kind: 'reload' })
+  tab.face.detach('c1')
+  await settle()
+  assert.equal(child.signal.aborted, true)
+  tab.dispose()
+  await settle()
+})
+
 test('a notice is shown until it is dismissed', async () => {
   const { api, tab } = make()
   tab.face.attach('s1')
@@ -308,15 +383,15 @@ test('two bodies on one target share one stream; the last to go stops it, and a 
   assert.equal(api.handles.length, 1)
   api.last().push({ kind: 'hello', watchId: '1' }, state({ title: 'Kept' }))
   await settle()
-  tab.face.detach()
+  tab.face.detach('s1')
   await settle()
   assert.equal(api.last().signal.aborted, false, 'one body is still there')
-  tab.face.detach()
+  tab.face.detach('s1')
   await settle()
   assert.equal(api.last().signal.aborted, true, 'the last body went')
   // Nothing goes up with no stream, and nothing throws.
   tab.face.send({ kind: 'back' })
-  tab.face.detach()
+  tab.face.detach('s1')
   // The title stays for the chip; the same target again resumes, connecting.
   assert.equal(tab.face.hooks.tab.getSnapshot().title, 'Kept')
   tab.face.attach('s1')

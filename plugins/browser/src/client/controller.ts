@@ -10,7 +10,11 @@
  *
  * **What goes up.** Every new generation is told whether the tab wants frames (it does while it is visible), and told again
  * when that changes. The address bar's `navigate` goes up when `addressInput` takes it; the picture's input and acks go as
- * they are. Nothing up waits for anything: an item for a generation that has ended is dropped.
+ * they are. A frame the picture won't draw (the source it already shows, or one the model refuses) is acked here, at once.
+ * Nothing up waits for anything: an item for a generation that has ended is dropped.
+ *
+ * A body detaches the target it attached: when two bodies show two targets (two panes), the later attach takes the one
+ * stream over, and the earlier body's detach, for a target no longer followed, changes nothing.
  *
  * **The presence** is the header button's: it watches the chat with frames off, so a chat left open keeps nothing alive,
  * and shows the button while the chat has an open browser or one of its crew children does.
@@ -33,8 +37,8 @@ export interface TabActions {
   hooks: { tab: ObservableSnapshot<TabState> }
   /** The body mounted, showing session `target`. */
   attach(target: string): void
-  /** The body unmounted. */
-  detach(): void
+  /** The body showing session `target` unmounted, or moved to another target. */
+  detach(target: string): void
   /** Whether the tab can be seen: frames are wanted only then. */
   setVisible(visible: boolean): void
   /** The address bar's Enter. */
@@ -123,7 +127,15 @@ export function createTabController(api: () => BrowserApi | undefined, stream: (
       receive: (down) => {
         if (!live()) return
         remember(down)
-        store.set(reduce(store.getSnapshot(), down))
+        const before = store.getSnapshot()
+        const after = reduce(before, down)
+        store.set(after)
+        // The picture acks a frame when its image has loaded. A frame whose source is the one already shown loads nothing
+        // (the host hands a watcher that turns frames on its latest frame again, number and all), and a frame the model
+        // won't keep is never drawn: ack those here, or the host would hold its next frame back for good.
+        if (down.kind === 'frame' && (after === before || after.frame?.src === before.frame?.src)) {
+          mine.follower.send({ kind: 'ack', seq: down.seq })
+        }
       },
       down: () => {
         if (live()) patch({ connection: 'down' })
@@ -152,8 +164,9 @@ export function createTabController(api: () => BrowserApi | undefined, stream: (
       stop()
       following = start(target)
     },
-    detach() {
-      if (following === undefined) return
+    detach(target) {
+      // A body whose target is no longer followed (another body's attach took the stream over) has nothing to let go of.
+      if (following === undefined || following.target !== target) return
       following.attached--
       if (following.attached <= 0) stop()
     },

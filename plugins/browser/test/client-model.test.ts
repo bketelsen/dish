@@ -100,6 +100,24 @@ test('a closed browser keeps its last frame; a browser that is gone or refused d
   assert.deepEqual(reduce(open, state({ url: 'http://127.0.0.1:5173/next' })).frame, open.frame)
 })
 
+test('a new browser\'s first frame, come while the tab still said closed, is kept when the state says open', () => {
+  // The host coalesces states, so the new browser's first frame can arrive before the `open` state does.
+  const closed = apply(state(), frame(1), state({ status: 'closed', reason: 'closed by you', url: '', title: '' }))
+  assert.equal(closed.frame?.seq, 1)
+  const reopened = reduce(reduce(closed, frame(9, { data: 'QkJCQg==' })), state({ status: 'open' }))
+  assert.equal(reopened.frame?.seq, 9)
+  assert.equal(reopened.frame?.src, 'data:image/jpeg;base64,QkJCQg==')
+  // With no frame since the closed state, the closed browser's last picture goes.
+  assert.equal(reduce(closed, state({ status: 'open' })).frame, undefined)
+  // A closed state said again (a new generation, a coalesced burst) doesn't make a newer frame the closed browser's.
+  const repeated = [frame(9, { data: 'QkJCQg==' }), state({ status: 'closed', reason: 'closed by you' }), state({ status: 'open' })]
+    .reduce<TabState>((current, down) => reduce(current, down), closed)
+  assert.equal(repeated.frame?.seq, 9)
+  // Once open, a later close and reopen with no frame between drops the picture again.
+  const again = [state({ status: 'closed', reason: 'idle' }), state({ status: 'open' })].reduce<TabState>((current, down) => reduce(current, down), reopened)
+  assert.equal(again.frame, undefined)
+})
+
 test('children replace the list, and a notice is the newest', () => {
   const one = apply({ kind: 'children', children: [{ sessionId: 'c1', label: '"coder: Fix login"' }] })
   assert.deepEqual(one.children, [{ sessionId: 'c1', label: '"coder: Fix login"' }])

@@ -8,12 +8,56 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { addressInput } from '../src/client/address.ts'
 import {
-  MOVE_INTERVAL_MS, buttonOf, clickCountOf, fit, isPaste, keyMessage, modifiersOf, pasteText, toViewport, wheelPixels,
+  MOVE_INTERVAL_MS, buttonOf, clickCountOf, createInputPacer, fit, isPaste, keyMessage, modifiersOf, pasteText, toViewport, wheelPixels,
 } from '../src/client/input.ts'
-import type { KeyLike } from '../src/client/input.ts'
+import type { KeyItem, KeyLike, PaceClock } from '../src/client/input.ts'
 import { ALT, CONTROL, META, SHIFT, TEXT_MAX, URL_MAX } from '../src/protocol.ts'
+import type { MouseButton, Up } from '../src/protocol.ts'
 
 const VIEWPORT = { width: 1280, height: 800 }
+
+/** A clock the test moves by hand: its timers run when `advance` passes them, in order. */
+class ManualClock implements PaceClock {
+  time = 1_000
+  private readonly timers: Array<{ at: number, run: () => void, live: boolean }> = []
+
+  now(): number {
+    return this.time
+  }
+
+  later(run: () => void, ms: number): () => void {
+    const timer = { at: this.time + ms, run, live: true }
+    this.timers.push(timer)
+    return () => { timer.live = false }
+  }
+
+  advance(ms: number): void {
+    const end = this.time + ms
+    for (;;) {
+      const due = this.timers.filter(timer => timer.live && timer.at <= end).sort((a, b) => a.at - b.at)[0]
+      if (due === undefined) break
+      this.time = due.at
+      due.live = false
+      due.run()
+    }
+    this.time = end
+  }
+
+  pending(): number {
+    return this.timers.filter(timer => timer.live).length
+  }
+}
+
+function pacing(): { sent: Up[], clock: ManualClock, pacer: ReturnType<typeof createInputPacer> } {
+  const sent: Up[] = []
+  const clock = new ManualClock()
+  return { sent, clock, pacer: createInputPacer((up) => { sent.push(up) }, clock) }
+}
+
+const mouse = (action: 'down' | 'up' | 'move', x: number, y: number, button: MouseButton = 'left', clickCount = 1): Up =>
+  ({ kind: 'mouse', action, x, y, button, clickCount })
+
+const keyItem = (action: 'down' | 'up', key: string, code: string, modifiers = 0): KeyItem => ({ kind: 'key', action, key, code, modifiers })
 
 function key(overrides: Partial<KeyLike> = {}): KeyLike {
   return { key: 'a', code: 'KeyA', isComposing: false, altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, ...overrides }
@@ -139,6 +183,155 @@ test('wheelPixels: lines and pages become pixels', () => {
 
 test('the picture sends a move at most every 33 ms: 30 a second', () => {
   assert.equal(MOVE_INTERVAL_MS, 33)
+})
+
+// --- the uplink's pace ------------------------------------------------------------------------------
+
+test('a move goes only while a button is down, at most every 33 ms, the newest kept', () => {
+  const { sent, clock, pacer } = pacing()
+  pacer.move({ x: 1, y: 1 })
+  clock.advance(100)
+  assert.equal(sent.length, 0, 'no button down: no move')
+  assert.equal(pacer.holding(), false)
+  pacer.press({ x: 10, y: 10 }, 'left', 1)
+  assert.deepEqual(sent, [mouse('move', 10, 10), mouse('down', 10, 10)])
+  assert.equal(pacer.holding(), true)
+  sent.length = 0
+  clock.advance(10)
+  pacer.move({ x: 11, y: 11 })
+  clock.advance(10)
+  pacer.move({ x: 12, y: 12 })
+  pacer.move(undefined)
+  assert.equal(sent.length, 0, 'within 33 ms of the press')
+  clock.advance(13)
+  assert.deepEqual(sent, [mouse('move', 12, 12)], 'the newest, when the interval allows')
+  // A move after a quiet spell goes at once.
+  sent.length = 0
+  clock.advance(100)
+  pacer.move({ x: 13, y: 13 })
+  assert.deepEqual(sent, [mouse('move', 13, 13)])
+  // A second of moves every 4 ms: about 30 go, never more than 31.
+  sent.length = 0
+  for (let i = 0; i < 250; i++) {
+    clock.advance(4)
+    pacer.move({ x: i, y: i })
+  }
+  assert.ok(sent.length >= 28 && sent.length <= 31, `${sent.length} moves in a second`)
+  assert.ok(sent.every(item => item.kind === 'mouse' && item.action === 'move'))
+  pacer.dispose()
+})
+
+test('a release sends the last point as a move first, then the up with the press\'s click count', () => {
+  const { sent, clock, pacer } = pacing()
+  pacer.press({ x: 10, y: 10 }, 'left', 2)
+  sent.length = 0
+  clock.advance(5)
+  pacer.move({ x: 20, y: 20 })
+  pacer.release('left', { x: 25, y: 25 })
+  assert.deepEqual(sent, [mouse('move', 25, 25), mouse('up', 25, 25, 'left', 2)])
+  assert.equal(pacer.holding(), false)
+  clock.advance(100)
+  assert.equal(sent.length, 2, 'the move that was waiting went with the release')
+  // Released outside the image: where it last was, the waiting move included.
+  sent.length = 0
+  pacer.press({ x: 1, y: 1 }, 'right', 1)
+  clock.advance(5)
+  pacer.move({ x: 30, y: 30 })
+  pacer.release('right', undefined)
+  assert.deepEqual(sent, [mouse('move', 1, 1, 'right'), mouse('down', 1, 1, 'right'), mouse('move', 30, 30, 'right'), mouse('up', 30, 30, 'right')])
+  // Released where it was pressed: no move first.
+  sent.length = 0
+  clock.advance(100)
+  pacer.press({ x: 5, y: 5 }, 'left', 3)
+  pacer.release('left', { x: 5, y: 5 })
+  assert.deepEqual(sent, [mouse('move', 5, 5), mouse('down', 5, 5, 'left', 3), mouse('up', 5, 5, 'left', 3)])
+  // Another button's release, and a second press while one is held, change nothing.
+  sent.length = 0
+  pacer.press({ x: 7, y: 7 }, 'left', 1)
+  pacer.press({ x: 8, y: 8 }, 'middle', 1)
+  pacer.release('right', { x: 9, y: 9 })
+  assert.deepEqual(sent, [mouse('move', 7, 7), mouse('down', 7, 7)])
+  assert.equal(pacer.holding(), true)
+  pacer.dispose()
+})
+
+test('wheel turns within 33 ms are summed into one, at the newest point; turns that cancel out send nothing', () => {
+  const { sent, clock, pacer } = pacing()
+  pacer.wheel({ x: 1, y: 1 }, 0, 100)
+  assert.deepEqual(sent, [{ kind: 'wheel', x: 1, y: 1, dx: 0, dy: 100 }])
+  sent.length = 0
+  clock.advance(5)
+  pacer.wheel({ x: 2, y: 2 }, 0, 40)
+  clock.advance(5)
+  pacer.wheel({ x: 3, y: 3 }, 10, 60)
+  assert.equal(sent.length, 0)
+  clock.advance(23)
+  assert.deepEqual(sent, [{ kind: 'wheel', x: 3, y: 3, dx: 10, dy: 100 }])
+  sent.length = 0
+  clock.advance(5)
+  pacer.wheel({ x: 4, y: 4 }, 0, 30)
+  clock.advance(5)
+  pacer.wheel({ x: 4, y: 4 }, 0, -30)
+  clock.advance(100)
+  assert.equal(sent.length, 0)
+  // A long spin: about 30 a second.
+  for (let i = 0; i < 250; i++) {
+    clock.advance(4)
+    pacer.wheel({ x: 5, y: 5 }, 0, 10)
+  }
+  clock.advance(100)
+  assert.ok(sent.length >= 28 && sent.length <= 32, `${sent.length} wheels in a second`)
+  assert.equal(sent.reduce((sum, item) => sum + (item.kind === 'wheel' ? item.dy : 0), 0), 2500, 'no turn is lost')
+  pacer.dispose()
+})
+
+test('keys are sent and remembered; an up for a key not pressed here sends nothing; leaving releases what is held', () => {
+  const { sent, pacer } = pacing()
+  pacer.keyDown('ShiftLeft', keyItem('down', 'Shift', 'ShiftLeft', SHIFT))
+  pacer.keyDown('KeyA', keyItem('down', 'A', 'KeyA', SHIFT))
+  assert.equal(pacer.keyUp('KeyQ', keyItem('up', 'q', 'KeyQ')), false)
+  assert.equal(pacer.keyUp('KeyA', keyItem('up', 'a', 'KeyA')), true)
+  assert.equal(pacer.keyUp('KeyA', keyItem('up', 'a', 'KeyA')), false, 'already up')
+  pacer.press({ x: 4, y: 4 }, 'left', 1)
+  assert.deepEqual(sent, [
+    keyItem('down', 'Shift', 'ShiftLeft', SHIFT), keyItem('down', 'A', 'KeyA', SHIFT), keyItem('up', 'a', 'KeyA'),
+    mouse('move', 4, 4), mouse('down', 4, 4),
+  ])
+  sent.length = 0
+  // Blur (or the picture going): the held button, then each key still down, in the words they went down with.
+  pacer.releaseAll()
+  assert.deepEqual(sent, [mouse('up', 4, 4), keyItem('up', 'Shift', 'ShiftLeft', SHIFT)])
+  assert.equal(pacer.holding(), false)
+  sent.length = 0
+  pacer.releaseAll()
+  assert.equal(sent.length, 0, 'nothing is held any more')
+  // An up whose own words are unknown (composing) goes in the words of its down.
+  pacer.keyDown('KeyB', keyItem('down', 'b', 'KeyB'))
+  assert.equal(pacer.keyUp('KeyB', undefined), true)
+  assert.deepEqual(sent.at(-1), keyItem('up', 'b', 'KeyB'))
+  pacer.dispose()
+})
+
+test('dispose cancels what is waiting, and nothing goes after it', () => {
+  const { sent, clock, pacer } = pacing()
+  pacer.press({ x: 1, y: 1 }, 'left', 1)
+  pacer.wheel({ x: 1, y: 1 }, 0, 10)
+  clock.advance(5)
+  pacer.move({ x: 2, y: 2 })
+  pacer.wheel({ x: 1, y: 1 }, 0, 10)
+  assert.ok(clock.pending() > 0)
+  const before = sent.length
+  pacer.releaseAll()
+  pacer.dispose()
+  const after = sent.length
+  assert.ok(after > before, 'the release went before the dispose')
+  clock.advance(1_000)
+  assert.equal(clock.pending(), 0)
+  pacer.press({ x: 3, y: 3 }, 'left', 1)
+  pacer.keyDown('KeyA', keyItem('down', 'a', 'KeyA'))
+  pacer.wheel({ x: 3, y: 3 }, 0, 10)
+  clock.advance(1_000)
+  assert.equal(sent.length, after)
 })
 
 test('addressInput: trimmed, and nothing for an empty or an over-long address', () => {

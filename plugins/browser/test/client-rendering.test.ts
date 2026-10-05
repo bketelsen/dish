@@ -186,7 +186,7 @@ function state(overrides: Partial<TabState> = {}): TabState {
   return {
     connection: 'live', status: 'open', reason: '', url: 'http://127.0.0.1:5173/', title: 'Widget', loading: false,
     canGoBack: false, canGoForward: false, acting: false, canStart: false, sandboxOff: false, viewport: { width: 1280, height: 800 },
-    children: [], ...overrides,
+    closedFrame: false, children: [], ...overrides,
   }
 }
 
@@ -404,7 +404,7 @@ test('no source of the client builds markup from a string, loads or runs one, or
     for (const [pattern, what] of forbidden) assert.ok(!pattern.test(text), `${file} has ${what}`)
     // The two image sources: the picture's frame (TabView's PictureFrame, given `frame.src`) and the screenshot's image (given
     // what `loadImage` answered).
-    const sources = [...text.matchAll(/\bsrc\s*=\s*\S*/g)].map(match => match[0])
+    const sources = [...text.matchAll(/\bsrc\s*=(?!=)\s*\S*/g)].map(match => match[0])
     const expected: Record<string, string[]> = { 'TabView.tsx': ['src={source}'], 'ScreenshotView.tsx': ['src={src}'], 'ScreenshotRow.tsx': ['src={loaded}'] }
     assert.deepEqual(sources, expected[file] ?? [], file)
   }

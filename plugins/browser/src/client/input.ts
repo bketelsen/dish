@@ -3,8 +3,9 @@
  * the page, which button and modifiers it carries, what a key becomes, and what a paste becomes. No DOM types here, so
  * `node --test` runs it (`test/client-input.test.ts`); `Picture.tsx` calls these from its handlers.
  *
- * The uplink is small (dsh buffers at most 256 KiB a stream), so the picture sends a `move` only while a button is down and at
- * most every `MOVE_INTERVAL_MS`, coalesces wheel turns the same way, and cuts a paste to `TEXT_MAX`.
+ * The uplink is small (dsh buffers at most 256 KiB a stream), so a paste is cut to `TEXT_MAX`, and the pacer
+ * (`createInputPacer`, over a clock a test can move) sends a `move` only while a button is down and at most every
+ * `MOVE_INTERVAL_MS`, sums wheel turns the same way, and releases what the picture holds down when it loses focus.
  */
 
 import { ALT, CONTROL, META, SHIFT, TEXT_MAX } from '../protocol.ts'
@@ -109,6 +110,174 @@ export function wheelPixels(e: { deltaX: number, deltaY: number, deltaMode: numb
   const unitX = e.deltaMode === 1 ? LINE_PIXELS : e.deltaMode === 2 ? viewport.width : 1
   const unitY = e.deltaMode === 1 ? LINE_PIXELS : e.deltaMode === 2 ? viewport.height : 1
   return { dx: finite(e.deltaX) * unitX, dy: finite(e.deltaY) * unitY }
+}
+
+// --- the uplink's pace ------------------------------------------------------------------------------
+
+/** What the pacer reads the time from and sets its timers on; a test passes one it moves by hand. */
+export interface PaceClock {
+  now(): number
+  /** Run `run` after `ms`; the answer cancels it. */
+  later(run: () => void, ms: number): () => void
+}
+
+export const systemClock: PaceClock = {
+  now: () => Date.now(),
+  later: (run, ms) => {
+    const timer = setTimeout(run, ms)
+    return () => { clearTimeout(timer) }
+  },
+}
+
+/** A point in the page. */
+export interface Point { x: number, y: number }
+
+export type KeyItem = Extract<Up, { kind: 'key' }>
+
+/**
+ * What the picture's handlers feed, and what decides what goes up the uplink and when. Points are the page's (`toViewport`).
+ * After `dispose`, nothing goes.
+ */
+export interface InputPacer {
+  /** A button went down: a `move` to the point, then the `down`. Ignored while a button is held. */
+  press(point: Point, button: MouseButton, clickCount: number): void
+  /** The pointer moved: a `move` only while a button is held, at most every `MOVE_INTERVAL_MS`, the newest kept. `undefined` (outside the image) is ignored. */
+  move(point: Point | undefined): void
+  /** `button` went up at `point`, or outside the image (`undefined`): a `move` to where it ends when that isn't where the last one went, then the `up` with the press's click count. Another button's release is ignored. */
+  release(button: MouseButton, point: Point | undefined): void
+  /** Whether a button is held. */
+  holding(): boolean
+  /** A wheel turn: turns are summed, and go at most every `MOVE_INTERVAL_MS`, at the newest point; turns that cancel out send nothing. */
+  wheel(point: Point, dx: number, dy: number): void
+  /** A key went down (`id` is its code, or its key when it has no code): sent, and remembered. */
+  keyDown(id: string, item: KeyItem): void
+  /** A key went up: sent only if it went down here, as `item`, or in the words of its down when `item` is undefined. The answer says whether it went. */
+  keyUp(id: string, item: KeyItem | undefined): boolean
+  /** Focus left, or the picture is going: release the held button where it was, then every key still down. */
+  releaseAll(): void
+  /** Cancel what is waiting; nothing goes after. */
+  dispose(): void
+}
+
+/**
+ * The pace of the tab's input, so the uplink (at most 256 KiB buffered a stream) never floods: moves only while a button is
+ * down, at most 30 a second; wheel turns summed at the same pace; and what the picture holds down released when it loses focus.
+ * @param send - one item up the uplink.
+ * @param clock - the time and the timers.
+ */
+export function createInputPacer(send: (up: Up) => void, clock: PaceClock = systemClock): InputPacer {
+  let disposed = false
+  let held: { button: MouseButton, clickCount: number, x: number, y: number } | undefined
+  let moveAt = Number.NEGATIVE_INFINITY
+  let moveWaiting: Point | undefined
+  let moveCancel: (() => void) | undefined
+  let wheelAt = Number.NEGATIVE_INFINITY
+  let wheelWaiting: { x: number, y: number, dx: number, dy: number } | undefined
+  let wheelCancel: (() => void) | undefined
+  const pressed = new Map<string, KeyItem>()
+
+  const out = (up: Up): void => {
+    if (!disposed) send(up)
+  }
+
+  const sendMove = (point: Point): void => {
+    if (held === undefined) return
+    moveAt = clock.now()
+    held.x = point.x
+    held.y = point.y
+    out({ kind: 'mouse', action: 'move', x: point.x, y: point.y, button: held.button, clickCount: 1 })
+  }
+
+  const flushMove = (): void => {
+    moveCancel = undefined
+    const point = moveWaiting
+    moveWaiting = undefined
+    if (point !== undefined) sendMove(point)
+  }
+
+  const cancelMove = (): void => {
+    moveCancel?.()
+    moveCancel = undefined
+  }
+
+  const flushWheel = (): void => {
+    wheelCancel = undefined
+    const turn = wheelWaiting
+    wheelWaiting = undefined
+    if (turn === undefined || (turn.dx === 0 && turn.dy === 0)) return
+    wheelAt = clock.now()
+    out({ kind: 'wheel', x: turn.x, y: turn.y, dx: turn.dx, dy: turn.dy })
+  }
+
+  const releaseHeld = (point: Point | undefined): void => {
+    const button = held
+    if (button === undefined) return
+    cancelMove()
+    const at = point ?? moveWaiting ?? { x: button.x, y: button.y }
+    moveWaiting = undefined
+    if (at.x !== button.x || at.y !== button.y) sendMove(at)
+    held = undefined
+    out({ kind: 'mouse', action: 'up', x: at.x, y: at.y, button: button.button, clickCount: button.clickCount })
+  }
+
+  return {
+    press(point, button, clickCount) {
+      if (disposed || held !== undefined) return
+      held = { button, clickCount, x: point.x, y: point.y }
+      moveAt = clock.now()
+      out({ kind: 'mouse', action: 'move', x: point.x, y: point.y, button, clickCount: 1 })
+      out({ kind: 'mouse', action: 'down', x: point.x, y: point.y, button, clickCount })
+    },
+    move(point) {
+      if (disposed || held === undefined || point === undefined) return
+      if (moveCancel === undefined && clock.now() - moveAt >= MOVE_INTERVAL_MS) {
+        sendMove(point)
+        return
+      }
+      moveWaiting = point
+      if (moveCancel === undefined) moveCancel = clock.later(flushMove, Math.max(0, MOVE_INTERVAL_MS - (clock.now() - moveAt)))
+    },
+    release(button, point) {
+      if (held === undefined || held.button !== button) return
+      releaseHeld(point)
+    },
+    holding: () => held !== undefined,
+    wheel(point, dx, dy) {
+      if (disposed) return
+      wheelWaiting = { x: point.x, y: point.y, dx: (wheelWaiting?.dx ?? 0) + finite(dx), dy: (wheelWaiting?.dy ?? 0) + finite(dy) }
+      if (wheelCancel !== undefined) return
+      const wait = MOVE_INTERVAL_MS - (clock.now() - wheelAt)
+      if (wait <= 0) flushWheel()
+      else wheelCancel = clock.later(flushWheel, wait)
+    },
+    keyDown(id, item) {
+      if (disposed) return
+      pressed.set(id, item)
+      out(item)
+    },
+    keyUp(id, item) {
+      const down = pressed.get(id)
+      if (disposed || down === undefined) return false
+      pressed.delete(id)
+      out(item ?? { ...down, action: 'up' })
+      return true
+    },
+    releaseAll() {
+      releaseHeld(undefined)
+      for (const down of pressed.values()) out({ ...down, action: 'up' })
+      pressed.clear()
+    },
+    dispose() {
+      disposed = true
+      cancelMove()
+      wheelCancel?.()
+      wheelCancel = undefined
+      moveWaiting = undefined
+      wheelWaiting = undefined
+      held = undefined
+      pressed.clear()
+    },
+  }
 }
 
 function finite(value: number): number {
