@@ -7,6 +7,9 @@
  *   is restated: the row's own `default` when it has one, else `standard`. A row that already has a `selectedDefault`,
  *   whatever its value, is a choice (made in the UI, or by hand) and is left exactly as it is, `default` included. So
  *   `--preset` is the default to set when none is chosen yet, and a later run never resets it;
+ * - the `dish-memory` row, with `--vault-remote <url>` or `--no-vault-remote`: the vault's `remote` (empty with
+ *   `--no-vault-remote`, which keeps the vault local), and the same `userName` and `userEmail` as `dish-config`'s, on its
+ *   config, and nothing else. With neither, the row is left as it is;
  * - the `sandbox` row (`@deepseek-ai/dsh-sandbox-local`), with `--sandbox-runner <path>`: `runnerCommand: [<path>]` and
  *   `runnerFailureSignatures: ['bwrap: ', 'dish-sandbox: ']` on its config, so that dsh runs every sandboxed command
  *   through `deploy/dish-sandbox` (docs/specs/sandbox-home.md). `--protect <path>` pairs added after the path by hand
@@ -22,11 +25,11 @@
  * the same `name`.
  *
  *   node deploy/profile.ts --patch <path> (--remote <url> | --no-remote) --user-name <name> --user-email <email> [--preset dish]
- *     [--sandbox-runner <absolute path> | --no-sandbox-runner]
+ *     [--vault-remote <url> | --no-vault-remote] [--sandbox-runner <absolute path> | --no-sandbox-runner]
  *   node deploy/profile.ts --patch <path> (--sandbox-runner <absolute path> | --no-sandbox-runner)
  *
  * `--preset` is the default preset to set when none is chosen yet (default `dish`); a default already chosen is kept.
- * The second form writes the sandbox row alone: `--no-sandbox-runner` so is the step before a rollback past the
+ * A row dish adds goes at the end, in the order above. The second form writes the sandbox row alone: `--no-sandbox-runner` so is the step before a rollback past the
  * runner, whose row would otherwise name a script the older checkout doesn't have.
  *
  * Prints `unchanged` or `updated` and exits 0. A file that cannot be read, or is not a YAML sequence of rows, exits
@@ -43,6 +46,9 @@ import type { Document, ParsedNode, YAMLMap, YAMLSeq } from 'yaml'
 /** The `dish-config` row: plugins/config/cordis.patch.yml inserts it with this id and name. */
 export const CONFIG_ROW_ID = 'dish-config'
 export const CONFIG_ROW_NAME = 'dish-config'
+/** The `dish-memory` row: plugins/memory/cordis.patch.yml inserts it with this id and name. */
+export const MEMORY_ROW_ID = 'dish-memory'
+export const MEMORY_ROW_NAME = 'dish-memory'
 /** The row the UI's "Set as new task default" writes. */
 export const PRESET_ROW_ID = 'agent-preset-registry'
 export const PRESET_ROW_NAME = '@deepseek-ai/dsh-agent-preset-registry'
@@ -63,6 +69,11 @@ export interface DishRowsOptions {
   remote: string
   userName: string
   userEmail: string
+  /**
+   * The vault's git remote, set on the `dish-memory` row with `userName` and `userEmail`. `''` keeps the vault local (the
+   * schema's default), and still writes the row. `undefined` (the default) leaves the row alone.
+   */
+  vaultRemote?: string
   /** The preset id made the default for new tasks when none is chosen yet. Defaults to `dish`. A chosen one is kept. */
   preset?: string
   /**
@@ -72,7 +83,7 @@ export interface DishRowsOptions {
   sandboxRunner?: string | null
 }
 
-type Normalized = Required<Omit<DishRowsOptions, 'sandboxRunner'>> & Pick<DishRowsOptions, 'sandboxRunner'>
+type Normalized = Required<Omit<DishRowsOptions, 'vaultRemote' | 'sandboxRunner'>> & Pick<DishRowsOptions, 'vaultRemote' | 'sandboxRunner'>
 
 export type Outcome = 'unchanged' | 'updated'
 
@@ -104,11 +115,13 @@ function checkRunner(runner: string): void {
 function normalize(options: DishRowsOptions): Normalized {
   const runner = options.sandboxRunner
   if (typeof runner === 'string') checkRunner(runner)
+  const vault = options.vaultRemote
   return {
     remote: options.remote === '' ? '' : requireLine('remote', options.remote),
     userName: requireLine('userName', options.userName),
     userEmail: requireLine('userEmail', options.userEmail),
     preset: requireLine('preset', options.preset ?? DEFAULT_PRESET),
+    ...vault === undefined ? {} : { vaultRemote: vault === '' ? '' : requireLine('vaultRemote', vault) },
     ...runner === undefined ? {} : { sandboxRunner: runner },
   }
 }
@@ -244,6 +257,22 @@ function editRows(text: string, edit: (editor: Editor, seq: YAMLSeq) => void): s
   return editor.changed ? String(doc) : text
 }
 
+/**
+ * A store's row (`dish-config`'s or `dish-memory`'s): `remote`, `userName` and `userEmail` set on its config, its other
+ * keys kept. A missing row is added at the end.
+ */
+function editStoreRow(editor: Editor, seq: YAMLSeq, id: string, name: string, values: { remote: string, userName: string, userEmail: string }): void {
+  const row = findRow(seq, id, name)
+  if (row === undefined) {
+    editor.append(seq, { id, name, config: { ...values } })
+    return
+  }
+  const config = editor.config(row, id)
+  editor.set(row, config, 'remote', values.remote)
+  editor.set(row, config, 'userName', values.userName)
+  editor.set(row, config, 'userEmail', values.userEmail)
+}
+
 /** The sandbox row: dish's runner set (a path), or taken off again (`null`). */
 function editSandboxRow(editor: Editor, seq: YAMLSeq, sandboxRunner: string | null): void {
   const sandboxRow = findRow(seq, SANDBOX_ROW_ID, SANDBOX_ROW_NAME)
@@ -275,17 +304,9 @@ function editSandboxRow(editor: Editor, seq: YAMLSeq, sandboxRunner: string | nu
  * @throws When `text` is not valid YAML, or is not a sequence, or a dish row has a config that is not a mapping.
  */
 export function writeDishRows(text: string, options: DishRowsOptions): string {
-  const { remote, userName, userEmail, preset, sandboxRunner } = normalize(options)
+  const { remote, userName, userEmail, preset, vaultRemote, sandboxRunner } = normalize(options)
   return editRows(text, (editor, seq) => {
-    const configRow = findRow(seq, CONFIG_ROW_ID, CONFIG_ROW_NAME)
-    if (configRow === undefined) {
-      editor.append(seq, { id: CONFIG_ROW_ID, name: CONFIG_ROW_NAME, config: { remote, userName, userEmail } })
-    } else {
-      const config = editor.config(configRow, CONFIG_ROW_ID)
-      editor.set(configRow, config, 'remote', remote)
-      editor.set(configRow, config, 'userName', userName)
-      editor.set(configRow, config, 'userEmail', userEmail)
-    }
+    editStoreRow(editor, seq, CONFIG_ROW_ID, CONFIG_ROW_NAME, { remote, userName, userEmail })
 
     const presetRow = findRow(seq, PRESET_ROW_ID, PRESET_ROW_NAME)
     if (presetRow === undefined) {
@@ -302,6 +323,8 @@ export function writeDishRows(text: string, options: DishRowsOptions): string {
       }
     }
 
+    // The vault's commits carry the same identity as the store's.
+    if (vaultRemote !== undefined) editStoreRow(editor, seq, MEMORY_ROW_ID, MEMORY_ROW_NAME, { remote: vaultRemote, userName, userEmail })
     if (sandboxRunner !== undefined) editSandboxRow(editor, seq, sandboxRunner)
   })
 }
@@ -347,9 +370,11 @@ export async function updatePatchFile(path: string, options: DishRowsOptions | {
 
 const USAGE = [
   'usage: node deploy/profile.ts --patch <path> (--remote <url> | --no-remote) --user-name <name> --user-email <email> [--preset dish]',
-  '         [--sandbox-runner <absolute path> | --no-sandbox-runner]',
+  '         [--vault-remote <url> | --no-vault-remote] [--sandbox-runner <absolute path> | --no-sandbox-runner]',
   '       node deploy/profile.ts --patch <path> (--sandbox-runner <absolute path> | --no-sandbox-runner)',
   '  --preset             the default preset to set when none is chosen yet (default dish); a default already chosen is kept',
+  '  --vault-remote       the memory vault\'s git remote, on the dish-memory row with the user name and email',
+  '  --no-vault-remote    the dish-memory row with no remote: the vault stays local; with neither, the row is left as it is',
   '  --sandbox-runner     run sandboxed commands through this runner (deploy/dish-sandbox): the sandbox row\'s runnerCommand',
   '  --no-sandbox-runner  take dish\'s runner off the sandbox row; with neither, the row is left as it is',
 ].join('\n')
@@ -372,6 +397,8 @@ export async function main(argv: string[]): Promise<number> {
         'user-name': { type: 'string' },
         'user-email': { type: 'string' },
         preset: { type: 'string' },
+        'vault-remote': { type: 'string' },
+        'no-vault-remote': { type: 'boolean' },
         'sandbox-runner': { type: 'string' },
         'no-sandbox-runner': { type: 'boolean' },
       },
@@ -386,8 +413,10 @@ export async function main(argv: string[]): Promise<number> {
   }
   const runner = values['no-sandbox-runner'] === true ? null : values['sandbox-runner']
 
-  // The second form: the sandbox row alone, when no dish-config input is given.
-  const dishInputs = [values.remote, values['no-remote'], values['user-name'], values['user-email'], values.preset]
+  // The second form: the sandbox row alone, when no dish-config or dish-memory input is given.
+  const dishInputs = [
+    values.remote, values['no-remote'], values['user-name'], values['user-email'], values.preset, values['vault-remote'], values['no-vault-remote'],
+  ]
   if (runner !== undefined && dishInputs.every((value) => value === undefined)) {
     try {
       if (runner !== null) checkRunner(runner)
@@ -403,10 +432,17 @@ export async function main(argv: string[]): Promise<number> {
   // `--no-remote` says on purpose what an empty `--remote "$UNSET"` would say by accident.
   if ((values.remote === undefined) === (values['no-remote'] !== true)) return usage('give one of --remote or --no-remote')
   if (values.remote === '') return usage('--remote must not be empty; use --no-remote to keep the store local')
+  // The vault's are optional, and the same: `--no-vault-remote` on purpose, never an empty `--vault-remote`.
+  if (values['vault-remote'] !== undefined && values['no-vault-remote'] === true) {
+    return usage('give one of --vault-remote or --no-vault-remote, not both')
+  }
+  if (values['vault-remote'] === '') return usage('--vault-remote must not be empty; use --no-vault-remote to keep the vault local')
+  const vaultRemote = values['no-vault-remote'] === true ? '' : values['vault-remote']
   const options: DishRowsOptions = {
     remote: values['no-remote'] === true ? '' : values.remote as string,
     userName: values['user-name'] as string,
     userEmail: values['user-email'] as string,
+    ...vaultRemote === undefined ? {} : { vaultRemote },
     ...values.preset === undefined ? {} : { preset: values.preset },
     ...runner === undefined ? {} : { sandboxRunner: runner },
   }

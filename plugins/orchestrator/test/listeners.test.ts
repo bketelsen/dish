@@ -15,7 +15,7 @@ import {
 
 const CODER_REPORT: CoderReport = {
   role: 'coder', turn: 3, at: NOW, status: 'done', summary: 'Fixed the redirect', commits: [HEAD],
-  rulings: [{ what: 'kept the cookie', why: 'compat', costIfWrong: 'a round' }],
+  rulings: [{ what: 'kept the cookie', why: 'compat', costIfWrong: 'a round' }], remember: ['the redirect test needs a fresh cookie jar'],
 }
 const REVIEWER_REPORT: ReviewerReport = {
   role: 'reviewer', turn: 2, at: NOW, verdict: 'changes_requested', head: HEAD, summary: 'Two things',
@@ -24,6 +24,7 @@ const REVIEWER_REPORT: ReviewerReport = {
     { severity: 'nit', file: 'src/b.ts', summary: 'name', fix: 'rename' },
     { severity: 'nit', file: 'src/c.ts', summary: 'name', fix: 'rename' },
   ],
+  remember: ['src/a.ts is generated: change its template'],
 }
 
 test('the pure builders: startedEntry, endedEntries and gateEntry', async () => {
@@ -106,6 +107,11 @@ test('child.ended: the stop reason, error, report files, the structured report c
     error: 'the model failed', reportFile: '/r/1-coder-1.md', structuredFile: '/r/1-coder-1.json', report: CODER_REPORT, head: SHA_C,
   }])
   assert.deepEqual(w.workspaces.calls.headOf, [[run.worktree]])
+  // The report is copied whole, remember included, a coder's and a reviewer's.
+  l.settled(settled({ id: 'r1', role: 'reviewer', reviews: 'c1', run: w.runs.refOf(run), task: 'fix-login' }, { structured: REVIEWER_REPORT }))
+  await w.ledger.flush()
+  const remembered = (await w.entries(run)).flatMap(entry => entry.kind === 'child.ended' ? [[entry.child, entry.report?.remember]] : [])
+  assert.deepEqual(remembered, [['c1', ['the redirect test needs a fresh cookie jar']], ['r1', ['src/a.ts is generated: change its template']]])
 })
 
 test('child.ended: a reviewer\'s head comes from its task\'s path; headOf rejecting is null; no structured report, none', async () => {

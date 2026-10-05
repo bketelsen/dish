@@ -1,9 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { gateAt, latestFinal, nextRound, openTasks, sameHead, summarize, taskOfChild } from '../src/derive.ts'
+import { CLOSING_RULINGS, closingRulings, closingRulingsBlock, gateAt, latestFinal, nextRound, openTasks, sameHead, summarize, taskOfChild } from '../src/derive.ts'
 import type { RunSummary } from '../src/derive.ts'
 import type { LedgerEntry } from '../src/entries.ts'
-import { everyKind, MINUTE, NOW, run, SHA_A, SHA_B, SHA_C } from './helpers.ts'
+import { everyKind, MASKED_TOKEN, MINUTE, NOW, run, SHA_A, SHA_B, SHA_C, TOKEN } from './helpers.ts'
 
 const ID = '20261003-fix-login'
 const at = (minute: number): number => NOW + minute * MINUTE
@@ -42,6 +42,18 @@ function taskOpened(task: string, minute: number, path = `/work/Acme/widget/.wor
 
 function taskRemoved(task: string, minute: number): LedgerEntry {
   return { at: at(minute), run: ID, kind: 'task.removed', by: 'harness', task }
+}
+
+/** The main agent's `ruling`, on `task` when given. */
+function mainRuling(what: string, minute: number, task?: string, more: Record<string, unknown> = {}): LedgerEntry {
+  return {
+    at: at(minute), run: ID, kind: 'ruling', by: 'main', session: 'session-1', what, why: 'why', costIfWrong: 'cost', ...(task === undefined ? {} : { task }), ...more,
+  } as LedgerEntry
+}
+
+/** A coder's `child.ended` whose report holds `rulings`. */
+function coderEnded(child: string, task: string | undefined, minute: number, rulings: unknown[]): LedgerEntry {
+  return ended(child, 'coder', task, minute, { report: { role: 'coder', turn: 1, at: 0, status: 'done', summary: 'done', rulings } })
 }
 
 test('nextRound counts the coder starts and follow-ups on the task only', () => {
@@ -253,4 +265,101 @@ test('malformed fields are passed over without a throw', () => {
     deferred: [],
     notes: [],
   })
+})
+
+test('closingRulings: every kind, oldest first, coders\' with their task', () => {
+  // everyKind: a coder's report ruling on api, then the ladder's ruling and the main agent's.
+  assert.deepEqual(closingRulings(everyKind(ID)), [
+    'kept the old cookie — compat — one more round (coder, api)',
+    'api: one more round — close — an hour',
+    'api: skip the e2e — flaky — a regression',
+  ])
+  // `run` `status`'s rulings are as they were: no coder's.
+  assert.deepEqual(summarize(run(), everyKind(ID)).rulings.map(view => view.text), ['one more round — close — an hour', 'skip the e2e — flaky — a regression'])
+  const entries: LedgerEntry[] = [
+    mainRuling('kept the old cookie', 1),
+    coderEnded('c1', undefined, 2, [{ what: 'a', why: 'b', costIfWrong: 'c' }, { what: 1, why: 'b', costIfWrong: 'c' }, 'not a ruling', { what: 'd', why: 'e', costIfWrong: 'f' }]),
+    { at: at(3), run: ID, kind: 'ladder.ruled', by: 'harness', task: 'ui', round: 5, ruling: 'one more round — close — an hour' },
+    { at: at(4), run: ID, kind: 'pr.checked', by: 'harness', session: 's', head: SHA_A, gate: null, final: null, gateOk: false, reviewOk: false,
+      overrides: { review: 'no reviewer — trivial — a bug', gate: 'flaky — known — a revert' }, result: 'pass' },
+    mainRuling('skip the e2e', 5, 'api'),
+    coderEnded('c2', 'ui', 6, [{ what: 'g', why: 'h', costIfWrong: 'i' }]),
+    // None of these: a reviewer's report, a coder's that ended without one or with rulings that aren't a list, and the wrong writers.
+    ended('r1', 'reviewer', 'ui', 7, { report: { role: 'reviewer', turn: 1, at: 0, verdict: 'approved', head: SHA_A, summary: 'x', findings: [], rulings: [{ what: 'r', why: 'r', costIfWrong: 'r' }] } }),
+    ended('c3', 'coder', 'ui', 8),
+    coderEnded('c4', 'ui', 9, 'none' as unknown as unknown[]),
+    { ...mainRuling('forged', 10), by: 'harness' } as unknown as LedgerEntry,
+    { ...coderEnded('c5', 'ui', 11, [{ what: 'forged', why: 'w', costIfWrong: 'c' }]), by: 'main' } as unknown as LedgerEntry,
+    { at: at(12), run: ID, kind: 'ladder.ruled', by: 'main', task: 'ui', round: 6, ruling: 'forged' } as unknown as LedgerEntry,
+  ]
+  assert.deepEqual(closingRulings(entries), [
+    'kept the old cookie — why — cost',
+    'a — b — c (coder)',
+    'd — e — f (coder)',
+    'ui: one more round — close — an hour',
+    'gate: flaky — known — a revert',
+    'review: no reviewer — trivial — a bug',
+    'api: skip the e2e — why — cost',
+    'g — h — i (coder, ui)',
+  ])
+  assert.deepEqual(closingRulings([]), [])
+})
+
+test('closingRulingsBlock: \'\' with none; the newest ten oldest first and how many more', () => {
+  assert.equal(CLOSING_RULINGS, 10)
+  assert.equal(closingRulingsBlock([]), '')
+  assert.equal(closingRulingsBlock([started('c1', 'coder', 'api', 1), mainRuling('x', 2, undefined, { why: 1 })]), '')
+  assert.equal(closingRulingsBlock(everyKind(ID)), [
+    'Rulings in this run:',
+    '- kept the old cookie — compat — one more round (coder, api)',
+    '- api: one more round — close — an hour',
+    '- api: skip the e2e — flaky — a regression',
+  ].join('\n'))
+  const many = (count: number): LedgerEntry[] => Array.from({ length: count }, (_, index) => mainRuling(`r${index + 1}`, index + 1))
+  assert.deepEqual(closingRulingsBlock(many(10)).split('\n'), ['Rulings in this run:', ...Array.from({ length: 10 }, (_, index) => `- r${index + 1} — why — cost`)])
+  assert.deepEqual(closingRulingsBlock(many(13)).split('\n'), [
+    'Rulings in this run:', ...Array.from({ length: 10 }, (_, index) => `- r${index + 4} — why — cost`), '- and 3 more in the ledger',
+  ])
+  assert.equal(closingRulingsBlock(many(11)).split('\n').at(-1), '- and 1 more in the ledger')
+})
+
+test('a ruling with a secret is masked, and each is one line of at most 300 characters', () => {
+  const entries: LedgerEntry[] = [
+    mainRuling(`used ${TOKEN}`, 1, 'api'),
+    { at: at(2), run: ID, kind: 'ladder.ruled', by: 'harness', task: 'api', round: 5, ruling: `round with ${TOKEN}` },
+    { at: at(3), run: ID, kind: 'pr.checked', by: 'harness', session: 's', head: SHA_A, gate: null, final: null, gateOk: false, reviewOk: true,
+      overrides: { gate: `key ${TOKEN}` }, result: 'pass' },
+    coderEnded('c1', 'api', 4, [{ what: 'kept\nthe key', why: TOKEN, costIfWrong: 'a leak' }]),
+    mainRuling(`${'x'.repeat(290)} ${TOKEN}`, 5),
+    mainRuling('w'.repeat(400), 6),
+  ]
+  const lines = closingRulings(entries)
+  assert.deepEqual(lines.slice(0, 4), [
+    `api: used ${MASKED_TOKEN} — why — cost`,
+    `api: round with ${MASKED_TOKEN}`,
+    `gate: key ${MASKED_TOKEN}`,
+    `kept the key — ${MASKED_TOKEN} — a leak (coder, api)`,
+  ])
+  // Masked before it is cut: no part of the token is left where the line ends.
+  assert.equal(lines[4], `${`${'x'.repeat(290)} ${MASKED_TOKEN} — why — cost`.slice(0, 299)}…`)
+  assert.equal(lines[5], `${'w'.repeat(299)}…`)
+  for (const text of lines) assert.ok(text.length <= 300 && !text.includes('ghs_') && !text.includes('\n'), text)
+  assert.ok(!closingRulingsBlock(entries).includes('ghs_'))
+})
+
+test('closingRulings: a coder\'s ruling over 300 characters is cut before its tag, which stays; the line is at most 300', () => {
+  const long = { what: 'k'.repeat(400), why: 'w', costIfWrong: 'c' }
+  const lines = closingRulings([
+    coderEnded('c1', 'api', 1, [long]),
+    coderEnded('c2', undefined, 2, [long]),
+    // Masked before it is cut: no part of the token is left where the text ends.
+    coderEnded('c3', 'api', 3, [{ what: `${'x'.repeat(280)} ${TOKEN}`, why: 'w', costIfWrong: 'c' }]),
+  ])
+  assert.deepEqual(lines, [
+    `${'k'.repeat(286)}… (coder, api)`,
+    `${'k'.repeat(291)}… (coder)`,
+    `${`${'x'.repeat(280)} ${MASKED_TOKEN}`.slice(0, 286)}… (coder, api)`,
+  ])
+  for (const text of lines) assert.equal(text.length, 300, text)
+  assert.ok(!lines.some(text => text.includes('ghs_')))
 })

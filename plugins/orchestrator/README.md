@@ -88,7 +88,7 @@ Written by the main agent (`by: main`), only through `run`:
 | `resume` | `id`, `takeover?` | Drives an open run again, after a compaction, a restart or from another chat. A run with a pull request reopens. |
 | `goal` | `goal` | Names the goal (one line, at most 300 characters). |
 | `plan` | `plan` | Attaches a plan: a path in the repo (relative, no `..`, at most 300 characters) to a file in the run's worktree, recorded with the worktree's head. The answer warns when the worktree isn't clean. |
-| `abandon` | `reason` | Ends the run without a pull request. |
+| `abandon` | `reason` | Ends the run without a pull request. The answer ends with the run's rulings, as `open_pr`'s does ([step 7](#open_pr)). |
 | `status` | | Where the run this chat drives stands, from its ledger: its branch, base and driver; its pull request, with what `pr_feedback` last read of it; the branch against GitHub; each task with its coder round, last gate and verdict; the final review; the rulings, deferred findings and notes; and what `open_pr` would find now (the head; clean or not, as `open_pr` checks it, so untracked files alone read "head <head7>, clean (untracked, not pushed: <names>)"; the gate's last result at it; and whether the final review approved it). Read it after a compaction. |
 | `list` | `project?` | The open runs (50 at most), who drives each and whether that chat is live, then the 10 newest runs with a pull request, which `resume` reopens. |
 | `ruling` | `what`, `why`, `costIfWrong`, `task?` | The main agent's ruling; `task` must be one of the run's. |
@@ -114,7 +114,7 @@ The writes (`goal`, `plan`, `abandon`, `ruling`, `defer`, `note`) take the chat'
    - `⚠ dish: opened without an approved final review of this head. Ruling: <ruling>`
 
    The ruling is shown without its leading `Ruling:`. A pull request already open for `dish/<slug>` is reported, not opened again, and its body is never given an override line: that goes in a comment on it.
-7. **`pr.opened`,** or `pr.updated` for a pull request that was open already, **and `run.closed`.** The run's state becomes `pr`, and its driver is released. The answer gives the URL. A ledger line that can't be written is logged and named in the answer: the record and GitHub are the truth.
+7. **`pr.opened`,** or `pr.updated` for a pull request that was open already, **and `run.closed`.** The run's state becomes `pr`, and its driver is released. The answer gives the URL. A ledger line that can't be written is logged and named in the answer: the record and GitHub are the truth. The answer ends, after a blank line, with "Rulings in this run:": the newest 10, oldest first, one `- ` line each, then "- and N more in the ledger" when there were more. They're read from the ledger after the close, so this call's overrides are among them, with the main agent's rulings, the ladder's and coders' report rulings. A run with none has no such block, and a ledger that can't be read then is logged, and the answer goes without them.
 
 **On a reopened run** (a run with a pull request, after `resume`), the same steps, the run's own worktree included, with three differences:
 - **GitHub's branch first.** Before the gate it asks `compareBranch`, and refuses at once when GitHub's `dish/<slug>` has commits the worktree lacks: "GitHub's dish/<slug> has 1 commit the run's worktree lacks (an 'Update branch', a committed suggestion, or a push of someone's own). Have a coder merge `origin/dish/<slug>` into the run's worktree, then call open_pr again. dish never forces a push."

@@ -40,7 +40,7 @@ projects:
 | Field | | |
 |---|---|---|
 | the key | required | `owner/repo`, as GitHub spells it. The clone goes to `<work root>/<owner>/<repo>`. |
-| `family` | required | Free text for now (step 8 gives families their own documents). |
+| `family` | required | A lowercase name: letters, digits and hyphens, starting with a letter or digit, at most 64 characters (`[a-z0-9][a-z0-9-]*`). It names paths in the config store and dish-memory's vault. |
 | `role` | required | One line on what the repo is. |
 | `gate` | required | The command [dish-gates](../gates/) runs in a bound coder's worktree when the coder finishes, and that `open_pr` runs on a run's head before it opens a pull request. |
 | `gateTimeout` | required | `<n>s`, `<n>m` or `<n>h`, from 10s to 10m (dsh's shell caps a run at 10 minutes). |

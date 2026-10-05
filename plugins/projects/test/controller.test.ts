@@ -37,13 +37,14 @@ function fields(overrides: Partial<Fields> = {}): Fields {
 }
 
 const GRAMMAR = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/
+const FAMILY = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 /**
  * A registry that behaves as the real one does where the page cares: a list read at the head, a write whose `base` is older
  * than the file's last change is a `CONFLICT` (the file, not the project: a change to another project conflicts too), adding
  * a name that is there or editing one that isn't is `INVALID`, writing what is there is `null`, and `retry` is refused for a
- * project that is being onboarded. Seeded: `acme/gadget` (failed) and `acme/widget` (ready). A gate with `BAD` in it fails
- * `check`.
+ * project that is being onboarded. Seeded: `acme/gadget` (failed) and `acme/widget` (ready). A family that isn't a lowercase
+ * name, and a gate with `BAD` in it, fail `check`.
  */
 class FakeProjects {
   head = 0
@@ -111,6 +112,9 @@ class FakeProjects {
     if (!adding && spelled !== name) return `projects.yaml: ${name} isn't in projects.yaml`
     for (const key of ['family', 'role', 'gate', 'gateTimeout'] as const) {
       if (entry[key].trim() === '') return `projects.yaml: ${name}: ${key} is blank`
+    }
+    if (!FAMILY.test(entry.family.trim())) {
+      return `projects.yaml: ${name}: family must be a lowercase name: letters, digits and hyphens, starting with a letter or digit, at most 64 characters`
     }
     if (entry.gate.includes('BAD')) return `projects.yaml: ${name}: gate is BAD`
     return null
@@ -419,6 +423,20 @@ test('save is refused here, with no call, while the form has a problem', async (
   assert.equal(state().notice?.tone, 'error')
   assert.match(state().notice?.text ?? '', /^Can't save: .*family is blank/)
   assert.equal(state().busy, undefined)
+  assert.notEqual(state().form, null)
+})
+
+test('a family that isn\'t a lowercase name stops a save here, with the registry\'s words', async () => {
+  const made = await opened()
+  const { fake, page, state } = made
+  await page.face.startAdd()
+  await fillAdd(made)
+  page.face.editField('family', 'Frostyard')
+  await checked(made)
+  await page.face.save()
+  assert.equal(count(fake.calls, 'save'), 0)
+  assert.equal(state().notice?.tone, 'error')
+  assert.match(state().notice?.text ?? '', /^Can't save: .*family must be a lowercase name/)
   assert.notEqual(state().form, null)
 })
 

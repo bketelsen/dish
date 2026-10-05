@@ -41,7 +41,7 @@ You register repos as **projects**, and dish gets them ready to work on.
 
 - Pushing branches and opening PRs (step 7, `orchestrator`).
 - Gates (step 6c).
-- Families as their own documents with direction and initiatives (step 8). `family` is free text here.
+- Families as their own documents (step 8, memory, and step 9). `family` is a lowercase name (`[a-z0-9][a-z0-9-]*`, at most 64 characters): it names paths in the config store and the vault.
 - Webhooks (step 9).
 - Fencing a coder's writes to its worktree. Crew allows one writer at a time, and the brief names the worktree.
 
@@ -66,7 +66,7 @@ projects:
 - **Namespace:** `projects.yaml` is claimed by `dish-projects` with agent policy `propose`, and seeded empty.
 - **Validation** refuses (`INVALID`):
   - keys that aren't `owner/name` (GitHub's grammar), or whose owner is `scratch` (reserved for the [scratch workspace](#the-scratch-workspace)) or `tokens` (dish-workspaces' token directory, `<state>/workspaces/tokens/`, would collide with that owner's state), or two keys that differ only in case (GitHub's names don't);
-  - a missing or blank `family`, `role`, `gate` or `gateTimeout`;
+  - a missing or blank `family`, `role`, `gate` or `gateTimeout`, or a `family` that isn't a lowercase name;
   - timeouts that aren't `<n>s`, `<n>m` or `<n>h` between 10s and 10m for the gate, or between 10s and 1h for setup. `setupTimeout` defaults to 15m;
   - a `gateEnv` that isn't a map of variable names to strings, or that names a variable starting with `DSH_` or looking like a secret (`KEY`, `TOKEN`, `SECRET` or `PASSWORD` in the name, as dsh's own scrub reads them). 6c added `HOME` and names starting with `LD_`: a gate's environment reaches dish's sandbox runner, which works out what it protects from `HOME` and runs outside the sandbox. The values may use `<clone>` and `<worktree>`, which 6c expands;
   - unknown fields, and anything at the top level but `projects`.

@@ -1,7 +1,8 @@
 /**
  * dish-config — the git-backed, versioned config store, as a Cordis plugin.
  *
- * `ConfigStore` (in `store/`) does all the repository work. This plugin opens
+ * `ConfigStore` (in `store/`: dish-kit's `VersionedStore`, opened under the
+ * config store's words) does all the repository work. This plugin opens
  * it, owns its lifetime, and offers it to the other plugins as the `dishConfig`
  * service:
  *
@@ -21,14 +22,12 @@
  * @module dish-config
  */
 
-import { execFile } from 'node:child_process'
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
-import { promisify } from 'node:util'
 import type { Context, Events } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { printOwnLogs, xdgPaths } from 'dish-kit'
-import { gitEnv } from './store/git.ts'
+import { AGENT_IDENTITY, personIdentity } from 'dish-kit/store'
 import type { GitIdentity } from './store/git.ts'
 import { NamespaceRegistry } from './store/namespaces.ts'
 import type { NamespaceSpec } from './store/namespaces.ts'
@@ -100,10 +99,6 @@ export interface Config {
   terminal: boolean
 }
 
-const AGENT_NAME = 'dish agent'
-const AGENT_EMAIL = 'agent@dish.local'
-const FALLBACK_NAME = 'dish'
-const FALLBACK_EMAIL = 'dish@localhost'
 const DEFAULT_MAX_BYTES = 262_144
 const DEFAULT_PUSH_TIMEOUT_MS = 60_000
 
@@ -116,9 +111,9 @@ export const Config: Schema<Config> = Schema.object({
     .description('The name commits made by a person carry. Leave blank to use git\'s global user.name, or "dish".'),
   userEmail: Schema.string().default('')
     .description('The email commits made by a person carry. Leave blank to use git\'s global user.email, or "dish@localhost".'),
-  agentName: Schema.string().default(AGENT_NAME)
+  agentName: Schema.string().default(AGENT_IDENTITY.name)
     .description('The name commits made by an agent, and by the store itself, carry.'),
-  agentEmail: Schema.string().default(AGENT_EMAIL)
+  agentEmail: Schema.string().default(AGENT_IDENTITY.email)
     .description('The email commits made by an agent, and by the store itself, carry.'),
   maxBytes: Schema.natural().default(DEFAULT_MAX_BYTES)
     .description('The most one document may take, in bytes.'),
@@ -145,34 +140,10 @@ const README_SPEC: NamespaceSpec = {
   validate: (_path, text) => text.trim() === '' ? 'README.md must not be empty' : undefined,
 }
 
-const execFileAsync = promisify(execFile)
-
 /** A string setting as it will be used: trimmed, and `undefined` when nothing is left (use the default). */
 function text(value: string | undefined): string | undefined {
   const trimmed = value?.trim()
   return trimmed === undefined || trimmed === '' ? undefined : trimmed
-}
-
-/** One value of git's global config, read as the store reads everything (scrubbed environment, no prompts), or `undefined` if there is none. */
-async function gitGlobal(key: 'user.name' | 'user.email'): Promise<string | undefined> {
-  try {
-    const { stdout } = await execFileAsync('git', ['config', '--global', '--includes', '--get', key], { env: gitEnv(), timeout: 10_000, encoding: 'utf8' })
-    return text(stdout)
-  } catch {
-    // Not set (exit 1), or no git at all: the store will find its own way to report the latter.
-    return undefined
-  }
-}
-
-/** The identity for commits made by a person: the config, then git's global config, then `dish`. */
-async function personIdentity(config: Config): Promise<GitIdentity> {
-  const userName = text(config.userName)
-  const userEmail = text(config.userEmail)
-  const [gitName, gitEmail] = await Promise.all([
-    userName === undefined ? gitGlobal('user.name') : undefined,
-    userEmail === undefined ? gitGlobal('user.email') : undefined,
-  ])
-  return { name: userName ?? gitName ?? FALLBACK_NAME, email: userEmail ?? gitEmail ?? FALLBACK_EMAIL }
 }
 
 /**
@@ -208,7 +179,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const repository = resolve(repositoryPath(text(config.repository)))
   const remote = text(config.remote)
   const user = await personIdentity(config)
-  const agent: GitIdentity = { name: text(config.agentName) ?? AGENT_NAME, email: text(config.agentEmail) ?? AGENT_EMAIL }
+  const agent: GitIdentity = { name: text(config.agentName) ?? AGENT_IDENTITY.name, email: text(config.agentEmail) ?? AGENT_IDENTITY.email }
   const namespaces = new NamespaceRegistry()
 
   // `ctx.emit` neither isolates its listeners (the first to throw ends the dispatch, so those after it never hear the

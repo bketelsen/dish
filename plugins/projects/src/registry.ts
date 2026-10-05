@@ -36,6 +36,8 @@ export const RESERVED_OWNERS: readonly string[] = Object.freeze(Object.keys(RESE
 export const OWNER = /^(?=.{1,39}$)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/
 /** GitHub's repository names: 1 to 100 of letters, digits, `.`, `_` and `-`. `.`, `..` and names ending in `.git` are refused separately. */
 export const REPO = /^[A-Za-z0-9._-]{1,100}$/
+/** A family's name: 1 to 64 lowercase letters, digits and hyphens, starting with a letter or digit. It names paths in the config store and dish-memory's vault. */
+export const FAMILY = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 /** The names dsh's environment scrub drops (`KEY`, `PASSWORD`, `SECRET`, `TOKEN`). Pinned to dsh's pattern by dish-workspaces' env test. */
 export const SECRET_NAME = /KEY|PASSWORD|SECRET|TOKEN/i
@@ -257,8 +259,12 @@ function readFields(name: string, input: unknown): ProjectFields {
         refuse(`unknown field ${quote(key)}; the fields are ${known}`)
       }
     }
+    const family = readText(input, 'family', { required: true, oneLine: true, spawned: false })!
+    if (!FAMILY.test(family)) {
+      refuse('family must be a lowercase name: letters, digits and hyphens, starting with a letter or digit, at most 64 characters')
+    }
     const fields: ProjectFields = {
-      family: readText(input, 'family', { required: true, oneLine: true, spawned: false })!,
+      family,
       role: readText(input, 'role', { required: true, oneLine: true, spawned: false })!,
       gate: readText(input, 'gate', { required: true, oneLine: true, spawned: true })!,
       gateTimeout: readDuration(input, 'gateTimeout', GATE_TIMEOUT, true)!,

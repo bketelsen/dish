@@ -120,7 +120,7 @@ test('Environment is exactly two entries, PATH and TMPDIR, and TMPDIR is made be
 })
 
 test('no line sets or mentions what dev, the install or the plugin manager use', () => {
-  const names = ['DISH_ENV', 'DISH_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL', 'install.env', 'XDG_', 'PNPM_HOME', 'DSH_']
+  const names = ['DISH_ENV', 'DISH_REMOTE', 'DISH_VAULT_REMOTE', 'DISH_USER_NAME', 'DISH_USER_EMAIL', 'install.env', 'XDG_', 'PNPM_HOME', 'DSH_']
   for (const line of lines) {
     for (const name of names) {
       assert.ok(!line.includes(name), `a unit line mentions ${name}: ${line}`)

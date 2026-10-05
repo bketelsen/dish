@@ -9,6 +9,9 @@
 #                    Set but empty, the store stays local: no remote is written.
 #   DISH_USER_NAME   the store's commit author name. Required.
 #   DISH_USER_EMAIL  the store's commit author email. Required.
+#   DISH_VAULT_REMOTE  the memory vault's git remote, e.g. git@github-dish-vault:bketelsen/dish-vault.git. Optional:
+#                    unset or empty, the vault stays local (the dish-memory row gets an empty remote). Its commits carry
+#                    DISH_USER_NAME and DISH_USER_EMAIL too.
 #   DISH_PROFILE     the dsh profile to install into. Default `web`.
 #   DISH_SANDBOX_HOME  `on` runs every sandboxed agent command through deploy/dish-sandbox, which lets it write the home
 #                    directory less a protected list: the profile's `sandbox` row gets it as its runnerCommand. `off`,
@@ -31,19 +34,19 @@
 # goes with every clone of dish, and agents' clones and worktrees should keep linking (copies of ~545 MB each on ext4).
 # None of this touches the store itself, or which store is used (the store-pin contract below).
 #
-# The rows go in before the bundles on purpose. The dish-config row patches a row that the config bundle inserts, so
-# between steps 3 and 4 it has no target. dsh only complains about that when it composes the profile (`--dump-config`
-# or a boot), and nothing here composes the profile in between: `dsh plugin ... add` runs pnpm and reads the bundles'
-# manifests, and does not load the patch file.
+# The rows go in before the bundles on purpose. The dish-config row patches a row that the config bundle inserts (and
+# the dish-memory row one the memory bundle inserts), so between steps 3 and 4 it has no target. dsh only complains
+# about that when it composes the profile (`--dump-config` or a boot), and nothing here composes the profile in between:
+# `dsh plugin ... add` runs pnpm and reads the bundles' manifests, and does not load the patch file.
 #
 # Every dsh command runs with the four XDG directories pointing into a throwaway directory. dsh commands that load a
-# profile boot its plugins, and dish-config opens or creates $XDG_CONFIG_HOME/dish/config.git when it boots. An install
-# that did that on a fresh machine would leave an empty local store, and the first start with a remote would then push
-# that store over the one on GitHub instead of restoring it. In dsh 0.2.0-rc.2 `--dump-config` and `plugin ... add` do
-# not boot anything (the first composes patch files, the second runs pnpm), so this is a guard against a later dsh, not
-# a fix. HOME and DSH_HOME stay real, so the profile lands where `dsh web` reads it. Under `pnpm dev` the launcher sets
-# DSH_DISH_HOME, which moves dish's directories ahead of XDG_*, so run_dsh removes it: otherwise the throwaway
-# directories would do nothing there.
+# profile boot its plugins, and dish-config opens or creates $XDG_CONFIG_HOME/dish/config.git when it boots (dish-memory
+# its vault, $XDG_DATA_HOME/dish/vault.git, the same way). An install that did that on a fresh machine would leave an
+# empty local store, and the first start with a remote would then push that store over the one on GitHub instead of
+# restoring it. In dsh 0.2.0-rc.2 `--dump-config` and `plugin ... add` do not boot anything (the first composes patch
+# files, the second runs pnpm), so this is a guard against a later dsh, not a fix. HOME and DSH_HOME stay real, so the
+# profile lands where `dsh web` reads it. Under `pnpm dev` the launcher sets DSH_DISH_HOME, which moves dish's
+# directories ahead of XDG_*, so run_dsh removes it: otherwise the throwaway directories would do nothing there.
 #
 # One thing in those directories has to stay put: pnpm's store. pnpm finds it under $PNPM_HOME, else $XDG_DATA_HOME,
 # records it in the profile's node_modules/.modules.yaml, and refuses (ERR_PNPM_UNEXPECTED_STORE) to work on that
@@ -81,6 +84,7 @@ trap 'exit 143' TERM HUP
 : "${DISH_REMOTE?DISH_REMOTE must be set: the git remote of the config store, or set empty to keep the store local}"
 : "${DISH_USER_NAME:?DISH_USER_NAME must be set: the commit author name for the config store}"
 : "${DISH_USER_EMAIL:?DISH_USER_EMAIL must be set: the commit author email for the config store}"
+: "${DISH_VAULT_REMOTE:=}"
 profile=${DISH_PROFILE:-web}
 case ${DISH_SANDBOX_HOME-} in
   on) sandbox_home=on ;;
@@ -120,8 +124,9 @@ run_dsh() {
 
 # Each after what it builds on: projects after config (its store), workspaces after projects (whose types it imports),
 # gates after them (it reads crew, projects and workspaces), orchestrator after them (it reads crew, gates, workspaces and
-# projects), and browser last (it needs no other dish plugin).
-bundles=(copilot config prompts skills crew judge web projects workspaces gates orchestrator browser)
+# projects), browser after them (it needs no other dish plugin), and memory last (it reads config, projects, workspaces
+# and the judge, each with ctx.get).
+bundles=(copilot config prompts skills crew judge web projects workspaces gates orchestrator browser memory)
 profile_dir="${DSH_HOME:-$HOME/.dsh}/profiles/$profile"
 patch="$profile_dir/cordis.patch.yml"
 changed=0
@@ -168,10 +173,17 @@ if [ -n "$DISH_REMOTE" ]; then
   remote_args=("--remote=$DISH_REMOTE")
   remote_shown=$DISH_REMOTE
 fi
+vault_args=(--no-vault-remote)
+vault_shown='none, the vault stays local'
+if [ -n "$DISH_VAULT_REMOTE" ]; then
+  vault_args=("--vault-remote=$DISH_VAULT_REMOTE")
+  vault_shown=$DISH_VAULT_REMOTE
+fi
 sandbox_args=(--no-sandbox-runner)
 if [ "$sandbox_home" = on ]; then sandbox_args=("--sandbox-runner=$root/deploy/dish-sandbox"); fi
 # The --opt=value form, so that a value that starts with a dash is not read as another option.
-rows=$(node deploy/profile.ts --patch "$patch" "${remote_args[@]}" "--user-name=$DISH_USER_NAME" "--user-email=$DISH_USER_EMAIL" "${sandbox_args[@]}")
+rows=$(node deploy/profile.ts --patch "$patch" "${remote_args[@]}" "--user-name=$DISH_USER_NAME" "--user-email=$DISH_USER_EMAIL" \
+  "${vault_args[@]}" "${sandbox_args[@]}")
 if [ "$rows" != unchanged ]; then changed=1; fi
 
 added=()
@@ -197,6 +209,7 @@ while read -r _ count _; do copied=$((copied + count)); done <<<"$unlinked"
 step='printing the summary'
 echo "install: profile $profile at $profile_dir: $profile_made"
 echo "install: dish rows ($remote_shown): $rows"
+echo "install: memory vault: $vault_shown"
 echo "install: sandbox home: $sandbox_home"
 echo "install: the profile's pnpm installs copy: ${profile_copies#workspace: }"
 echo "install: links into pnpm's store replaced by copies: $copied"

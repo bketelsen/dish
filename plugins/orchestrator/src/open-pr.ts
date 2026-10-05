@@ -20,7 +20,9 @@
  *   holding it through a push would stall the chat's `worktree` hook. `close` is called holding it.
  * - **The ledger.** `pr.checked` is written whether the checks passed or not (but not for a refusal before the gate, nor when
  *   cancelled); then `pr.opened` or `pr.updated`, and `run.closed` (through `close`). A ledger line that can't be written is
- *   logged and named in the answer: the record and GitHub are the truth, so it fails nothing.
+ *   logged and named in the answer: the record and GitHub are the truth, so it fails nothing. The answer ends with the
+ *   run's rulings (`closingRulingsBlock`), after a blank line, from the ledger read again after `close`, so this call's
+ *   overrides are among them.
  * - **Untracked files never block it.** Both cleanliness checks ask `isClean` with `{ untracked: 'ignore' }`: a gate's
  *   output git doesn't ignore (a `go build` binary, a coverage file) would otherwise refuse every call after the first. Only
  *   commits are pushed, so they aren't in the pull request; the answer, or the refusal, after the first check names them.
@@ -32,7 +34,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { maskSecrets } from 'dish-kit'
 import type { GateCheck } from 'dish-gates'
-import { latestFinal, openTasks, sameHead } from './derive.ts'
+import { closingRulingsBlock, latestFinal, openTasks, sameHead } from './derive.ts'
 import type { VerdictView } from './derive.ts'
 import type { PrFinal, PrGate } from './entries.ts'
 import { describe, mainSession, otherBase } from './runs.ts'
@@ -572,6 +574,15 @@ export function openPrTool(deps: ToolDeps): ToolDefinition {
       + 'Review feedback: `run` `resume` reopens it.')
     lines.push(...unrecorded)
     if (seen.untracked !== undefined && seen.untracked.length > 0) lines.push(untrackedLine(seen.untracked, true))
+    // The answer ends with the run's rulings, after a blank line, as `abandon`'s does: from the ledger read again after the
+    // close, so this call's overrides are among them. The run is closed either way: a ledger that can't be read is logged,
+    // and the answer goes without them.
+    try {
+      const rulings = closingRulingsBlock(await runs.entries(run))
+      if (rulings !== '') lines.push('', rulings)
+    } catch (error) {
+      runs.logOnce(`open_pr in run ${run.id}: the run is closed, but its ledger couldn't be read for its rulings: ${describe(error)}`)
+    }
     return { url, number, existing: pull.existing, head, text: maskSecrets(lines.join('\n')) }
   }
 }

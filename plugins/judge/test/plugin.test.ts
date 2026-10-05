@@ -69,7 +69,7 @@ test('dishJudge is provided when the plugin loads, with settings(), and goes whe
   const handle = mountJudge(ctx, where.state)
   await handle
   const service: DishJudge = ctx.dishJudge
-  assert.deepEqual(Object.keys(service), ['settings', 'log'])
+  assert.deepEqual(Object.keys(service), ['settings', 'log', 'screenText'])
   await handle.dispose()
   assert.equal(ctx.get('dishJudge'), undefined)
 })

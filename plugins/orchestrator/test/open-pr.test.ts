@@ -487,6 +487,94 @@ test('open_pr: all passing pushes the head, opens the pull request, and closes t
   await assert.rejects(call(tool), (error: Error) => error.message === NO_RUN)
 })
 
+test('open_pr: with rulings in the run, the answer ends with them, after a blank line', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  await w.runs.main(run, SESSION, { kind: 'ruling', what: 'Kept the old cookie', why: 'Compatibility', costIfWrong: 'One more round' })
+  await w.runs.harness(run, {
+    kind: 'child.ended', session: SESSION, child: 'c1', task: run.slug, role: 'coder', stopReason: 'completed', reportFile: '/r/c1.md', head: HEAD,
+    report: { role: 'coder', turn: 1, at: 0, status: 'done', summary: 'Done', rulings: [{ what: 'Skipped e2e', why: `Flaky with ${TOKEN}`, costIfWrong: 'A regression' }] },
+  })
+  const value = await call(tool)
+  const url = `https://github.com/${PROJECT}/pull/1`
+  assert.equal(value.text, [
+    `Opened PR #1 for run \`${run.id}\`: ${url}`,
+    'Pushed dish/fix-login at bbbbbbb: the gate passed on it; the final review approved it.',
+    `Run \`${run.id}\` is closed. Humans merge; dish removes the run's own worktree once the PR is merged, and task worktrees are removed with \`worktree\` \`remove\`. `
+      + 'Review feedback: `run` `resume` reopens it.',
+    '',
+    'Rulings in this run:',
+    '- Kept the old cookie — Compatibility — One more round',
+    `- Skipped e2e — Flaky with ${MASKED_TOKEN} — A regression (coder, fix-login)`,
+  ].join('\n'))
+})
+
+test('open_pr: the rulings come last, after the unrecorded writes and the untracked files', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  await w.runs.main(run, SESSION, { kind: 'ruling', what: 'Kept the old cookie', why: 'Compatibility', costIfWrong: 'One more round' })
+  w.workspaces.impl.isClean = async () => ({ clean: true, untracked: ['clippy'] })
+  const original = w.runs.harness.bind(w.runs)
+  w.runs.harness = async (target, entry) => {
+    if (entry.kind === 'pr.opened') throw new Error('disk full')
+    return original(target, entry)
+  }
+  try {
+    const value = await call(tool)
+    const url = `https://github.com/${PROJECT}/pull/1`
+    assert.equal(value.text, [
+      `Opened PR #1 for run \`${run.id}\`: ${url}`,
+      'Pushed dish/fix-login at bbbbbbb: the gate passed on it; the final review approved it.',
+      `Run \`${run.id}\` is closed. Humans merge; dish removes the run's own worktree once the PR is merged, and task worktrees are removed with \`worktree\` \`remove\`. `
+        + 'Review feedback: `run` `resume` reopens it.',
+      'dish couldn\'t write pr.opened to the run\'s ledger (disk full); the record and GitHub are as said.',
+      untrackedLine('clippy', true),
+      '',
+      'Rulings in this run:',
+      '- Kept the old cookie — Compatibility — One more round',
+    ].join('\n'))
+  } finally {
+    w.runs.harness = original
+  }
+})
+
+test('open_pr: this call\'s overrides are among the closing rulings', async () => {
+  const { w, run, tool } = await setup()
+  await w.runs.main(run, SESSION, { kind: 'ruling', what: 'Kept the old cookie', why: 'Compatibility', costIfWrong: 'One more round' })
+  w.gates.impl.runAt = async () => gate({})
+  const value = await call(tool, { gateRuling: RULING, reviewRuling: `Ruling: merge of origin/main only — no conflicts — ${TOKEN}` })
+  const lines = value.text.split('\n')
+  const start = lines.indexOf('Rulings in this run:')
+  assert.ok(start > 1 && lines[start - 1] === '' && lines[start - 2]!.startsWith(`Run \`${run.id}\` is closed.`), value.text)
+  assert.deepEqual(lines.slice(start), [
+    'Rulings in this run:',
+    '- Kept the old cookie — Compatibility — One more round',
+    '- gate: the flaky e2e suite — it fails on main too — a real failure could hide in it',
+    `- review: merge of origin/main only — no conflicts — ${MASKED_TOKEN}`,
+  ])
+})
+
+test('open_pr: a ledger that can\'t be read after the close is logged, and the answer has no rulings; the run stays closed', async () => {
+  const { w, run, tool } = await setup()
+  await verdict(w, run)
+  await w.runs.main(run, SESSION, { kind: 'ruling', what: 'Kept the old cookie', why: 'Compatibility', costIfWrong: 'One more round' })
+  const entries = w.runs.entries.bind(w.runs)
+  w.runs.entries = async target => {
+    if (w.record(run)?.state === 'pr') throw new Error(`disk gone ${TOKEN}`)
+    return entries(target)
+  }
+  try {
+    const value = await call(tool)
+    assert.ok(value.text.split('\n').at(-1)!.startsWith(`Run \`${run.id}\` is closed.`), value.text)
+    assert.ok(!value.text.includes('Rulings'), value.text)
+    assert.equal(w.record(run)?.state, 'pr')
+    assert.ok(w.logs.some(text => text.includes(`open_pr in run ${run.id}`) && text.includes('rulings') && text.includes(`disk gone ${MASKED_TOKEN}`)), w.logs.join('\n'))
+    assert.ok(!w.logs.some(text => text.includes(TOKEN)))
+  } finally {
+    w.runs.entries = entries
+  }
+})
+
 test('open_pr: a final reviewer\'s re-review with `to` counts; an approval of a 7-character prefix doesn\'t (full shas only)', async () => {
   const { w, run, tool } = await setup()
   await verdict(w, run, { child: 'rev-1', head: SHA_A })

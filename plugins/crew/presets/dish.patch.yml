@@ -2,7 +2,7 @@
 # (presets/standard.patch.yml). Do not edit it by hand: the next run replaces
 # it, and the drift test fails until the committed file matches.
 #
-# The dish preset: the standard preset's plugin list, with four changes:
+# The dish preset: the standard preset's plugin list, with five changes:
 #   - its `persona` row is replaced by dish-prompts/persona, so the main
 #     agent's prompts come from Settings → Prompts;
 #   - dish-crew/delegate follows it, which gives the main agent `delegate`;
@@ -12,7 +12,9 @@
 #   - dsh's `tool-subagent-control` row is replaced by dish-crew/control:
 #     the same `send_message` and `interrupt_agent`, without dsh's mark, so
 #     dsh adds no "send your result with send_message" note to a crew
-#     child's task.
+#     child's task;
+#   - dish-memory/context is added after `agent-instructions`: dish's
+#     memory and direction, delivered as dsh delivers `AGENTS.md`.
 # Edits saved from Settings → Agent presets live in your profile and override
 # this row's `config.plugins` there.
 #
@@ -37,6 +39,8 @@
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+          - id: dish-memory-context
+            name: dish-memory/context
           - id: tool-bash
             name: '@deepseek-ai/dsh-tool-bash'
             disabled: !!js process.platform === 'win32'

@@ -10,6 +10,7 @@
   - Doubtful ones get a warning in front.
   - When the judge can't be reached, results are marked "not screened".
   - A private key in a result is cut out of what the judge reads, however the result shows it, and the rest is screened. The agent gets the result as it was.
+  - `screenText` (on `dishJudge`) screens other text with the same machinery. `dish-memory` uses it for an agent's memory before it's saved (subject `memory:<id>`, tool `remember`). It answers a verdict and never keeps the text.
 - **`ask_judge`** for every agent, crew children included: one call, any number of typed questions (yes/no, a choice, a score), with numbers back and no explanation.
 - **Settings → Judge:** the key, the status and a Test button, the thresholds with their history, and a log of recent decisions.
 

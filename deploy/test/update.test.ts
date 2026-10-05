@@ -10,8 +10,8 @@
  * - it never half-updates: every refusal comes before the first change, and the stamp is written only after dsh answers;
  * - it restarts exactly when the service is stale, stopped, or install.sh changed the profile, and reloads the user
  *   manager whenever it may hold another definition of the unit;
- * - install.sh gets the unit's environment, install.env's three inputs and DISH_SANDBOX_HOME=on, and nothing of the
- *   caller's;
+ * - install.sh gets the unit's environment, install.env's inputs (DISH_VAULT_REMOTE empty when it has none) and
+ *   DISH_SANDBOX_HOME=on, and nothing of the caller's;
  * - it never runs as root;
  * - it prints no line that mentions a token.
  */
@@ -43,10 +43,10 @@ const OWN_ENV: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: OWN_HOME }
 const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex')
 
 /**
- * The names install.sh may see: the clean environment, its three inputs, DISH_SANDBOX_HOME, and what bash adds to any
+ * The names install.sh may see: the clean environment, its four inputs, DISH_SANDBOX_HOME, and what bash adds to any
  * environment.
  */
-const INSTALL_NAMES = ['DISH_REMOTE', 'DISH_SANDBOX_HOME', 'DISH_USER_EMAIL', 'DISH_USER_NAME', 'HOME', 'LANG', 'LOGNAME', 'PATH', 'TMPDIR', 'USER', 'XDG_RUNTIME_DIR']
+const INSTALL_NAMES = ['DISH_REMOTE', 'DISH_SANDBOX_HOME', 'DISH_USER_EMAIL', 'DISH_USER_NAME', 'DISH_VAULT_REMOTE', 'HOME', 'LANG', 'LOGNAME', 'PATH', 'TMPDIR', 'USER', 'XDG_RUNTIME_DIR']
 /** The DISH_* values install.sh gets: install.env's, and the VM's writable home in the sandbox (deploy/dish-sandbox). */
 const INSTALL_VALUES = { ...INPUTS, DISH_SANDBOX_HOME: 'on' }
 const BASH_NAMES = ['OLDPWD', 'PWD', 'SHLVL', '_']
@@ -597,15 +597,23 @@ const REFUSALS: Refusal[] = [
   {
     name: 'install.env with another name',
     step: 'reading the inputs',
-    message: /install\.env line 5: only DISH_REMOTE, DISH_USER_NAME and DISH_USER_EMAIL belong there/,
+    message: /install\.env line 6: only DISH_REMOTE, DISH_VAULT_REMOTE, DISH_USER_NAME and DISH_USER_EMAIL belong there/,
     async setup() {
       return { options: { installEnv: `${INSTALL_ENV}DISH_PROFILE=web\n` } }
     },
   },
   {
+    name: 'install.env with DISH_VAULT_REMOTE twice',
+    step: 'reading the inputs',
+    message: /install\.env has DISH_VAULT_REMOTE more than once/,
+    async setup() {
+      return { options: { installEnv: `${INSTALL_ENV}DISH_VAULT_REMOTE=\n` } }
+    },
+  },
+  {
     name: 'install.env with a line that is not NAME=value',
     step: 'reading the inputs',
-    message: /install\.env line 5 is not NAME=value/,
+    message: /install\.env line 6 is not NAME=value/,
     async setup() {
       return { options: { installEnv: `${INSTALL_ENV}export\n` } }
     },
@@ -838,6 +846,44 @@ test('install.sh always gets DISH_SANDBOX_HOME=on, whatever the caller set', asy
     assertOk(result)
     assert.equal(host.installs()[0]?.env.DISH_SANDBOX_HOME, 'on', JSON.stringify(value))
   }
+})
+
+// The memory vault's remote is optional: without it the vault stays on the VM, which a warning says, and nothing stops.
+const NO_VAULT_REMOTE = 'update: install.env has no DISH_VAULT_REMOTE: the memory vault stays on this machine (deploy/README.md, The vault)'
+
+test('DISH_VAULT_REMOTE reaches install.sh', async () => {
+  const { host } = await hostWithUpdate()
+  const result = await host.run('update.sh', ['--apply'])
+  assertOk(result)
+  assert.equal(host.installs()[0]?.env.DISH_VAULT_REMOTE, INPUTS.DISH_VAULT_REMOTE)
+  assert.equal(result.stderr, '', 'no warning')
+})
+
+test('install.env without DISH_VAULT_REMOTE deploys and warns', async () => {
+  const { host, sha } = await hostWithUpdate()
+  const installEnv = withoutLine('DISH_VAULT_REMOTE')
+  assert.doesNotMatch(installEnv, /DISH_VAULT_REMOTE/)
+  const dry = await host.run('update.sh', [], { installEnv })
+  assertOk(dry)
+  assert.deepEqual(dry.stderr.split('\n').filter((line) => line !== ''), [NO_VAULT_REMOTE], 'the dry run warns too')
+  assert.equal(stdoutLines(dry).at(-1), 'update: dry run; run with --apply to update')
+
+  const result = await host.run('update.sh', ['--apply'])
+  assertOk(result)
+  assert.deepEqual(result.stderr.split('\n').filter((line) => line !== ''), [NO_VAULT_REMOTE])
+  assert.equal(await host.head(), sha)
+  assert.deepEqual(host.installs()[0]?.env, { ...INSTALL_VALUES, DISH_VAULT_REMOTE: '' }, 'install.sh gets it empty: the vault stays local')
+  assert.ok(stdoutLines(result).includes('update: dish-web.service: active (restarted)'), result.stdout)
+})
+
+test('an empty DISH_VAULT_REMOTE is allowed', async () => {
+  const { host } = await hostWithUpdate()
+  const installEnv = INSTALL_ENV.replace(`DISH_VAULT_REMOTE=${INPUTS.DISH_VAULT_REMOTE}`, 'DISH_VAULT_REMOTE=')
+  assert.notEqual(installEnv, INSTALL_ENV)
+  const result = await host.run('update.sh', ['--apply'], { installEnv })
+  assertOk(result)
+  assert.deepEqual(result.stderr.split('\n').filter((line) => line !== ''), [NO_VAULT_REMOTE])
+  assert.equal(host.installs()[0]?.env.DISH_VAULT_REMOTE, '')
 })
 
 test('as the account with only what the dish-update wrapper passes, the same', async () => {

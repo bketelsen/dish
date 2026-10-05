@@ -103,7 +103,7 @@ export function Form({ state, form, actions }: { state: PageState, form: FormSta
           autoFocus={adding}
           onChange={text('name')}
         />
-        <TextField id="dish-projects-family" label="Family" hint="Free text, as bketelsen or frostyard." value={form.fields.family} readOnly={frozen} onChange={text('family')} />
+        <TextField id="dish-projects-family" label="Family" hint="A lowercase name, as bketelsen or frostyard." value={form.fields.family} readOnly={frozen} onChange={text('family')} />
         <TextField id="dish-projects-role" label="Role" hint="What the project is, in a few words." value={form.fields.role} readOnly={frozen} onChange={text('role')} />
         <TextField
           id="dish-projects-gate"

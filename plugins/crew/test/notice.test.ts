@@ -1095,6 +1095,25 @@ test('reportBlock: a reviewer\'s verdict and head, the counts, each finding with
   assert.equal(counts(['nit', 'blocking', 'should_fix']), 'Findings (3): 1 blocking, 1 should_fix, 1 nit')
 })
 
+test('reportBlock: Worth remembering is the last list, for a coder and a reviewer', () => {
+  const remember = ['the e2e suite  is\nflaky on CI ', 'migrations run in file order']
+  const worth = 'Worth remembering:\n- the e2e suite is flaky on CI\n- migrations run in file order'
+  assert.equal(reportBlock({ ...FULL_CODER, remember }), `${FULL_CODER_BLOCK}\n${worth}`)
+  assert.equal(reportBlock({ ...FULL_REVIEW, remember }), `${FULL_REVIEW_BLOCK}\n${worth}`)
+  // Last whatever else the report has: after the summary alone, and after a clean review's findings.
+  assert.equal(reportBlock(coderReport({ remember })), `Status: done\nSummary: Added the login form.\n${worth}`)
+  assert.equal(reportBlock(reviewerReport({ remember })), `Verdict: approved, at \`${SHA}\`\nSummary: Looks right.\nFindings: none\n${worth}`)
+  // An empty list has no line.
+  assert.equal(reportBlock(coderReport({ remember: [] })), 'Status: done\nSummary: Added the login form.')
+  assert.equal(reportBlock(reviewerReport({ remember: [] })), `Verdict: approved, at \`${SHA}\`\nSummary: Looks right.\nFindings: none`)
+  // Masked, like every string.
+  for (const report of [coderReport({ remember: [`the key is ${TOKEN}`] }), reviewerReport({ remember: [`the key is ${TOKEN}`] })]) {
+    const block = reportBlock(report)
+    assert.ok(!block.includes(TOKEN), block)
+    assert.ok(block.endsWith(`\nWorth remembering:\n- the key is ${maskSecrets(TOKEN)}`), block)
+  }
+})
+
 test('reportBlock: code spans are quoted whole, on one line, past any backticks in them', () => {
   const block = reportBlock(reviewerReport({
     findings: [{ severity: 'nit', file: 'odd `name`.ts', line: 7, summary: 's', fix: 'f' }],

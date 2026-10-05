@@ -1,22 +1,21 @@
-/** The only failure codes the config store throws on purpose. */
-export type ErrorCode =
-  | 'CONFLICT'
-  | 'INVALID'
-  | 'UNOWNED'
-  | 'FORBIDDEN'
-  | 'SECRET'
-  | 'TOO_LARGE'
-  | 'LOCKED'
-  | 'STALE'
-  | 'NOT_FOUND'
+// The store's code is dish-kit's (`dish-kit/store`), and it throws `StoreError`s. This file keeps dish-config's own
+// error class at its old path, for the plugins and tests that import it from here or from dish-config.
+import { StoreError } from 'dish-kit/store'
+import type { ErrorCode } from 'dish-kit/store'
 
-/** A refusal the caller can act on, tagged with a stable `code`. */
-export class ConfigStoreError extends Error {
-  code: ErrorCode
+export type { ErrorCode }
 
+/**
+ * A refusal the caller can act on, tagged with a stable `code`, under dish-config's name. One made here is named
+ * `ConfigStoreError`; and every `StoreError` is an instance, so `instanceof ConfigStoreError` matches what the store throws.
+ */
+export class ConfigStoreError extends StoreError {
   constructor(code: ErrorCode, message?: string) {
-    super(message ?? code)
+    super(code, message)
     this.name = 'ConfigStoreError'
-    this.code = code
+  }
+
+  static [Symbol.hasInstance](value: unknown): boolean {
+    return value instanceof StoreError
   }
 }
