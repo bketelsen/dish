@@ -35,6 +35,7 @@ pnpm dsh plugin --profile web add ./plugins/projects
 pnpm dsh plugin --profile web add ./plugins/workspaces
 pnpm dsh plugin --profile web add ./plugins/gates
 pnpm dsh plugin --profile web add ./plugins/orchestrator
+pnpm dsh plugin --profile web add ./plugins/browser
 pnpm dsh web        # prints the UI URL (with its access token)
 ```
 
@@ -67,6 +68,7 @@ Shared code lives in [`packages/dish-kit`](packages/dish-kit): XDG paths, termin
 | [`workspaces`](plugins/workspaces) | The mechanics behind projects: a clone of each under the work root through a GitHub App (agents' git can fetch, not push; only `open_pr` pushes, with a write token dish mints in memory), setup on dish's own fresh clone, a dsh workspace per clone plus a `scratch` one, task worktrees through the main agent's `worktree` tool (crew's `delegate` binds a coder to one), a sweep that removes merged ones, and Settings → GitHub App. |
 | [`gates`](plugins/gates) | The harness's check on a coder's work: when a crew coder bound to a worktree is about to finish, the project's gate runs in that worktree through dsh's sandbox, and a failure goes back to the coder (up to 3 gate runs a turn). Crew records each result, the finish notice says how the gate ended, and a review of work whose gate didn't pass needs the main agent's ruling. |
 | [`orchestrator`](plugins/orchestrator) | Runs: every change that ends in a pull request is a run, owned by its project, driven by one chat at a time, and reopened for review feedback. A ledger per run that the harness writes, and the main agent's tools: `run` (open, resume, status, rulings), `open_pr`, which pushes the run's branch and opens the pull request only when the gate passes on its head and the final review approved that head (or a ruling overrides), and `pr_feedback`, which reads a pull request's reviews, comments and checks. Settings → Runs shows each run and its ledger, read-only. |
+| [`browser`](plugins/browser) | A shared browser: one headless Chromium on the host, a browser of its own for each chat and each crew child, and ten `browser_*` tools to open a page, read it as an accessibility tree with refs, click, type, press keys, choose options, scroll, wait, go back and take a screenshot the model sees. The main agent, the coder, the reviewer and the writer have them, and the judge screens what they return. The Browser tab in the right sidebar shows the page live, and you can click and type in it: the agent's next call says what you did, never what you typed. Screenshots render in the chat. Without Chromium on the host, no tools. |
 | [`web`](plugins/web) | Settings over the tailnet. On your trusted host (`--trusted-host`), pages count as the operator's own machine, so Settings → Models, provider sign-ins and durable UI preferences work there as they do on `127.0.0.1`. Host-only, with no browser half. |
 
 ## Deploying
