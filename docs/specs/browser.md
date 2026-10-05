@@ -138,15 +138,15 @@ The page's accessibility tree follows. Refs like [ref=e7] are what browser_click
 - **If you started the browser,** it says so.
 
 **Failures.**
-- **Errors** (`isError`) carry only dish's words and a masked URL, never page text, because the judge doesn't screen errors. They are: an argument that's wrong (both `text` and `gone`, a `ref` that isn't a ref); a URL the rules refuse; no browser on the host; Chromium that won't start ("Chromium wouldn't start: <its first line>", tried again on the next call); and, for `browser_screenshot`, a model that doesn't take images.
+- **Errors** (`isError`) carry only dish's words and a masked URL, never page text, because the judge doesn't screen errors. They are: an argument that's wrong (both `text` and `gone`, a `ref` that isn't a ref); a URL the rules refuse; Chromium that won't start ("Chromium wouldn't start: <its first line>", tried again on the next call); the browser closing, or its page crashing, during the call; every browser busy at the cap for 30 s; a failure dish has no words for ([Notes from the build](#notes-from-the-build)); and, for `browser_screenshot`, a model that doesn't take images, or no attachment store. With no Chromium on the host the tools aren't registered, so no call meets that ([Configuration](#configuration)).
 - **What fails on the page is a result, not an error,** led by "Not done:" and followed by the page as it is, so the agent has fresh refs at once:
   - a stale ref: "Not done: [ref=e7] isn't on the page now (it changed since your snapshot). Use a ref from the snapshot below.";
   - a timeout: "Not done: [ref=e7] didn't respond within 5 s (covered, disabled or off the page?).";
   - a navigation error. One worth naming: `net::ERR_CONNECTION_REFUSED` on `127.0.0.1` reads "Nothing is listening at 127.0.0.1:5173. Start the dev server first, with `bash` and `run_in_background: true`."
 
 **`browser_read`** adds, after the page line:
-- how far the page is scrolled ("scrolled 1,400 of 5,200 px");
-- the newest 10 console errors and uncaught exceptions, and the newest 10 failed requests (network errors, and responses of 400 and up), since the last read, each one line of at most 300 characters. A count of what wasn't listed follows.
+- how far the page is scrolled ("Scrolled 1,400 of 5,200 px.");
+- the newest 10 console errors and uncaught exceptions, and the newest 10 failed requests (network errors, and responses of 400 and up), since the last read, each one line of at most 300 characters. A header counts them all: "Failed requests (the newest 10 of 37):".
 
 **`browser_screenshot`** returns two blocks, as `read_image` does: a text block and an image block.
 - **The image** is a PNG of the viewport (or of `ref`'s element), saved with `ctx.attachments.saveImage`.
@@ -177,7 +177,7 @@ The same rules apply to the agent's `browser_navigate` and to your address bar.
 
 **`file://` confinement.**
 - The path is taken from the URL, its real path is resolved (`realpath`), and it must be the workspace root's real path or under it, or `/tmp` or under it (decision 9), on a `/` boundary. `/tmp` counts only where agents share the machine's `/tmp`: when `realpath(os.tmpdir())`, dsh's own `TMPDIR`, is neither `/tmp` nor under it. That is the VM (`~/.cache/dish/tmp`), where `deploy/dish-sandbox` binds the machine's `/tmp` for every command. In dev, a command's `/tmp` is its own, and the host's `/tmp` holds other programs' files, so it stays out. A symbolic link that leads out is refused, and so is a path that doesn't exist.
-- A refusal names the workspace: "file:///etc/hosts is outside this chat's workspace (/home/dish/work/bketelsen/clippy)."
+- A refusal names the workspace, and `/tmp` where it counts. On the VM: "file:///etc/hosts is outside this chat's workspace (/home/dish/work/bketelsen/clippy) and /tmp."
 - Chromium lists a directory, so a `file://` directory inside the workspace opens as a listing.
 - **From the address bar,** a `file://` URL needs the session's workspace. dish knows it once the session's agent has used the browser, or while that agent is live. Otherwise it is refused, with that reason.
 
@@ -196,7 +196,7 @@ The same rules apply to the agent's `browser_navigate` and to your address bar.
 - **How dish knows the address:**
   - **the port** is `ctx.get('webServer').port`, on every loopback name: `localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`, and `0.0.0.0` and `[::]`, which reach `127.0.0.1` on Linux;
   - **the trusted host** is `DISH_TRUSTED_HOST`, from the unit's `deploy.env` (`deploy/dish-web.service:25`), on any port. dsh's connection service keeps its own list private.
-- **WebSockets** to that address are refused too, with `context.routeWebSocket`, since the route doesn't see them.
+- **WebSockets** to that address are refused too, with `context.routeWebSocket`, since the route doesn't see them. Workers' own connections aren't all seen ([Known limits](#known-limits)).
 - Nothing an agent needs goes there. dish working on itself runs a dev dsh on another port.
 
 ## The Browser tab
@@ -329,7 +329,7 @@ The shipped defaults change, and `previous.json` is regenerated for each (dish-p
 
 - **Fixed in code:** the timeouts, the JPEG quality (60), the frame cap (15 a second), Chromium's stop after 60 s, and the 10 s for "they are using it now".
 - **Nothing in the config store.**
-- **The log** gets launches, crashes, evictions and closes, by session id and reason. A URL appears only as its origin, never with its path or query.
+- **The log** gets launches, crashes, evictions and closes, by session id and reason. No address appears in it, not even an origin: Chromium's own messages have theirs replaced by `<address>` ([Notes from the build](#notes-from-the-build)).
 
 **No Chromium on the host** (dev on the desktop, which has none).
 - At start, dish checks that `executablePath` is an executable file. If it isn't, dish logs it once, registers no tools, and the tab says there's no browser. Nothing else changes: crew's lists drop the names, and the prompts' second bullet applies.
@@ -395,7 +395,8 @@ The shipped defaults change, and `previous.json` is regenerated for each (dish-p
 - **No HTTP cache, and a hop per request.** With a route on the context, Playwright turns its cache off, and every request goes through Node to be checked. Pages load slower in the agent's browser than in yours.
 - **Redirects aren't routed.** Playwright's route sees only the first URL of a redirect chain (playwright-core 1.63.0 `types/types.d.ts`, `route`'s notes). A subresource that redirects to dsh's own address isn't aborted; a main-frame redirect there is caught after it lands (`framenavigated`), and the page is sent to `about:blank`.
 - **Host names that resolve to loopback,** such as `127.0.0.1.nip.io`, reach dsh's port: the rules know loopback by name and address, not by what a name resolves to. dsh still needs its browser-session cookie.
-- **A dedicated Worker's WebSocket isn't routed:** `routeWebSocket` doesn't see a socket a `new Worker(…)` opens, so one to dsh's address isn't closed. The same cookie applies.
+- **Workers' own connections aren't all routed:** `routeWebSocket` sees no WebSocket a worker opens (dedicated, shared or service), and the context's route sees no request a shared worker makes, so one to dsh's address isn't stopped. A dedicated or service worker's requests are routed. The same cookie applies.
+- **A popup's address is loaded twice:** in the popup, before dish learns where it went, then in the session's page. A one-time link opened in a new window can be spent by the first load, and a form posted to a new window is opened again with GET.
 - **`browser_wait`'s text** is looked for in the main frame, not in iframes.
 - **Browsers live in memory.** A restart closes every browser, and crew children's browsers last one run (decision 10).
 
@@ -513,7 +514,7 @@ The WebSocket leg, the same for every stream, is the end-to-end run's.
 **Known limits the build found** (the first three now under [Known limits](#known-limits); the fourth is a rule for the deploy):
 - **Redirects:** Playwright's route sees only the first URL of a redirect chain. A subresource that redirects to dsh's own address isn't aborted; a main-frame redirect there is caught by `framenavigated` after it lands.
 - **Loopback host names:** a name that resolves to loopback, such as `127.0.0.1.nip.io`, reaches dsh's port.
-- **A dedicated Worker's WebSocket** isn't seen by `routeWebSocket`.
+- **Workers' own connections:** a WebSocket any worker opens, and a shared worker's requests, aren't seen by `routeWebSocket` or the route.
 - **`TMPDIR`'s length:** Chromium's singleton socket goes in an `org.chromium.Chromium.*` directory under `TMPDIR`, and a socket's path holds at most 107 bytes, so a long `TMPDIR` keeps Chromium from starting ("Socket path too long"). The VM's `~/.cache/dish/tmp` is short; `deploy/README.md` (The state) and the plugin's README (Tests) say so.
 
 **Refs.**

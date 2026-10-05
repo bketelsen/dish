@@ -5,7 +5,8 @@
  *
  * The uplink is small (dsh buffers at most 256 KiB a stream), so a paste is cut to `TEXT_MAX`, and the pacer
  * (`createInputPacer`, over a clock a test can move) sends a `move` only while a button is down and at most every
- * `MOVE_INTERVAL_MS`, sums wheel turns the same way, and releases what the picture holds down when it loses focus.
+ * `MOVE_INTERVAL_MS`, sums wheel turns the same way, sends what still waits before anything that comes after it, and
+ * releases what the picture holds down when it loses focus.
  */
 
 import { ALT, CONTROL, META, SHIFT, TEXT_MAX } from '../protocol.ts'
@@ -136,7 +137,8 @@ export type KeyItem = Extract<Up, { kind: 'key' }>
 
 /**
  * What the picture's handlers feed, and what decides what goes up the uplink and when. Points are the page's (`toViewport`).
- * After `dispose`, nothing goes.
+ * Items go in the order their events came: a wheel turn or a move still waiting goes first (the turn, then the move) when
+ * anything else goes. After `dispose`, nothing goes.
  */
 export interface InputPacer {
   /** A button went down: a `move` to the point, then the `down`. Ignored while a button is held. */
@@ -153,6 +155,8 @@ export interface InputPacer {
   keyDown(id: string, item: KeyItem): void
   /** A key went up: sent only if it went down here, as `item`, or in the words of its down when `item` is undefined. The answer says whether it went. */
   keyUp(id: string, item: KeyItem | undefined): boolean
+  /** A paste's or a composition's text (`pasteText`'s): a `text` item. Empty text sends nothing. */
+  text(text: string): void
   /** Focus left, or the picture is going: release the held button where it was, then every key still down. */
   releaseAll(): void
   /** Cancel what is waiting; nothing goes after. */
@@ -209,6 +213,19 @@ export function createInputPacer(send: (up: Up) => void, clock: PaceClock = syst
     out({ kind: 'wheel', x: turn.x, y: turn.y, dx: turn.dx, dy: turn.dy })
   }
 
+  /** A waiting wheel turn, now, its timer cancelled. */
+  const wheelNow = (): void => {
+    wheelCancel?.()
+    flushWheel()
+  }
+
+  /** What still waits, now, before an item that came after it: the wheel turn, then the move. */
+  const waitingNow = (): void => {
+    wheelNow()
+    cancelMove()
+    flushMove()
+  }
+
   const releaseHeld = (point: Point | undefined): void => {
     const button = held
     if (button === undefined) return
@@ -223,6 +240,7 @@ export function createInputPacer(send: (up: Up) => void, clock: PaceClock = syst
   return {
     press(point, button, clickCount) {
       if (disposed || held !== undefined) return
+      waitingNow()
       held = { button, clickCount, x: point.x, y: point.y }
       moveAt = clock.now()
       out({ kind: 'mouse', action: 'move', x: point.x, y: point.y, button, clickCount: 1 })
@@ -239,6 +257,8 @@ export function createInputPacer(send: (up: Up) => void, clock: PaceClock = syst
     },
     release(button, point) {
       if (held === undefined || held.button !== button) return
+      // The waiting move is the release's own (`releaseHeld`); a waiting turn goes first.
+      wheelNow()
       releaseHeld(point)
     },
     holding: () => held !== undefined,
@@ -252,17 +272,25 @@ export function createInputPacer(send: (up: Up) => void, clock: PaceClock = syst
     },
     keyDown(id, item) {
       if (disposed) return
+      waitingNow()
       pressed.set(id, item)
       out(item)
     },
     keyUp(id, item) {
       const down = pressed.get(id)
       if (disposed || down === undefined) return false
+      waitingNow()
       pressed.delete(id)
       out(item ?? { ...down, action: 'up' })
       return true
     },
+    text(text) {
+      if (disposed || text === '') return
+      waitingNow()
+      out({ kind: 'text', text })
+    },
     releaseAll() {
+      wheelNow()
       releaseHeld(undefined)
       for (const down of pressed.values()) out({ ...down, action: 'up' })
       pressed.clear()
