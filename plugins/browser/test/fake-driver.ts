@@ -53,6 +53,8 @@ export class FakeDriver implements Driver {
   /** The next launches reject with these messages, in order. */
   failLaunches: string[] = []
   browsers: FakeBrowser[] = []
+  /** Called with each new page of every browser this launches, before the core gets it (to hold its first `goto`, say). */
+  onPage: ((page: FakePage) => void) | undefined
   private launchHolds: PendingHold[] = []
 
   /** Hold the next launch until `release()`. */
@@ -72,6 +74,7 @@ export class FakeDriver implements Driver {
     const failure = this.failLaunches.shift()
     if (failure !== undefined) throw new Error(failure)
     const browser = new FakeBrowser()
+    browser.onPage = page => { this.onPage?.(page) }
     this.browsers.push(browser)
     return browser
   }
@@ -96,6 +99,8 @@ export class FakeBrowser implements DriverBrowser {
   closeCalls = 0
   /** The next `newContext` rejects with this. */
   failNewContext: Error | undefined
+  /** Called with each new page of its contexts. */
+  onPage: ((page: FakePage) => void) | undefined
   private listeners: Array<() => void> = []
   private disconnected = false
 
@@ -163,6 +168,7 @@ export class FakeContext implements DriverContext {
     }
     const page = new FakePage(this.viewport)
     this.pages.push(page)
+    this.browser.onPage?.(page)
     return page
   }
 

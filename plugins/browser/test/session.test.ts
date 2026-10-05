@@ -469,6 +469,44 @@ test('the user\'s input: a replay that fails is ignored, logged once for the ses
   assert.doesNotMatch(w.logs[0] ?? '', /broke/)
 })
 
+test('a replay that fails on a key logs no key: only the session and a reason', async () => {
+  const w = await world()
+  w.page.failNext('keyDown', new Error('keyboard.down: Unknown key: "Hunter2Secret"'))
+  w.browser.input({ kind: 'key', action: 'down', key: 'Enter', code: 'Enter', modifiers: 0 })
+  await w.browser.inputsDone()
+  assert.equal(w.logs.length, 1)
+  assert.doesNotMatch(w.logs[0] ?? '', /Hunter2Secret|Unknown key|Enter/)
+})
+
+test('the input chain ends at a close, even on a replay that never settles', async () => {
+  const w = await world()
+  w.page.hold('mouse')
+  w.browser.input({ kind: 'mouse', action: 'down', x: 1, y: 1, button: 'left', clickCount: 1 })
+  w.browser.input({ kind: 'mouse', action: 'up', x: 1, y: 1, button: 'left', clickCount: 1 })
+  let done = false
+  void w.browser.inputsDone().then(() => { done = true })
+  await flush()
+  assert.equal(done, false)
+  w.browser.markClosed('tab')
+  await flush()
+  assert.equal(done, true)
+  assert.equal(w.page.callsOf('mouse').length, 1)
+  assert.deepEqual(w.logs, [])
+})
+
+test('ensureAllowed ends at a close, even when its about:blank never loads', async () => {
+  const w = await world({ workspace: '/work/project' })
+  w.page.currentUrl = 'file:///etc/passwd'
+  w.page.hold('goto')
+  let done = false
+  void w.browser.ensureAllowed().then(() => { done = true })
+  await flush()
+  assert.equal(done, false)
+  w.browser.markClosed('agent')
+  await flush()
+  assert.equal(done, true)
+})
+
 test('the user\'s input marks the browser used', async () => {
   const w = await world()
   w.clock.advance(60_000)

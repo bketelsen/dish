@@ -131,6 +131,8 @@ export class Browsers {
   private readonly framesOn = new Map<string, number>()
   /** Disposed agents' browsers held open while a frames-on watcher watches them. */
   private readonly held = new Set<string>()
+  /** The tab's navigations in flight, per session: such a session's browser is in use, as one in a call is. */
+  private readonly navigating = new Map<string, number>()
   private readonly latest = new Map<string, Frame>()
   private seq = 0
   private readonly waiters = new Set<Waiter>()
@@ -272,12 +274,12 @@ export class Browsers {
     try {
       switch (action.kind) {
         case 'navigate':
-          await this.userNavigate(sessionId, action.url, start)
+          await this.navigation(sessionId, () => this.userNavigate(sessionId, action.url, start))
           return
         case 'back':
         case 'forward':
         case 'reload':
-          await this.userHistory(sessionId, action.kind)
+          await this.navigation(sessionId, () => this.userHistory(sessionId, action.kind))
           return
         case 'close':
           await this.close(sessionId, 'tab')
@@ -288,6 +290,28 @@ export class Browsers {
     } catch (error) {
       if (error instanceof BrowserError) this.notice(sessionId, { kind: 'error', code: error.code, detail: error.detail })
     }
+  }
+
+  /**
+   * One of the tab's navigations, counted from before its address is resolved to its end: neither eviction nor the sweep
+   * takes the session's browser meanwhile, including a browser this navigation opens.
+   */
+  private async navigation(sessionId: string, run: () => Promise<void>): Promise<void> {
+    this.navigating.set(sessionId, (this.navigating.get(sessionId) ?? 0) + 1)
+    try {
+      await run()
+    } finally {
+      const left = (this.navigating.get(sessionId) ?? 1) - 1
+      if (left > 0) this.navigating.set(sessionId, left)
+      else this.navigating.delete(sessionId)
+      // Its browser may be the room a waiting call needs.
+      this.wakeWaiters()
+    }
+  }
+
+  /** In a call (running or queued), or in one of the tab's navigations. */
+  private inUse(sessionId: string, browser: SessionBrowser): boolean {
+    return browser.inCall || this.navigating.has(sessionId)
   }
 
   private async userNavigate(sessionId: string, input: string, start: { workspace: string | undefined } | undefined): Promise<void> {
@@ -405,7 +429,7 @@ export class Browsers {
     const closing: Array<Promise<void>> = []
     for (const [sessionId, browser] of [...this.open]) {
       if (archived.has(sessionId)) closing.push(this.close(sessionId, 'archived'))
-      else if (!this.watched(sessionId) && !browser.inCall && now - browser.lastUsed >= idleMs) closing.push(this.close(sessionId, 'idle'))
+      else if (!this.watched(sessionId) && !this.inUse(sessionId, browser) && now - browser.lastUsed >= idleMs) closing.push(this.close(sessionId, 'idle'))
     }
     await Promise.all(closing)
   }
@@ -663,11 +687,11 @@ export class Browsers {
     }
   }
 
-  /** The least recently used open browser with no call running or queued, watched or not. */
+  /** The least recently used open browser with no call running or queued and no navigation of the tab's, watched or not. */
   private evictable(): string | undefined {
     let best: { sessionId: string, used: number } | undefined
     for (const [sessionId, browser] of this.open) {
-      if (browser.inCall) continue
+      if (this.inUse(sessionId, browser)) continue
       const used = browser.lastUsed
       if (best === undefined || used < best.used) best = { sessionId, used }
     }

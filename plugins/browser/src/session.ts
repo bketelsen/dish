@@ -137,6 +137,7 @@ export class SessionBrowser {
   // The user's input.
   private inputs: InputAction[] = []
   private inputRunning = false
+  private draining: Promise<void> | undefined
   private inputFailureLogged = false
   private readonly heldModifiers = new Set<string>()
 
@@ -358,7 +359,12 @@ export class SessionBrowser {
     if (this.closed !== undefined) return
     this.noteInput(action)
     this.inputs.push(action)
-    if (!this.inputRunning) void this.drainInputs()
+    if (!this.inputRunning) this.draining = this.drainInputs()
+  }
+
+  /** Resolves when the user's input chain is idle: every input replayed, or dropped by a close. */
+  inputsDone(): Promise<void> {
+    return this.draining ?? Promise.resolve()
   }
 
   private noteInput(action: InputAction): void {
