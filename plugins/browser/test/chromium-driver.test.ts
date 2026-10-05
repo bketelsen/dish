@@ -13,7 +13,7 @@
 import { test } from 'node:test'
 import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -22,6 +22,7 @@ import type {
   Driver, DriverBrowser, DriverContext, DriverDialog, DriverPage, DriverPopup, FailedRequest, RouteDecider, RouteRequest, ScreencastFrame,
 } from '../src/driver.ts'
 import { playwrightDriver } from '../src/playwright.ts'
+import { REF_MS } from '../src/types.ts'
 import { chromiumPath, launchForTests, pageServer, processesHolding, scratchTmp } from './chromium.ts'
 import type { PageServer, TestPage } from './chromium.ts'
 
@@ -70,6 +71,57 @@ function refOf(snapshot: string, role: string, name: string): string {
   return match[1]!
 }
 
+/** The ref on the first line of `snapshot` that holds `text`. */
+function lineRef(snapshot: string, text: string): string {
+  const line = snapshot.split('\n').find(candidate => candidate.includes(text) && /\[ref=/.test(candidate))
+  const match = line === undefined ? null : /\[ref=((?:f\d+)?e\d+)\]/.exec(line)
+  assert.ok(match, `no line with "${text}" and a ref in:\n${snapshot}`)
+  return match[1]!
+}
+
+/** A ref's frame part: '' for `e5`, 'f2' for `f2e5`. */
+function framePart(ref: string): string {
+  return /^(f\d+)?/.exec(ref)?.[1] ?? ''
+}
+
+/** A ref's form, as `snapshot.ts`'s `REF`. A main frame's refs aren't always `e…`: Playwright numbers the main frame anew on each new document after the first. */
+const REF_FORM = /^(?:f\d+)?e\d+$/
+
+/** Settles with `work`'s outcome, or 'hung' after `ms`. */
+async function outcome<T>(work: Promise<T>, ms: number): Promise<{ value: T } | { error: unknown } | 'hung'> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      work.then(value => ({ value }), (error: unknown) => ({ error })),
+      new Promise<'hung'>(resolve => { timer = setTimeout(() => resolve('hung'), ms) }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Every regular file under `dir` whose whole content is `body`. */
+function filesHolding(dir: string, body: string): string[] {
+  const found: string[] = []
+  let entries: string[]
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return found
+  }
+  for (const entry of entries) {
+    const path = resolve(dir, entry)
+    try {
+      const stat = statSync(path)
+      if (stat.isDirectory()) found.push(...filesHolding(path, body))
+      else if (stat.isFile() && stat.size === Buffer.byteLength(body) && readFileSync(path, 'utf8') === body) found.push(path)
+    } catch {
+      // Gone meanwhile, or not ours to read.
+    }
+  }
+  return found
+}
+
 /** A PNG's width and height, from its IHDR chunk; fails when `bytes` isn't a PNG. */
 function pngSize(bytes: Uint8Array): { width: number, height: number } {
   const buffer = Buffer.from(bytes)
@@ -92,6 +144,9 @@ async function refusedPort(): Promise<number> {
   if (address === null || typeof address === 'string') throw new Error('no port')
   return address.port
 }
+
+/** The download's body: no file anywhere may hold it, since downloads are refused. */
+const DOWNLOAD_BODY = 'DOWNLOAD-BODY-of-report.txt'
 
 function pages(refused: number): Record<string, TestPage> {
   const html = (body: string): TestPage => ({ body: `<!doctype html><meta charset="utf-8">${body}` })
@@ -121,7 +176,7 @@ function pages(refused: number): Record<string, TestPage> {
       <button onclick="document.title = confirm('sure?') ? 'confirmed' : 'declined'">Confirm</button>
       <script>addEventListener('beforeunload', event => { event.preventDefault(); event.returnValue = '' })</script>`),
     '/download.html': html('<title>Download</title><a href="/report.txt" download="report.txt">Download</a>'),
-    '/report.txt': { type: 'text/plain', body: 'a report', headers: { 'content-disposition': 'attachment; filename="report.txt"' } },
+    '/report.txt': { type: 'text/plain', body: DOWNLOAD_BODY, headers: { 'content-disposition': 'attachment; filename="report.txt"' } },
     '/upload.html': html(`<title>Upload</title><button onclick="document.getElementById('file').click()">Choose file</button><input id="file" type="file" hidden>`),
     '/errors.html': html(`<title>Errors</title>
       <script>console.error('broken thing'); setTimeout(() => { throw new Error('kaboom') }, 0)</script>
@@ -146,6 +201,36 @@ function pages(refused: number): Record<string, TestPage> {
       </script>`),
     '/screencast.html': html(`<title>Screencast</title><p id="tick">0</p>
       <script>let n = 0; setInterval(() => { document.getElementById('tick').textContent = String(++n) }, 50)</script>`),
+    '/frozen.html': html('<title>Frozen</title><p>Soon stuck</p><script>setTimeout(() => { for (;;) {} }, 500)</script>'),
+    '/freeze-on-wheel.html': html(`<title>Freeze on wheel</title><div style="height: 3000px">Tall</div>
+      <script>addEventListener('wheel', () => setTimeout(() => { for (;;) {} }, 0))</script>`),
+    '/number.html': html('<title>Number</title><label>Quantity <input type="number" value="7" data-secret="PAGE-ATTR-TEXT"></label>'),
+    '/traps.html': html(`<title>Traps</title><label>Secret <input type="password" value="pw"></label><div style="height: 3000px"></div>
+      <script>
+        Object.defineProperty(window, 'scrollY', { get() { throw new Error('PAGE-SAYS-SCROLL') } })
+        Object.defineProperty(HTMLInputElement.prototype, 'type', { get() { throw new Error('PAGE-SAYS-TYPE') } })
+      </script>`),
+    '/sw.html': html(`<title>Service worker</title><ul id="log"></ul>
+      <script>
+        const log = text => { const li = document.createElement('li'); li.textContent = text; document.getElementById('log').append(li) }
+        // The usual call, or the container's own method: 'block' in Playwright 1.63 only replaced the first.
+        const registered = new URLSearchParams(location.search).get('how') === 'prototype'
+          ? ServiceWorkerContainer.prototype.register.call(navigator.serviceWorker, '/sw.js')
+          : navigator.serviceWorker.register('/sw.js')
+        registered.then(async () => {
+          log('registered')
+          const ready = await navigator.serviceWorker.ready
+          navigator.serviceWorker.onmessage = event => log(event.data)
+          ready.active.postMessage('go')
+        }, error => log('not registered ' + error.name))
+      </script>`),
+    '/sw.js': { type: 'text/javascript', body: `self.addEventListener('message', event => {
+      const say = text => event.source.postMessage(text)
+      fetch('/sw-allowed').then(response => say('allowed ' + response.status), () => say('allowed failed'))
+      fetch('/blocked-from-sw').then(response => say('blocked ' + response.status), () => say('blocked failed'))
+    })` },
+    '/sw-allowed': { type: 'text/plain', body: 'fine' },
+    '/blocked-from-sw': { type: 'text/plain', body: 'should never be served' },
     '/input.html': html(`<title>Input</title>
       <button style="position: fixed; left: 20px; top: 20px; width: 200px; height: 50px" onclick="this.textContent = 'Pressed ' + (++presses)">Pressed 0</button>
       <input aria-label="Text" style="position: fixed; left: 20px; top: 100px; width: 300px; height: 30px">
@@ -225,7 +310,7 @@ test('snapshot: refs in ai mode; an iframe\'s refs f…e…; a password value is
   await page.goto(`${server.origin}/form.html`, NAV)
   const snapshot = await page.snapshot(SNAP)
   for (const [role, name] of [['textbox', 'Name'], ['textbox', 'Password'], ['combobox', 'Colour'], ['button', 'Add item'], ['link', 'Second page']]) {
-    assert.match(refOf(snapshot, role!, name!), /^e\d+$/)
+    assert.match(refOf(snapshot, role!, name!), REF_FORM)
   }
   assert.match(snapshot, /textbox "Password" [^\n]*hunter2-SECRET/)
 
@@ -237,7 +322,10 @@ test('snapshot: refs in ai mode; an iframe\'s refs f…e…; a password value is
   await page.goto(`${server.origin}/frame.html`, NAV)
   const framed = await page.snapshot(SNAP)
   const inner = refOf(framed, 'button', 'Inner button')
+  const outer = lineRef(framed, 'Outer')
   assert.match(inner, /^f\d+e\d+$/)
+  // The iframe's refs carry its own frame's number, not the main frame's (which may carry one too).
+  assert.notEqual(framePart(inner), framePart(outer), `the iframe's ${inner} and the page's ${outer}`)
   assert.equal(await page.hasRef(inner), true)
   await page.click({ ref: inner }, { ...ACT, double: false })
   assert.match(await page.snapshot(SNAP), /button "Inner clicked"/)
@@ -345,6 +433,91 @@ test('errors: an unknown key, select on a button, fill on a div → DriverBadArg
   await assert.rejects(page.fill(refOf(snapshot, 'region', 'Notes'), 'text', ACT), badArgument('fill'))
 })
 
+test('a frozen page: the calls Playwright doesn\'t time out end within about REF_MS', async (t) => {
+  if (skipped(t)) return
+  const { server, page } = await open(t)
+  await page.goto(`${server.origin}/frozen.html`, NAV)
+  // Its script loops for ever from 0.5 s on: nothing in the page answers again.
+  await sleep(1_500)
+  const limit = REF_MS + 4_000
+  const started = Date.now()
+  const [hasRef, title, position, scrolled] = await Promise.all([
+    outcome(page.hasRef('e1'), limit),
+    outcome(page.title(), limit),
+    outcome(page.scrollPosition(), limit),
+    outcome(page.scrollBy(0, 100), limit),
+  ])
+  const timedOut = (result: typeof hasRef | typeof title | typeof position | typeof scrolled) =>
+    result !== 'hung' && 'error' in result && result.error instanceof DriverTimeout
+  assert.ok(timedOut(hasRef), `hasRef: ${String(hasRef === 'hung' ? 'hung' : JSON.stringify(hasRef))}`)
+  assert.ok(timedOut(title), `title: ${String(title === 'hung' ? 'hung' : JSON.stringify(title))}`)
+  assert.ok(timedOut(scrolled), `scrollBy: ${String(scrolled === 'hung' ? 'hung' : JSON.stringify(scrolled))}`)
+  // The scroll position comes from CDP: it may answer, or time out, but never hangs.
+  assert.ok(position !== 'hung' && ('value' in position || position.error instanceof DriverTimeout), `scrollPosition: ${JSON.stringify(position)}`)
+  t.diagnostic(`scrollPosition on a frozen page: ${'value' in position ? 'CDP answered' : 'timed out'}`)
+  assert.ok(Date.now() - started < limit, `they ended in ${Date.now() - started} ms`)
+
+  // A page that freezes once the wheel is in: scrollBy's wait for the scroll to land gives up, and scrollBy ends.
+  const wheeled = await open(t)
+  await wheeled.page.goto(`${server.origin}/freeze-on-wheel.html`, NAV)
+  const result = await outcome(wheeled.page.scrollBy(0, 100), limit)
+  assert.ok(result !== 'hung', 'scrollBy ended')
+})
+
+test('errors are one line, with no typed text and no page text', async (t) => {
+  if (skipped(t)) return
+  const { server, page } = await open(t)
+  await page.goto(`${server.origin}/number.html`, NAV)
+  const quantity = lineRef(await page.snapshot(SNAP), 'Quantity')
+  const filled = await outcome(page.fill(quantity, 'TYPED-SECRET-abc', ACT), 10_000)
+  assert.ok(filled !== 'hung' && 'error' in filled, 'text into a number field fails')
+  const fillError = filled.error as Error
+  assert.ok(fillError instanceof DriverBadArgument && fillError.what === 'fill', `a not-fillable error: ${fillError.message}`)
+  assert.doesNotMatch(fillError.message, /\n|TYPED-SECRET|PAGE-ATTR-TEXT/)
+
+  // An error the driver doesn't map keeps its first line only: Playwright's call log is dropped.
+  const port = await refusedPort()
+  const failed = await outcome(page.goto(`http://127.0.0.1:${port}/nothing-here`, NAV), 20_000)
+  assert.ok(failed !== 'hung' && 'error' in failed)
+  const gotoError = failed.error as Error
+  assert.match(gotoError.message, /net::ERR_CONNECTION_REFUSED/)
+  assert.doesNotMatch(gotoError.message, /\n|Call log/)
+
+  // What the page's own script can make Playwright say never comes out.
+  await page.goto(`${server.origin}/traps.html`, NAV)
+  const position = await page.scrollPosition()
+  assert.equal(position.y, 0)
+  assert.ok(position.height >= 3000, `the page's height: ${position.height}`)
+  await page.scrollBy(0, 200).catch((error: unknown) => assert.doesNotMatch(String((error as Error).message), /PAGE-SAYS/))
+  // The page's broken scrollY ends scrollBy's wait for the scroll to land, so look again until it has.
+  await eventually('the wheel scrolled, though the page\'s scrollY throws', async () => (await page.scrollPosition()).y > 0)
+  const secret = lineRef(await page.snapshot(SNAP), 'Secret')
+  const checked = await outcome(page.isPassword(secret), 10_000)
+  assert.ok(checked !== 'hung' && 'error' in checked, 'it can\'t tell, since the page broke `type`')
+  assert.doesNotMatch((checked.error as Error).message, /PAGE-SAYS|\n/)
+})
+
+test('a stale f-ref: hasRef false, and an action on it is a DriverTimeout "stale ref" at once', async (t) => {
+  if (skipped(t)) return
+  const { server, page } = await open(t)
+  await page.goto(`${server.origin}/form.html`, NAV)
+  await page.goto(`${server.origin}/second.html`, NAV)
+  // After the second new document, Playwright numbers the main frame anew, so its refs carry a frame part.
+  const heading = refOf(await page.snapshot(SNAP), 'heading', 'Second page')
+  assert.match(heading, /^f\d+e\d+$/)
+  await page.goto(`${server.origin}/form.html`, NAV)
+  assert.equal(await page.hasRef(heading), false)
+  const stale = (error: unknown) => error instanceof DriverTimeout && error.message === 'stale ref'
+  const started = Date.now()
+  await assert.rejects(page.click({ ref: heading }, { ...ACT, double: false }), stale)
+  await assert.rejects(page.snapshot({ ...SNAP, ref: heading }), stale)
+  await assert.rejects(page.fill(heading, 'text', ACT), stale)
+  assert.ok(Date.now() - started < 2_000, 'none of them waited for its timeout')
+  // A ref of the page's own frame that matches nothing reads the same way.
+  const current = refOf(await page.snapshot(SNAP), 'button', 'Add item')
+  await assert.rejects(page.snapshot({ ...SNAP, ref: `${framePart(current)}e99999` }), stale)
+})
+
 test('events: navigated and load; popup with its URL; a script-filled popup stays about:blank; dialog accept and dismiss; download name; filechooser; consoleError and uncaught; requestFailed for a 404 and a refused port', async (t) => {
   if (skipped(t)) return
   const { server, page } = await open(t)
@@ -414,6 +587,10 @@ test('events: navigated and load; popup with its URL; a script-filled popup stay
     await page.click({ ref: refOf(await page.snapshot(SNAP), 'link', 'Download') }, { ...ACT, double: false })
     await eventually('a download', () => downloads.length === 1)
     assert.deepEqual(downloads, ['report.txt'])
+    // acceptDownloads: false: the download is refused, and nothing is written, in Playwright's places or the user's.
+    await sleep(1_000)
+    assert.ok(server.requests.includes('/report.txt'))
+    assert.deepEqual([...filesHolding(tmp, DOWNLOAD_BODY), ...filesHolding(process.env.HOME ?? '', DOWNLOAD_BODY)], [])
   })
 
   await t.test('a file chooser', async () => {
@@ -504,6 +681,46 @@ test('route: sees file:// subresources and the main frame\'s navigations, with m
     assert.match(snapshot, /In the workspace/)
     assert.doesNotMatch(snapshot, /TOP-SECRET-TEXT/)
   })
+
+  await t.test('a decider that throws aborts the request', async () => {
+    const throwing = await open(t, {
+      route: async request => {
+        if (/\/blocked/.test(request.url)) throw new Error('dish could not check it')
+        return 'continue'
+      },
+    })
+    const before = server.requests.length
+    await throwing.page.goto(`${server.origin}/with-blocked.html`, NAV)
+    await assert.rejects(throwing.page.goto(`${server.origin}/blocked.html`, NAV), /ERR_BLOCKED_BY_CLIENT/)
+    const reached = server.requests.slice(before)
+    assert.ok(reached.includes('/with-blocked.html'))
+    assert.ok(!reached.includes('/blocked.png') && !reached.includes('/blocked.html'), `reached: ${reached.join(', ')}`)
+  })
+})
+
+test('service workers: the route sees a worker\'s script and its fetches, however it was registered, and aborts a refused one', async (t) => {
+  if (skipped(t)) return
+  for (const how of ['usual', 'prototype']) {
+    await t.test(how, async () => {
+      const seen: RouteRequest[] = []
+      const { server, page } = await open(t, {
+        route: async request => {
+          seen.push(request)
+          return /\/blocked/.test(request.url) ? 'abort' : 'continue'
+        },
+      })
+      const before = server.requests.length
+      await page.goto(`${server.origin}/sw.html?how=${how}`, NAV)
+      await page.waitForText('allowed 200', { timeoutMs: 15_000, gone: false })
+      await page.waitForText('blocked failed', { timeoutMs: 15_000, gone: false })
+      const strip = (request: RouteRequest | undefined) => request && { navigation: request.navigation, mainFrame: request.mainFrame, ownPage: request.ownPage }
+      assert.deepEqual(strip(seen.find(request => request.url === `${server.origin}/sw.js`)), { navigation: false, mainFrame: false, ownPage: false })
+      assert.deepEqual(strip(seen.find(request => request.url === `${server.origin}/blocked-from-sw`)), { navigation: false, mainFrame: false, ownPage: false })
+      const reached = server.requests.slice(before)
+      assert.ok(reached.includes('/sw-allowed'), `reached: ${reached.join(', ')}`)
+      assert.ok(!reached.includes('/blocked-from-sw'), 'the refused fetch never reached the server')
+    })
+  }
 })
 
 test('routeWebSocket: a refused URL is closed', async (t) => {

@@ -9,17 +9,23 @@
  *   :25436-25446): its SIGINT handler ends in `process.exit(130)`, which would take dsh down without its own shutdown.
  *   No `env`: Chromium gets dsh's environment, `TMPDIR` with it, and its temporary profile goes to `os.tmpdir()`.
  * - **A context** (`BrowserContextOptions` :25728): the viewport, `deviceScaleFactor` 1, `acceptDownloads` false (:25732)
- *   and `serviceWorkers: 'block'` (:26065), since a service worker's own requests would bypass the route. Every request
- *   goes through `route` (`BrowserContext.route`, :10399); WebSockets, which the route doesn't see, through
- *   `routeWebSocket` (:10482).
+ *   and `serviceWorkers: 'allow'` (:26065). Every request goes through `route` (`BrowserContext.route`, :10399), a
+ *   service worker's script and its fetches included: Playwright routes those only while it watches service workers,
+ *   and `'block'` would stop that while blocking nothing but the usual `navigator.serviceWorker.register` (a page can
+ *   call the container's own method). WebSockets, which the route doesn't see, go through `routeWebSocket` (:10482).
  * - **A page** reports its events in dish's terms (`PageEvents`), and keeps one CDP session (`newCDPSession`, :10325)
  *   for its history and the screencast.
  * - **Errors.** An action maps Playwright's errors to the driver's: a timeout (`errors.TimeoutError`, :18779) is a
- *   `DriverTimeout`; a closed or crashed target is `DriverClosed`; an unknown key, a `selectOption` on what isn't a
- *   `<select>` and a `fill` on what isn't fillable are `DriverBadArgument`; anything else is thrown as it is. A mapped
- *   error keeps only the first line of Playwright's message: the call log under it can name the page's elements and
- *   addresses. An action whose signal aborted rejects with the signal's reason. Launch errors are never mapped: dish
- *   reads Chromium's own words in them (its sandbox fallback).
+ *   `DriverTimeout`, and so is a ref that resolves to nothing at once (its frame is gone), as `stale ref`; a closed or
+ *   crashed target is `DriverClosed`; an unknown key, a `selectOption` on what isn't a `<select>` and a `fill` that the
+ *   element can't take are `DriverBadArgument`. Anything else becomes a plain `Error`. Every one keeps only the first
+ *   line of Playwright's message: the call log under it names the page's elements, their attributes, and what was
+ *   typed. Where even the first line could carry the page's own words (a script of the page throwing inside
+ *   `isPassword`), the error has fixed wording; the scroll position is read over CDP, with no script of the page.
+ *   An action whose signal aborted rejects with the signal's reason. Launch errors are never mapped: dish reads
+ *   Chromium's own words in them (its sandbox fallback).
+ * - **Nothing hangs on a frozen page.** A call Playwright doesn't time out itself (the mouse and keyboard, `title`,
+ *   `count`, `evaluate`, CDP) is bounded by `REF_MS` or the action's own time, and then a `DriverTimeout`.
  *
  * @module dish-browser/playwright
  */
@@ -56,6 +62,21 @@ const REF = /^(?:f\d+)?e\d+$/
 const DIALOG_KINDS: ReadonlySet<string> = new Set<DialogKind>(['alert', 'confirm', 'prompt', 'beforeunload'])
 /** Playwright's words for a page, context or browser that's gone: closed, or crashed. */
 const CLOSED = ['Target page, context or browser has been closed', 'Target closed', 'Page crashed', 'Target crashed']
+/**
+ * Playwright's words for an `aria-ref=` locator that resolves to nothing at once: its frame is gone (Playwright numbers
+ * the main frame anew on each new document after the first, so the page's own refs go stale this way too), or a subtree
+ * snapshot's ref matches nothing. Without a frame, an action fails at once rather than waiting out its time.
+ */
+const STALE = ['Invalid frame in aria-ref selector', 'does not match any element']
+/** A stale ref's error message: fixed, with no ref or page text in it. */
+const STALE_REF = 'stale ref'
+
+/** Whether Playwright's message says an `aria-ref=` locator resolved to nothing at once (`STALE`). */
+function staleRef(message: string): boolean {
+  return message.includes('aria-ref=') && STALE.some(words => message.includes(words))
+}
+/** Playwright's words for an element `fill` can't take: not an input at all, or an input that refuses the text. */
+const UNFILLABLE = ['Element is not an <input>', 'Cannot type text into', 'Malformed value']
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -72,11 +93,12 @@ function driverError(error: unknown, signal?: AbortSignal): unknown {
   if (signal?.aborted) return signal.reason
   if (error instanceof errors.TimeoutError) return new DriverTimeout(firstLine(error))
   const message = messageOf(error)
+  if (staleRef(message)) return new DriverTimeout(STALE_REF)
   if (CLOSED.some(words => message.includes(words))) return new DriverClosed(firstLine(error))
   if (message.includes('Unknown key')) return new DriverBadArgument('key', firstLine(error))
   if (message.includes('not a <select>')) return new DriverBadArgument('select', firstLine(error))
-  if (message.includes('Element is not an <input>')) return new DriverBadArgument('fill', firstLine(error))
-  return error
+  if (UNFILLABLE.some(words => message.includes(words))) return new DriverBadArgument('fill', firstLine(error))
+  return new Error(firstLine(error))
 }
 
 /** Runs one action: not at all when `signal` has aborted, and its errors mapped. */
@@ -211,7 +233,7 @@ class PlaywrightBrowser implements DriverBrowser {
       viewport: options.viewport,
       deviceScaleFactor: 1,
       acceptDownloads: false,
-      serviceWorkers: 'block',
+      serviceWorkers: 'allow',
     }))
     const own = new PlaywrightContext(context, options.viewport)
     try {
@@ -329,9 +351,9 @@ class PlaywrightPopup implements DriverPopup {
   /** The address of the popup's current history entry, through a CDP session of its own; `undefined` when it can't tell. */
   private async attempted(): Promise<string | undefined> {
     try {
-      const session = await this.page.context().newCDPSession(this.page)
+      const session = await bounded(this.page.context().newCDPSession(this.page), REF_MS)
       try {
-        const { currentIndex, entries } = await session.send('Page.getNavigationHistory')
+        const { currentIndex, entries } = await bounded(session.send('Page.getNavigationHistory'), REF_MS)
         const url = entries[currentIndex]?.url ?? ''
         return url === '' || url.startsWith('chrome-error:') ? undefined : url
       } finally {
@@ -514,13 +536,13 @@ class PlaywrightPage implements DriverPage {
   }
 
   title(): Promise<string> {
-    return act(undefined, () => this.page.title())
+    return act(undefined, () => bounded(this.page.title(), REF_MS))
   }
 
   history(): Promise<{ canGoBack: boolean, canGoForward: boolean }> {
     return act(undefined, async () => {
-      const session = await this.session()
-      const { currentIndex, entries } = await session.send('Page.getNavigationHistory')
+      const session = await bounded(this.session(), REF_MS)
+      const { currentIndex, entries } = await bounded(session.send('Page.getNavigationHistory'), REF_MS)
       return { canGoBack: currentIndex > 0, canGoForward: currentIndex < entries.length - 1 }
     })
   }
@@ -574,16 +596,22 @@ class PlaywrightPage implements DriverPage {
   async hasRef(ref: string): Promise<boolean> {
     if (!REF.test(ref)) return false
     try {
-      return await this.page.locator(`aria-ref=${ref}`).count() > 0
+      return await bounded(this.page.locator(`aria-ref=${ref}`).count(), REF_MS) > 0
     } catch (error) {
       const message = messageOf(error)
-      if (message.includes('Invalid frame in aria-ref') || message.includes('Execution context was destroyed')) return false
+      if (staleRef(message) || message.includes('Execution context was destroyed')) return false
       throw driverError(error)
     }
   }
 
-  isPassword(ref: string): Promise<boolean> {
-    return act(undefined, () => this.locate(ref).evaluate(isPasswordInput, undefined, { timeout: PASSWORD_MS }))
+  /** Rejects when it can't tell: the page's own scripts run here, so a failure has fixed wording, never theirs. */
+  async isPassword(ref: string): Promise<boolean> {
+    try {
+      return await act(undefined, () => this.locate(ref).evaluate(isPasswordInput, undefined, { timeout: PASSWORD_MS }))
+    } catch (error) {
+      if (error instanceof DriverTimeout || error instanceof DriverClosed) throw error
+      throw new Error('dish-browser: could not tell whether the field is a password')
+    }
   }
 
   /** A ref: `click` or `dblclick` (:14897, :15046). A point: `mouse.click` (:22094), two clicks for a double. */
@@ -628,14 +656,19 @@ class PlaywrightPage implements DriverPage {
       await bounded(this.page.mouse.move(size.width / 2, size.height / 2), REF_MS)
       await bounded(this.page.mouse.wheel(dx, dy), REF_MS)
     })
-    // A page that navigated meanwhile has nothing left to wait for.
-    await this.page.evaluate(scrollSettles).catch(() => {})
+    // A page that navigated meanwhile, or whose scripts broke the wait, or that froze, has nothing left to wait for.
+    await bounded(this.page.evaluate(scrollSettles), REF_MS).catch(() => {})
   }
 
+  /**
+   * The layout viewport's offset and the content's height, in CSS pixels, from CDP (`Page.getLayoutMetrics`,
+   * protocol.d.ts:15654): no script of the page runs, so the page can't put its words in an error here.
+   */
   scrollPosition(): Promise<{ y: number, height: number }> {
     return act(undefined, async () => {
-      const { y, height } = await this.page.evaluate(() => ({ y: scrollY, height: document.documentElement?.scrollHeight ?? 0 }))
-      return { y: Math.round(y), height: Math.round(height) }
+      const session = await bounded(this.session(), REF_MS)
+      const { cssLayoutViewport, cssContentSize } = await bounded(session.send('Page.getLayoutMetrics'), REF_MS)
+      return { y: Math.round(cssLayoutViewport.pageY), height: Math.round(cssContentSize.height) }
     })
   }
 
@@ -672,7 +705,7 @@ class PlaywrightPage implements DriverPage {
   /** CDP's screencast (`Page.startScreencast`, protocol.d.ts:16209): each frame acked at once, then given to `onFrame`. */
   startScreencast(options: { quality: number, maxWidth: number, maxHeight: number }, onFrame: (frame: ScreencastFrame) => void): Promise<void> {
     return act(undefined, async () => {
-      const session = await this.session()
+      const session = await bounded(this.session(), REF_MS)
       if (!this.screencasting) {
         this.screencasting = true
         session.on('Page.screencastFrame', event => {
@@ -686,13 +719,13 @@ class PlaywrightPage implements DriverPage {
       }
       this.onFrame = onFrame
       try {
-        await session.send('Page.startScreencast', {
+        await bounded(session.send('Page.startScreencast', {
           format: 'jpeg',
           quality: options.quality,
           maxWidth: options.maxWidth,
           maxHeight: options.maxHeight,
           everyNthFrame: 1,
-        })
+        }), REF_MS)
       } catch (error) {
         if (this.onFrame === onFrame) this.onFrame = undefined
         throw error
@@ -705,8 +738,8 @@ class PlaywrightPage implements DriverPage {
     this.onFrame = undefined
     if (this.cdp === undefined) return
     await closing(async () => {
-      const session = await this.session()
-      await session.send('Page.stopScreencast')
+      const session = await bounded(this.session(), REF_MS)
+      await bounded(session.send('Page.stopScreencast'), REF_MS)
     })
   }
 
