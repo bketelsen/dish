@@ -333,7 +333,7 @@ The shipped defaults change, and `previous.json` is regenerated for each (dish-p
 
 **No Chromium on the host** (dev on the desktop, which has none).
 - At start, dish checks that `executablePath` is an executable file. If it isn't, dish logs it once, registers no tools, and the tab says there's no browser. Nothing else changes: crew's lists drop the names, and the prompts' second bullet applies.
-- Chromium installed later is seen after dsh's next restart.
+- Chromium is looked for once, when the plugin starts: a Chromium installed later is seen after dsh's next restart, or a reload of the plugin.
 - **Chromium that's there but won't start** fails the call with its reason, and the next call tries again.
 
 ## Install
@@ -510,7 +510,7 @@ The WebSocket leg, the same for every stream, is the end-to-end run's.
 - **With `'allow'`,** Playwright routes a service worker's script and its fetches through the context's route, which aborts a refused one. A real-Chromium test registers a worker both ways, and checks that the route saw its script and its fetches, and that a refused fetch never reached the server.
 - **So the context allows service workers** ([The plugin](#the-plugin)). A dev server's offline caching or PWA works in the agent's browser, and Known limits no longer says it doesn't. The plan's Risks line about blocked workers stays as the plan wrote it.
 
-**Known limits the build found** (now under [Known limits](#known-limits)):
+**Known limits the build found** (the first three now under [Known limits](#known-limits); the fourth is a rule for the deploy):
 - **Redirects:** Playwright's route sees only the first URL of a redirect chain. A subresource that redirects to dsh's own address isn't aborted; a main-frame redirect there is caught by `framenavigated` after it lands.
 - **Loopback host names:** a name that resolves to loopback, such as `127.0.0.1.nip.io`, reaches dsh's port.
 - **A dedicated Worker's WebSocket** isn't seen by `routeWebSocket`.
@@ -529,9 +529,11 @@ The WebSocket leg, the same for every stream, is the end-to-end run's.
 - **The password check fails with fixed words,** since the page's own script can throw inside it, and the scroll position is read over CDP (`Page.getLayoutMetrics`), with no script of the page.
 
 **The driver.**
-- **Every Playwright call that doesn't time out by itself is bounded,** so a frozen page (a script in an endless loop) ends a call within about 5 s, never a hang. A page's snapshot has 10 s, and typing without a ref 5 s and 25 ms a character.
+- **Every Playwright call that doesn't time out by itself is bounded** (the mouse and keyboard, `title`, `count`, `evaluate`, CDP), by 5 s or the action's own time, so a frozen page (a script in an endless loop) fails a call with an error, never a hang. A page's snapshot has 10 s, and typing without a ref 5 s and 25 ms a character.
 - **An error keeps only the first line of Playwright's message:** the call log under it names the page's elements and what was typed.
 - **A failure dish has no words for** is an error that says the action may have happened: "The browser didn't finish this call: the page may be busy or stuck, and what you asked may have happened. `browser_read` shows the page as it is now: check it before you repeat an action."
+
+**The plugin.** Chromium is looked for once, when the plugin starts: a Chromium installed later needs a dsh restart (or a reload of the plugin) before the tools appear. An empty `executablePath` (`''`) means `/usr/bin/chromium`.
 
 **The core.**
 - **A call that waited 30 s at the cap** fails with "All 6 browsers dish keeps are in use by other calls; try again in a moment.", not the eviction's words. An address bar's opening at the cap gets it at once, as a notice.

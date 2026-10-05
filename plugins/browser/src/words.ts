@@ -15,7 +15,7 @@
 import { maskSecrets } from 'dish-kit'
 import { URL_MAX } from './protocol.ts'
 import type { Viewport } from './protocol.ts'
-import { LINE_MAX, NAV_MS, REF_MS, USING_NOW_MS } from './types.ts'
+import { LINE_MAX, LISTED, NAV_MS, REF_MS, USING_NOW_MS } from './types.ts'
 import type { BrowserErrorCode, CloseReason, Limits, Note, TabNotice, UserActivity } from './types.ts'
 import { isLoopbackHost } from './urls.ts'
 
@@ -324,11 +324,15 @@ export function resultText(parts: ResultParts): string {
   return maskSecrets(lines.join('\n'))
 }
 
-/** One section of `readExtra`: a header with the count, and a line for each listed. Nothing when there are none. */
-function logSection(label: string, listed: readonly string[], more: number): string[] {
-  const total = listed.length + Math.max(0, more)
+/**
+ * One section of `readExtra`: a header with the count, and a line for each of the newest `LISTED` (`kept` is oldest
+ * first, as the core keeps them). `more` counts those the core no longer holds. Nothing when there are none.
+ */
+function logSection(label: string, kept: readonly string[], more: number): string[] {
+  const listed = kept.slice(-LISTED)
+  const total = kept.length + Math.max(0, more)
   if (total === 0) return []
-  const header = more > 0 ? `${label} (the newest ${fmt(listed.length)} of ${fmt(total)}):` : `${label} (${fmt(total)}):`
+  const header = total > listed.length ? `${label} (the newest ${fmt(listed.length)} of ${fmt(total)}):` : `${label} (${fmt(total)}):`
   return [header, ...listed.map(line => `- ${quoted(line, LINE_MAX)}`)]
 }
 
