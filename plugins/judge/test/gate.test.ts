@@ -7,8 +7,8 @@ import { defineTool, ToolRuntime } from '@deepseek-ai/dsh-tools'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { Answer, Decision, JudgeRequest, JudgeResult, LogLine } from '../src/client.ts'
 import {
-  clipMiddle, commandGate, decideCommand, EFFECT_QUESTION, EFFECT_WITH_ESCALATION_QUESTION, isGated, MAX_MIDDLE_CHARS, MAX_PART_CHARS, MAX_TASK_CHARS, registerCommandGate,
-  SERVES_TASK_QUESTION, taskOf,
+  approvalPolicyFrom, CHILD_SERVES_TASK_QUESTION, clipMiddle, commandGate, decideCommand, EFFECT_QUESTION, EFFECT_WITH_ESCALATION_QUESTION, isGated, MAX_MIDDLE_CHARS,
+  MAX_PART_CHARS, MAX_TASK_CHARS, registerCommandGate, SERVES_TASK_QUESTION, taskOf,
   VERDICT_MAX_ENTRIES, VERDICT_TTL_MS, verdictOwner, VerdictCache,
 } from '../src/gate.ts'
 import type { CommandGateDeps, GateAgent } from '../src/gate.ts'
@@ -596,6 +596,241 @@ test('settings that fail to read fall back to the shipped default, and the call 
   assert.equal(judge.requests.length, 1)
 })
 
+// --- approval policy never: the judge decides alone (nsl-session decision 4) --------------------------------
+
+/** How every refusal under `never` ends, word for word. */
+const NOBODY_TO_ASK = 'This chat\'s approval policy is never, so there\'s no one to ask: tell your user, who can run it or set the policy back to ask.'
+const UNAVAILABLE_ALONE = 'The command was refused because the judge is unavailable; nothing ran. This chat\'s approval policy is never, so there\'s no one to ask: tell your user, who can run it or set the policy back to ask.'
+const OPAQUE_ALONE = 'The command was refused: it holds what looks like a private key, which isn\'t sent to the judge; nothing ran. This chat\'s approval policy is never, so there\'s no one to ask: tell your user, who can run it or set the policy back to ask.'
+/** Read-only and reversible together under the bar, the likeliest reading not irreversible. */
+const UNSURE = { read_only: 0.01, reversible: 0.72, irreversible: 0.25, other: 0.02 }
+const UNAVAILABLE_ASK = 'The command needs your approval because the judge is unavailable.'
+const UNAVAILABLE_DENY = 'The command was refused because the judge is unavailable; nothing ran. Report it to the main agent instead, or try again later.'
+
+test('under never, a main agent\'s command that passes the effect bar runs, whatever serves_task says', () => {
+  const readOnlyThenReversible = { read_only: 0.89, reversible: 0.07, irreversible: 0.03, other: 0.01 }
+  for (const [probabilities, serves] of [[REVERSIBLE, 0.12], [REVERSIBLE, 0], [REVERSIBLE, 0.9], [READ_ONLY, 0.05], [readOnlyThenReversible, 0.3]] as const) {
+    assert.deepEqual(decideCommand(answers(probabilities, serves), DEFAULT_SETTINGS, true, 'never'), { decision: 'allow', pre: { kind: 'allow' } }, `${JSON.stringify(probabilities)} ${serves}`)
+  }
+  // The effect bars are judge.yaml's, as ever.
+  const strict = settingsWith(d => { d.commands.readOnly = 0.99; d.commands.reversible = 0.995 })
+  assert.equal(decideCommand(answers(REVERSIBLE, 0.9), strict, true, 'never').decision, 'deny')
+  assert.equal(decideCommand(answers({ read_only: 0.5, reversible: 0.39, irreversible: 0.08, other: 0.03 }, 0.9), DEFAULT_SETTINGS, true, 'never').decision, 'deny')
+})
+
+test('under never, a main agent\'s command that doesn\'t pass the effect bar is refused, with the judge\'s reading and nobody to ask', () => {
+  assert.deepEqual(decideCommand(answers(IRREVERSIBLE, 0.91), DEFAULT_SETTINGS, true, 'never'), {
+    decision: 'deny',
+    pre: { kind: 'deny', reason: 'The judge didn\'t let this run: it reads as irreversible (p 0.87). This chat\'s approval policy is never, so there\'s no one to ask: tell your user, who can run it or set the policy back to ask.' },
+  })
+  // The causes are the child's, the effect's only: serves_task has no say under never.
+  for (const [result, cause, settings] of [
+    [answers(IRREVERSIBLE, 0.12), 'it reads as irreversible (p 0.87)', DEFAULT_SETTINGS],
+    [answers(UNSURE, 0.56), 'it may not be undoable (p 0.73 that it only reads or can be undone)', DEFAULT_SETTINGS],
+    [answers(UNSURE, 0.12), 'it may not be undoable (p 0.73 that it only reads or can be undone)', DEFAULT_SETTINGS],
+    [answers({ read_only: 0.1, reversible: 0.05, irreversible: 0.05, other: 0.8 }, 0.9), 'it may not be undoable (p 0.15 that it only reads or can be undone)', DEFAULT_SETTINGS],
+    [answers({ read_only: 0.2, reversible: 0.3, irreversible: 0.45, other: 0.05 }, 0.9), 'it reads as irreversible (p 0.45)', settingsWith(d => { d.commands.reversible = 0.5 })],
+  ] as const) {
+    assert.deepEqual(decideCommand(result, settings, true, 'never'), { decision: 'deny', pre: { kind: 'deny', reason: `The judge didn't let this run: ${cause}. ${NOBODY_TO_ASK}` } }, cause)
+  }
+})
+
+test('under never, an unavailable judge and a command it couldn\'t read are refused, not asked', () => {
+  for (const result of [
+    DOWN,
+    { ok: false, reason: 'invalid', from: 'server', message: 'TypeSafe refused the request (HTTP 400)' },
+    { ok: false, reason: 'invalid', from: 'request', message: 'the state is too big', tooBig: true },
+    { ok: true, latencyMs: 1, answers: {} },
+  ] as const) {
+    assert.deepEqual(decideCommand(result, DEFAULT_SETTINGS, true, 'never'), { decision: 'deny', pre: { kind: 'deny', reason: UNAVAILABLE_ALONE } })
+  }
+  assert.deepEqual(decideCommand(OPAQUE, DEFAULT_SETTINGS, true, 'never'), { decision: 'deny', pre: { kind: 'deny', reason: OPAQUE_ALONE } })
+})
+
+test('under ask, decideCommand is as it was: the policy defaults to ask', () => {
+  for (const result of [answers(READ_ONLY, 0.05), answers(REVERSIBLE, 0.12), answers(REVERSIBLE, 0.9), answers(IRREVERSIBLE, 0.9), answers(UNSURE, 0.56), DOWN, OPAQUE]) {
+    for (const topLevel of [true, false]) {
+      assert.deepEqual(decideCommand(result, DEFAULT_SETTINGS, topLevel, 'ask'), decideCommand(result, DEFAULT_SETTINGS, topLevel))
+    }
+  }
+  assert.equal(decideCommand(answers(REVERSIBLE, 0.12), DEFAULT_SETTINGS, true, 'ask').decision, 'ask')
+})
+
+test('a child is decided as before under either policy: decideCommand gives it the same answer', () => {
+  for (const result of [answers(READ_ONLY, 0.05), answers(REVERSIBLE, 0.12), answers(REVERSIBLE, 0.9), answers(IRREVERSIBLE, 0.9), answers(UNSURE, 0.56), DOWN, OPAQUE]) {
+    assert.deepEqual(decideCommand(result, DEFAULT_SETTINGS, false, 'never'), decideCommand(result, DEFAULT_SETTINGS, false, 'ask'))
+  }
+  assert.deepEqual(decideCommand(answers(REVERSIBLE, 0.12), DEFAULT_SETTINGS, false, 'never').pre, {
+    kind: 'deny',
+    reason: 'The judge didn\'t let this run: it doesn\'t look like it serves the task (p 0.12). Report it to the main agent instead, or find a step that serves the task.',
+  })
+})
+
+test('through the gate, under never: a reversible off-task command runs and the others have their say; the rest is refused, and nobody is asked', async () => {
+  const allowing = gateOf(() => answers(REVERSIBLE, 0.12), { approvalPolicy: () => 'never' })
+  const next = nextOf()
+  const exec = execOf()
+  assert.deepEqual(await allowing.gate(exec, next.next), ALLOW)
+  assert.equal(next.spy.calls, 1)
+  assert.equal(verdictFor(allowing.cache, exec)?.verdict, 'allow')
+
+  const refusals: Array<[() => JudgeResult, string]> = [
+    [() => answers(IRREVERSIBLE, 0.91), `The judge didn't let this run: it reads as irreversible (p 0.87). ${NOBODY_TO_ASK}`],
+    [() => answers(UNSURE, 0.9), `The judge didn't let this run: it may not be undoable (p 0.73 that it only reads or can be undone). ${NOBODY_TO_ASK}`],
+    [() => DOWN, UNAVAILABLE_ALONE],
+    [() => OPAQUE, OPAQUE_ALONE],
+  ]
+  for (const [script, reason] of refusals) {
+    const { gate, cache, judge } = gateOf(script, { approvalPolicy: () => 'never' })
+    const refused = nextOf()
+    const call = execOf()
+    assert.deepEqual(await gate(call, refused.next), { kind: 'deny', reason })
+    assert.equal(refused.spy.calls, 0, 'its own deny is final')
+    assert.equal(verdictFor(cache, call)?.verdict, 'deny')
+    assert.deepEqual(judge.decisions, ['deny'], 'the log line says deny')
+  }
+  // No judge service, and a judge that throws, are an unavailable judge too.
+  for (const judge of [() => undefined, () => fakeJudge(() => answers(READ_ONLY, 0.99), { throws: true })]) {
+    const gate = commandGate({ judge, settings: async () => DEFAULT_SETTINGS, cache: new VerdictCache(), approvalPolicy: () => 'never' })
+    assert.deepEqual((await run(gate)).decision, { kind: 'deny', reason: UNAVAILABLE_ALONE })
+  }
+})
+
+test('through the gate, under ask or a policy that can\'t be read, the main agent is asked as before', async () => {
+  const readings: Array<CommandGateDeps['approvalPolicy']> = [undefined, () => 'ask', () => undefined, (() => 'sometimes') as never, () => { throw new Error('no approval service') }]
+  for (const approvalPolicy of readings) {
+    const offTask = await run(gateOf(() => answers(REVERSIBLE, 0.12), { approvalPolicy }).gate)
+    const reading = 'The judge reads this as reversible (p 0.96), and as unlikely to serve the task (p 0.12).'
+    assert.deepEqual(offTask.decision, { kind: 'ask', reason: reading, displayReason: { en: reading } })
+    const down = await run(gateOf(() => DOWN, { approvalPolicy }).gate)
+    assert.deepEqual(down.decision, { kind: 'ask', reason: UNAVAILABLE_ASK, displayReason: { en: UNAVAILABLE_ASK } })
+    const opaque = await run(gateOf(() => OPAQUE, { approvalPolicy }).gate)
+    assert.deepEqual(opaque.decision, { kind: 'ask', reason: OPAQUE_ASK, displayReason: { en: OPAQUE_ASK } })
+  }
+})
+
+test('through the gate, a child is decided as before under either policy, and its policy isn\'t read', async () => {
+  let reads = 0
+  for (const policy of ['ask', 'never'] as const) {
+    const approvalPolicy = () => { reads += 1; return policy }
+    const child = () => agentOf({ child: true, cwd: '/work/app', events: [userEvent(1, 'add a test')] })
+    const offTask = await run(gateOf(() => answers(REVERSIBLE, 0.12), { approvalPolicy }).gate, { agent: child() })
+    assert.deepEqual(offTask.decision, {
+      kind: 'deny',
+      reason: 'The judge didn\'t let this run: it doesn\'t look like it serves the task (p 0.12). Report it to the main agent instead, or find a step that serves the task.',
+    })
+    assert.deepEqual((await run(gateOf(() => answers(REVERSIBLE, 0.9), { approvalPolicy }).gate, { agent: child() })).decision, ALLOW)
+    assert.deepEqual((await run(gateOf(() => DOWN, { approvalPolicy }).gate, { agent: child() })).decision, { kind: 'deny', reason: UNAVAILABLE_DENY })
+    assert.deepEqual((await run(gateOf(() => OPAQUE, { approvalPolicy }).gate, { agent: child() })).decision, { kind: 'deny', reason: OPAQUE_DENY })
+  }
+  assert.equal(reads, 0, 'a child\'s policy is dsh\'s pin, or the answerer\'s switch: it is not the gate\'s to read')
+})
+
+test('through the gate, the policy is read on each call, for the agent that makes it, and a call gated again is judged under the policy now', async () => {
+  let policy: 'ask' | 'never' = 'ask'
+  const seen: unknown[] = []
+  const { gate, judge } = gateOf(() => answers(IRREVERSIBLE, 0.9), { approvalPolicy: (agent) => { seen.push(agent.id); return policy } })
+  const kinds: string[] = []
+  kinds.push((await run(gate)).decision.kind)
+  policy = 'never'
+  kinds.push((await run(gate, { agent: agentOf({ id: 'main-2', cwd: '/w' }) })).decision.kind)
+  policy = 'ask'
+  kinds.push((await run(gate)).decision.kind)
+  assert.deepEqual(kinds, ['ask', 'deny', 'ask'])
+  assert.deepEqual(seen, ['main-1', 'main-2', 'main-1'])
+  // The same call again, as it was, after the policy changed: not the decision made under the other one.
+  const agent = agentOf({ cwd: '/w' })
+  const first = await run(gate, { callId: 'same', agent })
+  policy = 'never'
+  const again = await run(gate, { callId: 'same', agent })
+  assert.deepEqual([first.decision.kind, again.decision.kind], ['ask', 'deny'])
+  assert.equal(judge.requests.length, 5)
+  // And under the same policy, it is not put to the judge again.
+  await run(gate, { callId: 'same', agent })
+  assert.equal(judge.requests.length, 5)
+})
+
+/** The refusal of a command that asks for a wider sandbox, for a main agent at never, word for word. */
+const WIDER_ALONE = (mode: string) => `The command asks for a wider sandbox (\`${mode}\`), which needs your user's approval, and this chat's approval policy is never, so there's no one to ask: nothing ran. Tell your user, who can run it or set the policy back to ask.`
+
+test('under never, a command that asks for a wider sandbox is refused before the judge is asked: dsh would reject the escalation itself', async () => {
+  assert.equal(WIDER_ALONE('danger-full-access'),
+    'The command asks for a wider sandbox (`danger-full-access`), which needs your user\'s approval, and this chat\'s approval policy is never, so there\'s no one to ask: nothing ran. Tell your user, who can run it or set the policy back to ask.')
+  // Whatever the judge would say of the command: it is not asked.
+  const { gate, judge, cache } = gateOf(() => answers(READ_ONLY, 0.99), { approvalPolicy: () => 'never', sandboxMode: () => 'workspace-write' })
+  for (const [name, args, mode] of [
+    ['bash, with a justification', { command: 'npm install', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'the network' }, 'danger-full-access'],
+    ['bash, without one', { command: 'npm install', description: 'x', sandbox_permissions: 'danger-full-access' }, 'danger-full-access'],
+    ['pwsh', { command: 'Remove-Item x', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'outside the workspace' }, 'danger-full-access'],
+  ] as const) {
+    const next = nextOf()
+    const exec = execOf({ name: name === 'pwsh' ? 'pwsh' : 'bash', args })
+    assert.deepEqual(await gate(exec, next.next), { kind: 'deny', reason: WIDER_ALONE(mode) }, name)
+    assert.equal(next.spy.calls, 0, `${name}: its own deny is final`)
+    const entry = verdictFor(cache, exec)
+    assert.deepEqual([entry?.verdict, entry?.escalationCovered, entry?.askReason], ['deny', false, undefined], name)
+  }
+  assert.equal(judge.requests.length, 0, 'no call is spent on a command that can\'t run')
+  // The mode the session already has is no escalation: the command is decided as any other, by the judge.
+  const same = await run(gate, { args: { command: 'npm test', description: 'x', sandbox_permissions: 'workspace-write', justification: 'writes files' } })
+  assert.deepEqual(same.decision, ALLOW)
+  assert.equal(judge.requests.length, 1)
+  // And so is a command without one.
+  const plain = await run(gateOf(() => answers(REVERSIBLE, 0.12), { approvalPolicy: () => 'never' }).gate, { args: { command: 'touch notes.txt', description: 'x' } })
+  assert.deepEqual(plain.decision, ALLOW)
+})
+
+test('under ask, a command that asks for a wider sandbox is put to the judge and asked as before; a child\'s is decided as before under either policy', async () => {
+  const escalating = { command: 'npm install', description: 'x', sandbox_permissions: 'danger-full-access', justification: 'the network' }
+  for (const approvalPolicy of [() => 'ask' as const, undefined, () => { throw new Error('no approval service') }]) {
+    const { gate, judge } = gateOf(() => answers(IRREVERSIBLE, 0.9), { approvalPolicy })
+    const asked = await run(gate, { args: escalating })
+    const reason = 'The judge reads this as irreversible (p 0.87), and as serving the task (p 0.90). The command also asks for danger-full-access permissions: "the network". Allowing it allows that too.'
+    assert.deepEqual(asked.decision, { kind: 'ask', reason, displayReason: { en: reason } })
+    assert.equal(judge.requests.length, 1)
+    assert.equal(judge.requests[0]!.questions.effect, EFFECT_WITH_ESCALATION_QUESTION)
+  }
+  for (const policy of ['ask', 'never'] as const) {
+    const child = agentOf({ child: true, cwd: '/work/app', events: [userEvent(1, 'add a test')] })
+    const refused = gateOf(() => answers(IRREVERSIBLE, 0.9), { approvalPolicy: () => policy })
+    assert.deepEqual((await run(refused.gate, { agent: child, args: escalating })).decision, {
+      kind: 'deny',
+      reason: 'The judge didn\'t let this run: it reads as irreversible (p 0.87). Report it to the main agent instead, or find a reversible way.',
+    }, policy)
+    const allowed = gateOf(() => answers(READ_ONLY, 0.95), { approvalPolicy: () => policy })
+    const covered = await run(allowed.gate, { agent: child, args: escalating })
+    assert.deepEqual(covered.decision, ALLOW, policy)
+    assert.equal(verdictFor(allowed.cache, covered.exec)?.escalationCovered, true, `${policy}: the judge's cover of a child's escalation, as before`)
+    assert.equal(refused.judge.requests.length + allowed.judge.requests.length, 2, `${policy}: the judge is asked about a child's escalation`)
+  }
+})
+
+test('approvalPolicyFrom reads ctx.get("approval") on each call, as the answerer reads a parent\'s, and says nothing when it can\'t', () => {
+  let service: unknown
+  const asked: string[] = []
+  const ctx = { get: (name: string) => { asked.push(name); return service } }
+  const policyOf = approvalPolicyFrom(ctx as never)
+  const agent = agentOf({ cwd: '/w' })
+  const sessions: unknown[] = []
+  assert.equal(policyOf(agent), undefined, 'no approval service')
+  service = { overrideOf: (session: unknown) => { sessions.push(session); return 'never' }, config: { policy: 'ask' } }
+  assert.equal(policyOf(agent), 'never', 'the session\'s own override first')
+  assert.equal(sessions[0], agent.session)
+  service = { overrideOf: () => undefined, config: { policy: 'never' } }
+  assert.equal(policyOf(agent), 'never', 'else the deployment\'s default')
+  service = { overrideOf: () => 'ask', config: { policy: 'never' } }
+  assert.equal(policyOf(agent), 'ask')
+  service = { overrideOf: () => undefined }
+  assert.equal(policyOf(agent), 'ask', 'else ask')
+  service = { overrideOf: () => { throw new Error('no session log') } }
+  assert.equal(policyOf(agent), undefined)
+  service = { request: async () => 'rejected' }
+  assert.equal(policyOf(agent), undefined, 'a service with no overrideOf')
+  service = { overrideOf: () => 'never' }
+  assert.equal(policyOf({ id: 'x', options: {} } as GateAgent), undefined, 'an agent with no session')
+  assert.ok(asked.length >= 7 && asked.every(name => name === 'approval'), 'looked up on each call')
+})
+
 // --- what is asked ----------------------------------------------------------------------------------
 
 test('the questions are the spec\'s, word for word', () => {
@@ -609,7 +844,21 @@ test('the questions are the spec\'s, word for word', () => {
       other: null,
     },
   })
-  assert.deepEqual(SERVES_TASK_QUESTION, { type: 'noul', instructions: 'Is running `command` a reasonable step toward `task`?' })
+  assert.deepEqual(SERVES_TASK_QUESTION, {
+    type: 'noul',
+    instructions: 'Is running `command` a reasonable step toward the user\'s latest request in `task`? Read it with the earlier messages there as context: an earlier request doesn\'t rule out what a later one asks for.',
+  })
+  // A child's task is unlabelled, a brief of several paragraphs and its parent's latest instruction: its question is as it was.
+  assert.deepEqual(CHILD_SERVES_TASK_QUESTION, { type: 'noul', instructions: 'Is running `command` a reasonable step toward `task`?' })
+})
+
+test('a main agent is asked about its latest request, and a child about its task, as before', async () => {
+  const { gate, judge } = gateOf(() => answers(READ_ONLY, 0.9))
+  await run(gate)
+  await run(gate, { agent: agentOf({ child: true, cwd: '/w', events: [userEvent(1, 'add a test')] }) })
+  assert.equal(judge.requests[0]!.questions.serves_task, SERVES_TASK_QUESTION)
+  assert.equal(judge.requests[1]!.questions.serves_task, CHILD_SERVES_TASK_QUESTION)
+  assert.equal(judge.requests[1]!.questions.effect, EFFECT_QUESTION, 'the effect question is the same for both')
 })
 
 test('one call to the judge, for the command purpose, with both questions, the log fields and the call\'s own signal', async () => {
@@ -749,10 +998,60 @@ const FIX_ROUND = 'Fix round. A reviewer checked the blog against the spec and f
 /** A lone surrogate, high or low: what a cut through the middle of an emoji leaves. */
 const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/
 
+/** The labels of a main agent's task with more than one prompt (nsl-session decision 3), word for word. */
+const EARLIER = 'Earlier in this chat:'
+const LATEST = 'Your user\'s latest request:'
+
+/** A main agent's task with more than one prompt: the earlier parts (the first, a gap line, the ones kept) and the newest, labelled. */
+function labelled(earlier: readonly string[], latest: string): string {
+  return [EARLIER, ...earlier, LATEST, latest].join('\n\n')
+}
+
 test('the task\'s limits: 4000 characters a message, 1000 for one between the first and the newest, 8000 in all', () => {
   assert.equal(MAX_PART_CHARS, 4000)
   assert.equal(MAX_MIDDLE_CHARS, 1000)
   assert.equal(MAX_TASK_CHARS, 8000)
+})
+
+test('a main agent\'s task with one prompt is that prompt alone, with no labels', () => {
+  assert.equal(taskOf(agentOf({ events: [userEvent(1, 'do a read-only review of the documentation site')] }), true), 'do a read-only review of the documentation site')
+  // A resend is one prompt, so it has no labels either.
+  assert.equal(taskOf(agentOf({ events: [userEvent(1, 'hello!'), otherEvent(2), userEvent(3, 'hello!')] }), true), 'hello!')
+})
+
+test('a main agent\'s task with more prompts labels the earlier ones and the latest request: the nsl session', () => {
+  const review = 'do a read-only review of the documentation site'
+  const update = 'bring https://github.com/frostyard/nsl/pull/50 up to date with main'
+  const events = [userEvent(1, review), otherEvent(2), userEvent(3, update)]
+  assert.equal(taskOf(agentOf({ events }), true), `Earlier in this chat:\n\n${review}\n\nYour user's latest request:\n\n${update}`)
+  // Three: the first and the one between are both earlier, oldest first.
+  const three = [...events, otherEvent(4), userEvent(5, 'and merge it when it passes')]
+  assert.equal(taskOf(agentOf({ events: three }), true), `Earlier in this chat:\n\n${review}\n\n${update}\n\nYour user's latest request:\n\nand merge it when it passes`)
+  // A resend of the latest is counted once: it is the latest request, and not an earlier one too.
+  const resent = [...events, otherEvent(4), userEvent(5, update)]
+  assert.equal(taskOf(agentOf({ events: resent }), true), labelled([review], update))
+  // A child's task has no labels, whatever it is made of.
+  const child = taskOf(agentOf({ child: true, events: [userEvent(1, 'the brief'), agentMessage(2, 'main-1', FIX_ROUND)] }), false)
+  assert.equal(child, `the brief\n\n${FIX_ROUND}`)
+})
+
+test('the labels count toward the 8000 characters: a middle prompt that fits only without them is left out', () => {
+  // With the labels: 21 + 2 + 4000 + 2 + 1000 + 2 + 27 + 2 + newest = 5056 + newest.
+  const first = 'f'.repeat(MAX_PART_CHARS)
+  const middle = 'm'.repeat(MAX_MIDDLE_CHARS)
+  const fits = 'n'.repeat(MAX_TASK_CHARS - 5_056)
+  const exact = taskOf(agentOf({ events: [userEvent(1, first), userEvent(2, middle), userEvent(3, fits)] }), true)
+  assert.equal(exact, labelled([first, middle], fits))
+  assert.equal(exact.length, MAX_TASK_CHARS)
+  // One character more and it doesn't fit, though the task without labels would have come to 7,949.
+  const over = `${fits}n`
+  const gapped = taskOf(agentOf({ events: [userEvent(1, first), userEvent(2, middle), userEvent(3, over)] }), true)
+  assert.equal(gapped, labelled([first, '[… 1 earlier message left out]'], over))
+  assert.ok([first, middle, over].join('\n\n').length <= MAX_TASK_CHARS)
+  // Two in the middle, where only the newer fits with the labels.
+  const two = taskOf(agentOf({ events: [userEvent(1, first), userEvent(2, `${middle}-older`), userEvent(3, middle), userEvent(4, 'n'.repeat(1_950))] }), true)
+  assert.equal(two, labelled([first, '[… 1 earlier message left out]', middle], 'n'.repeat(1_950)))
+  assert.ok(two.length <= MAX_TASK_CHARS)
 })
 
 test('a top-level agent\'s task is its prompts, a resend once, and nothing a child or dsh put in: the session where the site URL came last', () => {
@@ -774,7 +1073,7 @@ test('a top-level agent\'s task is its prompts, a resend once, and nothing a chi
     otherEvent(12),
   ]
   const task = taskOf(agentOf({ events }), true)
-  assert.equal(task, ['hello!', request, 'yes write it up', url].join('\n\n'))
+  assert.equal(task, labelled(['hello!', request, 'yes write it up'], url))
   assert.doesNotMatch(task, /research summary|Subagent|Current time|Goal continuation|file changed|left out/)
 })
 
@@ -786,7 +1085,7 @@ test('a long chat keeps the first prompt, marks the gap, and fills the rest of t
   const task = taskOf(agentOf({ events }), true)
   // The ones between are cut to 1000 characters each; the first and the newest keep theirs.
   const between = (n: number) => clipMiddle(later(n), MAX_MIDDLE_CHARS)
-  assert.equal(task, [first, '[… 15 earlier messages left out]', between(17), between(18), between(19), later(20)].join('\n\n'))
+  assert.equal(task, labelled([first, '[… 15 earlier messages left out]', between(17), between(18), between(19)], later(20)))
   assert.equal(task.includes('p16 '), false)
   assert.ok(task.length <= MAX_TASK_CHARS, `${task.length} characters`)
 })
@@ -799,7 +1098,7 @@ test('long pastes after the request don\'t push it out: a trivial first prompt, 
   assert.ok(first.length >= 5_000 && second.length >= 5_000)
   const events = [userEvent(1, 'hello!'), otherEvent(2), userEvent(3, request), otherEvent(4), userEvent(5, first), otherEvent(6), userEvent(7, second)]
   const task = taskOf(agentOf({ events }), true)
-  assert.equal(task, ['hello!', request, clipMiddle(first, MAX_MIDDLE_CHARS), clipMiddle(second, MAX_PART_CHARS)].join('\n\n'))
+  assert.equal(task, labelled(['hello!', request, clipMiddle(first, MAX_MIDDLE_CHARS)], clipMiddle(second, MAX_PART_CHARS)))
   assert.ok(task.includes('Create a blog app for me using Astro'))
   assert.doesNotMatch(task, /left out/)
 })
@@ -808,14 +1107,14 @@ test('the first and the newest prompt are always in, each clipped in the middle,
   const one = `ONE-${'x'.repeat(9_992)}-ONE`
   const two = `TWO-${'y'.repeat(9_992)}-TWO`
   const task = taskOf(agentOf({ events: [userEvent(1, one), userEvent(2, two)] }), true)
-  assert.equal(task, `${clipMiddle(one, MAX_PART_CHARS)}\n\n${clipMiddle(two, MAX_PART_CHARS)}`)
-  assert.equal(task.length, 2 * MAX_PART_CHARS + 2)
-  assert.ok(task.startsWith('ONE-') && task.includes('-ONE\n\nTWO-') && task.endsWith('-TWO'))
+  assert.equal(task, labelled([clipMiddle(one, MAX_PART_CHARS)], clipMiddle(two, MAX_PART_CHARS)))
+  assert.equal(task.length, 2 * MAX_PART_CHARS + EARLIER.length + LATEST.length + 3 * 2)
+  assert.ok(task.startsWith(`${EARLIER}\n\nONE-`) && task.includes(`-ONE\n\n${LATEST}\n\nTWO-`) && task.endsWith('-TWO'))
   assert.doesNotMatch(task, /left out/)
   // One between them that doesn't fit is left out, and the gap says so.
   const three = `THREE-${'z'.repeat(9_988)}-THREE`
   const gapped = taskOf(agentOf({ events: [userEvent(1, one), userEvent(2, three), userEvent(3, two)] }), true)
-  assert.equal(gapped, [clipMiddle(one, MAX_PART_CHARS), '[… 1 earlier message left out]', clipMiddle(two, MAX_PART_CHARS)].join('\n\n'))
+  assert.equal(gapped, labelled([clipMiddle(one, MAX_PART_CHARS), '[… 1 earlier message left out]'], clipMiddle(two, MAX_PART_CHARS)))
 })
 
 test('clipMiddle keeps a message\'s head and tail, takes out its middle, and splits no surrogate pair', () => {
@@ -911,7 +1210,7 @@ test('a private key whose header falls in a cut is masked before the cut: its EN
     assert.doesNotMatch(task, /‹secret:/, `${where}: no mask the client would read as a private key's`)
     assert.ok(task.includes(prose(400)), `${where}: the prose before the key is still there`)
   }
-  assert.equal(tasks['a middle prompt'], ['hello!', `${prose(700)}\n[a private key, left out]`, 'yes write it up'].join('\n\n'))
+  assert.equal(tasks['a middle prompt'], labelled(['hello!', `${prose(700)}\n[a private key, left out]`], 'yes write it up'))
 })
 
 test('a token that a cut goes through is masked before the cut, so none of it reaches the task', () => {
@@ -1138,6 +1437,8 @@ interface WorldOptions {
   workspaceRoot?: string
   /** Hold every approval request until `release()`, which a test calls. */
   holdApproval?: Promise<void>
+  /** More of the approval service than `request`: its `overrideOf` and `config`, which say a session's policy. */
+  approvalService?: Record<string, unknown>
 }
 
 /** A real tool registry with the gate mounted by `registerCommandGate`, and stubs of the services around it, as siblings. */
@@ -1156,6 +1457,7 @@ async function world(options: WorldOptions = {}) {
   const seenByApproval: Array<ReturnType<VerdictCache['get']>> = []
   let cache!: VerdictCache
   await provideStub(ctx, 'approval', {
+    ...options.approvalService,
     async request(request: ApprovalRequest): Promise<ApprovalOutcome> {
       approvals.push(request)
       await options.holdApproval
@@ -1243,6 +1545,54 @@ test('through the registry: with no judge service the main agent is asked and a 
   assert.equal(child.isError, true)
   assert.match(textOf(child), /the judge is unavailable; nothing ran/)
   assert.equal(w.ran.length, 0)
+})
+
+test('through the registry: the main agent\'s policy is the approval service\'s, its own override else the default, and under never the gate decides alone', async () => {
+  const cases: Array<[string | undefined, string | undefined, 'ask' | 'never']> = [
+    ['never', 'ask', 'never'],
+    [undefined, 'never', 'never'],
+    ['ask', 'never', 'ask'],
+    [undefined, 'ask', 'ask'],
+    [undefined, undefined, 'ask'],
+  ]
+  for (const [override, byDefault, expected] of cases) {
+    const sessions: unknown[] = []
+    const approvalService = { overrideOf: (session: unknown) => { sessions.push(session); return override }, config: byDefault === undefined ? {} : { policy: byDefault } }
+    const w = await world({ script: request => String(request.subject).startsWith('git push') ? answers(IRREVERSIBLE, 0.91) : answers(REVERSIBLE, 0.12), approvalService })
+    const main = agentOf({ cwd: '/work/app', events: [userEvent(1, 'fix the failing test in parser.ts')] })
+    const push = await w.call('bash', BASH('git push'), main)
+    const offTask = await w.call('bash', BASH('touch notes.txt'), main)
+    const name = `${String(override)} over ${String(byDefault)}`
+    assert.equal(sessions[0], main.session, name)
+    assert.equal(push.isError, true, name)
+    if (expected === 'never') {
+      assert.equal(textOf(push), `Error: The judge didn't let this run: it reads as irreversible (p 0.87). ${NOBODY_TO_ASK}`, name)
+      assert.equal(offTask.isError, false, name)
+      assert.deepEqual(w.ran.map(args => args.command), ['touch notes.txt'], name)
+      // A wider sandbox can't be had at never: refused before the judge is asked, and before dsh's own rejection.
+      const asked = w.judge.requests.length
+      const wider = await w.call('bash', BASH('npm install', { sandbox_permissions: 'danger-full-access', justification: 'the network' }), main)
+      assert.equal(wider.isError, true, name)
+      assert.equal(textOf(wider), `Error: ${WIDER_ALONE('danger-full-access')}`, name)
+      assert.equal(w.judge.requests.length, asked, `${name}: the judge is not asked`)
+      assert.deepEqual(w.ran.map(args => args.command), ['touch notes.txt'], name)
+      assert.equal(w.approvals.length, 0, `${name}: nobody is asked`)
+    } else {
+      assert.deepEqual(w.approvals.map(request => request.displayReason?.en), [
+        'The judge reads this as irreversible (p 0.87), and as serving the task (p 0.91).',
+        'The judge reads this as reversible (p 0.96), and as unlikely to serve the task (p 0.12).',
+      ], name)
+      assert.deepEqual(w.ran, [], name)
+    }
+    // A child's calls are as they were, whatever its parent's or its own policy says.
+    const child = await w.call('bash', BASH('touch notes.txt'), agentOf({ child: true, cwd: '/work/app', events: [userEvent(1, 'add a test')] }))
+    assert.equal(child.isError, true, name)
+    assert.match(textOf(child), /it doesn't look like it serves the task \(p 0\.12\)\. Report it to the main agent instead/, name)
+  }
+  // A service whose override can't be read is ask.
+  const broken = await world({ script: () => answers(IRREVERSIBLE, 0.91), approvalService: { overrideOf: () => { throw new Error('no log') }, config: { policy: 'never' } } })
+  await broken.call('bash', BASH('git push'))
+  assert.equal(broken.approvals.length, 1)
 })
 
 test('through the registry: when the plugin that registered the gate goes, the gate goes with it', async () => {
@@ -1657,7 +2007,7 @@ test('the gate sends the task: a child\'s brief with its fix round, and a main a
   await run(gate, { agent: agentOf({ child: true, cwd: '/w', events: child }), args: { command: 'git commit -am "fix: review findings"', description: 'x' } })
   await run(gate, { agent: agentOf({ cwd: '/w', events: main }) })
   assert.equal(stateOf(judge.requests[0]!).task, `the brief: write tests for parser.ts\n\n${FIX_ROUND}`)
-  assert.equal(stateOf(judge.requests[1]!).task, 'the first request: build a blog\n\na later nudge\n\nand the latest')
+  assert.equal(stateOf(judge.requests[1]!).task, 'Earlier in this chat:\n\nthe first request: build a blog\n\na later nudge\n\nYour user\'s latest request:\n\nand the latest')
 })
 
 // --- through the plugin's own wiring -----------------------------------------------------------------------
@@ -1773,7 +2123,8 @@ test('a private key in the first prompt, which is always in the task, does not m
   assert.equal(p.jev.requests.length, 3, 'each command went to the judge, and none was refused as opaque')
   for (const request of p.jev.requests) {
     const task: string = request.json.state.task
-    assert.match(task, /^Use this deploy key for the server:\n\[a private key, left out\]\nand set up the blog\./)
+    // The main agent's task opens with the label for the earlier prompts; the child's, with its brief.
+    assert.match(task, /^(Earlier in this chat:\n\n)?Use this deploy key for the server:\n\[a private key, left out\]\nand set up the blog\./)
     assert.doesNotMatch(request.text, /PRIVATE KEY|ghp_|‹secret: a private key›/)
     assert.equal(leaks(request.text, PEM_BODY), false, 'the key\'s base64 was sent')
     assert.equal(leaks(request.text, GH_TOKEN.slice(4)), false, 'the token was sent')

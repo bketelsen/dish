@@ -8,12 +8,17 @@
  *   `run_code`. `ask_judge` is the judge's own tool and gating it would only slow the question down; `run_code` is PTC's
  *   transport, whose inner calls (`bash`, `pwsh`) each come through here by themselves, with `exec.parent` set.
  * - **One question, two answers.** The state (`command`, `cwd`, `workspace`, `escalation`, `task`) and the two questions
- *   (`effect`, `serves_task`) are the spec's, as constants below. The answers become a verdict by the spec's table: allow,
- *   ask you (the main agent), or deny (a crew child). A judge that is unavailable in any way, that gives answers the gate
- *   can't read, or whose `decide` hook did not come back, is **unavailable**, and unavailable asks you or denies a child.
- *   Nothing here lets a command run on a failure. A command with what looks like a private key in it is not sent (the client's
- *   `opaque` flag on its refusal): it asks you or denies a child the same way, but the words say what is so, not that the judge
- *   is unavailable.
+ *   (`effect`, `serves_task`) are the spec's, as constants below; a main agent's `serves_task` names its latest request, and a
+ *   child's is the question as it was. The answers become a verdict by the spec's table: allow, ask you (the main agent), or
+ *   deny (a crew child). A judge that is unavailable in any way, that gives answers the gate can't read, or whose `decide` hook
+ *   did not come back, is **unavailable**, and unavailable asks you or denies a child. Nothing here lets a command run on a
+ *   failure. A command with what looks like a private key in it is not sent (the client's `opaque` flag on its refusal): it asks
+ *   you or denies a child the same way, but the words say what is so, not that the judge is unavailable.
+ * - **A main agent at approval policy `never` is never asked** (`decideCommand`): dsh would reject the ask unseen. The gate
+ *   reads the policy on each call from the approval service (`approvalPolicyFrom`), as the approval answerer reads a parent's,
+ *   and `ask` when it can't. At `never` the judge decides alone: what passes the effect bar runs, and the rest, an unavailable
+ *   judge and an opaque command are refused, with words that say there is no one to ask. A call that asks for a wider sandbox
+ *   (`escalation`) is refused before the judge is asked: dsh's approval service would reject the escalation itself.
  * - **No log of its own.** The client writes one line for each call it makes. The gate passes `decide`, which gives that
  *   line the verdict (`allow`, `ask` or `deny`), and `tool`, `callId` and `subject` (the command), so there is one line per
  *   decision. The client masks the TypeSafe key in the line, and the decision log (`log.ts`) masks secrets when it writes it.
@@ -61,7 +66,9 @@
  *     the newest are always in, cut to `MAX_PART_CHARS`. The first is often the request, and the newest what was said since
  *     ("site URL will be …"). The ones between are cut to `MAX_MIDDLE_CHARS`, so that more of them fit: in the friction
  *     session the first prompt was "hello!" and the request came second, where two long pastes after it would otherwise
- *     have pushed it out.
+ *     have pushed it out. With more than one prompt, `Earlier in this chat:` goes above the earlier ones and `Your user's
+ *     latest request:` above the newest, which is the request (the nsl session's first prompt asked for a read-only review,
+ *     and a commit for its later request was judged against it); with one, the task is that prompt alone.
  *   - **A child's** task comes from its own events, which `session.inheritedEventCount` says where they start (a forked
  *     child's log begins with its parent's). The brief is the text blocks of its first prompt before the note about how to
  *     report, joined (`briefOf`): the task, a bound coder's worktree block and a reviewer's ruling, but not crew's closing
@@ -90,6 +97,7 @@ import { createHash } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
+import type { ApprovalPolicy, ApprovalService } from '@deepseek-ai/dsh-user-approval'
 import { isTopLevelAgent, leftOut, maskSecrets, RETURN_NOTE_LEAD } from 'dish-kit'
 import type { Decision, Judge, JudgeAgent, JudgeResult, JsonValue, Question } from './client.ts'
 import { ASK_JUDGE_TOOL } from './ask.ts'
@@ -120,8 +128,24 @@ export const EFFECT_WITH_ESCALATION_QUESTION: Question = {
   instructions: 'What would running `command` from `cwd`, with the extra access requested in `escalation`, do to files, systems and data?',
 }
 
-/** Whether the command belongs to the task. */
+/**
+ * Whether the command belongs to the task, for a top-level agent: the newest prompt is the request, and the ones before it are
+ * context (`topLevelTask` labels them). In the nsl session the first prompt asked for a read-only review and a later one for a
+ * merge, and "a reasonable step toward `task`" read the merge against the first. With one prompt the task has no labels, and
+ * that prompt is the latest request.
+ */
 export const SERVES_TASK_QUESTION: Question = {
+  type: 'noul',
+  instructions: 'Is running `command` a reasonable step toward the user\'s latest request in `task`? Read it with the earlier messages there as context: an earlier request doesn\'t rule out what a later one asks for.',
+}
+
+/**
+ * Whether the command belongs to the task, for a crew child: the question as it was. A child's task is its brief and its parent's
+ * latest instruction, with no labels, and the brief is often several paragraphs joined by blank lines (a bound coder's worktree
+ * block, a reviewer's ruling). "The user's latest request" would name neither its writer (the parent) nor where it starts, and
+ * could be read as the brief's last paragraph, which is how coders were refused their commits before the friction fixes.
+ */
+export const CHILD_SERVES_TASK_QUESTION: Question = {
   type: 'noul',
   instructions: 'Is running `command` a reasonable step toward `task`?',
 }
@@ -134,9 +158,9 @@ export const MAX_PART_CHARS = 4000
  */
 export const MAX_MIDDLE_CHARS = 1000
 /**
- * The task is kept within this many characters; the first and the newest message are always in. What it bounds is the
- * messages between those two: the two alone can come to `2 * MAX_PART_CHARS`, plus a separator, and a gap line and its
- * separator when some were left out.
+ * The task is kept within this many characters, its labels and separators counted; the first and the newest message are always
+ * in. What it bounds is the messages between those two: the two alone can come to `2 * MAX_PART_CHARS`, plus the two labels,
+ * their separators, and a gap line and its separator when some were left out.
  */
 export const MAX_TASK_CHARS = 8000
 /** A justification is cut to this many characters. */
@@ -170,6 +194,22 @@ const UNAVAILABLE_DENY = 'The command was refused because the judge is unavailab
  */
 const OPAQUE_ASK = 'The command needs your approval: it holds what looks like a private key, which isn\'t sent to the judge, so the judge couldn\'t read it.'
 const OPAQUE_DENY = 'The command was refused: it holds what looks like a private key, which isn\'t sent to the judge; nothing ran. Report it to the main agent instead, or leave the key out.'
+
+/**
+ * How a refusal ends for a main agent whose approval policy is `never`: an ask would be rejected by dsh at once, unseen, and dsh
+ * tells the agent "the user rejected" it (the nsl session), so the gate refuses instead, and says why and who can change it.
+ */
+const NOBODY_TO_ASK = 'This chat\'s approval policy is never, so there\'s no one to ask: tell your user, who can run it or set the policy back to ask.'
+const UNAVAILABLE_ALONE = `The command was refused because the judge is unavailable; nothing ran. ${NOBODY_TO_ASK}`
+const OPAQUE_ALONE = `The command was refused: it holds what looks like a private key, which isn't sent to the judge; nothing ran. ${NOBODY_TO_ASK}`
+
+/**
+ * For a main agent at `never` whose call asks for a wider sandbox (`mode`, the call's `sandbox_permissions`): dsh's tool asks the
+ * approval service for it, which rejects it unseen and tells the agent that the user did. So the gate refuses it first, without
+ * asking the judge, and says so.
+ */
+const widerAlone = (mode: string): string =>
+  `The command asks for a wider sandbox (\`${mode}\`), which needs your user's approval, and this chat's approval policy is never, so there's no one to ask: nothing ran. Tell your user, who can run it or set the policy back to ask.`
 
 const p2 = (probability: number): string => probability.toFixed(2)
 
@@ -537,11 +577,20 @@ function taskPart(text: string, max: number): string {
   return clipMiddle(maskSecrets(text).replace(SECRET_MASK, (_mask, kind: string) => leftOut(kind)), max)
 }
 
+/** Above a main agent's earlier prompts in its task, when it has more than one. */
+const EARLIER_LABEL = 'Earlier in this chat:'
+/** Above a main agent's newest prompt in its task, when it has more than one: the request the judge reads the command against. */
+const LATEST_LABEL = 'Your user\'s latest request:'
+
 /**
  * A top-level agent's task: its prompts, oldest first, a resend (one equal to the one before it) once. The first and the newest
  * are always in, each cut to `MAX_PART_CHARS`; the ones between are cut to `MAX_MIDDLE_CHARS` and added newest first while
  * the whole stays within `MAX_TASK_CHARS`, and a gap line stands for those left out. Only the messages it looks at are
  * masked (`taskPart`): those it keeps, and the one that didn't fit, not the whole of a long chat on every command.
+ *
+ * With one prompt, the task is that prompt. With more, the newest is the request and the rest are context (nsl-session
+ * decision 3): `EARLIER_LABEL` goes above the earlier ones and `LATEST_LABEL` above the newest, each as a part of its own, and
+ * both count toward `MAX_TASK_CHARS`.
  */
 function topLevelTask(events: Iterable<unknown>): string {
   const texts: string[] = []
@@ -557,21 +606,23 @@ function topLevelTask(events: Iterable<unknown>): string {
   const first = taskPart(texts[0]!, MAX_PART_CHARS)
   if (newest === 0) return first
   const last = taskPart(texts[newest]!, MAX_PART_CHARS)
+  // What always goes in: the first, under its label, and the newest, under its own.
+  const head = EARLIER_LABEL.length + SEPARATOR.length + first.length
   // The ones kept between the first and the newest, newest first; `from` is the oldest of them (or the newest, with none), and
-  // `kept` the length of those from it to the newest, joined.
+  // `kept` the length of those from it to the newest, joined, the newest's label included.
   const between: string[] = []
   let from = newest
-  let kept = last.length
+  let kept = LATEST_LABEL.length + SEPARATOR.length + last.length
   for (let index = newest - 1; index >= 1; index--) {
     const part = taskPart(texts[index]!, MAX_MIDDLE_CHARS)
     const withIt = part.length + SEPARATOR.length + kept
     const gap = index > 1 ? gapLine(index - 1).length + SEPARATOR.length : 0
-    if (first.length + SEPARATOR.length + gap + withIt > MAX_TASK_CHARS) break
+    if (head + SEPARATOR.length + gap + withIt > MAX_TASK_CHARS) break
     between.push(part)
     from = index
     kept = withIt
   }
-  return [first, ...from > 1 ? [gapLine(from - 1)] : [], ...between.reverse(), last].join(SEPARATOR)
+  return [EARLIER_LABEL, first, ...from > 1 ? [gapLine(from - 1)] : [], ...between.reverse(), LATEST_LABEL, last].join(SEPARATOR)
 }
 
 /**
@@ -678,6 +729,34 @@ export function sandboxModeFrom(ctx: Context): SandboxMode {
   return agent => given(resolvedPolicy(ctx, agent)?.mode)
 }
 
+/**
+ * The approval policy in effect for an agent's session (`ask` or `never`), or `undefined` if it can't be read. Only a top-level
+ * agent's is read: a child's is dsh's `never` pin, or the approval answerer's switch to `ask`, and says nothing about whom the
+ * gate may ask (it never asks about a child's call).
+ */
+export type ApprovalPolicyOf = (agent: GateAgent) => ApprovalPolicy | undefined
+
+/** What the gate reads of dsh's approval service: a session's override, and the deployment's default. */
+type ApprovalPolicies = Pick<ApprovalService, 'overrideOf'> & { readonly config?: { readonly policy?: ApprovalPolicy } }
+
+/**
+ * `ApprovalPolicyOf` over `ctx.get('approval')`, looked up on every call (the service is a sibling's): the session's own override,
+ * else the deployment's default, else `ask`, as the approval answerer reads a parent's (`parentPolicyOf` in `answerer.ts`).
+ * `undefined` when there is no service, no session, or it throws. Never throws.
+ */
+export function approvalPolicyFrom(ctx: Context): ApprovalPolicyOf {
+  return (agent) => {
+    try {
+      const approval = (ctx as unknown as { get(name: string): unknown }).get('approval') as ApprovalPolicies | undefined
+      const session = agent.session
+      if (approval === undefined || approval === null || typeof approval.overrideOf !== 'function' || session === undefined || session === null) return undefined
+      return approval.overrideOf(session as unknown as Parameters<ApprovalPolicies['overrideOf']>[0]) ?? approval.config?.policy ?? 'ask'
+    } catch {
+      return undefined
+    }
+  }
+}
+
 /** Whether `name` is one of `patterns`: a plain entry must match exactly, an entry ending in `*` is a prefix. */
 export function isGated(name: string, patterns: readonly string[]): boolean {
   if (NEVER_GATED.has(name)) return false
@@ -692,15 +771,27 @@ interface Outcome extends Decision {
   pre: PreToolDecision
 }
 
-/** Ask the main agent's user, or refuse a child: with `reason` for the one, and `denial` for the other. */
-function notLetThrough(topLevel: boolean, reason: string, denial: string): Outcome {
-  return topLevel
-    ? { decision: 'ask', pre: { kind: 'ask', reason, displayReason: { en: reason } } }
-    : { decision: 'deny', pre: { kind: 'deny', reason: denial } }
+/**
+ * Whom a command that isn't let through is answered for: `you`, a top-level agent's user, who is asked; `alone`, a top-level
+ * agent whose approval policy is `never`, so nobody would see an ask and the gate refuses it itself; or a crew `child`, refused.
+ */
+type Stance = 'you' | 'alone' | 'child'
+
+function stanceOf(topLevel: boolean, policy: ApprovalPolicy): Stance {
+  return !topLevel ? 'child' : policy === 'never' ? 'alone' : 'you'
 }
 
-function unavailable(topLevel: boolean): Outcome {
-  return notLetThrough(topLevel, UNAVAILABLE_ASK, UNAVAILABLE_DENY)
+const deny = (reason: string): Outcome => ({ decision: 'deny', pre: { kind: 'deny', reason } })
+
+/** Ask the main agent's user, or refuse: with `reason` for the user, `alone` for a main agent at `never`, and `denial` for a child. */
+function notLetThrough(stance: Stance, words: { reason: string, alone: string, denial: string }): Outcome {
+  if (stance === 'child') return deny(words.denial)
+  if (stance === 'alone') return deny(words.alone)
+  return { decision: 'ask', pre: { kind: 'ask', reason: words.reason, displayReason: { en: words.reason } } }
+}
+
+function unavailable(stance: Stance): Outcome {
+  return notLetThrough(stance, { reason: UNAVAILABLE_ASK, alone: UNAVAILABLE_ALONE, denial: UNAVAILABLE_DENY })
 }
 
 /** The numbers the table reads, from the checked answers; `undefined` if they are not what was asked for. */
@@ -719,20 +810,27 @@ function readings(result: JudgeResult): { choice: string, probabilities: Record<
  * `irreversible` (the spec says it for the second row; both rows say it here, which only matters with a `readOnly` set
  * below one half). Anything else is not let through: the main agent is asked, with the judge's reading, and a child is
  * refused, with the reading, written for the model.
+ *
+ * **A main agent whose approval policy is `never`** (nsl-session decision 4) is never asked: dsh would reject the ask before
+ * anyone saw it, and tell the agent that the user had. So the judge decides alone. What passes the effect bar (the first row, or
+ * read-only and reversible together at `reversible`, the likeliest reading not `irreversible`) runs, whatever `serves_task`
+ * says; the rest, an unavailable judge, and a command it couldn't read are refused, with words that say there is no one to ask.
+ * A child is decided the same under either policy. `policy` is the agent's effective one, `ask` when it can't be read.
  */
-export function decideCommand(result: JudgeResult, settings: JudgeSettings, topLevel: boolean): Outcome {
+export function decideCommand(result: JudgeResult, settings: JudgeSettings, topLevel: boolean, policy: ApprovalPolicy = 'ask'): Outcome {
+  const stance = stanceOf(topLevel, policy)
   // The client's own flag, not its message: a request that holds a private key was refused, and the judge could not read it. It
   // is asked or refused like an unavailable judge, but not called one.
-  if (!result.ok && result.reason === 'invalid' && result.opaque === true) return notLetThrough(topLevel, OPAQUE_ASK, OPAQUE_DENY)
+  if (!result.ok && result.reason === 'invalid' && result.opaque === true) return notLetThrough(stance, { reason: OPAQUE_ASK, alone: OPAQUE_ALONE, denial: OPAQUE_DENY })
   const seen = readings(result)
-  if (seen === undefined) return unavailable(topLevel)
+  if (seen === undefined) return unavailable(stance)
   const { readOnly, reversible, servesTask } = settings.commands
   const pRead = seen.probabilities.read_only ?? 0
   const pReversible = seen.probabilities.reversible ?? 0
   const serves = seen.serves + EPSILON >= servesTask
   const readsOnly = seen.choice !== 'irreversible' && pRead + EPSILON >= readOnly
   const effectOk = readsOnly || (seen.choice !== 'irreversible' && pRead + pReversible + EPSILON >= reversible)
-  if (readsOnly || (serves && effectOk)) return { decision: 'allow', pre: { kind: 'allow' } }
+  if (readsOnly || (effectOk && (serves || stance === 'alone'))) return { decision: 'allow', pre: { kind: 'allow' } }
 
   const label = EFFECT_WORDS[seen.choice] ?? seen.choice
   const chosen = p2(seen.probabilities[seen.choice] ?? 0)
@@ -741,17 +839,20 @@ export function decideCommand(result: JudgeResult, settings: JudgeSettings, topL
   // give the sum instead.
   const unsure = !effectOk && seen.choice !== 'irreversible'
   const undoable = `p ${p2(pRead + pReversible)} that it only reads or can be undone`
-  if (topLevel) {
+  if (stance === 'you') {
     const effect = unsure ? `isn't sure this can be undone (${undoable})` : `reads this as ${label} (p ${chosen})`
     const task = serves ? `as serving the task (p ${p2(seen.serves)})` : `as unlikely to serve the task (p ${p2(seen.serves)})`
     const reason = unsure ? `The judge ${effect}, and reads it ${task}.` : `The judge ${effect}, and ${task}.`
     return { decision: 'ask', pre: { kind: 'ask', reason, displayReason: { en: reason } } }
   }
+  const effectCause = unsure ? `it may not be undoable (${undoable})` : `it reads as ${label} (p ${chosen})`
+  // Alone, only the effect stops a command (whatever passes it ran, above), so the effect is the one cause.
+  if (stance === 'alone') return deny(`The judge didn't let this run: ${effectCause}. ${NOBODY_TO_ASK}`)
   const causes: string[] = []
-  if (!effectOk) causes.push(unsure ? `it may not be undoable (${undoable})` : `it reads as ${label} (p ${chosen})`)
+  if (!effectOk) causes.push(effectCause)
   if (!serves) causes.push(`it doesn't look like it serves the task (p ${p2(seen.serves)})`)
   const way = !effectOk && !serves ? 'a reversible way that serves the task' : !effectOk ? 'a reversible way' : 'a step that serves the task'
-  return { decision: 'deny', pre: { kind: 'deny', reason: `The judge didn't let this run: ${causes.join(', and ')}. Report it to the main agent instead, or find ${way}.` } }
+  return deny(`The judge didn't let this run: ${causes.join(', and ')}. Report it to the main agent instead, or find ${way}.`)
 }
 
 const STRICTNESS: Readonly<Record<PreToolDecision['kind'], number>> = { allow: 0, ask: 1, deny: 2, cancel: 3 }
@@ -779,6 +880,12 @@ export interface CommandGateDeps {
    * or when it says nothing, every escalation the call names is taken to be asked for.
    */
   sandboxMode?: SandboxMode
+  /**
+   * The approval policy of a top-level agent, read on each of its calls: at `never` the gate decides alone (`decideCommand`).
+   * Without it, when it says nothing or anything but `never`, or when it throws, the policy is `ask`, and the gate asks as it
+   * always has. Never read for a child.
+   */
+  approvalPolicy?: ApprovalPolicyOf
   /** Where verdicts are kept. */
   cache: VerdictCache
 }
@@ -830,16 +937,28 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
       // No workspace root to be had: the cwd stands in, as it does without a sandbox policy.
     }
     workspace ??= cwd
+    // A top-level agent's approval policy, now: at `never` nobody would see an ask, and the judge decides alone.
+    let policy: ApprovalPolicy = 'ask'
+    try {
+      if (topLevel && deps.approvalPolicy?.(agent) === 'never') policy = 'never'
+    } catch {
+      // Not known: ask, as the gate always has.
+    }
 
     // Once per call: a call of this agent that comes through again, as it was, is not put to the judge again. The escalation
-    // dsh's tool will ask for is part of it, whole, since the gate's ask shows it.
+    // dsh's tool will ask for is part of it, whole, since the gate's ask shows it; and so is the policy, so that a decision made
+    // for one policy is not given under the other.
     const key = createHash('sha256')
-      .update(JSON.stringify([exec.name, command, cwd ?? null, escalation ?? null, escalationReason ?? null]))
+      .update(JSON.stringify([exec.name, command, cwd ?? null, escalation ?? null, escalationReason ?? null, policy]))
       .digest('hex')
     const known = deps.cache.get(owner, callId)
 
     let ours: PreToolDecision
-    if (known?.memo?.key === key) {
+    if (policy === 'never' && escalation !== undefined && permissions !== undefined) {
+      // A wider sandbox at never: dsh's approval service would reject the escalation, unseen, whatever the judge said, so no
+      // call is spent on it. (`escalation` is set only for a shell with `sandbox_permissions` other than the session's mode.)
+      ours = { kind: 'deny', reason: widerAlone(permissions) }
+    } else if (known?.memo?.key === key) {
       // Gated again, as it was: the same decision, and the entry is written afresh below. A yes you gave its earlier ask covers
       // nothing of this one, and the judge's cover is back, as it was the first time.
       ours = known.memo.decision
@@ -856,8 +975,12 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
         if (judge !== undefined) {
           const answered = await judge.ask<Outcome>({
             state,
-            // The spec's question, or, when a wider sandbox is asked for, the same with the escalation named in it.
-            questions: { effect: escalation === undefined ? EFFECT_QUESTION : EFFECT_WITH_ESCALATION_QUESTION, serves_task: SERVES_TASK_QUESTION },
+            // The spec's question, or, when a wider sandbox is asked for, the same with the escalation named in it; and a main
+            // agent is asked about its latest request, a child about its task.
+            questions: {
+              effect: escalation === undefined ? EFFECT_QUESTION : EFFECT_WITH_ESCALATION_QUESTION,
+              serves_task: topLevel ? SERVES_TASK_QUESTION : CHILD_SERVES_TASK_QUESTION,
+            },
             purpose: 'command',
             agent,
             signal: exec.signal,
@@ -865,7 +988,7 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
             callId,
             subject: command,
             // A call that was cancelled has no one to ask, so the line says it was cancelled, not asked or denied.
-            decide: result => exec.signal.aborted ? { decision: 'cancel', pre: { kind: 'cancel' } } : decideCommand(result, settings, topLevel),
+            decide: result => exec.signal.aborted ? { decision: 'cancel', pre: { kind: 'cancel' } } : decideCommand(result, settings, topLevel, policy),
           })
           outcome = answered.decided
         }
@@ -874,7 +997,7 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
       }
       // A call that was cancelled must not leave an approval prompt behind.
       if (exec.signal.aborted) return { kind: 'cancel' }
-      ours = (outcome ?? unavailable(topLevel)).pre
+      ours = (outcome ?? unavailable(stanceOf(topLevel, policy))).pre
       // The gate's own ask shows you the escalation the tool will ask for, so that your yes to it can cover that request too.
       if (ours.kind === 'ask' && asked !== undefined) ours = showingEscalation(ours, asked)
     }
@@ -906,9 +1029,9 @@ export function commandGate(deps: CommandGateDeps): CommandGate {
 
 /**
  * Register the gate on `ctx`, the host context: a prepended `tools/pre-execute` listener, and a `tools/result` listener that
- * forgets a call's verdict when it settles. The Jev client, the settings and the sandbox policy are looked up with `ctx.get`
- * on each call, so there is no order to keep between this and the plugins that provide them. Returns the cache, for the
- * approval answerer.
+ * forgets a call's verdict when it settles. The Jev client, the settings, the sandbox policy and the approval service are looked
+ * up with `ctx.get` on each call, so there is no order to keep between this and the plugins that provide them. Returns the
+ * cache, for the approval answerer.
  */
 export function registerCommandGate(ctx: Context): VerdictCache {
   const cache = new VerdictCache()
@@ -917,6 +1040,7 @@ export function registerCommandGate(ctx: Context): VerdictCache {
     settings: () => ctx.get('dishJudge')?.settings() ?? Promise.resolve(DEFAULT_SETTINGS),
     workspaceRoot: workspaceRootFrom(ctx),
     sandboxMode: sandboxModeFrom(ctx),
+    approvalPolicy: approvalPolicyFrom(ctx),
     cache,
   })
   ctx.on('tools/pre-execute', gate, { prepend: true })

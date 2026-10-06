@@ -1,9 +1,10 @@
 # dish-judge
 
 [TypeSafe's Jev](https://typesafe.ai), a fast typed judge, in front of the risky edges of every agent:
-- **A command gate.** Before a shell command runs, the judge reads it as read-only, reversible or irreversible, and asks whether it serves the agent's task.
+- **A command gate.** Before a shell command runs, the judge reads it as read-only, reversible or irreversible, and asks whether it serves the agent's task. For the main agent, that is your latest request, with your earlier messages as context.
   - Confident and safe commands run.
   - Anything else asks you (the main agent) or is refused (a crew child).
+  - In a chat whose approval policy is `never`, nobody would see an ask, so the judge decides alone: what's read-only or reversible enough runs, whether or not it serves the task, and the rest is refused with a reason that tells the agent to tell you. A command that asks for a wider sandbox is refused without asking the judge, since dsh would reject the escalation anyway.
 - **An approval answerer.** It answers dsh's approval requests for crew children, which can't wait on you. A child gets `allowed-once` only for an escalation the gate already judged for that call; everything else is refused.
 - **A result screen.** Web and MCP results, `pr_feedback`'s read of a pull request, and the browser tools' pages are checked for instructions aimed at an agent.
   - Clear injections are withheld and kept in the log for you.
@@ -62,7 +63,7 @@ Since 2026-10-03 ([bketelsen/dish#11](https://github.com/bketelsen/dish/pull/11)
 ## When the judge is unavailable
 
 No key, a timeout, an error from TypeSafe or a malformed answer all count as unavailable, and everything fails closed:
-- **Commands:** the main agent asks you, and a child is refused.
+- **Commands:** the main agent asks you, and a child is refused. In a chat at approval policy `never`, the main agent's are refused too.
 - **Results:** they pass through, marked "Not screened".
 - **`ask_judge`:** it returns an error telling the agent to continue without it.
 
