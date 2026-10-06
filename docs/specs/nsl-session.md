@@ -1,6 +1,6 @@
 # Spec: fixes from the nsl session (2026-10-05)
 
-Status: agreed 2026-10-06. The user took each recommendation below, as one pull request. It covers crew, the judge and the shipped prompts. There's no separate plan: the [tasks](#tasks) are short.
+Status: agreed and built 2026-10-06, on branch `nsl-fixes`, with a review of the whole branch, a fix round and a re-check ([Notes from the build](#notes-from-the-build)). The user took each recommendation below, as one pull request. It covers crew, the judge and the shipped prompts. There's no separate plan: the [tasks](#tasks) are short.
 
 ## What the session showed
 
@@ -61,3 +61,16 @@ Each task is one commit with tests, run through `pnpm typecheck && pnpm test`. N
    - `docs/specs/prompts.md`'s Defaults row for main.
 
 The controller adds the backlog row to `ROADMAP.md`, and after the merge updates `HANDOFF.md` and adds this spec's Notes from the build. Nothing needs fleet. The change needs a deploy, which is the user's.
+
+## Notes from the build
+
+- **Crew: where a child's mode comes from.**
+  - A running child's mode is read from its live session.
+  - A settled child's comes from its log: the last `sandbox/mode` event, through `sessionQuery.readSession`, within 2 s. dsh disposes a child as soon as it settles, before the parent's notice, so a fix round always finds it settled (found in review).
+  - No service, a failed read or no mode event means no refusal. On dish's deployment a child always has the event: dsh's permission presets pin every session's mode, and the child inherits it.
+- **The judge: what didn't change.**
+  - A child keeps today's serves-task question (`CHILD_SERVES_TASK_QUESTION`). Its brief is unlabelled and comes from the parent, so "the user's latest request" would misread it.
+  - The live calibration (`pnpm --filter dish-judge test:live`, which needs the TypeSafe key) wasn't rerun after the question's wording changed. It's the user's to run. Those tests use one-prompt tasks, which read as before.
+- **The judge: an escalation under `never`.** It's refused before any judge call, since dsh's own approval of the wider sandbox would reject it silently, with the same false "the user rejected". So no decision-log line is written for it.
+- **The judge: other listeners.** A later `tools/pre-execute` listener that answers `ask` could still reach a `never` chat. dsh-base loads none.
+
