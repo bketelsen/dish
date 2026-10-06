@@ -24,7 +24,7 @@ A chat in `frostyard/nsl` began on 2026-10-03 with "do a read-only review of the
 
 | # | Topic | Decision |
 |---|---|---|
-| 1 | `delegate` in a read-only chat | When the delegating agent's sandbox mode is `read-only`, `delegate` refuses a role with `writes: true` in `crew.yaml` (today the architect, coder, writer and ops). That covers a new child and a follow-up to one (`to`). Read-only roles still run. The refusal says why and how to fix it (below). Nothing starts. |
+| 1 | `delegate` in a read-only chat | When the delegating agent's sandbox mode is `read-only`, `delegate` refuses a role with `writes: true` in `crew.yaml` (today the architect, coder, writer and ops). That covers a new child and a follow-up to one (`to`). Read-only roles still run. The refusal says why and how to fix it (below). Nothing starts. A child keeps the sandbox mode it started with: dsh copies the parent's mode once, at start. So a follow-up to a writing child that started read-only is refused too, even after the chat switches, with the advice to delegate a new one. |
 | 2 | The main agent and a read-only chat | `main.md` gains one bullet: when the chat is read-only and the user asks for a change, say so before starting, and how to switch (`/permission workspace-write`). |
 | 3 | The judge's view of a main agent's task | The newest prompt is the request. The earlier ones, the first included, go along as context. The task text labels them: `Earlier in this chat:` above the earlier ones (with the gap line, as now), and `Your user's latest request:` above the newest. With one prompt, it's that prompt alone, as now. The serves-task question names the latest request and says an earlier one doesn't rule out what a later one asks for. A child's task (its brief and latest instruction) doesn't change. |
 | 4 | Approval policy `never` | For a top-level agent whose effective approval policy is `never`, the command gate never answers `ask`: no one would see it. It decides alone. It **allows** what passes the effect bar (read-only, or reversible enough), whatever `serves_task` says. It **refuses** the rest with the judge's reason, worded for the main agent: the chat's approval policy is never, so there's no one to ask; tell your user, who can run it or set the policy back to ask. An unavailable judge, and a command it can't read (opaque), are refused the same way instead of asked. Under `ask`, nothing changes. |
@@ -36,6 +36,10 @@ A chat in `frostyard/nsl` began on 2026-10-03 with "do a read-only review of the
 > This chat is read-only (`/permission read-only`), so <a role> couldn't write its worktree. Ask your user to switch the chat to workspace-write (`/permission workspace-write`), then delegate again. Read-only roles (researcher, reviewer) still run.
 
 Its first sentence names the role. The read-only roles listed are the ones `crew.yaml` gives `writes: false`.
+
+**A follow-up to a child that started read-only:**
+
+> This coder started while the chat was read-only, and keeps that sandbox: it can't write its worktree. Delegate a new coder (without `to`) instead.
 
 ## Tasks
 
