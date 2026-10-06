@@ -12,7 +12,13 @@
  * 1. **The caller** is the main agent (`isTopLevelAgent`), nobody's child.
  * 2. **The role** is one of `crew.yaml`'s (an own property: the settings have no prototype, and the name comes from the
  *    model) and, for a start, has a prompt. A follow-up doesn't read the prompt: its child keeps the one it started with.
- * 3. **The follow-up target** (`to`) is a crew child of this session, in the same role.
+ * 3. **The follow-up target** (`to`) is a crew child of this session, in the same role. Then **the chat's sandbox**, for a
+ *    start and a follow-up alike: while the main agent's sandbox mode is `read-only`, a role with `writes: true` is refused,
+ *    with how to switch (`readOnlyRefusal`). The mode is `sandboxPolicy`'s `resolve({ session }).mode`, read with `ctx.get`
+ *    on every call, as dish-judge's gate reads it. Any other mode, no service, or one that throws (logged) is no refusal.
+ *    When the chat isn't read-only, a follow-up to a role that writes asks the same of the child's own session (its live
+ *    agent's, from dsh's registry) and is refused when that is `read-only` (`stuckRefusal`): dsh fixes a child's sandbox
+ *    when it starts. A child that isn't live, or whose session can't be read, is no refusal.
  * 4. **The limits:** children running, writers running, and delegations in the session.
  * 5. **The model:** the role's own, or an override `crew.yaml` lists; the reviewer's by the reviewer rule (`chooseRoute`),
  *    whose reviewed work is a crew child of this session or `"main"`. Then, for a review, **the gate check** (below).
@@ -279,6 +285,38 @@ interface RunsReader {
   place(sessionId: string, where: PlaceTarget): Promise<Placement | undefined>
   ladder(entry: LadderEntry): Promise<void>
   driving?(sessionId: string): Promise<unknown>
+}
+
+/**
+ * What the row reads of dsh's sandbox policy with `ctx.get('sandboxPolicy')` (`dsh-sandbox-policy`'s service, a sibling
+ * of the row), structurally: crew doesn't depend on it. `resolve({ session })` gives the session's policy as dsh's `bash`
+ * and file tools enforce it, `{ mode, workspaceRoot, sessionId }`, with `mode` one of `read-only`, `workspace-write` and
+ * `danger-full-access`.
+ */
+interface SandboxPolicyReader {
+  resolve(request: { session: unknown }): unknown
+}
+
+/** The sandbox mode in which `delegate` refuses a role that writes. */
+const READ_ONLY = 'read-only'
+
+/**
+ * The refusal of a role that writes (`role`) in a read-only chat: why, and how the user switches. It lists the roles of
+ * `settings` without `writes: true`, sorted, or leaves that sentence out when there are none.
+ */
+function readOnlyRefusal(settings: CrewSettings, role: string): string {
+  const readOnly = Object.keys(settings.roles).filter(name => !settings.roles[name]!.writes).sort()
+  return `This chat is read-only (\`/permission read-only\`), so ${article(role)} couldn't write its worktree. `
+    + 'Ask your user to switch the chat to workspace-write (`/permission workspace-write`), then delegate again.'
+    + (readOnly.length === 0 ? '' : ` Read-only roles (${listed(readOnly)}) still run.`)
+}
+
+/**
+ * The refusal of a follow-up to a child of a role that writes (`role`) whose own sandbox is read-only while the chat's
+ * isn't: it started in a read-only chat and keeps that mode, so only a new child can write.
+ */
+function stuckRefusal(role: string): string {
+  return `This ${role} started while the chat was read-only, and keeps that sandbox: it can't write its worktree. Delegate a new ${role} (without \`to\`) instead.`
 }
 
 /** What a ruling says, as the refusals and the parameter put it. */
@@ -746,6 +784,51 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
     throw new Error(`no worktree ${shownWorktree(ref)} in a registered project; make one with the worktree tool (action create)`)
   }
 
+  /**
+   * The sandbox mode dsh's sandbox policy resolves for `session` now: read on every call, since the service is a sibling's
+   * (it may come and go) and the user switches the chat's mode with `/permission`. `undefined` without the service or a
+   * `resolve`, for an answer with no mode, and when it throws (logged, naming `whose`).
+   */
+  function sandboxMode(session: unknown, whose: string): string | undefined {
+    try {
+      const policy = lookup.get('sandboxPolicy') as Partial<SandboxPolicyReader> | undefined
+      if (typeof policy?.resolve !== 'function') return undefined
+      const resolved: unknown = policy.resolve({ session })
+      const mode = typeof resolved === 'object' && resolved !== null ? (resolved as { mode?: unknown }).mode : undefined
+      return typeof mode === 'string' ? mode : undefined
+    } catch (error) {
+      warn('could not read the sandbox mode of %s, so delegate went on as if it weren\'t read-only: %s', whose, describe(error))
+      return undefined
+    }
+  }
+
+  /**
+   * The session of `child`'s live agent in dsh's registry, or `undefined`: not live (after a restart, say), with no session,
+   * or one that can't be read. Never a session `resolve` would read as no session at all, which is the deployment default.
+   */
+  function liveSession(call: Call, child: ChildRecord): object | undefined {
+    try {
+      const session: unknown = call.agents.get(child.id as SessionId)?.session
+      return typeof session === 'object' && session !== null ? session : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * The sandboxes, for a role that writes; a role that doesn't never asks. @throws `readOnlyRefusal` when the chat's mode
+   * is exactly `read-only`, since a new child would start in it. Otherwise, for a follow-up (`target`), `stuckRefusal` when
+   * the child's own mode is: dsh fixes a child's sandbox when it starts, so one started in a read-only chat keeps it after
+   * the chat switches. Any other mode, or none, passes; so does a child that isn't live, or whose session can't be read.
+   */
+  function enforceSandbox(call: Call, target: ChildRecord | undefined): void {
+    if (!call.roleSettings.writes) return
+    if (sandboxMode(call.agent.session, 'this chat') === READ_ONLY) throw new Error(readOnlyRefusal(call.settings, call.role))
+    if (target === undefined) return
+    const session = liveSession(call, target)
+    if (session !== undefined && sandboxMode(session, `child ${target.id}`) === READ_ONLY) throw new Error(stuckRefusal(call.role))
+  }
+
   /** The first check of a `worktree`: the role writes. */
   function enforceWrites(call: Call): void {
     if (!call.roleSettings.writes) throw new Error(`\`worktree\` is for roles that write; give ${article(call.role)} the path in its task instead`)
@@ -1209,6 +1292,9 @@ export function apply(ctx: Context, _config: Config): Promise<void> {
               + `Set role to ${target.role}, or leave to out to start a new ${call.role}.`)
           }
         }
+        // A read-only chat, or a follow-up's child that is still read-only, refuses a role that writes, before the worktree
+        // is looked up or anything starts.
+        enforceSandbox(call, target)
         // The worktree's checks that need no lock. A start's is the worktree to bind; a follow-up's, the one its child is bound to.
         const bound = target === undefined ? await startBinding(call) : undefined
         const worktree = target === undefined ? bound?.path : await followUpBinding(call, target)

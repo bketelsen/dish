@@ -1384,6 +1384,261 @@ test('a follow-up that is sent but can\'t be counted still succeeds, and says so
   assert.ok(logs.some(line => /disk full/.test(line)), logs.join('\n'))
 })
 
+// --- a read-only chat (the nsl session's decision 1) --------------------------------------------------------
+
+/** The refusal of a coder in a read-only chat, with the shipped crew.yaml, word for word. */
+const READ_ONLY_CODER = 'This chat is read-only (`/permission read-only`), so a coder couldn\'t write its worktree. '
+  + 'Ask your user to switch the chat to workspace-write (`/permission workspace-write`), then delegate again. '
+  + 'Read-only roles (researcher, reviewer) still run.'
+
+/** A stub of dsh's sandbox policy, and what it was asked. */
+interface Policy {
+  /** The `mode` that `resolve` gives now, for a session `sessions` doesn't have. */
+  mode: unknown
+  /** The mode `resolve` gives for a session, by the session object, or an error it throws for that session. */
+  sessions: Map<unknown, unknown>
+  /** What `resolve` was asked, in order. */
+  asked: Array<Record<string, unknown>>
+  /** An error `resolve` throws instead of answering. */
+  fails: Error | undefined
+  /** Takes the service away. */
+  handle: { dispose(): Promise<void> | void }
+}
+
+/**
+ * dsh's `sandboxPolicy` (`dsh-sandbox-policy`), provided from a plugin of its own as dsh provides it, after the row is
+ * mounted: `resolve({ session })` gives `{ mode, workspaceRoot, sessionId }`, with the mode `Policy.sessions` has for the
+ * session at the time, else `Policy.mode`.
+ */
+async function sandboxPolicy(w: World, mode: unknown): Promise<Policy> {
+  const policy: Omit<Policy, 'handle'> = { mode, sessions: new Map(), asked: [], fails: undefined }
+  const handle = await provideStub(w.ctx, 'sandboxPolicy', {
+    defaultMode: 'workspace-write',
+    resolve(request: Record<string, unknown> = {}) {
+      policy.asked.push(request)
+      if (policy.fails !== undefined) throw policy.fails
+      const own = policy.sessions.has(request.session) ? policy.sessions.get(request.session) : policy.mode
+      if (own instanceof Error) throw own
+      return { mode: own, workspaceRoot: w.workspace, sessionId: SESSION }
+    },
+  })
+  disposables.push(handle)
+  return Object.assign(policy, { handle })
+}
+
+test('in a read-only chat, a start of a role that writes is refused before anything starts, and says how to switch', async () => {
+  const w = await world()
+  const policy = await sandboxPolicy(w, 'read-only')
+  assert.equal(await refusal(w.delegate(CODER)), READ_ONLY_CODER)
+  assert.equal(policy.asked.length, 1)
+  assert.equal(policy.asked[0]!.session, w.main.session, 'the policy is resolved for the delegating agent\'s session')
+  // Each role with `writes: true`, with the article that fits it.
+  for (const [role, named] of [['architect', 'an architect'], ['ops', 'an ops'], ['writer', 'a writer']] as const) {
+    assert.equal(await refusal(w.delegate({ role, title: 't', task: 't' })), READ_ONLY_CODER.replace('a coder', named), role)
+  }
+  // Before the worktree is looked up, and before the limits: a writer running is not the reason.
+  await w.makeWorktree('login')
+  assert.equal(await refusal(w.delegate({ ...CODER, worktree: 'frostyard/snosi/login' })), READ_ONLY_CODER)
+  assert.deepEqual(w.resolveAsked, [])
+  await w.seed({ id: 'w1', role: 'coder' })
+  assert.equal(await refusal(w.delegate({ role: 'ops', title: 't', task: 't' })), READ_ONLY_CODER.replace('a coder', 'an ops'))
+  assert.equal(w.starts.length, 0)
+  assert.equal(w.resolves.length, 0)
+  assert.deepEqual((await w.records.children(SESSION)).map(child => child.id), ['w1'], 'nothing was recorded')
+})
+
+test('in a read-only chat, a follow-up to a role that writes is refused too, and nothing is sent or counted', async () => {
+  const w = await world()
+  await w.seed({ id: 'c1', role: 'coder', last: 'finished' }, 'idle')
+  const policy = await sandboxPolicy(w, 'read-only')
+  assert.equal(await refusal(w.delegate({ ...CODER, to: 'c1' })), READ_ONLY_CODER)
+  assert.equal(policy.asked[0]!.session, w.main.session)
+  assert.equal(w.sends.length, 0)
+  assert.equal((await w.records.children(SESSION))[0]!.followUps, 0)
+  // The target is checked first: a child that isn't this session's, or of another role, is that refusal.
+  assert.match(await refusal(w.delegate({ ...CODER, to: 'nobody' })), /"nobody" is not a crew child of this session/)
+  assert.match(await refusal(w.delegate({ role: 'ops', task: 't', to: 'c1' })), /is a coder/)
+  // Once the user switches, the same follow-up goes.
+  policy.mode = 'workspace-write'
+  await w.delegate({ ...CODER, to: 'c1' })
+  assert.equal(w.sends.length, 1)
+})
+
+test('in a read-only chat, the read-only roles still start, and their follow-ups go', async () => {
+  const w = await world()
+  const policy = await sandboxPolicy(w, 'read-only')
+  const researcher = await w.delegate(RESEARCHER)
+  const reviewer = await w.delegate({ role: 'reviewer', title: 'review it', task: 'Review.', reviews: 'main' })
+  assert.equal(w.starts.length, 2)
+  await finish(w, researcher.child)
+  await finish(w, reviewer.child)
+  await w.delegate({ ...RESEARCHER, to: researcher.child })
+  await w.delegate({ role: 'reviewer', task: 'Again.', to: reviewer.child })
+  assert.equal(w.sends.length, 2)
+  assert.equal(policy.asked.length, 0, 'a role that doesn\'t write doesn\'t ask')
+})
+
+test('workspace-write and full access change nothing: a coder starts, and takes a follow-up', async () => {
+  for (const mode of ['workspace-write', 'danger-full-access']) {
+    const w = await world()
+    const policy = await sandboxPolicy(w, mode)
+    const started = await w.delegate(CODER)
+    await finish(w, started.child)
+    await w.delegate({ ...CODER, to: started.child })
+    assert.equal(w.starts.length, 1, mode)
+    assert.equal(w.sends.length, 1, mode)
+    assert.equal(policy.asked.length, 2, mode)
+  }
+})
+
+test('no sandbox policy, one that throws, or a mode that isn\'t exactly read-only: no refusal', async () => {
+  const many = settingsFrom((d) => { d.limits = { running: 20, writers: 20, perSession: 30 } })
+  // No service.
+  const none = await world({ settings: many })
+  await none.delegate(CODER)
+  assert.equal(none.starts.length, 1)
+  // A service with no `resolve`.
+  const odd = await world({ settings: many })
+  disposables.push(await provideStub(odd.ctx, 'sandboxPolicy', { overrideOf: () => 'read-only' }))
+  await odd.delegate(CODER)
+  assert.equal(odd.starts.length, 1)
+  // A `resolve` that throws: logged, and the coder starts.
+  const w = await world({ settings: many })
+  const logs = watchLogs(w.ctx)
+  const policy = await sandboxPolicy(w, 'read-only')
+  policy.fails = new Error('policy broke')
+  await w.delegate(CODER)
+  assert.equal(w.starts.length, 1)
+  assert.ok(logs.some(line => /sandbox mode/.test(line) && /policy broke/.test(line)), logs.join('\n'))
+  policy.fails = undefined
+  // Modes dsh doesn't have, and answers with none.
+  const modes: unknown[] = [undefined, null, '', 'READ-ONLY', ' read-only', 'readonly', 'locked-down', 42, ['read-only'], { mode: 'read-only' }]
+  for (const mode of modes) {
+    policy.mode = mode
+    await w.delegate({ ...CODER, title: `mode ${JSON.stringify(mode)}` })
+  }
+  assert.equal(w.starts.length, 1 + modes.length)
+})
+
+test('the mode is read on each call: a switch, and a policy that goes away, take effect at once', async () => {
+  const w = await world()
+  const policy = await sandboxPolicy(w, 'read-only')
+  assert.equal(await refusal(w.delegate(CODER)), READ_ONLY_CODER)
+  policy.mode = 'workspace-write'
+  const started = await w.delegate(CODER)
+  await finish(w, started.child)
+  policy.mode = 'read-only'
+  assert.equal(await refusal(w.delegate({ ...CODER, to: started.child })), READ_ONLY_CODER)
+  await policy.handle.dispose()
+  await w.delegate({ ...CODER, to: started.child })
+  assert.equal(w.starts.length, 1)
+  assert.equal(w.sends.length, 1)
+  assert.equal(policy.asked.length, 3)
+})
+
+/** The refusal of a follow-up to a coder whose own sandbox is read-only, while the chat's isn't, word for word. */
+const STUCK_CODER = 'This coder started while the chat was read-only, and keeps that sandbox: it can\'t write its worktree. '
+  + 'Delegate a new coder (without `to`) instead.'
+
+/** Seed a finished child of this session, live in the registry (idle) on `session`: what `ctx.agents.get` gives for it. */
+async function liveChild(w: World, id: string, role: string, session: unknown): Promise<void> {
+  await w.seed({ id, role, last: 'finished' }, 'idle')
+  w.agents.set(id, { status: 'idle', session } as never)
+}
+
+test('a follow-up to a writing child whose own sandbox is read-only is refused once the chat isn\'t: it keeps the mode it started with', async () => {
+  const w = await world()
+  const policy = await sandboxPolicy(w, 'workspace-write')
+  // The nsl session: the coder started while the chat was read-only, and the user has switched the chat since.
+  const stuck = { id: 'c1', header: { id: 'c1' } }
+  await liveChild(w, 'c1', 'coder', stuck)
+  policy.sessions.set(stuck, 'read-only')
+  assert.equal(await refusal(w.delegate({ ...CODER, to: 'c1' })), STUCK_CODER)
+  assert.deepEqual(policy.asked.map(request => request.session), [w.main.session, stuck], 'the chat\'s mode, then the child\'s')
+  // So in a full-access chat.
+  policy.mode = 'danger-full-access'
+  assert.equal(await refusal(w.delegate({ ...CODER, to: 'c1' })), STUCK_CODER)
+  // The role is the call's.
+  const ops = { id: 'o1', header: { id: 'o1' } }
+  await liveChild(w, 'o1', 'ops', ops)
+  policy.sessions.set(ops, 'read-only')
+  assert.equal(await refusal(w.delegate({ role: 'ops', task: 't', to: 'o1' })),
+    'This ops started while the chat was read-only, and keeps that sandbox: it can\'t write its worktree. Delegate a new ops (without `to`) instead.')
+  // Both read-only: the chat's refusal wins, and the child isn't asked.
+  policy.mode = 'read-only'
+  policy.asked.length = 0
+  assert.equal(await refusal(w.delegate({ ...CODER, to: 'c1' })), READ_ONLY_CODER)
+  assert.deepEqual(policy.asked.map(request => request.session), [w.main.session])
+  // Nothing was sent or counted.
+  assert.equal(w.sends.length, 0)
+  for (const child of await w.records.children(SESSION)) assert.equal(child.followUps, 0, child.id)
+  // A new coder, as the refusal says, starts.
+  policy.mode = 'workspace-write'
+  await w.delegate(CODER)
+  assert.equal(w.starts.length, 1)
+})
+
+test('a writing child started outside a read-only chat takes its follow-up, and a read-only role\'s child isn\'t asked', async () => {
+  const w = await world()
+  const policy = await sandboxPolicy(w, 'workspace-write')
+  const session = { id: 'c1', header: { id: 'c1' } }
+  await liveChild(w, 'c1', 'coder', session)
+  for (const mode of ['workspace-write', 'danger-full-access', undefined, 'READ-ONLY']) {
+    policy.sessions.set(session, mode)
+    await w.delegate({ ...CODER, to: 'c1' })
+    await finish(w, 'c1')
+    w.agents.set('c1', { status: 'idle', session } as never)
+  }
+  assert.equal(w.sends.length, 4)
+  // A researcher's child read-only is as it should be: nothing is asked of it, or of the chat.
+  const researcher = { id: 'r1', header: { id: 'r1' } }
+  await liveChild(w, 'r1', 'researcher', researcher)
+  policy.sessions.set(researcher, 'read-only')
+  policy.asked.length = 0
+  await w.delegate({ ...RESEARCHER, to: 'r1' })
+  assert.equal(w.sends.length, 5)
+  assert.deepEqual(policy.asked, [])
+})
+
+test('a writing child whose sandbox can\'t be read takes its follow-up: not live, no session, or a policy that throws for it (logged)', async () => {
+  const w = await world({ settings: settingsFrom((d) => { d.limits = { running: 10, writers: 10, perSession: 30 } }) })
+  const logs = watchLogs(w.ctx)
+  const policy = await sandboxPolicy(w, 'workspace-write')
+  // Not live (a restart, say): no agent to read.
+  await w.seed({ id: 'gone', role: 'coder', last: 'finished' }, 'absent')
+  await w.delegate({ ...CODER, to: 'gone' })
+  // Live with no session, or one that can't be read: the policy isn't asked for it, since it would resolve the default.
+  await w.seed({ id: 'bare', role: 'coder', last: 'finished' }, 'idle')
+  await w.delegate({ ...CODER, to: 'bare' })
+  await w.seed({ id: 'broken', role: 'coder', last: 'finished' }, 'idle')
+  w.agents.set('broken', { status: 'idle', get session() { throw new Error('session closed') } } as never)
+  await w.delegate({ ...CODER, to: 'broken' })
+  assert.deepEqual(policy.asked.map(request => request.session), [w.main.session, w.main.session, w.main.session])
+  // A policy that throws for the child's session: logged, naming the child.
+  const session = { id: 'c1', header: { id: 'c1' } }
+  await liveChild(w, 'c1', 'coder', session)
+  policy.sessions.set(session, new Error('log unreadable'))
+  await w.delegate({ ...CODER, to: 'c1' })
+  assert.equal(w.sends.length, 4)
+  assert.ok(logs.some(line => /sandbox mode of child c1/.test(line) && /log unreadable/.test(line)), logs.join('\n'))
+})
+
+test('the read-only roles the refusal names are crew.yaml\'s, and with none it names none', async () => {
+  const w = await world({
+    settings: settingsFrom((d) => {
+      d.roles.tester = { tier: 'mid', family: 'anthropic', tools: ['read'] }
+      d.roles.researcher.writes = true
+    }),
+  })
+  await sandboxPolicy(w, 'read-only')
+  assert.equal(await refusal(w.delegate(RESEARCHER)), READ_ONLY_CODER.replace('a coder', 'a researcher').replace('(researcher, reviewer)', '(reviewer, tester)'))
+  await w.delegate({ role: 'tester', title: 't', task: 't' })
+  assert.equal(w.starts.length, 1)
+  const all = await world({ settings: settingsFrom((d) => { for (const role of Object.values(d.roles) as Array<Record<string, unknown>>) role.writes = true }) })
+  await sandboxPolicy(all, 'read-only')
+  assert.equal(await refusal(all.delegate(RESEARCHER)), READ_ONLY_CODER.replace('a coder', 'a researcher').replace(' Read-only roles (researcher, reviewer) still run.', ''))
+})
+
 // --- the reviewer rule, end to end -------------------------------------------------------------------------
 
 const REVIEW = { role: 'reviewer', title: 'review the login', task: 'Review the change.' }
