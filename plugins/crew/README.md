@@ -33,6 +33,7 @@ Talk to the main agent as usual. It delegates by itself, as its prompt (`prompts
 - **The session header's subagent list** shows each child as `role · model · title`, with its status. Click a child to open its session.
 - **Fix rounds:** `delegate` again with `to` set to the same child. It continues with its history.
 - **Reviews:** the `reviewer` role with `reviews` set to the child whose work it checks, or `main` for the main agent's own work.
+- **A read-only chat starts no writer.** While the chat is `/permission read-only`, `delegate` refuses a role with `writes: true` (a start or a follow-up), since its child couldn't write: "This chat is read-only (`/permission read-only`), so a coder couldn't write its worktree. Ask your user to switch the chat to workspace-write (`/permission workspace-write`), then delegate again. Read-only roles (researcher, reviewer) still run." Any other mode, or no sandbox policy to ask, refuses nothing. A writing child keeps the sandbox it started with, so after the switch a follow-up to one started while the chat was read-only is refused too: "This coder started while the chat was read-only, and keeps that sandbox: it can't write its worktree. Delegate a new coder (without `to`) instead." A running child's mode is read from its live session, and a settled one's (dsh disposes a child when it settles) from the last `sandbox/mode` event in its log, through dsh's `sessionQuery`. A log with no such event, or one that can't be read, refuses nothing.
 
 ### Reports
 
